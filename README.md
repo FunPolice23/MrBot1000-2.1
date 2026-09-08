@@ -1,5 +1,7 @@
 # MrBot1000 2.1 — Dual-Brain AI Earning Agent
 
+# Not A final finish nor 100% working - Still W.I.P
+
 A local-first, human-gated AI agent that helps you earn money across multiple paths:
 freelance, micro-tasks, crypto, bounties, and trading.
 
