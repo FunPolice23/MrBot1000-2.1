@@ -16,7 +16,7 @@ freelance, micro-tasks, crypto, bounties, and trading.
 1. Clone the repo
 2. Copy `.env.example` to `.env` and fill in your API keys
 3. Install dependencies: `pip install -r requirements.txt`
-4. Start llama.cpp with your models
+4. if more than 1 GPU or want llama.cpp, Start llama.cpp with your models or any available local providers
 5. Run: `python main.py`
 
 ## 📁 Project Structure
