@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# MrBot1000 secrets — NEVER commit!
+.env
+wallet.key
+*.db
+*.db-shm
+*.db-wal
+models_cache.json
+settings.json
+
+# MrBot1000 local data
+data/
+plans/
+research/
+proposals/
+references/
+nul
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Test cache
+.pytest_cache/
+.py_compile_check/
+htmlcov/
+.coverage

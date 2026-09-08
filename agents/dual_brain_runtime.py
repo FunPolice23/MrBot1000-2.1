@@ -1,0 +1,422 @@
+"""
+agents/dual_brain_runtime.py — Canonical dual-brain runtime & configuration (v2.1).
+
+Single source of truth for the MrBot1000 dual-brain GPU/model contract:
+
+    Big Brain   → CUDA device 0 (RTX 5060 Ti 16 GB) → llama-server :1234
+    Small Brain → CUDA device 1 (GTX 1660 Super 6 GB) → llama-server :1235
+
+Every component (adapters, GUI, legacy workers) reads its endpoint/model/device
+from this runtime so the application never operates with contradictory role→GPU
+assignments. This module is dependency-light (stdlib only) so it can be imported
+anywhere without pulling in Qt, openai, or provider clients.
+
+Design invariants
+-----------------
+- Model output is never authoritative for actions; the runtime only resolves
+  WHERE to call a model, never WHAT the model may do.
+- Role→GPU isolation is explicit and verifiable (``validate_isolation``).
+- Health probes are bounded and NEVER raise; they degrade to "offline" instead.
+- The canonical provider is llama.cpp (llama-server, OpenAI-compatible /v1).
+  Ollama/LM Studio are explicit opt-in provider kinds, never silent defaults.
+
+Environment contract (all optional; defaults match the llama-server scripts)
+-----------------------------------------------------------------------------
+  BIG_BRAIN_PROVIDER   (default "llamacpp")  llamacpp | ollama | lmstudio
+  BIG_BRAIN_URL        (default http://127.0.0.1:1234/v1)
+  BIG_BRAIN_MODEL      (default "")          auto-detected from the server
+  BIG_BRAIN_DEVICE     (default "0")         CUDA device index
+  BIG_BRAIN_PORT       (default "1234")
+  BIG_BRAIN_CONTEXT    (default "32768")     context length in tokens
+  BIG_BRAIN_GPU_LAYERS (default "")          ""/auto → server decides
+  BIG_BRAIN_ENABLED    (default "true")
+  SMALL_* ... same keys, device "1", port "1235".
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import urllib.request
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+
+class BrainRole(str, Enum):
+    BIG = "big"
+    SMALL = "small"
+
+
+# Provider kinds the runtime understands. `llamacpp` is the canonical default
+# (llama-server exposes an OpenAI-compatible /v1/models endpoint).
+PROVIDER_LLAMACPP = "llamacpp"
+PROVIDER_OLLAMA = "ollama"
+PROVIDER_LMSTUDIO = "lmstudio"
+SUPPORTED_PROVIDERS = {PROVIDER_LLAMACPP, PROVIDER_OLLAMA, PROVIDER_LMSTUDIO}
+
+# llama-server binary (v2.1 fix). The WindowsApps `llama.exe` (MSVC 0.3.0 build)
+# has NO CUDA kernel for sm_75 (GTX 1660 Super), so `--device CUDA1` crashes on
+# the Small Brain. The Clang 0.4.0 build in /d/llama.cpp ships kernels for both
+# GPUs and is the verified-working binary. Override per-brain with
+# BIG/SMALL_BRAIN_SERVER, or globally with LLAMA_SERVER_BIN.
+DEFAULT_LLAMA_SERVER_BIN = r"D:\llama.cpp\llama-server.exe"
+
+
+def _server_bin(prefix: str = "") -> str:
+    if prefix:
+        v = os.getenv(f"{prefix}_SERVER", "").strip()
+        if v:
+            return v
+    v = os.getenv("LLAMA_SERVER_BIN", "").strip()
+    if v:
+        return v
+    return DEFAULT_LLAMA_SERVER_BIN
+
+
+# Default device/port pairing — MUST mirror the intended hardware assignment.
+ROLE_DEFAULTS: Dict[BrainRole, Dict[str, Any]] = {
+    BrainRole.BIG: {
+        "provider": PROVIDER_LLAMACPP,
+        "endpoint": "http://127.0.0.1:1234/v1",
+        "device": 0,
+        "port": 1234,
+        "context": 32768,
+        "gpu_layers": None,
+        "display_name": "Marcus Rivera",
+        "gpu_label": "RTX 5060 Ti 16 GB",
+        "kv_cache": "f16",
+        "split_mode": "none",
+        "threads": 8,
+        "batch": 2048,
+    },
+    BrainRole.SMALL: {
+        "provider": PROVIDER_LLAMACPP,
+        "endpoint": "http://127.0.0.1:1235/v1",
+        "device": 1,
+        "port": 1235,
+        "context": 32768,
+        "gpu_layers": None,
+        "display_name": "Alex Vega",
+        "gpu_label": "GTX 1660 Super 6 GB",
+        "kv_cache": "f16",
+        "split_mode": "none",
+        "threads": 4,
+        "batch": 2048,
+    },
+}
+
+
+@dataclass
+class BrainConfig:
+    """Resolved, validated configuration for one brain role."""
+
+    role: BrainRole
+    provider: str = PROVIDER_LLAMACPP
+    endpoint: str = ""
+    model: str = ""
+    device: int = 0
+    port: int = 1234
+    context: int = 32768
+    gpu_layers: Optional[int] = None
+    display_name: str = ""
+    gpu_label: str = ""
+    enabled: bool = True
+    kv_cache: str = "f16"
+    split_mode: str = "none"
+    threads: int = 8
+    batch: int = 2048
+
+    def __post_init__(self) -> None:
+        defaults = ROLE_DEFAULTS[self.role]
+        self._env_prefix = "BIG_BRAIN" if self.role is BrainRole.BIG else "SMALL_BRAIN"
+        if not self.endpoint:
+            self.endpoint = defaults["endpoint"]
+        if not self.display_name:
+            self.display_name = defaults["display_name"]
+        if not self.gpu_label:
+            self.gpu_label = defaults["gpu_label"]
+        if self.provider not in SUPPORTED_PROVIDERS:
+            self.provider = PROVIDER_LLAMACPP
+        if not self.kv_cache:
+            self.kv_cache = defaults.get("kv_cache", "f16")
+        if not self.split_mode:
+            self.split_mode = defaults.get("split_mode", "none")
+        if not self.threads:
+            self.threads = defaults.get("threads", 8)
+        if not self.batch:
+            self.batch = defaults.get("batch", 2048)
+
+    # ── Convenience ──────────────────────────────────────────────────────────
+    @property
+    def models_path(self) -> str:
+        """HTTP path for listing models for this provider kind."""
+        if self.provider == PROVIDER_OLLAMA:
+            return f"{self.endpoint}/api/tags"
+        # OpenAI-compatible (llama-server, LM Studio) expose /v1/models.
+        return f"{self.endpoint}/models"
+
+    def build_llama_command(self, model_path: str = "") -> List[str]:
+        """Build the llama-server launch command for this role.
+
+        Honors context, gpu_layers, split_mode, threads, batch, and kv_cache
+        so the GUI Start buttons and any launcher share one source of truth
+        (v2.1 llama.cpp customization).
+
+        v2.1 fix: uses the verified-working llama-server binary (Clang build,
+        /d/llama.cpp) which ships sm_75 kernels for the 1660 Super, and passes
+        the device by NAME (``CUDA0``/``CUDA1``) — this llama.cpp line rejects
+        numeric indices (``--device 1`` -> "invalid device") and the WindowsApps
+        MSVC build can't run the 1660 Super at all.
+        """
+        model = model_path or self.model
+        bin_path = _server_bin(self._env_prefix)
+        device_name = f"CUDA{self.device}"
+        cmd = [bin_path,
+               "--host", "127.0.0.1",
+               "--port", str(self.port),
+               "--device", device_name,
+               "--ctx-size", str(self.context),
+               "--threads", str(self.threads),
+               "--batch-size", str(self.batch),
+               "--split-mode", self.split_mode or "none",
+               "--cache-type-k", self.kv_cache or "f16",
+               "--cache-type-v", self.kv_cache or "f16",
+               "--model", model]
+        if self.gpu_layers is not None:
+            cmd += ["--n-gpu-layers", str(self.gpu_layers)]
+        return cmd
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "role": self.role.value,
+            "provider": self.provider,
+            "endpoint": self.endpoint,
+            "model": self.model,
+            "device": self.device,
+            "port": self.port,
+            "context": self.context,
+            "gpu_layers": self.gpu_layers,
+            "display_name": self.display_name,
+            "gpu_label": self.gpu_label,
+            "enabled": self.enabled,
+            "kv_cache": self.kv_cache,
+            "split_mode": self.split_mode,
+            "threads": self.threads,
+            "batch": self.batch,
+        }
+
+
+def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> BrainConfig:
+    """Build a ``BrainConfig`` for a role from environment (or an injected map).
+
+    ``env`` is the environment mapping (defaults to ``os.environ``). This
+    indirection keeps tests hermetic without mutating the real environment.
+    """
+    e = env if env is not None else os.environ
+    prefix = "BIG_BRAIN" if role is BrainRole.BIG else "SMALL_BRAIN"
+    defaults = ROLE_DEFAULTS[role]
+
+    def _g(name: str, default: str = "") -> str:
+        return (e.get(f"{prefix}_{name}", "") or "").strip() or default
+
+    def _i(name: str, default: int) -> int:
+        try:
+            return int((e.get(f"{prefix}_{name}", "") or "").strip() or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _b(name: str, default: bool = True) -> bool:
+        raw = (e.get(f"{prefix}_{name}", "") or "").strip().lower()
+        if not raw:
+            return default
+        return raw in ("1", "true", "yes", "on")
+
+    provider = _g("PROVIDER", defaults["provider"]).lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        provider = PROVIDER_LLAMACPP
+    gpu_raw = _g("GPU_LAYERS", "")
+    gpu_layers: Optional[int] = None
+    if gpu_raw:
+        try:
+            gpu_layers = int(gpu_raw)
+        except (TypeError, ValueError):
+            gpu_layers = None
+    threads = _i("THREADS", defaults.get("threads", 8))
+    batch = _i("BATCH", defaults.get("batch", 2048))
+
+    return BrainConfig(
+        role=role,
+        provider=provider,
+        endpoint=_g("URL", defaults["endpoint"]),
+        model=_g("MODEL", ""),
+        device=_i("DEVICE", defaults["device"]),
+        port=_i("PORT", defaults["port"]),
+        context=_i("CONTEXT", defaults["context"]),
+        gpu_layers=gpu_layers,
+        enabled=_b("ENABLED", True),
+        kv_cache=_g("KV_CACHE", defaults.get("kv_cache", "f16")),
+        split_mode=_g("SPLIT_MODE", defaults.get("split_mode", "none")),
+        threads=threads,
+        batch=batch,
+    )
+
+
+class DualBrainRuntime:
+    """Authoritative runtime/configuration owner for both brain roles.
+
+    - Resolves role → endpoint/model/device.
+    - Probes model servers with bounded timeouts (never raises).
+    - Tracks the currently selected model per role (thread-safe).
+    """
+
+    HEALTH_TIMEOUT_S = float(os.getenv("DUAL_BRAIN_HEALTH_TIMEOUT", "3"))
+
+    def __init__(self,
+                 big: Optional[BrainConfig] = None,
+                 small: Optional[BrainConfig] = None):
+        self._lock = threading.RLock()
+        self._configs = {
+            BrainRole.BIG: big or build_config(BrainRole.BIG),
+            BrainRole.SMALL: small or build_config(BrainRole.SMALL),
+        }
+        self._health_cache: Dict[BrainRole, Dict[str, Any]] = {}
+
+    # ── Factories ────────────────────────────────────────────────────────────
+    @classmethod
+    def from_env(cls, env: Optional[Dict[str, str]] = None) -> "DualBrainRuntime":
+        return cls(big=build_config(BrainRole.BIG, env),
+                   small=build_config(BrainRole.SMALL, env))
+
+    # ── Role access ──────────────────────────────────────────────────────────
+    def config(self, role: BrainRole) -> BrainConfig:
+        return self._configs[role]
+
+    def endpoint(self, role: BrainRole) -> str:
+        return self._configs[role].endpoint
+
+    def model(self, role: BrainRole) -> str:
+        return self._configs[role].model
+
+    def device(self, role: BrainRole) -> int:
+        return self._configs[role].device
+
+    def set_model(self, role: BrainRole, model_name: str) -> None:
+        with self._lock:
+            self._configs[role].model = model_name
+            self._health_cache.pop(role, None)
+
+    # ── Isolation check ──────────────────────────────────────────────────────
+    def validate_isolation(self) -> Dict[str, Any]:
+        """Confirm the canonical role→GPU pairing holds.
+
+        Big Brain must target device 0; Small Brain device 1. Also verifies the
+        two roles do NOT share a port (a same-port pair would break isolation).
+        Returns a report; never raises.
+        """
+        big = self._configs[BrainRole.BIG]
+        small = self._configs[BrainRole.SMALL]
+        big_device_ok = big.device == 0
+        small_device_ok = small.device == 1
+        distinct_ports = big.port != small.port
+        ok = big_device_ok and small_device_ok and distinct_ports
+        return {
+            "isolated": bool(ok),
+            "big_device": big.device,
+            "small_device": small.device,
+            "big_device_ok": big_device_ok,
+            "small_device_ok": small_device_ok,
+            "big_port": big.port,
+            "small_port": small.port,
+            "distinct_ports": distinct_ports,
+        }
+
+    # ── Model listing / health (bounded, never raises) ───────────────────────
+    def _http_get(self, url: str, timeout: float) -> Optional[str]:
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    return None
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+    def list_models(self, role: BrainRole, refresh: bool = False) -> List[str]:
+        """Return model ids available on a role's server. Bounded; [] if offline."""
+        cfg = self._configs[role]
+        if not cfg.enabled:
+            return []
+        with self._lock:
+            cached = self._health_cache.get(role)
+            if cached is not None and not refresh:
+                return list(cached.get("models", []))
+        payload = self._http_get(cfg.models_path, timeout=self.HEALTH_TIMEOUT_S)
+        models: List[str] = []
+        if payload:
+            try:
+                data = json.loads(payload)
+                if cfg.provider == PROVIDER_OLLAMA:
+                    models = [m.get("name", "") for m in data.get("models", [])]
+                else:
+                    models = [m.get("id", "") for m in data.get("data", [])]
+                models = [m for m in models if m]
+            except (ValueError, TypeError, AttributeError):
+                models = []
+        with self._lock:
+            self._health_cache[role] = {
+                "reachable": bool(models) or payload is not None,
+                "models": models,
+                "checked_at": time.time(),
+            }
+        return models
+
+    def health(self, role: BrainRole, refresh: bool = False) -> Dict[str, Any]:
+        """Health snapshot for a role. Never raises; reports reachable/offline."""
+        cfg = self._configs[role]
+        t0 = time.time()
+        models = self.list_models(role, refresh=refresh)
+        latency_ms = int((time.time() - t0) * 1000)
+        return {
+            "role": role.value,
+            "display_name": cfg.display_name,
+            "provider": cfg.provider,
+            "endpoint": cfg.endpoint,
+            "device": cfg.device,
+            "model": cfg.model,
+            "enabled": cfg.enabled,
+            "reachable": bool(models),
+            "model_count": len(models),
+            "models": models,
+            "latency_ms": latency_ms,
+        }
+
+    # ── GUI snapshot ─────────────────────────────────────────────────────────
+    def snapshot(self, refresh_health: bool = False) -> Dict[str, Any]:
+        """Full runtime snapshot for dashboards (per-role + isolation)."""
+        return {
+            "isolation": self.validate_isolation(),
+            "big": self.health(BrainRole.BIG, refresh=refresh_health),
+            "small": self.health(BrainRole.SMALL, refresh=refresh_health),
+        }
+
+
+# ── Module-level canonical contract (for docs/config checks) ──────────────────
+def default_contract() -> Dict[str, Any]:
+    """Return the canonical default role→GPU/endpoint contract as a dict."""
+    return {role.value: dict(ROLE_DEFAULTS[role]) for role in BrainRole}
+
+
+__all__ = [
+    "BrainRole",
+    "BrainConfig",
+    "DualBrainRuntime",
+    "build_config",
+    "default_contract",
+    "SUPPORTED_PROVIDERS",
+    "PROVIDER_LLAMACPP",
+    "PROVIDER_OLLAMA",
+    "PROVIDER_LMSTUDIO",
+]
