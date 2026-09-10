@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import List
+from typing import List, Optional
 
 from agents.opportunity_models import Opportunity, BaseOpportunitySource, classify_category
 
@@ -192,6 +192,68 @@ class MicrotaskSource(BaseOpportunitySource):
         return out
 
 
+class UgigSource(BaseOpportunitySource):
+    """Read public hiring listings from uGig without requiring credentials.
+
+    This adapter is deliberately read-only. Applying, creating listings, and
+    account actions remain separate approval-gated operations.
+    """
+
+    name = "ugig"
+    endpoint = "https://ugig.net/api/gigs"
+
+    def _discover(self, query: Optional[str] = None,
+                  categories: Optional[List[str]] = None) -> List[Opportunity]:
+        import requests
+
+        params = {"listing_type": "hiring"}
+        if query and query.strip():
+            params["search"] = query.strip()
+        response = requests.get(
+            self.endpoint,
+            params=params,
+            headers={"User-Agent": "MrBot1000-discovery/2.0"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        listings = payload.get("gigs", []) if isinstance(payload, dict) else payload
+        if not isinstance(listings, list):
+            return []
+
+        out = []
+        for listing in listings:
+            if not isinstance(listing, dict):
+                continue
+            listing_id = str(listing.get("id", "")).strip()
+            title = str(listing.get("title", "")).strip()
+            if not listing_id or not title:
+                continue
+            description = str(listing.get("description", "")).strip() or title
+            skills = listing.get("skills_required", [])
+            if not isinstance(skills, list):
+                skills = []
+            text = " ".join([title, description, " ".join(map(str, skills))])
+            category = classify_category(text)
+            currency = str(listing.get("payment_coin", "USD") or "USD").upper()
+            amount = max(
+                float(listing.get("budget_max", 0) or 0),
+                float(listing.get("budget_min", 0) or 0),
+            )
+            url = f"https://ugig.net/gigs/{listing_id}"
+            out.append(Opportunity(
+                opportunity_id=f"ugig_{listing_id}", source=self.name,
+                platform="uGig", title=title, description=description,
+                category=category, required_skills=[str(s) for s in skills],
+                payment_type="crypto" if currency not in ("USD", "EUR", "GBP") else "usd",
+                currency=currency, advertised_amount=amount,
+                estimated_net_value=amount, risk_level="medium",
+                source_reliability=0.5, external_id=listing_id,
+                external_url=url, provenance=f"{self.name}::{url}",
+            ))
+        return out
+
+
 class ContentSource(BaseOpportunitySource):
     """DEPRECATED / REMOVED from default discovery (v2.0.36p).
 
@@ -259,6 +321,6 @@ def all_builtin_sources() -> List[BaseOpportunitySource]:
     from agents.web_discovery import WebDiscoverySource
     return [
         UpworkSource(), FiverrSource(), SocialSource(), AirdropSource(),
-        DefiSource(), MicrotaskSource(), DynamicSource(),
+        DefiSource(), MicrotaskSource(), UgigSource(), DynamicSource(),
         WebDiscoverySource(),   # disabled unless ALLOW_WEB_DISCOVERY=true (human review)
     ]

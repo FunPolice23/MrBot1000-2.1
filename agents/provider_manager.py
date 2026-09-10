@@ -91,11 +91,37 @@ class ProviderManager:
         return cls._instance
     
     def detect_providers(self) -> Dict[str, ProviderInfo]:
-        """Detect all available providers."""
+        """Detect all available providers.
+
+        Preserve any user-selected state (enabled/disabled status, selected model,
+        and GPU assignment) from the prior snapshot so a re-detect does not
+        silently reset a provider that the operator already toggled or configured.
+        """
+        previous = dict(self._providers)
         self._providers = {}
         self._detect_gpus()
         self._detect_local_providers()
         self._detect_cloud_providers()
+
+        for name, provider in dict(previous).items():
+            if name not in self._providers:
+                self._providers[name] = provider
+                continue
+            current = self._providers[name]
+            current.status = provider.status if provider.status else current.status
+            if provider.selected_model:
+                current.selected_model = provider.selected_model
+            if getattr(provider, "gpu_index", -1) != -1:
+                current.gpu_index = provider.gpu_index
+            if getattr(provider, "base_url", ""):
+                current.base_url = provider.base_url
+            if getattr(provider, "api_key_env", ""):
+                current.api_key_env = provider.api_key_env
+            if provider.models:
+                current.models = provider.models
+            if getattr(provider, "last_error", ""):
+                current.last_error = provider.last_error
+
         self._detected = True
         return self._providers
     
@@ -264,7 +290,8 @@ class ProviderManager:
             # Try default paths
             default_paths = [
                 r"D:\llama.cpp\llama-server.exe",
-                r"D:\llama.cppuildin\llama-server.exe",
+                r"D:\llama.cpp\build\bin\llama-server.exe",
+                r"D:\llama.cpp\build\bin\Release\llama-server.exe",
             ]
             for p in default_paths:
                 if os.path.exists(p):
@@ -357,6 +384,14 @@ class ProviderManager:
         """Get cloud providers."""
         return {k: v for k, v in self.get_providers().items() if v.is_cloud}
     
+    def set_provider_status(self, name: str, status: str | ProviderStatus) -> bool:
+        """Set the runtime status for a provider without losing it on re-detect."""
+        provider = self.get_provider(name)
+        if provider is None:
+            return False
+        provider.status = status.value if isinstance(status, ProviderStatus) else str(status)
+        return True
+
     def get_provider(self, name: str) -> Optional[ProviderInfo]:
         """Get a specific provider."""
         return self.get_providers().get(name)

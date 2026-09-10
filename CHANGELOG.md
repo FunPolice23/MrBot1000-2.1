@@ -1,3 +1,105 @@
+## [2.1.0] - 2026-09-10 - Stability and Provider Routing Maintenance
+
+### Development History for This Maintenance Cycle
+This section records the work completed from the initial provider/GPU report through the current Dialogue and discovery fixes.
+
+1. **Provider and GPU configuration**
+  - Investigated why Provider/GPU settings for GPU layers, KV cache, and batch size appeared to have no effect.
+  - Connected the persisted settings to the dual-brain runtime and llama-server launch configuration.
+  - Added role-specific GPU routing: Big Brain on the RTX 5060 Ti and Small Brain on the GTX 1660 Super.
+  - Added context, threads, split mode, KV-cache type, batch size, and GPU-layer handling for each brain.
+
+2. **Unified provider support**
+  - Enabled llama.cpp alongside Ollama, LM Studio, vLLM, KoboldCpp, and cloud providers.
+  - Added provider selection, enable/disable state, active local/cloud routing, API-key persistence, model selection, and cloud pricing information.
+  - Added role-aware provider registration so Big Brain and Small Brain can use different local endpoints and models.
+  - Added live registry invalidation so provider and model changes can take effect without restarting the whole application.
+
+3. **Startup and crash repair**
+  - Fixed duplicate Start/Stop signal wiring that caused full application crashes when launching either brain.
+  - Added safer worker and QThread cleanup, interruption-aware GPU polling, and queued VRAM warning updates.
+  - Moved the loading state ahead of model and VRAM checks so the UI reports progress immediately.
+  - Verified that the Start action reaches the Running state in the focused GUI smoke test.
+
+4. **GUI persistence and responsiveness**
+  - Restored Appearance and Action Pipeline setting persistence.
+  - Added lazy tab construction to reduce startup work and peak memory use.
+  - Fixed stale Qt widget reads when provider controls have already been deleted or rebuilt.
+  - Fixed the Settings provider configuration surface appearing as a separate Python window by assigning its Qt parent during construction.
+
+5. **Dialogue routing and rendering**
+  - Fixed blank first responses and removed synchronous endpoint probes from Dialogue tab construction.
+  - Added inline capability notes instead of a misleading modal model-capability warning.
+  - Preserved full llama.cpp model IDs while using provider-appropriate model names for other APIs.
+  - Added response filtering and retry handling for boilerplate, severe repetition, and malformed local-model output.
+  - Added visible generation status so an in-flight response is not mistaken for a blank or frozen tab.
+  - Scaled Dialogue output budgets from each model's configured context instead of imposing a fixed 2k/4k limit.
+  - Kept long-running Live conversations unlimited by default, with optional `DIALOGUE_MAX_EXCHANGES` and explicit Stop control.
+
+6. **Long-running recovery and model stability**
+  - Prevented Dialogue from replacing an already-loaded llama.cpp model with a stale or reordered combo-box entry.
+  - Prefer the model reported by each live `/v1/models` endpoint during initial synchronization.
+  - Added retry behavior for transient connection failures without passing transport errors to the other persona or stopping Live mode.
+  - Changed duplicate-response handling so one repeated answer does not terminate a running conversation.
+
+7. **Discovery and earning workflow**
+  - Fixed the Twitter/X scanner's missing `os` import.
+  - Added a read-only uGig source using its public hiring-listings API; uGig and the opt-in web source are now included in normal and scheduled discovery defaults.
+  - Added uGig-specific scheduler search terms so scheduled discovery assigns tasks directly to uGig instead of routing generic strategies to the first source.
+  - Preserved the existing human-gated action and earning workflow while improving the social opportunity scan path.
+
+### Provider and Model Runtime
+- Fixed llama.cpp provider registration for the dual-brain runtime, including role-specific Big Brain and Small Brain endpoints.
+- Fixed the Settings llama.cpp Enable action being immediately reversed by a second toggle in the main-window bridge.
+- Added separate Big Brain and Small Brain URL fields, defaulting to ports 1234 and 1235, and persist both role enable flags together.
+- Fixed the Providers & GPU status remaining at `Loading...` after llama-server had already loaded and begun listening, by moving the completion refresh back onto the Qt event loop.
+- Applied the selected KV-cache precision to launch commands and VRAM estimates; `q8_0` and `q4_0` now reduce the estimated KV allocation, while `auto` normalizes to `f16`.
+- Clarified that the `Actual (nvidia-smi)` bar measures total GPU memory only; the KV breakdown remains a metadata-based estimate because nvidia-smi cannot separate weights from KV cache.
+- Added unified local/cloud provider configuration with API-key fields, model selection, active-provider routing, and cloud model pricing display.
+- Enabled llama.cpp as a selectable local provider and connected the GPU, KV-cache, batch-size, context, thread, and GPU-layer settings to the runtime configuration.
+- Preserved the model actually loaded by each llama-server during Dialogue initialization instead of replacing it with a stale or reordered GUI combo selection.
+- Kept explicit model changes from the Providers & GPU tab working while preventing per-turn Dialogue model overwrites.
+- Improved Dialogue generation budgets so output scales with each model's configured context window, with `DIALOGUE_MAX_TOKENS` available as an override.
+
+### Dialogue and Long-Running Operation
+- Fixed blank Dialogue responses by adding visible generation status and improving local-model response handling.
+- Added retry handling for transient llama.cpp connection failures without stopping Live mode or passing transport errors to the other persona.
+- Changed repeated-response handling so one duplicate does not terminate a long-running conversation.
+- Removed the implicit 100-exchange Live limit; Live mode now runs until stopped or until the optional `DIALOGUE_MAX_EXCHANGES` limit is reached.
+- Preserved bounded Auto-Step behavior for manually controlled runs.
+
+### GUI Stability
+- Fixed Settings-tab provider configuration ownership so it remains embedded instead of appearing as a separate Python window.
+- Hardened stale Qt widget reads during settings persistence.
+- Improved lazy tab construction, provider status handling, GPU polling, and QThread cleanup around the Providers & GPU surface.
+- Added resolution-aware window sizing and View > Window Mode options for Normal, Maximized, Fullscreen, and Borderless presentation.
+- Fixed the Start/Stop crash path caused by duplicate signal wiring and unsafe running-QThread cleanup.
+- Restored the visible Start All Brains and Stop All Brains controls in the active Providers & GPU tab; Start All now launches both non-blocking brain probes together instead of delaying the second brain by two seconds.
+- Fixed the Providers & GPU layout omission that constructed the Quick Actions group but never added it to the rendered layout, so Start All Brains and Stop All Brains are now visible after a clean launch.
+
+### Agent Collaboration and Trust Boundaries
+- Fixed the ordinary Marcus/Alex chat tool loop so shell commands, file writes, account/payment changes, and proposal creation are refused unless an approval-capable workflow handles them.
+- Routed remote `skill.md` reads through the instruction provenance gate; fetched documents are labeled untrusted and require human review before any action is based on them.
+- Updated typed dual-brain collaboration handoffs so research, review, and execution receive labeled results from preceding stages instead of only the original goal.
+- Routed refused Dialogue actions into the visible approval queue, strengthened receipt-based rules against fabricated credentials or completed actions, and stopped duplicate/empty model output from feeding endless Live-mode loops.
+- Clarified the platform-playbook workflow: agents may read and discuss a remote `skill.md`, summarize its requirements and risks, and draft next steps; credentials, installations, shell commands, account creation, and external submissions remain separate approval-gated actions.
+- Fixed Dialogue cancellation when Live is stopped or a brain model changes: active generations are cancelled cooperatively, stale completions are discarded, and cancelled QThreads remain referenced while they unwind instead of leaving the UI stuck on Loading or risking premature thread destruction.
+- Moved VRAM warnings and model-loading feedback onto the GUI-safe signal path so startup does not freeze or update widgets from worker threads.
+- Restored persistence for Appearance and Action Pipeline settings.
+
+### Social Discovery
+- Fixed the Twitter/X social scanner `name 'os' is not defined` failure.
+- Added live read-only uGig discovery and source-level parsing coverage so public hiring listings are no longer omitted from discovery cycles.
+
+### Verification
+- Updated modules compile cleanly.
+- Provider and tab regression tests pass (`6 passed`).
+
+### Known Limitation
+- Some llama.cpp model/template combinations can still return malformed repeated thought-token output (for example repeated `4096` fragments). This is handled as invalid/retryable Dialogue output but requires matching the server chat template to eliminate at the source.
+
+---
+
 ## [2.1.0] - 2026-09-07 — Phase 2.5: Unified Web Controller
 
 ### Web Controller (`agents/web_controller.py`)
@@ -149,11 +251,25 @@
 - **`FreelanceFinder`** — live web search for real gigs across Upwork, Fiverr, Reddit, Prolific.
 - **`ProposalWriter`** — generates tailored proposals/cover letters for found gigs.
 - **`PlatformSubmitter`** — packages proposals with human approval gates and evidence trails.
-- Revenue path: human submits, real money; agent does research + drafting only.
+Revenue path: human submits, real money; agent does research + drafting only.
+
+## [2.0.37e] - 2026-09-10 — DB column migration + DualBrainControl deferred signal wiring
+
+### Bug fix: `sqlite3.OperationalError: near "EXISTS": syntax error` on startup (database.py)
+- `_create_tables()` ran `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` batches that failed on existing databases that already had some (but not all) of the new columns — e.g. a DB created before `cost_usd` was added would hit the column-level `IF NOT EXISTS` edge case on `ALTER TABLE`.
+- Fix: split the schema init into per-column `ALTER TABLE llm_costs ADD COLUMN ...` migration steps guarded by `try/except OperationalError`, so legacy databases get `prompt_tokens`, `completion_tokens`, `tokens_per_second`, and `cost_usd` columns on startup without error. The `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` DDL stays intact for brand-new databases.
+- Verified: `AgentDB()` + `get_llm_stats()` succeed on an existing DB; the returned stats dict includes `total_cost`.
+
+### Bug fix: `DualBrainControl` construction — `AttributeError` / `AttributeError: '_on_start_small_brain'` on tab switch (gui/dual_brain_control.py)
+- Root cause: `setup_ui()` runs during `__init__` and called `.connect()` on handlers that are defined later in the class body (56 methods appear after `setup_ui` in source order). The first tab switch triggered `_ensure_tab_built` → builder → `DualBrainControl(...)` → `setup_ui` → `.connect(self._on_start_small_brain)` where `_on_start_small_brain` did not yet exist on the instance → `AttributeError`.
+- Fix: introduced a deferred-wiring pattern. All `_wire_*` helpers (`_wire_all_signals`, `_wire_start_stop_buttons`, `_wire_refresh_buttons`, `_wire_settings_signals`) are defined in the class body BEFORE `setup_ui` and only touch methods that exist at class-definition time. A single `QTimer.singleShot(0, self._wire_all_signals)` in `__init__` fires after `setup_ui()` completes and the full class body is loaded, so every handler is present when the connections are made. Each `_wire_*` uses `hasattr` guards so it is safe to call multiple times.
+- Additionally restored two missing `QLabel.addWidget()` calls for the per-brain advanced llama.cpp settings labels (`sb_adv_label` at settings row 2, `bb_adv_label` at row 5) that had been dropped by an earlier patch.
+- Verified: `DualBrainControl` imports cleanly; AST audit confirms zero `.connect()` calls inside `setup_ui` targeting methods defined after `setup_ui`; all `_wire_*` and all target handler methods exist on the class.
+
+### CHANGELOG catch-up
+- This entry retroactively documents the database column migration and the `DualBrainControl` deferred-wiring fix that were applied above. Subsequent entries will follow the same format.
 
 ---
-
-## [2.0.37d] - 2026-09-06 - Persona-driven goal dialogue (Driver/Navigator) + in-app Help
 
 ### Personas (agents/personas.py) — replace generic Big/Small "robot" framing
 - Two named personas the user can relate to, each with a real identity, personality

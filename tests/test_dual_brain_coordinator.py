@@ -94,6 +94,26 @@ class TestCollaborate(unittest.TestCase):
                           CollaborationStage.REVIEW])
         self.assertFalse(run.stages[-1].success)
 
+    def test_later_stages_receive_prior_results(self):
+        prompts = []
+
+        def fake_model(role, stage, prompt):
+            prompts.append((stage, prompt))
+            return f"{stage.value}-facts"
+
+        coord = _fresh_coordinator(model_fn=fake_model)
+        coord.collaborate("verify a platform signup flow")
+
+        research_prompt = prompts[1][1]
+        review_prompt = prompts[2][1]
+        execute_prompt = prompts[3][1]
+        self.assertIn("PLAN by", research_prompt)
+        self.assertIn("plan-facts", research_prompt)
+        self.assertIn("RESEARCH by", review_prompt)
+        self.assertIn("research-facts", review_prompt)
+        self.assertIn("REVIEW by", execute_prompt)
+        self.assertIn("review-facts", execute_prompt)
+
 
 class TestDurableLedger(unittest.TestCase):
     def test_each_stage_persists_request_and_result(self):

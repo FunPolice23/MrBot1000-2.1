@@ -25,7 +25,7 @@ from agents.opportunity_models import (
 )
 from agents.discovery_sources import (
     UpworkSource, FiverrSource, SocialSource, AirdropSource, DefiSource,
-    MicrotaskSource, ContentSource, DynamicSource, all_builtin_sources,
+    MicrotaskSource, UgigSource, ContentSource, DynamicSource, all_builtin_sources,
 )
 from agents.discovery_engine import DiscoveryEngine, DiscoveryStats
 from agents.web_discovery import WebDiscoverySource
@@ -145,6 +145,32 @@ class FakeUpworkClient:
 
 
 class TestExistingIntegrationsAsSources(unittest.TestCase):
+    def test_ugig_source_parses_public_hiring_listings(self):
+        payload = {
+            "gigs": [{
+                "id": "gig-1", "title": "Build a Python API",
+                "description": "Create an HTTP service.",
+                "skills_required": ["Python", "API"],
+                "budget_min": 100, "budget_max": 250,
+                "payment_coin": "USDC",
+            }]
+        }
+        response = mock.Mock(status_code=200)
+        response.json.return_value = payload
+        with mock.patch("requests.get", return_value=response) as get:
+            opps = UgigSource().discover(query="python")
+
+        get.assert_called_once()
+        self.assertEqual(get.call_args.kwargs["params"], {
+            "listing_type": "hiring", "search": "python",
+        })
+        self.assertEqual(len(opps), 1)
+        self.assertEqual(opps[0].opportunity_id, "ugig_gig-1")
+        self.assertEqual(opps[0].advertised_amount, 250.0)
+        self.assertEqual(opps[0].currency, "USDC")
+        self.assertEqual(opps[0].category, "api_data_task")
+        self.assertEqual(opps[0].external_url, "https://ugig.net/gigs/gig-1")
+
     def test_upwork_source_sets_provenance_and_category(self):
         for k in ("UPWORK_CLIENT_ID", "UPWORK_CLIENT_SECRET",
                   "UPWORK_ACCESS_TOKEN", "UPWORK_REFRESH_TOKEN"):
@@ -174,7 +200,7 @@ class TestExistingIntegrationsAsSources(unittest.TestCase):
 
     def test_all_builtin_sources_are_registry_compatible(self):
         srcs = all_builtin_sources()
-        self.assertEqual(len(srcs), 8)
+        self.assertEqual(len(srcs), 9)
         for s in srcs:
             self.assertIsInstance(s, BaseOpportunitySource)
 

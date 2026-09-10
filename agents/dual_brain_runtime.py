@@ -55,7 +55,10 @@ class BrainRole(str, Enum):
 PROVIDER_LLAMACPP = "llamacpp"
 PROVIDER_OLLAMA = "ollama"
 PROVIDER_LMSTUDIO = "lmstudio"
-SUPPORTED_PROVIDERS = {PROVIDER_LLAMACPP, PROVIDER_OLLAMA, PROVIDER_LMSTUDIO}
+PROVIDER_VLLM = "vllm"
+SUPPORTED_PROVIDERS = {
+    PROVIDER_LLAMACPP, PROVIDER_OLLAMA, PROVIDER_LMSTUDIO, PROVIDER_VLLM,
+}
 
 # llama-server binary (v2.1 fix). The WindowsApps `llama.exe` (MSVC 0.3.0 build)
 # has NO CUDA kernel for sm_75 (GTX 1660 Super), so `--device CUDA1` crashes on
@@ -154,7 +157,8 @@ class BrainConfig:
     def models_path(self) -> str:
         """HTTP path for listing models for this provider kind."""
         if self.provider == PROVIDER_OLLAMA:
-            return f"{self.endpoint}/api/tags"
+            base = self.endpoint.removesuffix("/v1")
+            return f"{base}/api/tags"
         # OpenAI-compatible (llama-server, LM Studio) expose /v1/models.
         return f"{self.endpoint}/models"
 
@@ -187,8 +191,8 @@ class BrainConfig:
                "--threads", str(self.threads),
                "--batch-size", str(self.batch),
                "--split-mode", self.split_mode or "none",
-               "--cache-type-k", self.kv_cache or "f16",
-               "--cache-type-v", self.kv_cache or "f16",
+               "--cache-type-k", self.kv_cache if self.kv_cache != "auto" else "f16",
+               "--cache-type-v", self.kv_cache if self.kv_cache != "auto" else "f16",
                "--model", model]
         if self.gpu_layers is not None:
             cmd += ["--n-gpu-layers", str(self.gpu_layers)]
@@ -325,6 +329,13 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
     provider = _g("PROVIDER", defaults["provider"]).lower()
     if provider not in SUPPORTED_PROVIDERS:
         provider = PROVIDER_LLAMACPP
+    endpoint_default = defaults["endpoint"]
+    if provider == PROVIDER_OLLAMA:
+        endpoint_default = "http://127.0.0.1:11434/v1"
+    elif provider == PROVIDER_LMSTUDIO:
+        endpoint_default = "http://127.0.0.1:1234/v1"
+    elif provider == PROVIDER_VLLM:
+        endpoint_default = "http://127.0.0.1:8000/v1"
     gpu_raw = _g("GPU_LAYERS", "")
     gpu_layers: Optional[int] = None
     if gpu_raw:
@@ -338,7 +349,7 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
     return BrainConfig(
         role=role,
         provider=provider,
-        endpoint=_g("URL", defaults["endpoint"]),
+        endpoint=_g("URL", endpoint_default),
         model=_g("MODEL", ""),
         device=_i("DEVICE", defaults["device"]),
         port=_i("PORT", defaults["port"]),

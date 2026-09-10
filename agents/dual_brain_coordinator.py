@@ -216,7 +216,21 @@ class DualBrainCoordinator:
         role = self.stage_roles[stage]
         cfg = self.runtime.config(role)
         model = cfg.model or f"{role.value}-model"
-        prompt = f"{_STAGE_PROMPTS[stage]}\n\nGoal: {run.goal}"
+        prior_results = []
+        for previous in run.stages:
+            if previous.success and previous.result:
+                prior_results.append(
+                    f"[{previous.stage.value.upper()} by {previous.role.value}]\n"
+                    f"{previous.result}"
+                )
+        shared_context = "\n\n".join(prior_results)
+        if len(shared_context) > 16000:
+            shared_context = shared_context[-16000:]
+        handoff = (
+            "\n\nSHARED HANDOFF FROM PREVIOUS STAGES:\n" + shared_context
+            if shared_context else ""
+        )
+        prompt = f"{_STAGE_PROMPTS[stage]}\n\nGoal: {run.goal}{handoff}"
         stage_run = StageRun(stage=stage, role=role, model=model, prompt=prompt)
 
         req = Message(

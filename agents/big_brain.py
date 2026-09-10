@@ -141,12 +141,23 @@ class BigBrainAdapter:
                 continue
             
             if decision == SafetyDecision.NEEDS_APPROVAL:
-                # For now, block approval-required tools and notify UI
-                # TODO: emit signal for UI approval dialog
+                from agents.approval_queue import ApprovalKind, ApprovalItem, HumanApprovalQueue
+                approval = HumanApprovalQueue.instance().enqueue(ApprovalItem(
+                    kind=ApprovalKind.ACTION,
+                    title=f"Big Brain tool request: {fn_name}",
+                    description=f"{reason}. Human approval is required before this tool can run.",
+                    requested_by="big_brain",
+                    details={"tool": fn_name, "arguments": arguments, "reason": reason},
+                    payload={"tool_call_id": tc.id, "tool": fn_name, "arguments": arguments},
+                ))
                 results.append({
                     "tool_call_id": tc.id,
                     "role": "tool",
-                    "content": f"[PENDING APPROVAL] {reason}. Use approved tools only."
+                    "content": (
+                        f"[PENDING APPROVAL] request_id={approval.id}; {reason}. "
+                        "The tool was not executed. Wait for explicit human approval "
+                        "and retry the request."
+                    )
                 })
                 continue
             
@@ -301,8 +312,13 @@ class BigBrainAdapter:
         max_tokens = int(self.context_length * 0.8)
         
         # Cap at reasonable limits to avoid OOM
-        max_tokens = min(max_tokens, 32768)
-        max_tokens = max(max_tokens, 2048)
+        # Scale Dialogue output with the model's configured context. A fixed
+        # 2k cap discards useful model-to-model reasoning on larger contexts;
+        # an explicit environment value remains available for tighter setups.
+        dialogue_cap = int(os.getenv(
+            "DIALOGUE_MAX_TOKENS", max(4096, min(32768, self.context_length // 2))))
+        max_tokens = min(max_tokens, dialogue_cap)
+        max_tokens = max(max_tokens, min(4096, self.context_length // 2))
 
         if history:
             messages = [{"role": "system", "content": full_system}]

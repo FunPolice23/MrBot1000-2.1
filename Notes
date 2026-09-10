@@ -1,0 +1,4 @@
+My currently system setup is 5060 Ti 16GB on PCIe0 and GTX 1660 super 6GB on PCIe 1
+llama.cpp gives me the ability to split both GPU's by themselves to run models,
+if you choose to use ollama | lm studio(bionic) they do not allow this so both models will be loaded + system ram.
+

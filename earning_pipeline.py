@@ -248,11 +248,11 @@ class EarningPipeline:
         """
         requested = sources or [
             "social", "upwork", "fiverr", "airdrop",
-            "defi", "microtask", "content", "dynamic",
+            "defi", "microtask", "ugig", "web", "content", "dynamic",
         ]
         valid_sources = {
             "social", "upwork", "fiverr", "airdrop",
-            "defi", "microtask", "content", "dynamic",
+            "defi", "microtask", "ugig", "web", "content", "dynamic",
         }
 
         from agents.discovery_sources import all_builtin_sources
@@ -308,7 +308,7 @@ class EarningPipeline:
         """
         requested = sources or [
             "social", "upwork", "fiverr", "airdrop",
-            "defi", "microtask", "content", "dynamic",
+            "defi", "microtask", "ugig", "web", "content", "dynamic",
         ]
         from agents.discovery_sources import all_builtin_sources
         by_name = {s.name: s for s in all_builtin_sources()}

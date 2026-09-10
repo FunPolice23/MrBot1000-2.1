@@ -99,6 +99,7 @@ if _args.safe_mode:
     os.environ["MRBOT_SAFE_MODE"] = "true"
 
 import html
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -137,7 +138,7 @@ def _ensure_qt_font_directory():
 
 _ensure_qt_font_directory()
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, qInstallMessageHandler
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -460,7 +461,9 @@ class MainWindow(TabBuildersMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MrBot1000 v2.1")
-        self.resize(1450, 950)
+        self._window_mode = os.getenv("MRBOT_WINDOW_MODE", "normal").strip().lower()
+        self._normal_window_geometry = None
+        self._size_for_screen()
         self.root_folder  = ROOT_FOLDER
         self._http_workers = []
         self._log_buffer   = []
@@ -569,15 +572,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # Bridge: event logger → alerting engine
         self.event_logger.on_log = self._on_event_logged
 
-        # Bridge: event logger → goal tracker (Phase 6)
-        try:
-            from agents.goal_system import GoalTracker
-            self.goal_tracker = GoalTracker.instance()
-            self.event_logger.add_event_callback(self.goal_tracker.process_event)
-        except Exception as e:
-            self.log_signal.emit(f"[Startup] GoalTracker unavailable: {e}")
-            self.goal_tracker = None
-
         # Provider hot-reload: monitor .env for changes and update providers at runtime
         try:
             from agents.provider_hot_reload import ProviderHotReload
@@ -674,6 +668,20 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         view_menu.addAction("🟡 Comms Window").triggered.connect(self._show_comms_win)
         view_menu.addAction("📊 Summary Window").triggered.connect(self._show_summary_win)
 
+        view_menu.addSeparator()
+        window_mode_menu = view_menu.addMenu("Window Mode")
+        self._window_mode_actions = {}
+        for mode, label in (
+            ("normal", "Normal"),
+            ("maximized", "Maximized"),
+            ("fullscreen", "Fullscreen"),
+            ("borderless", "Borderless"),
+        ):
+            action = window_mode_menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked, m=mode: self._set_window_mode(m))
+            self._window_mode_actions[mode] = action
+
 
         theme_menu = menubar.addMenu("Theme")
         for t in self.THEMES:
@@ -709,7 +717,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self._validate_model_config(ollama_main, ollama_chat)
         self.thought_panel.route("System", "Research folder: not set")
 
-        QTimer.singleShot(600, self.refresh_db_stats)
+        self._db_stats_start_timer = QTimer(self)
+        self._db_stats_start_timer.setSingleShot(True)
+        self._db_stats_start_timer.timeout.connect(self.refresh_db_stats)
+        self._db_stats_start_timer.start(600)
 
     # ── v2.0.21 P1#1: startup dependency check ────────────────────────────────
     def _check_dependencies(self):
@@ -800,7 +811,9 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # Stop app-owned timers first so a single-shot timer cannot fire into a
         # half-torn-down window.
         for timer in (getattr(self, "_auto_start_timer", None),
-                      getattr(self, "_stats_timer", None)):
+                  getattr(self, "_db_stats_start_timer", None),
+                  getattr(self, "_stats_timer", None),
+                  getattr(self, "_balance_timer", None)):
             if timer is not None:
                 try:
                     timer.stop()
@@ -1243,7 +1256,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                     ("Earnings",       self.create_earnings_tab),
                     ("Insights",       self.create_insights_tab),
                     ("Approvals",      self.create_approval_tab),
-                    ("Goals",          self.create_goals_tab),
                     ("Opportunities",  self.create_opportunities_tab),
                     ("Paper Trading",  self.create_paper_trading_tab),
                     ("Analytics",      self.create_analytics_tab),
@@ -1258,8 +1270,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self._tab_builders.append([idx, builder, False])
 
         # Management is the startup dashboard and is intentionally built eagerly;
-        # the remaining tabs stay lazy to reduce startup cost.
+        # Providers & GPU is also built eagerly because it owns the primary
+        # provider/GPU status surface and must never remain on a Loading label.
         self._ensure_tab_built(0)
+        self._ensure_tab_built(1)
 
         # Auto-populate the Ollama model dropdowns the first time the Settings
         # tab is opened, so you don't have to click Refresh manually (v2.0.20h).
@@ -1273,6 +1287,58 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # the Providers & GPU tab. This prevents the brains from auto-running
         # at startup when the operator doesn't want them to.
         self._auto_start_timer = None
+
+        # Apply the saved presentation mode after the menu actions exist.
+        QTimer.singleShot(0, lambda: self._set_window_mode(self._window_mode, persist=False))
+
+    def _size_for_screen(self):
+        """Choose a usable initial size on the current display."""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1280, 800)
+            return
+        available = screen.availableGeometry()
+        width = min(1450, max(960, int(available.width() * 0.92)))
+        height = min(950, max(640, int(available.height() * 0.90)))
+        self.resize(min(width, available.width()), min(height, available.height()))
+        self.move(
+            available.left() + max(0, (available.width() - self.width()) // 2),
+            available.top() + max(0, (available.height() - self.height()) // 2),
+        )
+
+    def _set_window_mode(self, mode: str, persist: bool = True):
+        """Switch presentation mode without rebuilding or reparenting the UI."""
+        mode = mode if mode in {"normal", "maximized", "fullscreen", "borderless"} else "normal"
+        if self.isFullScreen():
+            self.showNormal()
+        if self._normal_window_geometry is None and not self.isMaximized():
+            self._normal_window_geometry = self.geometry()
+        self.setWindowFlag(Qt.FramelessWindowHint, mode == "borderless")
+        if mode == "fullscreen":
+            self.showFullScreen()
+        elif mode == "maximized":
+            self.showMaximized()
+        else:
+            self.showNormal()
+            if mode == "borderless":
+                screen = self.screen() or QApplication.primaryScreen()
+                if screen is not None:
+                    self.setGeometry(screen.availableGeometry())
+            elif self._normal_window_geometry is not None:
+                self.setGeometry(self._normal_window_geometry)
+            else:
+                self._size_for_screen()
+        self._window_mode = mode
+        for name, action in getattr(self, "_window_mode_actions", {}).items():
+            action.blockSignals(True)
+            action.setChecked(name == mode)
+            action.blockSignals(False)
+        if persist:
+            os.environ["MRBOT_WINDOW_MODE"] = mode
+            try:
+                set_env_values({"MRBOT_WINDOW_MODE": mode})
+            except Exception:
+                pass
 
     def _log(self, msg):
         """Write a log line to the Providers & GPU tab if available.
@@ -1682,11 +1748,14 @@ class MainWindow(TabBuildersMixin, QMainWindow):
     def refresh_db_stats(self):
         """Refresh DB Stats tab with data from database."""
         # Guard: new DB Stats tab uses table widgets
-        if not hasattr(self, "db_stat_calls"):
+        if getattr(self, "_shutting_down", False) or not hasattr(self, "db_stat_calls"):
+            return
+        db = getattr(self, "db", None)
+        if db is None or getattr(db, "_conn", None) is None:
             return
         try:
-            stats = self.db.get_llm_stats()
-            props = self.db.count_proposals()
+            stats = db.get_llm_stats()
+            props = db.count_proposals()
             disc = {}
             if getattr(self.manager, "earning_pipeline", None) is not None:
                 try:
@@ -1731,8 +1800,8 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             
             # Update recent calls table
             self.db_calls_table.setRowCount(0)
-            for c in self.db.get_recent_llm_calls(20):
-                ts = self.db.ts_to_str(c["ts"])
+            for c in db.get_recent_llm_calls(20):
+                ts = db.ts_to_str(c["ts"])
                 status = "OK" if not c["error"] else "ERR"
                 row = self.db_calls_table.rowCount()
                 self.db_calls_table.insertRow(row)
@@ -1746,9 +1815,9 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             
             # Update event table
             self.event_table.setRowCount(0)
-            recent_events = self.db.get_recent_events(100)
+            recent_events = db.get_recent_events(100)
             for e in recent_events:
-                ts = self.db.ts_to_str(e.get("ts", 0))
+                ts = db.ts_to_str(e.get("ts", 0))
                 row = self.event_table.rowCount()
                 self.event_table.insertRow(row)
                 self.event_table.setItem(row, 0, QTableWidgetItem(ts))
@@ -2293,28 +2362,61 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # write DISABLE_<X> (legacy, = role "Disabled"), <X>_MAIN_ENABLED,
         # <X>_CHAT_ENABLED, and <X>_CHAT_MODEL, derived from the Role combo.
         values = {}
+
+        def _safe_widget_text(name, env_key=""):
+            """Read a lazily-built widget without trusting its C++ lifetime."""
+            widget = getattr(self, name, None)
+            try:
+                if widget is not None:
+                    return widget.currentText().strip() if hasattr(widget, "currentText") else widget.text().strip()
+            except RuntimeError:
+                pass
+            return os.getenv(env_key, "") if env_key else ""
+
+        def _safe_widget_checked(name, env_key=""):
+            widget = getattr(self, name, None)
+            try:
+                if widget is not None:
+                    return bool(widget.isChecked())
+            except RuntimeError:
+                pass
+            return os.getenv(env_key, "false").lower() == "true"
+
         def _save_provider(prefix, role_combo, model_combo, chat_combo, key="", base="",
                           model="", hide_cb=None):
-            main_on, chat_on = self._role_enabled(role_combo)
+            try:
+                main_on, chat_on = self._role_enabled(role_combo)
+            except RuntimeError:
+                main_on = os.getenv(f"{prefix}_MAIN_ENABLED", "true").lower() == "true"
+                chat_on = os.getenv(f"{prefix}_CHAT_ENABLED", "true").lower() == "true"
             disabled = not (main_on or chat_on)
-            if model_combo is not None:
-                values[f"{prefix}_MODEL"] = model_combo.currentText().strip()
-            if chat_combo is not None:
-                values[f"{prefix}_CHAT_MODEL"] = chat_combo.currentText().strip()
+            try:
+                if model_combo is not None:
+                    values[f"{prefix}_MODEL"] = model_combo.currentText().strip()
+            except RuntimeError:
+                values[f"{prefix}_MODEL"] = os.getenv(f"{prefix}_MODEL", model)
+            try:
+                if chat_combo is not None:
+                    values[f"{prefix}_CHAT_MODEL"] = chat_combo.currentText().strip()
+            except RuntimeError:
+                values[f"{prefix}_CHAT_MODEL"] = os.getenv(f"{prefix}_CHAT_MODEL", "")
             values[f"DISABLE_{prefix}"] = str(disabled)
             values[f"{prefix}_MAIN_ENABLED"] = str(main_on)
             values[f"{prefix}_CHAT_ENABLED"] = str(chat_on)
             if hide_cb is not None:
-                values[f"{prefix}_HIDE"] = str(bool(hide_cb.isChecked()))
+                try:
+                    values[f"{prefix}_HIDE"] = str(bool(hide_cb.isChecked()))
+                except RuntimeError:
+                    values[f"{prefix}_HIDE"] = os.getenv(f"{prefix}_HIDE", "false")
             if key != "":
                 values[f"{prefix}_API_KEY"] = key
             if base != "":
                 values[f"{prefix}_BASE_URL"] = base.strip()
 
-        _save_provider("OPENAI", self.openai_role, self.openai_model_combo,
-                       self.openai_chat_combo, self.openai_key_edit.text(), hide_cb=self.openai_hide)
-        _save_provider("ANTHROPIC", self.anthropic_role, self.anthropic_model_combo,
-                       self.anthropic_chat_combo, self.anthropic_key_edit.text(), hide_cb=self.anthropic_hide)
+        _save_provider("OPENAI", getattr(self, "openai_role", None), getattr(self, "openai_model_combo", None),
+                   getattr(self, "openai_chat_combo", None), _safe_widget_text("openai_key_edit", "OPENAI_API_KEY"), hide_cb=getattr(self, "openai_hide", None))
+        _save_provider("ANTHROPIC", getattr(self, "anthropic_role", None), getattr(self, "anthropic_model_combo", None),
+                   getattr(self, "anthropic_chat_combo", None), _safe_widget_text("anthropic_key_edit", "ANTHROPIC_API_KEY"), hide_cb=getattr(self, "anthropic_hide", None))
         _save_provider("OLLAMA", self.ollama_role, self.ollama_model_combo,
                        self.ollama_chat_model_combo, hide_cb=self.ollama_hide)
         # The Ollama adapter's `model_env` (from settings.json) must match the env
@@ -2336,28 +2438,35 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         values["OLLAMA_MAIN_GPU"] = str(
             main_gpu_spin.value() if main_gpu_spin is not None
             else os.getenv("OLLAMA_MAIN_GPU", "-1"))
-        _save_provider("OPENROUTER", self.openrouter_role, self.openrouter_model,
-                       self.openrouter_chat, self.openrouter_key.text(),
-                       self.openrouter_base.text(), hide_cb=self.openrouter_hide)
-        _save_provider("GEMINI", self.gemini_role, self.gemini_model,
-                       self.gemini_chat, self.gemini_key.text(), self.gemini_base.text(), hide_cb=self.gemini_hide)
-        _save_provider("GROQ", self.groq_role, self.groq_model, self.groq_chat,
-                       self.groq_key.text(), self.groq_base.text(), hide_cb=self.groq_hide)
-        _save_provider("DEEPSEEK", self.deepseek_role, self.deepseek_model,
-                       self.deepseek_chat, self.deepseek_key.text(), self.deepseek_base.text(), hide_cb=self.deepseek_hide)
-        _save_provider("MISTRAL", self.mistral_role, self.mistral_model,
-                       self.mistral_chat, self.mistral_key.text(), self.mistral_base.text(), hide_cb=self.mistral_hide)
-        _save_provider("TOGETHER", self.together_role, self.together_model,
-                       self.together_chat, self.together_key.text(), self.together_base.text(), hide_cb=self.together_hide)
+        _save_provider("OPENROUTER", getattr(self, "openrouter_role", None), getattr(self, "openrouter_model", None),
+                   getattr(self, "openrouter_chat", None), _safe_widget_text("openrouter_key", "OPENROUTER_API_KEY"),
+                   _safe_widget_text("openrouter_base", "OPENROUTER_BASE_URL"), hide_cb=getattr(self, "openrouter_hide", None))
+        _save_provider("GEMINI", getattr(self, "gemini_role", None), getattr(self, "gemini_model", None),
+                   getattr(self, "gemini_chat", None), _safe_widget_text("gemini_key", "GEMINI_API_KEY"),
+                   _safe_widget_text("gemini_base", "GEMINI_BASE_URL"), hide_cb=getattr(self, "gemini_hide", None))
+        _save_provider("GROQ", getattr(self, "groq_role", None), getattr(self, "groq_model", None), getattr(self, "groq_chat", None),
+                   _safe_widget_text("groq_key", "GROQ_API_KEY"), _safe_widget_text("groq_base", "GROQ_BASE_URL"), hide_cb=getattr(self, "groq_hide", None))
+        _save_provider("DEEPSEEK", getattr(self, "deepseek_role", None), getattr(self, "deepseek_model", None),
+                   getattr(self, "deepseek_chat", None), _safe_widget_text("deepseek_key", "DEEPSEEK_API_KEY"),
+                   _safe_widget_text("deepseek_base", "DEEPSEEK_BASE_URL"), hide_cb=getattr(self, "deepseek_hide", None))
+        _save_provider("MISTRAL", getattr(self, "mistral_role", None), getattr(self, "mistral_model", None),
+                   getattr(self, "mistral_chat", None), _safe_widget_text("mistral_key", "MISTRAL_API_KEY"),
+                   _safe_widget_text("mistral_base", "MISTRAL_BASE_URL"), hide_cb=getattr(self, "mistral_hide", None))
+        _save_provider("TOGETHER", getattr(self, "together_role", None), getattr(self, "together_model", None),
+                   getattr(self, "together_chat", None), _safe_widget_text("together_key", "TOGETHER_API_KEY"),
+                   _safe_widget_text("together_base", "TOGETHER_BASE_URL"), hide_cb=getattr(self, "together_hide", None))
         # v2.0.34ap (H70): NVIDIA NIM cloud provider.
-        _save_provider("NVIDIA", self.nvidia_role, self.nvidia_model,
-                       self.nvidia_chat, self.nvidia_key.text(), self.nvidia_base.text(), hide_cb=self.nvidia_hide)
-        _save_provider("VLLM", self.vllm_role, self.vllm_model, self.vllm_chat,
-                       self.vllm_key.text(), self.vllm_base.text(), hide_cb=self.vllm_hide)
-        _save_provider("LM_STUDIO", self.lmstudio_role, self.lmstudio_model,
-                       self.lmstudio_chat, self.lmstudio_key.text(), self.lmstudio_base.text(), hide_cb=self.lmstudio_hide)
-        _save_provider("KOBOLDCPP", self.koboldcpp_role, self.koboldcpp_model,
-                       self.koboldcpp_chat, self.koboldcpp_key.text(), self.koboldcpp_base.text(), hide_cb=self.koboldcpp_hide)
+        _save_provider("NVIDIA", getattr(self, "nvidia_role", None), getattr(self, "nvidia_model", None),
+                   getattr(self, "nvidia_chat", None), _safe_widget_text("nvidia_key", "NVIDIA_API_KEY"),
+                   _safe_widget_text("nvidia_base", "NVIDIA_BASE_URL"), hide_cb=getattr(self, "nvidia_hide", None))
+        _save_provider("VLLM", getattr(self, "vllm_role", None), getattr(self, "vllm_model", None), getattr(self, "vllm_chat", None),
+                   _safe_widget_text("vllm_key", "VLLM_API_KEY"), _safe_widget_text("vllm_base", "VLLM_BASE_URL"), hide_cb=getattr(self, "vllm_hide", None))
+        _save_provider("LM_STUDIO", getattr(self, "lmstudio_role", None), getattr(self, "lmstudio_model", None),
+                   getattr(self, "lmstudio_chat", None), _safe_widget_text("lmstudio_key", "LM_STUDIO_API_KEY"),
+                   _safe_widget_text("lmstudio_base", "LM_STUDIO_BASE_URL"), hide_cb=getattr(self, "lmstudio_hide", None))
+        _save_provider("KOBOLDCPP", getattr(self, "koboldcpp_role", None), getattr(self, "koboldcpp_model", None),
+                   getattr(self, "koboldcpp_chat", None), _safe_widget_text("koboldcpp_key", "KOBOLDCPP_API_KEY"),
+                   _safe_widget_text("koboldcpp_base", "KOBOLDCPP_BASE_URL"), hide_cb=getattr(self, "koboldcpp_hide", None))
 
         # v2.0.26: persist effect toggles (Quality/Performance + individual).
         try:
@@ -2374,6 +2483,9 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             values["MRBOT_FX_BUTTON_STYLE"] = self.fx_button_style.currentText()
         except Exception as e:
             self.log_signal.emit(f"[FX] save failed: {e}")
+        values["PIPELINE_ENABLED"] = str(self.pipeline_enabled_check.isChecked())
+        values["PIPELINE_ALLOW_WRITE"] = str(self.pipeline_allow_write_check.isChecked())
+        values["PIPELINE_ALLOW_SELF_IMPROVE"] = str(self.pipeline_allow_selfimprove_check.isChecked())
         values["MRBOT_THEME"] = getattr(self, "theme_combo", None).currentText() \
             if getattr(self, "theme_combo", None) is not None \
             else os.getenv("MRBOT_THEME", "Dark")
@@ -2405,6 +2517,20 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                             values[f"{prefix}_{key}"] = v
         except Exception as e:
             self.log_signal.emit(f"[llama.cpp] dual-brain settings read failed: {e}")
+
+        # Settings owns llama.cpp role enablement only while llama.cpp is the
+        # selected backend. Do not let Save All Settings silently overwrite an
+        # Ollama/vLLM/LM Studio route selected in Provider Configuration.
+        if os.getenv("BIG_BRAIN_PROVIDER", "llamacpp").lower() == "llamacpp":
+            values["BIG_BRAIN_PROVIDER"] = "llamacpp"
+            values["BIG_BRAIN_ENABLED"] = str(
+                getattr(self, "llamacpp_big_enabled", None) is not None
+                and self.llamacpp_big_enabled.isChecked())
+        if os.getenv("SMALL_BRAIN_PROVIDER", "llamacpp").lower() == "llamacpp":
+            values["SMALL_BRAIN_PROVIDER"] = "llamacpp"
+            values["SMALL_BRAIN_ENABLED"] = str(
+                getattr(self, "llamacpp_small_enabled", None) is not None
+                and self.llamacpp_small_enabled.isChecked())
 
         # v2.0.34aj: single lock-resilient atomic write (replaces ~40 set_key calls
         # that each spawned a .tmp_* temp vulnerable to WinError 32/5 lock races).
@@ -2979,6 +3105,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 render_quality=self.fx_render_quality.currentText(),
                 compact_density=self.fx_compact.isChecked(),
                 rounded_corners=self.fx_rounded.isChecked(),
+                button_style=self.fx_button_style.currentText(),
             )
             for name, val in fx.to_env_dict().items():
                 os.environ[name] = val
@@ -3038,6 +3165,14 @@ class MainWindow(TabBuildersMixin, QMainWindow):
 
 if __name__ == "__main__":
     try:
+        _qt_crash_log = Path(tempfile.gettempdir()) / "mrbot-qt.log"
+        def _qt_message_handler(mode, context, message):
+            try:
+                with open(_qt_crash_log, "a", encoding="utf-8", errors="replace") as _f:
+                    _f.write(f"[{datetime.now().isoformat()}] Qt {mode}: {message}\n")
+            except Exception:
+                pass
+        qInstallMessageHandler(_qt_message_handler)
         app = QApplication(sys.argv)
         app.setStyle("Fusion")
         window = MainWindow()

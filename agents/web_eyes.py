@@ -172,8 +172,8 @@ class WebEyes:
     
     # ── Read Pages ─────────────────────────────────────────────────────────
     
-    def read_page(self, url: str) -> Dict[str, str]:
-        """Read a web page and extract clean text."""
+    def read_page(self, url: str) -> Dict[str, Any]:
+        """Read an HTML page or API response and extract usable data."""
         try:
             import requests
             from bs4 import BeautifulSoup
@@ -183,6 +183,22 @@ class WebEyes:
             }
             resp = requests.get(url, headers=headers, timeout=15)
             resp.raise_for_status()
+
+            # API responses need structured parsing. Passing minified JSON
+            # through BeautifulSoup turns useful fields into an opaque blob.
+            content_type = resp.headers.get("Content-Type", "").lower()
+            raw_body = resp.text.strip()
+            if "application/json" in content_type or raw_body[:1] in ("{", "["):
+                try:
+                    json_data = resp.json()
+                except (ValueError, json.JSONDecodeError):
+                    json_data = json.loads(raw_body)
+                return {
+                    "url": url,
+                    "title": "JSON API response",
+                    "content_type": content_type or "application/json",
+                    "json": json_data,
+                }
             
             soup = BeautifulSoup(resp.text, "html.parser")
             
@@ -284,10 +300,25 @@ class WebEyes:
         
         return "\n".join(parts)
     
-    def format_page_summary(self, page: Dict[str, str]) -> str:
+    def format_page_summary(self, page: Dict[str, Any]) -> str:
         """Format a page summary for display."""
         if "error" in page:
             return f"Error reading page: {page['error']}"
+
+        if "json" in page:
+            try:
+                formatted_json = json.dumps(
+                    page["json"], indent=2, ensure_ascii=True
+                )
+            except (TypeError, ValueError) as exc:
+                return f"JSON API response from {page.get('url', '')} could not be formatted: {exc}"
+            return (
+                "JSON API response\n"
+                f"URL: {page.get('url', '')}\n"
+                f"Content-Type: {page.get('content_type', 'application/json')}\n\n"
+                "Parsed data:\n"
+                f"{formatted_json[:6000]}"
+            )
         
         parts = [
             f"**{page.get('title', 'Page')}**",

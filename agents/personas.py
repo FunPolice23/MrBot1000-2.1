@@ -63,17 +63,29 @@ class Persona:
         3 times to ensure compliance. Includes thinking/reasoning support.
         """
         mem = self.memory_context(query or goal)
+        personality = self.personality_addon()
+        strengths = ", ".join(self.strengths)
+        abilities = ", ".join(self.abilities)
+        guardrails = "; ".join(self.rules_guardrails)
         mem_block = f"\n# MEMORY\n{mem}" if mem else ""
+        personality_block = f"\n{personality}" if personality else ""
 
         return (
             f"# IDENTITY\n"
             f"You are {self.name}. {self.tagline}\n"
+            f"{self.identity}\n"
+            f"Personality: {self.personality_type}\n"
+            f"Style: {self.style_notes}\n"
+            f"Strengths: {strengths}\n"
+            f"Abilities: {abilities}\n"
+            f"Guardrails: {guardrails}\n"
             f"Speak in FIRST PERSON ('I', 'me', 'my'). NEVER use third person.\n"
             f"You are an AI assistant that helps find earning opportunities.\n"
             f"You have REAL tools. When you need data, CALL A TOOL.\n"
             f"NEVER make up data. NEVER say 'I will search' without calling the tool.\n"
             f"ACTIVE GOAL: {goal}\n"
             f"{mem_block}\n"
+            f"{personality_block}\n"
             f"\n"
             f"# THINKING\n"
             f"Before responding, think through your reasoning. If your model supports "

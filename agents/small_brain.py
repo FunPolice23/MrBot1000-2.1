@@ -121,8 +121,13 @@ class SmallBrainAdapter:
         max_tokens = int(self.context_length * 0.8)
         
         # Cap at reasonable limits to avoid OOM
-        max_tokens = min(max_tokens, 32768)
-        max_tokens = max(max_tokens, 2048)
+        # Scale Dialogue output with the model's configured context. A fixed
+        # 2k cap discards useful model-to-model reasoning on larger contexts;
+        # an explicit environment value remains available for tighter setups.
+        dialogue_cap = int(os.getenv(
+            "DIALOGUE_MAX_TOKENS", max(4096, min(32768, self.context_length // 2))))
+        max_tokens = min(max_tokens, dialogue_cap)
+        max_tokens = max(max_tokens, min(4096, self.context_length // 2))
 
         if history:
             messages = [{"role": "system", "content": full_system}]

@@ -17,7 +17,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 try:
-    from PySide6.QtWidgets import QApplication  # noqa: F401
+    from PySide6.QtWidgets import QApplication, QGroupBox  # noqa: F401
     _PYQT_AVAILABLE = True
 except Exception:
     _PYQT_AVAILABLE = False
@@ -260,19 +260,20 @@ class TestGuiTabs(unittest.TestCase):
 
     def test_new_tabs_present(self):
         labels = [self.mw.tabs.tabText(i) for i in range(self.mw.tabs.count())]
-        self.assertIn("Model & GPU", labels)
+        self.assertIn("Providers & GPU", labels)
         self.assertIn("Memory & Stream", labels)
         self.assertIn("Collaboration", labels)
         # The current GUI includes the dual-brain and safety surfaces in addition
         # to the original ten tabs.
-        self.assertEqual(self.mw.tabs.count(), 15)
+        self.assertEqual(self.mw.tabs.count(), 20)
 
     def test_lazy_then_scroll_on_open(self):
         from PySide6.QtWidgets import QScrollArea
-        # Management (index 0) is built eagerly at startup
+        # Management and Providers & GPU are built eagerly at startup
         self.assertIsInstance(self.mw.tabs.widget(0), QScrollArea)
+        self.assertIsInstance(self.mw.tabs.widget(1), QScrollArea)
         # Others are placeholders until opened
-        for i in range(1, self.mw.tabs.count()):
+        for i in range(2, self.mw.tabs.count()):
             self.assertFalse(isinstance(self.mw.tabs.widget(i), QScrollArea))
         # Opening every tab builds it into a QScrollArea
         for i in range(self.mw.tabs.count()):
@@ -284,9 +285,14 @@ class TestGuiTabs(unittest.TestCase):
         # Build all tabs then confirm relocated widgets keep their names
         for i in range(self.mw.tabs.count()):
             self.mw._ensure_tab_built(i)
-        for attr in ("ollama_chat_gpu_spin", "ollama_main_gpu_spin",
-                     "model_info_browser", "max_tokens_spin",
-                     "memory_view", "stream_health_label"):
+        from gui.dual_brain_control import DualBrainControl
+        provider_tab = self.mw.tabs.widget(1).widget().findChild(DualBrainControl)
+        self.assertIsNotNone(provider_tab, "missing Providers & GPU control")
+        for attr in ("sb_ctx_spin", "bb_ctx_spin", "start_all_btn", "stop_all_btn"):
+            self.assertTrue(hasattr(provider_tab, attr), f"missing provider control {attr}")
+        self.assertIsNotNone(provider_tab.findChild(QGroupBox, "quickActionsGroup"))
+        for attr in ("model_info_browser", "max_tokens_spin", "memory_view",
+                     "stream_health_label"):
             self.assertTrue(hasattr(self.mw, attr), f"missing {attr}")
 
     def test_refresh_db_stats_guarded_when_lazy(self):

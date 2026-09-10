@@ -13,6 +13,7 @@ Replaces ClawGig dependency with:
 import re
 import time
 import json
+import os
 import httpx
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
