@@ -152,7 +152,7 @@ class SummarizerDB:
                      topics: List[str] = None, fp: str = ""):
         self._execute(
             "INSERT INTO summaries (ts, text, strategy, topics, fp) VALUES (?,?,?,?,?)",
-            (time.time(), text, strategy, json.dumps(topics or []), fp),
+            (time.time(), text, strategy, json.dumps(topics or [], default=str), fp),
             commit=True
         )
 
@@ -282,7 +282,7 @@ class SummarizerDB:
 
     # ── Speech patterns ───────────────────────────────────────────────────────
     def save_speech_patterns(self, session: str, bank: SpeechPatternBank):
-        payload = json.dumps(bank.export())
+        payload = json.dumps(bank.export(), default=str)
         self._execute(
             "INSERT INTO speech_patterns (ts, session, payload) VALUES (?,?,?)",
             (time.time(), session, payload),

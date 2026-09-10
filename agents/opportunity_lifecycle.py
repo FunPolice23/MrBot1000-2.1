@@ -680,7 +680,7 @@ class OpportunityLifecycleTracker:
             with open(path, 'w') as f:
                 json.dump(data, f, indent=2)
             return str(path)
-        return json.dumps(data, indent=2)
+        return json.dumps(data, indent=2, default=str)
 
     def export_analytics_report(self, path: str = None) -> str:
         """Export analytics summary to JSON file."""
@@ -718,7 +718,7 @@ class OpportunityLifecycleTracker:
             with open(path, 'w') as f:
                 json.dump(data, f, indent=2)
             return str(path)
-        return json.dumps(data, indent=2)
+        return json.dumps(data, indent=2, default=str)
 
 
 # ── Module-level convenience functions ────────────────────────────────────

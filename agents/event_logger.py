@@ -152,6 +152,7 @@ class StructuredEventLogger:
         self._file_size: int = 0
         self._next_rotation_check: float = 0.0
         self.on_log: Optional[Callable[[Event], None]] = None  # Phase 6 bridge
+        self._event_callbacks: List[Callable[[Event], None]] = []  # Phase 6 goal tracker
         self._ensure_dir()
 
     # ── Singleton ────────────────────────────────────────────────────────────
@@ -175,6 +176,18 @@ class StructuredEventLogger:
     def reset_singleton(cls):
         with cls._get_lock():
             cls._instance = None
+
+    # ── Event callbacks (Phase 6: goal tracker) ─────────────────────────────
+
+    def add_event_callback(self, callback: Callable[[Event], None]):
+        """Register a callback to be called on every logged event."""
+        if callback not in self._event_callbacks:
+            self._event_callbacks.append(callback)
+
+    def remove_event_callback(self, callback: Callable[[Event], None]):
+        """Remove a previously registered callback."""
+        if callback in self._event_callbacks:
+            self._event_callbacks.remove(callback)
 
     # ── Directory setup ──────────────────────────────────────────────────────
 
@@ -241,7 +254,7 @@ class StructuredEventLogger:
             event.prev_hash = ""
             event.hash = event.compute_hash()
 
-        self._maybe_rotate(len(json.dumps(event.to_dict())))
+        self._maybe_rotate(len(json.dumps(event.to_dict(), default=str)))
         self._write_event(event)
         idx = len(self._events)
         self._events.append(event)
@@ -253,7 +266,33 @@ class StructuredEventLogger:
                 self.on_log(event)
             except Exception as e:
                 logger.warning("event_logger.on_log callback failed: %s", e)
+        # Phase 6: fire event callbacks (goal tracker, etc.)
+        for cb in self._event_callbacks:
+            try:
+                cb(event)
+            except Exception as e:
+                logger.warning("event_logger._event_callback failed: %s", e)
         return event
+
+    def _write_event(self, event: Event):
+        path = self._current_log_path()
+        try:
+            # Use default=str to handle non-serializable objects gracefully
+            event_json = json.dumps(event.to_dict(), default=str)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(event_json + "\n")
+            self._file_size += len(event_json) + 1
+        except Exception as e:
+            logger.warning("event_logger write failed: %s", e)
+            # Try to log the error without the problematic details
+            try:
+                safe_dict = event.to_dict()
+                safe_dict["details"] = {k: str(v) for k, v in safe_dict.get("details", {}).items()}
+                event_json = json.dumps(safe_dict, default=str)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(event_json + "\n")
+            except Exception:
+                pass
 
     def _maybe_rotate(self, event_size: int):
         if self._should_rotate(event_size):
@@ -271,15 +310,6 @@ class StructuredEventLogger:
             self._free_text_index.clear()
             for i, ev in enumerate(self._events):
                 self._index_event(i, ev)
-
-    def _write_event(self, event: Event):
-        path = self._current_log_path()
-        try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event.to_dict()) + "\n")
-            self._file_size += len(json.dumps(event.to_dict())) + 1
-        except Exception as e:
-            logger.warning("event_logger write failed: %s", e)
 
     # ── Queries ──────────────────────────────────────────────────────────────
 

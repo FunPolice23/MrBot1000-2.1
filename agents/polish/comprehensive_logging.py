@@ -51,7 +51,7 @@ class AuditEvent:
         }
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict())
+        return json.dumps(self.to_dict(), default=str)
 
 
 class AuditLogger:
@@ -79,7 +79,7 @@ class AuditLogger:
                 self._entries.pop(0)
         # Also emit to standard logging
         log_fn = getattr(logger, severity.value, logger.info)
-        log_fn("[%s] %s: %s", source, event, json.dumps(details or {}))
+        log_fn("[%s] %s: %s", source, event, json.dumps(details or {}, default=str))
         # Persist to file if configured
         if self.log_path:
             self._persist(ev)

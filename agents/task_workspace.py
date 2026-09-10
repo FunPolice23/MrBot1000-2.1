@@ -192,7 +192,7 @@ class TaskWorkspace:
             data.update(extra)
         try:
             self._status_file().write_text(
-                json.dumps(data, indent=2), encoding="utf-8")
+                json.dumps(data, indent=2, default=str), encoding="utf-8")
         except Exception as e:
             self._log(f"[Workspace] status write error: {e}")
 

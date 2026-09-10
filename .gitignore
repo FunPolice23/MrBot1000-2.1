@@ -1,38 +1,72 @@
-# Python
+# MrBot1000 - Git Ignore
+
+# Environment files with secrets
+.env
+.env.*
+!.env.example
+
+# Decrypted .env temp artifacts (git smudge/clean filter scratch — plaintext secrets, never commit)
+.tmp_*
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Wallet secrets (B1): keys encrypted at rest — these must NEVER be committed
+wallets.json
+wallet.key
+gas_ledger.json
+
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Distribution / packaging
 .Python
-.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Virtual environments
 venv/
 ENV/
 env/
-*.egg-info/
-dist/
-build/
-*.egg
-
-# MrBot1000 secrets — NEVER commit!
-.env
-wallet.key
-*.db
-*.db-shm
-*.db-wal
-models_cache.json
-settings.json
-
-# MrBot1000 local data
-data/
-plans/
-research/
-proposals/
-references/
-nul
+.venv/
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
@@ -40,14 +74,24 @@ nul
 # OS
 .DS_Store
 Thumbs.db
-desktop.ini
 
 # Logs
 *.log
+crash.log
 logs/
 
-# Test cache
-.pytest_cache/
-.py_compile_check/
-htmlcov/
-.coverage
+# Data directories
+data/
+cache/*-wal
+*-shm
+*.db-wal
+*.db-shm
+
+# External publish mirror (lives at D:/github_upload, synced by scripts/sync_github_upload.py)
+github_upload/
+
+# Backup directory created by safe_write_file() pre-edit safety (2.0.19/2.0.20f)
+.mrbot_backups/
+
+# Generated test result JSON (python -m tests)
+tests/test_results/

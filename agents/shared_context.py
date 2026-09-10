@@ -113,7 +113,7 @@ class SharedContext:
 
     def _write_state_unlocked(self, state: SharedState):
         state.last_updated = time.time()
-        payload = json.dumps(state.to_dict(), indent=2)
+        payload = json.dumps(state.to_dict(), indent=2, default=str)
         tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
         with open(tmp_path, 'w', encoding='utf-8') as f:
             f.write(payload)
@@ -308,9 +308,9 @@ class SharedContext:
         if ctx.reasoning_chain:
             response += f"- Recent reasoning: {' -> '.join(ctx.reasoning_chain[-5:])}\n"
         if ctx.key_decisions:
-            response += f"- Key decisions: {json.dumps(ctx.key_decisions[-3:], indent=2)}\n"
+            response += f"- Key decisions: {json.dumps(ctx.key_decisions[-3:], indent=2, default=str)}\n"
         if ctx.results:
-            response += f"- Results: {json.dumps(ctx.results, indent=2)}\n"
+            response += f"- Results: {json.dumps(ctx.results, indent=2, default=str)}\n"
         
         # Add signal that we queried this model
         self.add_signal("Manager", model_name, f"query_{question[:50]}", {"question": question})

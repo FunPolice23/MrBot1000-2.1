@@ -107,17 +107,62 @@ import requests
 from dotenv import load_dotenv  # set_key no longer used directly (see set_env_values)
 from typing import Any, Callable, Dict, List, Optional
 
+def _ensure_qt_font_directory():
+    """Point Qt at the system font directory when PySide6's bundled folder is missing.
+
+    Qt no longer ships fonts with PySide6 on some installs, which triggers the
+    warning about a missing lib/fonts directory. We fix the root cause by
+    pointing QT_QPA_FONTDIR at the real Windows font folder before creating the
+    QApplication, while leaving the warning visible only when no valid system
+    font directory exists.
+    """
+    if os.environ.get("QT_QPA_FONTDIR"):
+        return
+
+    candidates = []
+    for raw in (
+        os.environ.get("WINDIR"),
+        os.environ.get("SystemRoot"),
+        r"C:\Windows\Fonts",
+        r"C:\Windows\SystemFonts",
+    ):
+        if raw:
+            candidates.append(Path(raw).expanduser())
+
+    for candidate in candidates:
+        if candidate.exists() and any(candidate.iterdir()):
+            os.environ["QT_QPA_FONTDIR"] = str(candidate)
+            return
+
+
+_ensure_qt_font_directory()
+
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QTabBar,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
+    QHeaderView,
 )
 
 from agents.base_worker import ROOT_FOLDER, WorkerAgent
@@ -128,6 +173,8 @@ from agents.summarizer import SummarizerThread
 from agents.event_logger import StructuredEventLogger, Event, EventLevel, EventType
 from agents.notifications import NotificationService, NotifLevel, notify
 from agents.approval_queue import HumanApprovalQueue, ApprovalKind, ApprovalStatus
+from agents.provider_manager import ProviderManager, ProviderStatus
+from agents.provider_hot_reload import ProviderHotReload
 from agents.alerting import (
     AlertRuleEngine, add_default_rules,
     llm_spend_threshold_rule, survival_tier_change_rule,
@@ -377,7 +424,10 @@ def _log_html(ts: str, severity: str, msg: str, color: str) -> str:
     - Converts embedded newlines to <br> so multi-line payloads (e.g. the
       'BEGIN UNTRUSTED GIG DATA' envelope) break onto their own line instead of
       collapsing into one giant inline line in the HTML view.
+    - Converts bare color strings to style-safe hex RGB.
     """
+    if color:
+        color = _color_to_hex(color)
     safe = html.escape(msg, quote=False).replace("\n", "<br>")
     return f'<span style="color:{color};">[{ts}] [{severity}] {safe}</span>'
 
@@ -518,6 +568,26 @@ class MainWindow(TabBuildersMixin, QMainWindow):
 
         # Bridge: event logger → alerting engine
         self.event_logger.on_log = self._on_event_logged
+
+        # Bridge: event logger → goal tracker (Phase 6)
+        try:
+            from agents.goal_system import GoalTracker
+            self.goal_tracker = GoalTracker.instance()
+            self.event_logger.add_event_callback(self.goal_tracker.process_event)
+        except Exception as e:
+            self.log_signal.emit(f"[Startup] GoalTracker unavailable: {e}")
+            self.goal_tracker = None
+
+        # Provider hot-reload: monitor .env for changes and update providers at runtime
+        try:
+            from agents.provider_hot_reload import ProviderHotReload
+            self.provider_hot_reload = ProviderHotReload.instance()
+            self.provider_hot_reload.register_callback(self._on_provider_config_changed)
+            self.provider_hot_reload.start_monitoring(interval=2.0)
+            self.log_signal.emit("[Startup] Provider hot-reload monitoring started")
+        except Exception as e:
+            self.log_signal.emit(f"[Startup] Provider hot-reload unavailable: {e}")
+            self.provider_hot_reload = None
 
         # Register specialized workers with the CEO manager
         try:
@@ -915,6 +985,30 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         except Exception:
             pass
 
+    def _on_provider_config_changed(self, changes: dict):
+        """Handle provider configuration changes at runtime (no restart needed)."""
+        try:
+            # Log the changes
+            for key, value in changes.items():
+                if "KEY" not in key and "SECRET" not in key:
+                    self.log_signal.emit(f"[Provider] Config changed: {key}={value}")
+                else:
+                    self.log_signal.emit(f"[Provider] Config changed: {key}=***")
+            
+            # Re-detect providers
+            from agents.provider_manager import ProviderManager
+            pm = ProviderManager.instance()
+            pm.detect_providers()
+            
+            # Refresh provider status in UI
+            if hasattr(self, 'tabs'):
+                # Refresh current tab if it's a provider-related tab
+                pass
+            
+            self.log_signal.emit("[Provider] Configuration updated - changes applied")
+        except Exception as e:
+            self.log_signal.emit(f"[Provider] Error applying config changes: {e}")
+
     def _on_manager_thought(self, text: str):
         self.thought_panel.route("Manager", text)
         self.log_signal.emit(f"[Manager] thought: {text}")
@@ -942,73 +1036,128 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self._append_log(msg)
 
     def _replay_log_buffer(self):
-        """Push all buffered log entries into the (now built) log_edit widget.
+        """Push all buffered log entries into the (now built) log_table widget.
 
         Called once when the Live Logs tab is first constructed. Re-applies the
         current filter so the replay matches what the user is looking at.
         """
-        if not hasattr(self, "log_edit"):
+        if not hasattr(self, "log_table") or self.log_table is None:
             return
-        self.log_edit.clear()
+        self.log_table.setRowCount(0)
         filter_text = (self.log_filter.text().lower()
-                       if hasattr(self, "log_filter") else "")
+                       if hasattr(self, "log_filter") and self.log_filter is not None else "")
         severity_filter = (self.log_severity_combo.currentText()
-                          if hasattr(self, "log_severity_combo") else "All")
+                          if hasattr(self, "log_severity_combo") and self.log_severity_combo is not None else "All")
+        category_filter = (self.log_category_combo.currentText()
+                          if hasattr(self, "log_category_combo") and self.log_category_combo is not None else "All")
         for e in self._log_buffer:
-            if severity_filter != "All" and e["severity"] != severity_filter:
+            if severity_filter != "All" and e.get("severity") != severity_filter:
                 continue
-            if filter_text and filter_text not in e["msg"].lower():
+            if category_filter != "All" and e.get("category") != category_filter:
                 continue
-            self.log_edit.append(_log_html(e["ts"], e["severity"], e["msg"], e["color"]))
+            if filter_text and filter_text not in e.get("msg", "").lower():
+                continue
+            self._append_log_to_table(e)
         if getattr(self, "auto_scroll_logs", None) and self.auto_scroll_logs.isChecked():
-            sb = self.log_edit.verticalScrollBar()
-            sb.setValue(sb.maximum())
+            self.log_table.scrollToBottom()
 
-    def _append_log(self, msg: str):
-        ts    = datetime.now().strftime("%H:%M:%S")
-        if "BLOCKED" in msg:
+    def _append_log_to_table(self, entry):
+        """Append a single log entry to the log table widget."""
+        if not hasattr(self, "log_table") or self.log_table is None:
+            return
+        row = self.log_table.rowCount()
+        self.log_table.insertRow(row)
+        
+        # Time
+        ts_item = QTableWidgetItem(entry.get("ts", ""))
+        ts_item.setForeground(QColor(entry.get("color", "#aaaaaa")))
+        self.log_table.setItem(row, 0, ts_item)
+        
+        # Severity
+        sev_item = QTableWidgetItem(entry.get("severity", "INFO"))
+        sev_item.setForeground(QColor(entry.get("color", "#aaaaaa")))
+        self.log_table.setItem(row, 1, sev_item)
+        
+        # Source
+        src_item = QTableWidgetItem(entry.get("source", ""))
+        src_item.setForeground(QColor(entry.get("color", "#aaaaaa")))
+        self.log_table.setItem(row, 2, src_item)
+        
+        # Message
+        msg_item = QTableWidgetItem(entry.get("msg", ""))
+        msg_item.setForeground(QColor(entry.get("color", "#aaaaaa")))
+        self.log_table.setItem(row, 3, msg_item)
+        
+        # Tokens/s
+        tok_item = QTableWidgetItem(entry.get("tokens_sec", ""))
+        tok_item.setForeground(QColor("#4caf50" if entry.get("tokens_sec") else "#666666"))
+        self.log_table.setItem(row, 4, tok_item)
+        
+        # Limit rows
+        if self.log_table.rowCount() > 5000:
+            self.log_table.removeRow(0)
+
+    def _append_log(self, msg: str, source: str = "", category: str = "", details: str = ""):
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%H:%M:%S.%f")[:-3]
+        
+        # Auto-detect severity from message content
+        severity = "INFO"
+        if "BLOCKED" in msg or "block" in msg.lower():
             severity = "BLOCKED"
-        elif "ERROR" in msg:
+        elif "ERROR" in msg or "❌" in msg or "fail" in msg.lower():
             severity = "ERROR"
-        elif "Ollama" in msg or "LLM" in msg:
+        elif "Ollama" in msg or "LLM" in msg or "llm" in msg.lower():
             severity = "OLLAMA"
-        elif "Manager" in msg or "Action" in msg:
+        elif "Manager" in msg or "Action" in msg or "Manager" in source:
             severity = "MANAGER"
-        else:
-            severity = "INFO"
+        elif "warning" in msg.lower() or "⚠️" in msg:
+            severity = "WARNING"
+        elif "success" in msg.lower() or "✅" in msg or "ready" in msg.lower():
+            severity = "SUCCESS"
+        
         color = {
             "BLOCKED": "#ffcc00",
             "ERROR": "#ff4444",
             "OLLAMA": "#00b0ff",
             "MANAGER": "#00ccff",
             "INFO": "#aaaaaa",
-        }[severity]
+            "WARNING": "#ff9800",
+            "SUCCESS": "#4caf50",
+        }.get(severity, "#aaaaaa")
+        
+        # Extract tokens/sec if present in message
+        tokens_sec = ""
+        if "tokens/s" in msg or "tok/s" in msg:
+            import re
+            match = re.search(r'([\d.]+)\s*(?:tokens|tok)/s', msg)
+            if match:
+                tokens_sec = f"{match.group(1)} tok/s"
 
-        entry = {"ts": ts, "msg": msg, "color": color, "severity": severity}
+        entry = {
+            "ts": ts,
+            "msg": msg,
+            "source": source or "system",
+            "category": category or "info",
+            "details": details,
+            "color": color,
+            "severity": severity,
+            "tokens_sec": tokens_sec,
+        }
         self._log_buffer.append(entry)
         if len(self._log_buffer) > 5000:
             self._log_buffer.pop(0)
 
-        # If the Live Logs tab hasn't been built yet, we've already buffered above;
-        # nothing more to do until the tab is constructed (then it replays).
-        if not hasattr(self, "log_edit"):
-            return
-
-        if hasattr(self, "log_severity_combo"):
-            current_filter = self.log_severity_combo.currentText()
-            if current_filter != "All" and severity != current_filter:
-                return
-        flt = self.log_filter.text().lower() if hasattr(self, "log_filter") else ""
-        if not flt or flt in msg.lower():
-            self.log_edit.append(_log_html(ts, severity, msg, color))
-            if getattr(self, "auto_scroll_logs", None) and self.auto_scroll_logs.isChecked():
-                sb = self.log_edit.verticalScrollBar()
-                sb.setValue(sb.maximum())
+        # Update the table widget if it exists
+        if hasattr(self, "log_table") and self.log_table is not None:
+            try:
+                self._append_log_to_table(entry)
+            except Exception:
+                pass
 
     def _set_log_auto_scroll(self, checked: bool):
-        if checked and hasattr(self, "log_edit"):
-            sb = self.log_edit.verticalScrollBar()
-            sb.setValue(sb.maximum())
+        if checked and hasattr(self, "log_table"):
+            self.log_table.scrollToBottom()
 
     def _apply_log_filter(self):
         # PERF: debounce filter rebuilds with a single-shot timer so rapid
@@ -1018,26 +1167,33 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self._filter_debounce.setSingleShot(True)
             self._filter_debounce.setInterval(200)
             self._filter_debounce.timeout.connect(self._do_apply_log_filter)
+        if not hasattr(self, "log_table"):
+            return
         self._filter_debounce.start()
 
     def _do_apply_log_filter(self):
-        self.log_edit.clear()
+        if not hasattr(self, "log_table"):
+            return
+        self.log_table.setRowCount(0)
         filter_text = self.log_filter.text().lower()
         severity_filter = self.log_severity_combo.currentText()
+        category_filter = (self.log_category_combo.currentText()
+                          if hasattr(self, "log_category_combo") else "All")
         for e in self._log_buffer:
-            if severity_filter != "All" and e["severity"] != severity_filter:
+            if severity_filter != "All" and e.get("severity") != severity_filter:
                 continue
-            if filter_text and filter_text not in e["msg"].lower():
+            if category_filter != "All" and e.get("category") != category_filter:
                 continue
-            color, ts, msg = e["color"], e["ts"], e["msg"]
-            self.log_edit.append(_log_html(ts, e["severity"], msg, color))
+            if filter_text and filter_text not in e.get("msg", "").lower():
+                continue
+            self._append_log_to_table(e)
         if getattr(self, "auto_scroll_logs", None) and self.auto_scroll_logs.isChecked():
-            sb = self.log_edit.verticalScrollBar()
-            sb.setValue(sb.maximum())
+            self.log_table.scrollToBottom()
 
     def _clear_log(self):
         self._log_buffer.clear()
-        self.log_edit.clear()
+        if hasattr(self, "log_table"):
+            self.log_table.setRowCount(0)
 
     def _toggle_thought_panel(self, checked):
         if checked:
@@ -1087,6 +1243,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                     ("Earnings",       self.create_earnings_tab),
                     ("Insights",       self.create_insights_tab),
                     ("Approvals",      self.create_approval_tab),
+                    ("Goals",          self.create_goals_tab),
                     ("Opportunities",  self.create_opportunities_tab),
                     ("Paper Trading",  self.create_paper_trading_tab),
                     ("Analytics",      self.create_analytics_tab),
@@ -1381,6 +1538,19 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self.log_signal.emit(f"[Proposal] {msg}")
 
 
+    def _format_ago(self, seconds: float) -> str:
+        """Format seconds as human-readable 'ago' string."""
+        if seconds <= 0:
+            return "just now"
+        if seconds < 60:
+            return f"{int(seconds)}s ago"
+        if seconds < 3600:
+            mins = int(seconds / 60)
+            return f"{mins}m ago"
+        hours = int(seconds / 3600)
+        mins = int((seconds % 3600) / 60)
+        return f"{hours}h {mins}m ago"
+
     def _refresh_stream_health(self):
         """v2.0.34ac (G5): render live steady-stream telemetry into the Management tab."""
         try:
@@ -1403,7 +1573,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 f"chat: {s.get('pending_chat', 0)} · "
                 f"jobs: {s.get('pending_jobs', 0)}",
                 f"Errors: {s.get('errors', 0)} (streak {s.get('error_streak', 0)}) · "
-                f"last ok {s.get('last_success_ago_s', 0)}s ago",
+                f"last ok {self._format_ago(s.get('last_success_ago_s', 0))}",
             ]
             self.stream_health_label.setText("<br>".join(lines))
         except Exception:
@@ -1510,9 +1680,9 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.log_signal.emit("File cache cleared")
 
     def refresh_db_stats(self):
-        # v2.0.34ag (A5): DB Stats tab is built lazily; the 15s stats timer may fire
-        # before the operator opens that tab. Guard so we don't crash.
-        if not hasattr(self, "db_stats_label"):
+        """Refresh DB Stats tab with data from database."""
+        # Guard: new DB Stats tab uses table widgets
+        if not hasattr(self, "db_stat_calls"):
             return
         try:
             stats = self.db.get_llm_stats()
@@ -1523,39 +1693,86 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                     disc = self.manager.get_discovery_summary()
                 except Exception:
                     disc = {}
-            parts = [
-                f"Calls: {stats.get('total_calls',0)}",
-                f"OK: {stats.get('successes',0)}",
-                f"Err: {stats.get('errors',0)}",
-                f"Avg: {int(stats.get('avg_latency_ms') or 0)}ms",
-                f"Chars: {int(stats.get('total_chars') or 0):,}",
-                f"Proposals: {props}",
-            ]
-            self.db_stats_label.setText("  ".join(parts))
-            # v2.0.21 P2#5: show last EarningPipeline discovery snapshot
-            if disc.get("total"):
-                by_src = " ".join(f"{k}:{v}" for k, v in disc.get("by_source", {}).items())
-                self.db_stats_label.setText(
-                    self.db_stats_label.text()
-                    + f"  | Discovered: {disc['total']} (queued {disc.get('queued',0)}) [{by_src}]")
-            self.db_actions_list.clear()
-            for a in self.db.get_recent_actions(20):
-                ts = self.db.ts_to_str(a["ts"])
-                self.db_actions_list.addItem(
-                    f"[{ts}] {a['trigger']}: {a['action_text']}")
-            lines = []
+            
+            # Update stat cards
+            self.db_stat_calls.value_label.setText(str(stats.get("total_calls", 0)))
+            self.db_stat_errors.value_label.setText(str(stats.get("errors", 0)))
+            avg_lat = int(stats.get("avg_latency_ms") or 0)
+            self.db_stat_avg_latency.value_label.setText(f"{avg_lat} ms")
+            self.db_stat_chars.value_label.setText(f"{int(stats.get('total_chars', 0)):,}")
+            self.db_stat_cost.value_label.setText(f"${stats.get('total_cost', 0):.2f}")
+            self.db_stat_tokens_sec.value_label.setText(f"{stats.get('avg_tokens_per_second', 0):.1f}")
+            self.db_stat_uptime.value_label.setText(f"{stats.get('uptime_hours', 0)}h")
+            self.db_stat_db_size.value_label.setText(f"{stats.get('db_size_mb', 0)} MB")
+            
+            # Update provider table
+            self.provider_table.setRowCount(0)
+            provider_stats = stats.get("by_provider", {})
+            for provider, pstats in provider_stats.items():
+                row = self.provider_table.rowCount()
+                self.provider_table.insertRow(row)
+                self.provider_table.setItem(row, 0, QTableWidgetItem(str(provider)))
+                self.provider_table.setItem(row, 1, QTableWidgetItem(str(pstats.get("calls", 0))))
+                self.provider_table.setItem(row, 2, QTableWidgetItem(str(pstats.get("errors", 0))))
+                self.provider_table.setItem(row, 3, QTableWidgetItem(f"{pstats.get('avg_ms', 0):.0f}"))
+                self.provider_table.setItem(row, 4, QTableWidgetItem(f"{pstats.get('avg_tok_s', 0):.1f}"))
+            
+            # Update model table
+            self.model_table.setRowCount(0)
+            model_stats = stats.get("by_model", {})
+            for model, mstats in model_stats.items():
+                row = self.model_table.rowCount()
+                self.model_table.insertRow(row)
+                self.model_table.setItem(row, 0, QTableWidgetItem(str(model)))
+                self.model_table.setItem(row, 1, QTableWidgetItem(str(mstats.get("calls", 0))))
+                self.model_table.setItem(row, 2, QTableWidgetItem(str(mstats.get("tokens_in", 0))))
+                self.model_table.setItem(row, 3, QTableWidgetItem(str(mstats.get("tokens_out", 0))))
+                self.model_table.setItem(row, 4, QTableWidgetItem(f"{mstats.get('avg_tok_s', 0):.1f}"))
+            
+            # Update recent calls table
+            self.db_calls_table.setRowCount(0)
             for c in self.db.get_recent_llm_calls(20):
-                ts     = self.db.ts_to_str(c["ts"])
+                ts = self.db.ts_to_str(c["ts"])
                 status = "OK" if not c["error"] else "ERR"
-                lines.append(
-                    f"[{ts}] {c['provider']!s:6} "
-                    f"{str(c['model'])[:24]:24} "
-                    f"{c['latency_ms'] or 0!s:>5}ms {status}")
-            self.db_calls_edit.setPlainText("\n".join(lines))
-            # v2.0.22 S4: refresh the Instruction Review Queue
-            self._refresh_review_queue()
+                row = self.db_calls_table.rowCount()
+                self.db_calls_table.insertRow(row)
+                self.db_calls_table.setItem(row, 0, QTableWidgetItem(ts))
+                self.db_calls_table.setItem(row, 1, QTableWidgetItem(str(c.get("provider", ""))))
+                self.db_calls_table.setItem(row, 2, QTableWidgetItem(str(c.get("model", ""))[:30]))
+                self.db_calls_table.setItem(row, 3, QTableWidgetItem(str(c.get("prompt_tokens", 0))))
+                self.db_calls_table.setItem(row, 4, QTableWidgetItem(str(c.get("completion_tokens", 0))))
+                self.db_calls_table.setItem(row, 5, QTableWidgetItem(f"${c.get('cost_usd', 0):.4f}"))
+                self.db_calls_table.setItem(row, 6, QTableWidgetItem(f"{c.get('tokens_per_second', 0):.1f}"))
+            
+            # Update event table
+            self.event_table.setRowCount(0)
+            recent_events = self.db.get_recent_events(100)
+            for e in recent_events:
+                ts = self.db.ts_to_str(e.get("ts", 0))
+                row = self.event_table.rowCount()
+                self.event_table.insertRow(row)
+                self.event_table.setItem(row, 0, QTableWidgetItem(ts))
+                self.event_table.setItem(row, 1, QTableWidgetItem(str(e.get("event_type", ""))))
+                self.event_table.setItem(row, 2, QTableWidgetItem(str(e.get("source", ""))))
+                self.event_table.setItem(row, 3, QTableWidgetItem(str(e.get("message", ""))[:100]))
+            
+            # Also update old widgets if they exist (back-compat)
+            if hasattr(self, "db_stats_label"):
+                parts = [
+                    f"Calls: {stats.get('total_calls',0)}",
+                    f"OK: {stats.get('successes',0)}",
+                    f"Err: {stats.get('errors',0)}",
+                    f"Avg: {avg_lat}ms",
+                    f"Chars: {int(stats.get('total_chars') or 0):,}",
+                    f"Proposals: {props}",
+                ]
+                self.db_stats_label.setText("  ".join(parts))
+            
         except Exception as e:
-            self.db_stats_label.setText(f"DB error: {e}")
+            if hasattr(self, "db_stats_label"):
+                self.db_stats_label.setText(f"DB error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _refresh_review_queue(self):
         """Populate the review queue list + counts from the instruction gate."""

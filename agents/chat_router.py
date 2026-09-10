@@ -14,7 +14,7 @@ def _format_lifecycle_status(lifecycle: List[dict], compact: bool = True) -> str
         return ""
 
     if not compact:
-        return "=== Opportunity Lifecycle ===\n" + json.dumps(lifecycle, indent=2)
+        return "=== Opportunity Lifecycle ===\n" + json.dumps(lifecycle, indent=2, default=str)
 
     lines = ["=== Opportunity Status Report ==="]
     active_count = sum(1 for item in lifecycle if (item.get("status") or "").lower() not in {"failed", "paid"})
@@ -198,7 +198,7 @@ class ChatRouter:
             if path.suffix.lower() == ".json":
                 try:
                     payload = json.loads(text)
-                    preview = json.dumps(payload, indent=2)[:6000]
+                    preview = json.dumps(payload, indent=2, default=str)[:6000]
                 except Exception:
                     preview = text[:6000]
             else:

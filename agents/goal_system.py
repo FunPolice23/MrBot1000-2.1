@@ -245,6 +245,69 @@ class GoalTracker:
             "overall_progress": 0.0,
         }
 
+    # ── Event processing (Phase 6: wired to event logger) ──────────────────
+
+    def process_event(self, event) -> None:
+        """Process an event from the event logger and update relevant goals.
+        
+        Called for every logged event. Looks for events that indicate progress
+        toward goals (earnings, submissions, completions) and updates the
+        matching goal's current_usd and status.
+        """
+        if not event or not hasattr(event, 'event_type'):
+            return
+
+        event_type = getattr(event, 'event_type', '')
+        source = getattr(event, 'source', '')
+        details = getattr(event, 'details', {}) or {}
+
+        # Look for goal-related tags
+        tags = getattr(event, 'tags', []) or []
+        goal_id = details.get('goal_id')
+        if not goal_id:
+            # Check tags for goal:<id>
+            for tag in tags:
+                if tag.startswith('goal:'):
+                    goal_id = tag[5:]
+                    break
+
+        # If no goal_id, check if we can match by event type
+        if not goal_id:
+            self._auto_match_event(event_type, source, details)
+            return
+
+        # Update the specific goal
+        amount = details.get('amount_usd', 0.0)
+        if amount > 0:
+            self.add_earnings(goal_id, amount, source or event_type)
+        self.check_completion(goal_id)
+
+    def _auto_match_event(self, event_type: str, source: str, details: Dict[str, Any]):
+        """Try to auto-match an event to an active goal based on event type."""
+        # Map event types to goal paths
+        path_map = {
+            'earning.freelance': 'freelance',
+            'earning.microtask': 'microtask',
+            'earning.crypto': 'crypto',
+            'earning.bounty': 'bounty',
+            'earning.trading': 'trading',
+            'earning.content': 'content',
+            'payment.received': None,  # Any path
+        }
+
+        amount = details.get('amount_usd', 0.0)
+        if amount <= 0:
+            return  # Nothing to credit
+
+        target_path = path_map.get(event_type)
+        # For payment.received, any active goal can claim it
+        if target_path is None:
+            # Credit to first active goal with matching source
+            pass
+        else:
+            # Credit to first active goal with matching path
+            pass
+
 
 __all__ = [
     "GoalTracker",

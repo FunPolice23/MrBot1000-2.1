@@ -68,7 +68,7 @@ class DataProvider(ABC):
             for k, v in headers.items():
                 req.add_header(k, v)
         
-        body = json.dumps(data).encode() if data else None
+        body = json.dumps(data, default=str).encode() if data else None
         if body:
             req.add_header("Content-Type", "application/json")
         

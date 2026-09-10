@@ -62,6 +62,10 @@ class SpendRecord:
     cost_usd: float
     platform: str = ""  # Which platform triggered the call
     purpose: str = ""  # What the call was for
+    tokens_per_second: float = 0.0  # Generation speed
+    time_to_first_token: float = 0.0  # TTFT in seconds
+    total_time: float = 0.0  # Total generation time
+    gpu_index: int = -1  # Which GPU was used (-1 for cloud)
     
     def to_dict(self) -> dict:
         return {

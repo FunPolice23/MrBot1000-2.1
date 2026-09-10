@@ -31,15 +31,14 @@ class AgentDB:
             return cursor
 
     def _create_tables(self):
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS thoughts (
+        statements = [
+            """CREATE TABLE IF NOT EXISTS thoughts (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts          REAL    NOT NULL,
                 source      TEXT    NOT NULL,
                 text        TEXT    NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS llm_calls (
+            )""",
+            """CREATE TABLE IF NOT EXISTS llm_calls (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts           REAL    NOT NULL,
                 model        TEXT    NOT NULL,
@@ -49,9 +48,15 @@ class AgentDB:
                 response_chars INTEGER,
                 latency_ms   INTEGER,
                 error        TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS research_cache (
+            )""",
+            """CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          REAL    NOT NULL,
+                event_type  TEXT    NOT NULL,
+                source      TEXT    NOT NULL,
+                message     TEXT    NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS research_cache (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts           REAL    NOT NULL,
                 folder_path  TEXT    NOT NULL,
@@ -59,24 +64,21 @@ class AgentDB:
                 root_chars   INTEGER,
                 research_chars INTEGER,
                 payload      TEXT    NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS actions (
+            )""",
+            """CREATE TABLE IF NOT EXISTS actions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts          REAL    NOT NULL,
                 trigger     TEXT    NOT NULL,
                 action_text TEXT    NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS decisions (
+            )""",
+            """CREATE TABLE IF NOT EXISTS decisions (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts           REAL    NOT NULL,
                 trigger      TEXT    NOT NULL,
                 full_text    TEXT    NOT NULL,
                 action_part  TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS file_cache (
+            )""",
+            """CREATE TABLE IF NOT EXISTS file_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 folder_path TEXT NOT NULL,
                 relative_path TEXT NOT NULL,
@@ -85,14 +87,12 @@ class AgentDB:
                 mtime REAL,
                 last_accessed REAL,
                 UNIQUE(folder_path, relative_path)
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
+            )""",
+            """CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS proposals (
+            )""",
+            """CREATE TABLE IF NOT EXISTS proposals (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts           REAL    NOT NULL,
                 gig_title    TEXT,
@@ -100,12 +100,9 @@ class AgentDB:
                 budget_usd   REAL,
                 draft        TEXT    NOT NULL,
                 status       TEXT    DEFAULT 'drafted'
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_proposals_ts ON proposals(ts);
-
-            -- v2.0.22 S1: instruction provenance gate (untrusted external playbooks)
-            CREATE TABLE IF NOT EXISTS instruction_quarantine (
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_proposals_ts ON proposals(ts)",
+            """CREATE TABLE IF NOT EXISTS instruction_quarantine (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts           REAL    NOT NULL,
                 url          TEXT    NOT NULL,
@@ -113,35 +110,30 @@ class AgentDB:
                 title        TEXT,
                 content_hash TEXT    NOT NULL,
                 content      TEXT    NOT NULL,
-                status       TEXT    DEFAULT 'pending'  -- pending|allowed|blocked
-            );
-
-            CREATE TABLE IF NOT EXISTS instruction_allowlist (
+                status       TEXT    DEFAULT 'pending'
+            )""",
+            """CREATE TABLE IF NOT EXISTS instruction_allowlist (
                 url          TEXT PRIMARY KEY,
                 content_hash TEXT,
                 title        TEXT,
                 approved_at  REAL    NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS instruction_blacklist (
+            )""",
+            """CREATE TABLE IF NOT EXISTS instruction_blacklist (
                 url          TEXT PRIMARY KEY,
                 content_hash TEXT,
-                related      TEXT,    -- related identifiers (url + skill.md + related)
+                related      TEXT,
                 rejected_at  REAL    NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_inst_q_status ON instruction_quarantine(status);
-            CREATE INDEX IF NOT EXISTS idx_inst_q_hash   ON instruction_quarantine(content_hash);
-
-            CREATE INDEX IF NOT EXISTS idx_thoughts_ts   ON thoughts(ts);
-            CREATE INDEX IF NOT EXISTS idx_llm_calls_ts  ON llm_calls(ts);
-            CREATE INDEX IF NOT EXISTS idx_actions_ts    ON actions(ts);
-            CREATE INDEX IF NOT EXISTS idx_thoughts_source ON thoughts(source);
-            CREATE INDEX IF NOT EXISTS idx_llm_calls_trigger ON llm_calls(trigger);
-            CREATE INDEX IF NOT EXISTS idx_actions_trigger ON actions(trigger);
-            CREATE INDEX IF NOT EXISTS idx_file_cache_path ON file_cache(folder_path, relative_path);
-
-            CREATE TABLE IF NOT EXISTS evidence (
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_inst_q_status ON instruction_quarantine(status)",
+            "CREATE INDEX IF NOT EXISTS idx_inst_q_hash   ON instruction_quarantine(content_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_thoughts_ts   ON thoughts(ts)",
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_ts  ON llm_calls(ts)",
+            "CREATE INDEX IF NOT EXISTS idx_actions_ts    ON actions(ts)",
+            "CREATE INDEX IF NOT EXISTS idx_thoughts_source ON thoughts(source)",
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_trigger ON llm_calls(trigger)",
+            "CREATE INDEX IF NOT EXISTS idx_actions_trigger ON actions(trigger)",
+            "CREATE INDEX IF NOT EXISTS idx_file_cache_path ON file_cache(folder_path, relative_path)",
+            """CREATE TABLE IF NOT EXISTS evidence (
                 id              TEXT PRIMARY KEY,
                 source          TEXT    NOT NULL,
                 evidence_type   TEXT    NOT NULL,
@@ -166,13 +158,32 @@ class AgentDB:
                 metadata        TEXT    NOT NULL DEFAULT '{}',
                 provenance      TEXT    NOT NULL DEFAULT '{}',
                 history         TEXT    NOT NULL DEFAULT '[]'
-            );
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_subject ON evidence(subject_type, subject_id)",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_type    ON evidence(evidence_type)",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_status  ON evidence(status)",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_parent  ON evidence(parent_evidence_id)",
+        ]
+        for statement in statements:
+            try:
+                self._conn.execute(statement)
+            except sqlite3.OperationalError:
+                # Safe for repeated startup, and tolerant of partially-created schemas.
+                pass
+        self._conn.commit()
 
-            CREATE INDEX IF NOT EXISTS idx_evidence_subject ON evidence(subject_type, subject_id);
-            CREATE INDEX IF NOT EXISTS idx_evidence_type    ON evidence(evidence_type);
-            CREATE INDEX IF NOT EXISTS idx_evidence_status  ON evidence(status);
-            CREATE INDEX IF NOT EXISTS idx_evidence_parent  ON evidence(parent_evidence_id);
-        """)
+        # Migration: add missing columns to legacy databases (idempotent).
+        # Uses per-column try/except so it works on any SQLite version.
+        for col_def in [
+            "prompt_tokens INTEGER DEFAULT 0",
+            "completion_tokens INTEGER DEFAULT 0",
+            "tokens_per_second REAL DEFAULT 0",
+            "cost_usd REAL DEFAULT 0",
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE llm_calls ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         self._conn.commit()
 
     def get_cached_file(self, folder_path: str, relative_path: str,
@@ -473,7 +484,7 @@ class AgentDB:
                 research.get("research_file_count", 0),
                 len(research.get("root", "")),
                 len(research.get("research", "")),
-                json.dumps(research),
+                json.dumps(research, default=str),
             ),
             commit=True
         )
@@ -524,3 +535,84 @@ class AgentDB:
 
     def close(self):
         self._conn.close()
+    
+    # ── Events ─────────────────────────────────────────────────────────────
+    
+    def log_event(self, event_type: str, source: str, message: str):
+        """Log an event."""
+        import time
+        self._execute(
+            "INSERT INTO events (ts, event_type, source, message) VALUES (?, ?, ?, ?)",
+            (time.time(), event_type, source, message),
+            commit=True
+        )
+    
+    def get_recent_events(self, limit: int = 100) -> list[dict]:
+        """Get recent events."""
+        rows = self._execute(
+            "SELECT ts, event_type, source, message FROM events ORDER BY ts DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    
+    # ── Enhanced LLM stats ─────────────────────────────────────────────────
+    
+    def get_llm_stats(self) -> dict:
+        """Get comprehensive LLM statistics."""
+        row = self._execute("""
+            SELECT
+                COALESCE(COUNT(*), 0) AS total_calls,
+                COALESCE(SUM(CASE WHEN error IS NULL THEN 1 ELSE 0 END), 0) AS successes,
+                COALESCE(SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END), 0) AS errors,
+                COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
+                COALESCE(SUM(prompt_chars + response_chars), 0) AS total_chars,
+                COALESCE(SUM(cost_usd), 0) AS total_cost,
+                COALESCE(AVG(tokens_per_second), 0) AS avg_tokens_per_second,
+                COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens
+            FROM llm_calls
+        """).fetchone()
+        
+        stats = dict(row) if row else {}
+        
+        # Get per-provider stats
+        provider_rows = self._execute("""
+            SELECT provider,
+                   COUNT(*) as calls,
+                   SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) as errors,
+                   AVG(latency_ms) as avg_ms,
+                   AVG(tokens_per_second) as avg_tok_s
+            FROM llm_calls
+            GROUP BY provider
+        """).fetchall()
+        stats["by_provider"] = {r["provider"]: dict(r) for r in provider_rows}
+        
+        # Get per-model stats
+        model_rows = self._execute("""
+            SELECT model,
+                   COUNT(*) as calls,
+                   SUM(prompt_tokens) as tokens_in,
+                   SUM(completion_tokens) as tokens_out,
+                   AVG(tokens_per_second) as avg_tok_s
+            FROM llm_calls
+            GROUP BY model
+        """).fetchall()
+        stats["by_model"] = {r["model"]: dict(r) for r in model_rows}
+        
+        # Get uptime (time since first call)
+        first_call = self._execute("SELECT MIN(ts) as first_ts FROM llm_calls").fetchone()
+        if first_call and first_call["first_ts"]:
+            import time
+            stats["uptime_hours"] = round((time.time() - first_call["first_ts"]) / 3600, 1)
+        else:
+            stats["uptime_hours"] = 0
+        
+        # Get DB size
+        try:
+            import os
+            db_path = self._execute("PRAGMA database_list").fetchone()["name"]
+            stats["db_size_mb"] = round(os.path.getsize(db_path) / (1024 * 1024), 2)
+        except Exception:
+            stats["db_size_mb"] = 0
+        
+        return stats

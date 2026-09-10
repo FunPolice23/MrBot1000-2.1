@@ -128,7 +128,7 @@ class WebDashboard:
         components = status.get("components", {})
         rows = []
         for name, data in components.items():
-            rows.append(f"<tr><td>{name}</td><td><pre>{json.dumps(data, indent=2)}</pre></td></tr>")
+            rows.append(f"<tr><td>{name}</td><td><pre>{json.dumps(data, indent=2, default=str)}</pre></td></tr>")
         return f"""<!DOCTYPE html>
 <html><head><title>MrBot1000 Dashboard</title>
 <style>body{{font-family:sans-serif;margin:20px;}}table{{border-collapse:collapse;width:100%;}}th,td{{border:1px solid #ccc;padding:8px;text-align:left;}}th{{background:#eee;}}</style>

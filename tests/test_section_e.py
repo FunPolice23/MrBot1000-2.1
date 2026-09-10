@@ -294,6 +294,39 @@ class TestGuiTabs(unittest.TestCase):
         if not hasattr(self.mw, "db_stats_label"):
             self.mw.refresh_db_stats()
 
+    def test_db_stats_tab_starts_auto_refresh(self):
+        self.mw.create_db_stats_tab()
+        self.assertTrue(hasattr(self.mw, "_stats_timer"))
+        self.assertGreater(self.mw._stats_timer.interval(), 0)
+
+    def test_provider_status_override_persists_after_redetect(self):
+        from agents.provider_manager import ProviderInfo, ProviderManager, ProviderStatus
+
+        pm = ProviderManager()
+
+        def fake_gpus():
+            pm._gpus = []
+
+        def fake_local():
+            pm._providers["demo"] = ProviderInfo(
+                name="Demo",
+                provider_type="demo",
+                status=ProviderStatus.RUNNING.value,
+                is_local=True,
+                is_cloud=False,
+            )
+
+        pm._detect_gpus = fake_gpus
+        pm._detect_local_providers = fake_local
+        pm._detect_cloud_providers = lambda: None
+
+        pm.detect_providers()
+        self.assertEqual(pm.get_provider("demo").status, ProviderStatus.RUNNING.value)
+
+        pm.set_provider_status("demo", ProviderStatus.STOPPED.value)
+        pm.detect_providers()
+        self.assertEqual(pm.get_provider("demo").status, ProviderStatus.STOPPED.value)
+
 
 if __name__ == "__main__":
     unittest.main()

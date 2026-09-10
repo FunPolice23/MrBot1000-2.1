@@ -43,7 +43,7 @@ class EvidenceStore:
                 d["status"], d["verification_method"], d["verification_level"], d["amount"],
                 d["currency"], d["gross_amount"], d["fees"], d["gas"], d["tax_expense"],
                 d["other_expenses"], d["source_reference"], d["raw_reference"],
-                json.dumps(d["metadata"]), json.dumps(d["provenance"]), json.dumps(d["history"]),
+                json.dumps(d["metadata"], default=str), json.dumps(d["provenance"]), json.dumps(d["history"]),
             ),
             commit=True,
         )

@@ -91,7 +91,7 @@ class GitHubAdapter(PlatformAdapter):
             url += "?" + urllib.parse.urlencode(params)
         
         if data and method in ("POST", "PATCH"):
-            body = json.dumps(data).encode()
+            body = json.dumps(data, default=str).encode()
         else:
             body = None
         

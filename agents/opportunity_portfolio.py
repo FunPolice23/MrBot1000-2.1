@@ -302,7 +302,7 @@ class OpportunityPortfolio:
                 entry.blocked_reason, entry.platform, entry.category, entry.task_type,
                 entry.skill_fit, entry.policy_score, entry.lifecycle_stage,
                 entry.added_at, entry.updated_at, entry.policy_version,
-                json.dumps(entry.opportunity_ref),
+                json.dumps(entry.opportunity_ref, default=str),
             ))
             conn.commit()
             conn.close()

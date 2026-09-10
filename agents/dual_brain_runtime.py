@@ -170,6 +170,11 @@ class BrainConfig:
         the device by NAME (``CUDA0``/``CUDA1``) — this llama.cpp line rejects
         numeric indices (``--device 1`` -> "invalid device") and the WindowsApps
         MSVC build can't run the 1660 Super at all.
+        
+        v2.1.1 fix: detects models with Jinja templates that use
+        ``raise_exception()`` (e.g., Ministral, Qwen3.5+, Gemma 4) and uses
+        a compatible built-in chat template as fallback since llama.cpp
+        doesn't provide that function.
         """
         model = model_path or self.model
         bin_path = _server_bin(self._env_prefix)
@@ -187,7 +192,90 @@ class BrainConfig:
                "--model", model]
         if self.gpu_layers is not None:
             cmd += ["--n-gpu-layers", str(self.gpu_layers)]
+        
+        # Check if model template uses raise_exception and provide fallback
+        if model and self._model_needs_raise_exception(model):
+            fallback_template = self._get_fallback_template(model)
+            if fallback_template:
+                cmd += ["--chat-template", fallback_template]
+        
         return cmd
+    
+    def get_template_info(self, model_path: str) -> dict:
+        """Get template info for logging purposes."""
+        try:
+            from agents.gguf_meta import read_metadata
+            meta = read_metadata(model_path)
+            template = meta.get("tokenizer.chat_template", "")
+            needs_fallback = "raise_exception" in template
+            return {
+                "needs_fallback": needs_fallback,
+                "fallback_template": self._get_fallback_template(model_path) if needs_fallback else None,
+                "template_len": len(template)
+            }
+        except Exception as e:
+            return {"needs_fallback": False, "fallback_template": None, "error": str(e)}
+    
+    @staticmethod
+    def _model_needs_raise_exception(model_path: str) -> bool:
+        """Check if a model's chat template uses raise_exception()."""
+        try:
+            from agents.gguf_meta import read_metadata
+            meta = read_metadata(model_path)
+            template = meta.get("tokenizer.chat_template", "")
+            return "raise_exception" in template
+        except Exception:
+            return False
+    
+    @staticmethod
+    def _get_fallback_template(model_path: str) -> str:
+        """Get a compatible built-in chat template for models with broken templates."""
+        try:
+            from agents.gguf_meta import read_metadata
+            meta = read_metadata(model_path)
+            arch = meta.get("general.architecture", "")
+            
+            # Map architectures to compatible built-in templates
+            arch_template_map = {
+                "llama": "chatml",
+                "qwen2": "chatml",
+                "qwen3": "chatml",
+                "gemma": "gemma",
+                "gemma2": "gemma",
+                "gemma3": "gemma",
+                "gemma4": "gemma",
+                "mistral": "chatml",
+                "mixtral": "chatml",
+                "phi3": "phi3",
+                "phi4": "phi4",
+                "falcon": "falcon3",
+                "starcoder": "chatml",
+                "bert": "chatml",
+            }
+            
+            # Try architecture-specific template
+            if arch in arch_template_map:
+                return arch_template_map[arch]
+            
+            # Fallback: try to detect from filename
+            fname = os.path.basename(model_path).lower()
+            if "qwen" in fname:
+                return "chatml"
+            if "gemma" in fname:
+                return "gemma"
+            if "mistral" in fname or "ministral" in fname:
+                return "chatml"
+            if "llama" in fname:
+                return "chatml"
+            if "phi" in fname:
+                return "phi3"
+            if "falcon" in fname:
+                return "falcon3"
+            
+            # Default fallback
+            return "chatml"
+        except Exception:
+            return "chatml"
 
     def to_dict(self) -> Dict[str, Any]:
         return {

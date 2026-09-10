@@ -80,7 +80,7 @@ class ProlificAdapter(PlatformAdapter):
             url += "?" + urllib.parse.urlencode(params)
         
         if data and method == "POST":
-            body = json.dumps(data).encode()
+            body = json.dumps(data, default=str).encode()
         else:
             body = None
         

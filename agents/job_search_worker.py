@@ -147,7 +147,7 @@ class JobSearchDB:
                  status=excluded.status, score=excluded.score,
                  notes=excluded.notes, assigned_to=excluded.assigned_to""",
             (jr.job_id, jr.platform, jr.title, jr.description,
-             jr.budget, json.dumps(jr.skills), jr.url,
+             jr.budget, json.dumps(jr.skills, default=str), jr.url,
              jr.status, jr.score, jr.notes, jr.found_at, jr.assigned_to),
             commit=True
         )

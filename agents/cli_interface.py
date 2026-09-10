@@ -98,7 +98,7 @@ def scan(ctx, strategy: str, platform: str, query: str):
     state.history.append(result)
     save_state(state)
     click.echo(f"Scanned {platform} for '{query or 'all'}' using {strategy}")
-    click.echo(json.dumps(result, indent=2))
+    click.echo(json.dumps(result, indent=2, default=str))
 
 
 @cli.command()
@@ -119,7 +119,7 @@ def evaluate(ctx, id: str, strategy: str):
     state.history.append(result)
     save_state(state)
     click.echo(f"Evaluating opportunity {id} with strategy {result['strategy']}")
-    click.echo(json.dumps(result, indent=2))
+    click.echo(json.dumps(result, indent=2, default=str))
 
 
 @cli.command()
@@ -143,7 +143,7 @@ def execute(ctx, id: str, dry_run: bool):
     state.context.update(result)
     state.history.append(result)
     save_state(state)
-    click.echo(json.dumps(result, indent=2))
+    click.echo(json.dumps(result, indent=2, default=str))
 
 
 @cli.command()
@@ -175,7 +175,7 @@ def register(ctx, chain: str, name: str, approved: bool):
     )
     result = identity.register(chain=chain, approved_by="human" if approved else None)
     click.echo(f"Agent card: {card.agent_id}")
-    click.echo(json.dumps(result, indent=2))
+    click.echo(json.dumps(result, indent=2, default=str))
 
 
 @cli.command()

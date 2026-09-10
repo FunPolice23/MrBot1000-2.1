@@ -140,7 +140,7 @@ class WalletManager:
             except Exception:
                 pass
         data = {"wallets": self.wallets}
-        self.wallets_file.write_text(json.dumps(data, indent=2))
+        self.wallets_file.write_text(json.dumps(data, indent=2, default=str))
 
     def add_solana_wallet(self, name: str, address: str,
                           private_key: str = ""):
@@ -318,7 +318,7 @@ class WalletManager:
         # H28: invalidate the cached total so the next read reflects the new row.
         self._gas_total_cache = None
         try:
-            ledger_path.write_text(json.dumps({"rows": rows}, indent=2))
+            ledger_path.write_text(json.dumps({"rows": rows}, indent=2, default=str))
         except Exception:
             pass
 

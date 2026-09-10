@@ -170,7 +170,7 @@ from agents.polish.comprehensive_logging import Severity, AuditEvent, AuditLogge
 def main(argv: Optional[List[str]] = None) -> int:
     cli = CLIInterface()
     result = cli.run(argv)
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 

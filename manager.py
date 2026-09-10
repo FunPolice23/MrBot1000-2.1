@@ -322,7 +322,7 @@ class ManagerThread(QThread):
         for jr in jobs:
             self._job_queue.append(jr.to_dict())
         if jobs:
-            self.job_found.emit(json.dumps([j.to_dict() for j in jobs]))
+            self.job_found.emit(json.dumps([j.to_dict() for j in jobs], default=str))
             self._m_think(
                 f"Job queue updated: {len(self._job_queue)} gig(s) waiting")
 
@@ -822,7 +822,7 @@ class ManagerThread(QThread):
         # ── STAGE 1+2: THINK + PLAN ───────────────────────────────────────────
         self._a_think(f"[{worker_name}] PLANNING: structuring directive…")
         plan = self._plan_task(worker_name, action)
-        self._a_think(f"[{worker_name}] PLAN: {json.dumps(plan)[:300]}")
+        self._a_think(f"[{worker_name}] PLAN: {json.dumps(plan, default=str)[:300]}")
         operation = (plan.get("operation") or "other").lower()
         target_file = plan.get("file")
         issue = plan.get("issue") or action

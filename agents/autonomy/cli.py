@@ -160,7 +160,7 @@ def cmd_identity_card(name: str, description: str, capabilities: str, endpoint: 
         endpoint=endpoint,
     )
     print(f"[identity] Agent card generated:")
-    print(json.dumps(card.to_dict(), indent=2))
+    print(json.dumps(card.to_dict(), indent=2, default=str))
     return 0
 
 
@@ -171,7 +171,7 @@ def cmd_identity_verify() -> int:
     id_ = OnChainIdentity()
     result = id_.verify()
     print(f"[identity] Verification:")
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 

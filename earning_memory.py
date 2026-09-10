@@ -574,7 +574,7 @@ class EarningMemory:
                 """INSERT OR REPLACE INTO opportunity_memory
                    (key, memory_data, memory_type, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (opp_id, json.dumps(memory_data), opp_type,
+                (opp_id, json.dumps(memory_data, default=str), opp_type,
                  time.time(), time.time())
             )
             conn.commit()
@@ -629,7 +629,7 @@ class EarningMemory:
                     time_spent_hours, was_scam, success, tags, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (opp_id, action, result, revenue_usd, time_spent,
-                 was_scam, success, json.dumps(tags or []), time.time())
+                 was_scam, success, json.dumps(tags or [], default=str), time.time())
             )
             conn.commit()
             conn.close()
@@ -875,7 +875,7 @@ class EarningMemory:
         """
         if not strategy_id:
             return
-        cats_json = json.dumps(categories or [], ensure_ascii=False)
+        cats_json = json.dumps(categories or [], ensure_ascii=False, default=str)
         norm = _normalize_query(query)
         with self._lock:
             conn = sqlite3.connect(self.db_path)
@@ -1201,7 +1201,7 @@ class EarningMemory:
                     """INSERT INTO skill_memory
                        (skill, success_count, failed_count, total_revenue, platforms, last_used)
                        VALUES (?, 1, 0, ?, ?, ?)""",
-                    (skill, revenue, json.dumps(platforms), now)
+                    (skill, revenue, json.dumps(platforms, default=str), now)
                 )
             else:
                 success_count = int(row[0] or 0) + 1
@@ -1221,7 +1221,7 @@ class EarningMemory:
                     """UPDATE skill_memory
                        SET success_count=?, total_revenue=?, platforms=?, last_used=?
                        WHERE skill=?""",
-                    (success_count, total_revenue, json.dumps(existing_platforms), now, skill)
+                    (success_count, total_revenue, json.dumps(existing_platforms, default=str), now, skill)
                 )
             conn.commit()
             conn.close()

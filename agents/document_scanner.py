@@ -127,7 +127,7 @@ class DocumentScanner:
             elif path_lower.endswith('.json'):
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    return json.dumps(data, indent=2)
+                    return json.dumps(data, indent=2, default=str)
             
             # Try as text file
             else:
