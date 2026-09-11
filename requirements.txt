@@ -20,4 +20,3 @@ openai==2.24.0
 feedparser==6.0.14
 beautifulsoup4==4.15.0
 ddgs==9.14.4
-playwright==1.55.0
