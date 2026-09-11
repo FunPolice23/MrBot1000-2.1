@@ -11,8 +11,6 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 - **First real paper/human-gated earning capability** (`agents/earning_capability.py`): produces a real TaskWorkspace deliverable, validates it deterministically, stops on human gates, packages locally, and records submission evidence — never fabricates payment or success.
 - **Dialogue and Management consolidation**: Dialogue now tracks goals, tasks,
   and progress; redundant Collaboration and Memory & Stream tabs are removed.
-- **Public publishing workflow**: safe mirror synchronization plus a confirmed
-  CLI/GUI GitHub upload helper.
 
 ## Quick Start
 
@@ -30,7 +28,9 @@ python main.py --safe-mode
 
 This is equivalent to setting `MRBOT_SAFE_MODE=true` for the session.
 
-Requires: Python 3.11+, llama.cpp (`llama.exe` / llama-server) or Ollama (local LLM server), and the packages listed in `requirements.txt`.
+Requires: Python 3.11+, the packages listed in `requirements.txt`, and either
+the default local llama.cpp servers or another configured provider. The default
+dual-brain contract uses llama-server on ports 1234 and 1235.
 
 ### Safe Mode
 
@@ -49,7 +49,7 @@ Safe mode can also be toggled from the Management tab at runtime.
 ## What It Does
 
 - Scans Reddit, Fiverr, Upwork, airdrop feeds, DeFi protocols, microtask platforms, and web search for earning opportunities
-- Evaluates and ranks opportunities using a local Ollama model **plus** a deterministic Opportunity Intelligence Engine (LLM scores feed it as semantic estimates only — never the sole decision-maker)
+- Evaluates and ranks opportunities using the configured Big Brain/Small Brain runtime **plus** a deterministic Opportunity Intelligence Engine (LLM scores feed it as semantic estimates only — never the sole decision-maker)
 - Executes safe, repeatable actions with full validation through a 14-step Task Execution pipeline with deterministic validators + human gates
 - Tracks opportunities through discovery → researched → applied → in_progress → submitted → paid/failed with explicit, auditable stage transitions
 - Surfaces startup warnings and runtime issues so configuration gaps are visible early
@@ -57,7 +57,7 @@ Safe mode can also be toggled from the Management tab at runtime.
 - Shares research snapshots across the manager and chat-side runtime context so both models can benefit from the same knowledge base
 - Tracks earnings and payouts locally in SQLite with **Unified Economic Accounting** (verified vs unverified revenue, LLM cost, gas, net profit, ROI, net hourly rate)
 - Runs a self-audit engine that identifies improvement opportunities across 14 categories without mutating safety constraints
-- Supports multiple LLM providers (Ollama local, OpenAI, Anthropic, OpenRouter, Gemini, Groq, DeepSeek, Mistral, Together, NVIDIA NIM, vLLM, LM Studio, KoboldCpp) with cost-aware routing, per-provider main/chat role control, and circuit breakers
+- Supports the local llama.cpp dual-brain runtime by default, with optional Ollama, OpenAI, Anthropic, OpenRouter, Gemini, Groq, DeepSeek, Mistral, Together, NVIDIA NIM, vLLM, LM Studio, and KoboldCpp providers through the Settings and Providers & GPU surfaces
 - Maintains per-role memory (chat + CEO) that survives restarts
 - Dynamically schedules discovery sources based on historical performance (exploration/exploitation balance)
 
@@ -87,13 +87,6 @@ The system runs a unified 24-stage autonomous planning loop:
 18. **Account** — Unified Economic Accounting (revenue = verified payment evidence only)
 19. **Learn** — feed outcomes back into memory (search strategy outcomes, proposal A/B variants, learning loop with governor bounds)
 20. **Re-rank** — update future opportunity prioritization based on learned results
-
-### Discovery Pipeline (legacy 4-stage, still supported)
-
-1. Discover opportunities from supported sources
-2. Evaluate and filter them by value, risk, and fit
-3. Create a concrete next-action plan for the best options
-4. Execute approved steps safely and record the result
 
 ## Running Tests
 
@@ -141,8 +134,9 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 
 ## Architecture
 
-- **Main model** (any model Ollama serves — e.g. gemma-4-E2B, ornith, llama3, or any size): GPU/CPU — Heavy analysis, code work, decisions
-- **Chat model** (any model Ollama serves — e.g. gemma-3-1b, gemma-4-E2B, or any size): Fast conversation
+- **Big Brain / Marcus Rivera**: llama-server on port 1234, normally GPU device 0 — planning, coding, deep research, and review
+- **Small Brain / Alex Vega**: llama-server on port 1235, normally GPU device 1 — human chat, triage, and lightweight coordination
+- **Optional providers**: Ollama, LM Studio, vLLM, and supported cloud providers can be selected explicitly; they are not silent defaults
 - **Multi-agent system**: Manager (CEO), Coder, Analyst, JobSearch, Summarizer
 - **Message routing**: Agents-tab chat is answered by the **Summarizer thread** (independent QThread, chat model) so replies are never blocked by the Manager's main-model work; task/command intents are forwarded to the Manager.
 - **Cross-model communication**: EventBus (structured messages) + legacy SharedContext JSON (read-only fallback)
@@ -202,7 +196,7 @@ The Agents tab contains:
 | `ui.py` | Animated agent sprites, theme-aware widget styling |
 | `Agent.md` | Agent runtime contract & rules |
 | `ARCHITECTURE.md` | Full system architecture documentation |
-| `CHANGELOG.md` | Change history (currently v2.0.36m) |
+| `CHANGELOG.md` | Change history through the current 2.1.1 release |
 | `tests/__main__.py` | Test suite runner |
 
 ## Configuration
@@ -214,9 +208,13 @@ cp .env.example .env
 ```
 
 Key settings:
-- `OLLAMA_MAIN_MODEL` — Main model for heavy work
-- `OLLAMA_CHAT_MODEL` — Chat model (smaller, faster)
-- `OLLAMA_CHAT_GPU=0` — Chat model runs on CPU (offload from GPU)
+- `BIG_BRAIN_PROVIDER`, `BIG_BRAIN_URL`, `BIG_BRAIN_PORT` — Big Brain provider and endpoint (default llama-server on 1234)
+- `SMALL_BRAIN_PROVIDER`, `SMALL_BRAIN_URL`, `SMALL_BRAIN_PORT` — Small Brain provider and endpoint (default llama-server on 1235)
+- `BIG_BRAIN_DEVICE` / `SMALL_BRAIN_DEVICE` — GPU device assignment for the two local brains
+- `BIG_BRAIN_CONTEXT` / `SMALL_BRAIN_CONTEXT` — per-role context limits
+- `OLLAMA_MAIN_MODEL` / `OLLAMA_CHAT_MODEL` — optional Ollama fallback model names
+- `OPENAI_STREAM_TIMEOUT_SECONDS` — bounded streaming timeout for OpenAI-compatible providers
+- `DIALOGUE_HISTORY_LIMIT`, `DIALOGUE_CONTEXT_CHAR_LIMIT`, `DIALOGUE_TURN_MAX_TOKENS` — Dialogue resource limits
 - `PIPELINE_ALLOW_SELF_IMPROVE` — Enable/disable auto code updates
 - `LLM_DAILY_BUDGET_USD` — Daily cloud-LLM spend cap (0 = off)
 - `WINRATE_DECLINE_BELOW` — Auto-decline platform if win-rate below this %
@@ -228,20 +226,28 @@ Key settings:
 ## UI Tabs
 
 1. **Management** — Agent controls, pause/resume, pipeline controls, gig proposals, payout verification
-2. **Agents** — Agent roster, chat interface, live status
-3. **Providers & GPU** — Dual-brain orchestrator: llama-server start/stop, GPU isolation (5060 Ti / 1660 Super), model dropdowns, ctx/threads/n-gpu-layers (seeded from the canonical runtime)
-4. **Safety & Tools** — Tool registry, safety rules, approval queue
-5. **Chat** — Human ↔ Small Brain (1660 Super)
-6. **Dialogue** — Big Brain ↔ Small Brain inter-brain chat
-7. **Collaboration** — Collaboration / Run Monitor: run ledger, stage detail, "Run Collaboration" (drives the DualBrainCoordinator)
-8. **Model & GPU** — Per-role GPU offload, LLM parameters, model info (dense/MoE, params, context, price)
-9. **Memory & Stream** — Stream health telemetry, per-role memory (chat + CEO), long-term notes
-10. **Browse Root** — File explorer
-11. **Payments** — Balance, payouts
-12. **Earnings** — Income tracking, revenue report (verified/unverified, LLM cost, gas, net profit, ROI)
-13. **Settings** — Model selection, provider configuration (15+ providers), effect toggles
-14. **Live Logs** — Debug output with severity filtering
-15. **DB Stats** — Database metrics, recent actions, LLM call history, instruction review queue
+2. **Providers & GPU** — Dual-brain orchestration, llama-server controls, GPU isolation, model selection, context, threads, and GPU layers
+3. **Model Library** — Local model discovery and download management
+4. **Safety & Tools** — Tool registry, safety rules, and approval queue
+5. **Chat** — Human conversation with the configured Small Brain
+6. **Dialogue** — Goal-driven Marcus/Alex conversation with Goals, Tasks, and Progress tracking
+7. **Browse Root** — File explorer
+8. **Payments** — Balance and payout verification
+9. **Earnings** — Income tracking, verified revenue, costs, gas, net profit, ROI
+10. **Insights** — Reports and operational summaries
+11. **Approvals** — Human approval queue
+12. **Opportunities** — Opportunity portfolio and work queue
+13. **Paper Trading** — Risk-contained trading simulation tools
+14. **Analytics** — Performance and economic analytics
+15. **Reputation** — Platform and opportunity reputation data
+16. **Data Explorer** — Local database and evidence exploration
+17. **Settings** — Provider configuration, model settings, themes, and effect toggles
+18. **Live Logs** — Debug output with severity filtering
+19. **DB Stats** — Database metrics, recent actions, LLM call history, and instruction review queue
+
+Memory and stream-health controls are integrated into **Management**. The
+Collaboration coordinator remains a backend capability used by the runtime, but
+it is not a separate visible tab.
 
 ## Agent Roster
 
@@ -286,4 +292,4 @@ Key settings:
 - **Hardware: runs on ANY setup** — from low-VRAM machines (e.g. 6GB VRAM + Zen3 + DDR4) up to modern RTX with more RAM. Model size is operator-chosen; the app works with whatever Ollama serves. A GPU helps speed but is not required.
 - RAM: 16GB minimum, 32GB recommended
 - Storage: 5GB+ for models and databases
-- Ollama server running locally at `127.0.0.1:11434`
+- Default local llama-server endpoints at `127.0.0.1:1234/v1` and `127.0.0.1:1235/v1`; Ollama is optional and uses its own configured endpoint when selected
