@@ -237,12 +237,17 @@ def launch_gui() -> None:
         if messagebox.askyesno("Confirm publish", "Sync, commit, and push to GitHub?", parent=root):
             action(lambda: publish(message))
 
+    def push_gui() -> None:
+        if messagebox.askyesno("Confirm push", "Push the existing local commit to GitHub?", parent=root):
+            action(push)
+
     def pull_gui() -> None:
         if messagebox.askyesno("Confirm pull", "Fast-forward the mirror from GitHub?", parent=root):
             action(pull)
 
     ttk.Button(bar, text="Pull", command=pull_gui).pack(side="left", padx=4)
     ttk.Button(bar, text="Commit", command=commit_gui).pack(side="left", padx=4)
+    ttk.Button(bar, text="Push", command=push_gui).pack(side="left", padx=4)
     ttk.Button(bar, text="Publish", command=publish_gui).pack(side="left", padx=4)
     show(f"Source: {source_dir()}\nUpload repo: {upload_dir()}\nRemote: {REMOTE_URL}")
     root.mainloop()
