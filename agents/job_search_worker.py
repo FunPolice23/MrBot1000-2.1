@@ -272,6 +272,11 @@ class JobSearchWorker(WorkerAgent):
     def set_new_jobs_callback(self, fn):
         self._new_jobs_callback = fn
 
+    def close(self):
+        """Close the worker-owned job database during application teardown."""
+        self.stop()
+        self._job_db.close()
+
     # ── Search ────────────────────────────────────────────────────────
 
     def search(self, platform: str, skill_tags: List[str] = None) -> List[JobRecord]:

@@ -55,7 +55,7 @@ class Persona:
         except Exception:
             return ""
 
-    def build_system_prompt(self, goal: str = "", query: str = "") -> str:
+    def build_system_prompt(self, goal: str = "", query: str = "", compact: bool = False) -> str:
         """Return a minimal system prompt focused on tool usage.
         
         v2.1: The model was ignoring tool instructions when they were buried
@@ -67,8 +67,22 @@ class Persona:
         strengths = ", ".join(self.strengths)
         abilities = ", ".join(self.abilities)
         guardrails = "; ".join(self.rules_guardrails)
+        if compact and len(mem) > 1600:
+            mem = mem[-1600:]
         mem_block = f"\n# MEMORY\n{mem}" if mem else ""
         personality_block = f"\n{personality}" if personality else ""
+
+        if compact:
+            return (
+                f"# IDENTITY\nYou are {self.name}, {self.tagline}\n"
+                f"{self.identity}\nPersonality: {self.personality_type}\n"
+                f"Strengths: {strengths}\nGuardrails: {guardrails}\n"
+                f"Speak as {self.name} in first person.\n"
+                f"ACTIVE GOAL: {goal}\n{mem_block}{personality_block}\n"
+                f"# TASK\nFollow the current phase instruction in the user message. "
+                f"Give one concrete, honest decision. Do not expose hidden reasoning, "
+                f"safety-policy analysis, or model identity. Do not invent facts.\n"
+            )
 
         return (
             f"# IDENTITY\n"
@@ -87,12 +101,10 @@ class Persona:
             f"{mem_block}\n"
             f"{personality_block}\n"
             f"\n"
-            f"# THINKING\n"
-            f"Before responding, think through your reasoning. If your model supports "
-            f"<thinking> tags, use them: <thinking>your reasoning here</thinking>. "
-            f"Otherwise, just reason naturally. Be thorough — consider risks, "
-            f"alternatives, and concrete next steps.\n"
-            f"\n"
+            f"\n# RESPONSE PROCESS\n"
+            f"Reason privately, then output only the final response. Do not expose "
+            f"chain-of-thought, hidden reasoning, safety-policy analysis, or model "
+            f"identity disclaimers. Follow the current phase instruction directly.\n"
             f"# HOW TO USE TOOLS (CRITICAL)\n"
             f"To search the web, write: web_search(\"your query here\")\n"
             f"To read a webpage, write: web_read(\"https://example.com\")\n"

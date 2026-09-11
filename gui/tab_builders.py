@@ -4,15 +4,17 @@
 # MainWindow instance methods (so `self.*` access is unchanged).
 import os
 
-from PySide6.QtCore import QTimer, QThread, Qt
+from PySide6.QtCore import QTimer, QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileSystemModel,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -21,17 +23,38 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QTreeView,
     QVBoxLayout,
     QWidget,
 )
 from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QAbstractItemView
 
 from ui import (  # GUI sprite + Agents tab widget used by create_agents_tab
     AgentSprite,
     AgentsTab,
 )
+
+
+class DataExplorerWorker(QThread):
+    """Run web scraping away from the GUI thread."""
+
+    finished = Signal(dict)
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            from agents.web_scraper import WebScraper
+            result = WebScraper().scrape(self.url, extract_tables=True)
+        except Exception as exc:
+            result = {"ok": False, "url": self.url, "error": str(exc)}
+        self.finished.emit(result)
 
 
 class TabBuildersMixin:
@@ -77,7 +100,19 @@ class TabBuildersMixin:
             idx, builder, built = entry
             if idx == index and not built:
                 label = self.tabs.tabText(index)
-                widget = builder()
+                try:
+                    widget = builder()
+                except Exception as exc:
+                    widget = QWidget()
+                    error_layout = QVBoxLayout(widget)
+                    error_layout.addWidget(QLabel(
+                        f"Providers & GPU could not be initialized:\n{exc}"))
+                    error_layout.addWidget(QLabel(
+                        "Open Live Logs for the full startup error."))
+                    try:
+                        self.log_signal.emit(f"[GUI] Tab '{label}' build failed: {exc}")
+                    except Exception:
+                        pass
                 sa = self._scroll_wrap(widget)
                 entry[2] = True  # mark built FIRST so a re-entrant currentChanged is a no-op
                 self.tabs.removeTab(index)
@@ -223,6 +258,15 @@ class TabBuildersMixin:
             self.dialogue_tab.goal_changed.connect(self._bridge_goal_to_collaboration)
         except Exception:
             pass
+        try:
+            providers = getattr(self, "providers_gpu_tab", None)
+            if providers is not None:
+                providers.small_brain_model_changed.connect(
+                    lambda model: self.dialogue_tab.on_model_changed("small"))
+                providers.big_brain_model_changed.connect(
+                    lambda model: self.dialogue_tab.on_model_changed("big"))
+        except Exception:
+            pass
         return self.dialogue_tab
 
     def _bridge_goal_to_collaboration(self, goal: str):
@@ -272,6 +316,12 @@ class TabBuildersMixin:
                                                   runtime=self.dual_brain_runtime)
         self.providers_gpu_tab.big_brain = self.big_brain
         self.providers_gpu_tab.small_brain = self.small_brain
+        dialogue = getattr(self, "dialogue_tab", None)
+        if dialogue is not None:
+            self.providers_gpu_tab.small_brain_model_changed.connect(
+                lambda model: dialogue.on_model_changed("small"))
+            self.providers_gpu_tab.big_brain_model_changed.connect(
+                lambda model: dialogue.on_model_changed("big"))
         
         # Sync adapter models from GUI selection
         self.providers_gpu_tab._sync_adapter_model(False)
@@ -288,6 +338,37 @@ class TabBuildersMixin:
         wrapper.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         wrapper.setMinimumHeight(450)
         return wrapper
+
+    def create_model_library_tab(self):
+        """Create the HTTPS Hugging Face GGUF browser and installer."""
+        from gui.model_library_tab import ModelLibraryTab
+
+        self.model_library_tab = ModelLibraryTab(parent=self)
+        self.model_library_tab.model_installed.connect(self._refresh_installed_models)
+        return self.model_library_tab
+
+    def _refresh_installed_models(self, _path: str = ""):
+        """Refresh both local model selectors after a library download."""
+        control = getattr(self, "providers_gpu_tab", None)
+        if control is None:
+            return
+        try:
+            if _path:
+                # Keep custom/provider-selected install folders discoverable for
+                # this session without replacing the user's existing GGUF path.
+                import os
+                import pathlib
+                current = os.getenv("MODEL_LIBRARY_DIR", "").strip()
+                parent = str(pathlib.Path(_path).parent)
+                if parent not in current.split(os.pathsep):
+                    os.environ["MODEL_LIBRARY_DIR"] = os.pathsep.join(filter(None, (current, parent)))
+            control._repopulate_model_combo(True)
+            control._repopulate_model_combo(False)
+        except Exception as exc:
+            try:
+                self.log_signal.emit(f"[GUI] Installed model refresh failed: {exc}")
+            except Exception:
+                pass
 
     def create_safety_tools_tab(self):
         """Create the Safety & Tools tab."""
@@ -392,8 +473,52 @@ class TabBuildersMixin:
         self.management_tab.request_review_proposal.connect(self._on_management_review_proposal)
         self.management_tab.request_submit_proposal.connect(self._on_management_submit_proposal)
         self.management_tab.request_verify_paid.connect(self._on_management_verify_paid)
+        self._attach_memory_stream_panel(self.management_tab)
         
         return self.management_tab
+
+    def _attach_memory_stream_panel(self, management_tab):
+        """Keep useful legacy telemetry in Management without a separate tab."""
+        stream_group = QGroupBox("Stream Health")
+        stream_layout = QVBoxLayout(stream_group)
+        self.stream_health_label = QLabel("Starting...")
+        self.stream_health_label.setWordWrap(True)
+        stream_layout.addWidget(self.stream_health_label)
+
+        memory_group = QGroupBox("Memory (chat + CEO / long-term)")
+        memory_layout = QVBoxLayout(memory_group)
+        self.memory_view = QTextEdit()
+        self.memory_view.setReadOnly(True)
+        self.memory_view.setMinimumHeight(120)
+        memory_layout.addWidget(self.memory_view)
+        buttons = QHBoxLayout()
+        self.memory_chat_clear_btn = QPushButton("Clear Chat memory")
+        self.memory_main_clear_btn = QPushButton("Clear CEO memory")
+        self.memory_notes_clear_btn = QPushButton("Clear long-term notes")
+        self.memory_refresh_btn = QPushButton("Refresh")
+        self.memory_chat_clear_btn.clicked.connect(lambda: self._clear_memory("chat"))
+        self.memory_main_clear_btn.clicked.connect(lambda: self._clear_memory("main"))
+        self.memory_notes_clear_btn.clicked.connect(lambda: self._clear_memory("notes"))
+        self.memory_refresh_btn.clicked.connect(self._refresh_memory_panel)
+        for button in (self.memory_chat_clear_btn, self.memory_main_clear_btn,
+                       self.memory_notes_clear_btn, self.memory_refresh_btn):
+            buttons.addWidget(button)
+        memory_layout.addLayout(buttons)
+
+        layout = management_tab.layout()
+        insert_at = max(0, layout.count() - 1)
+        layout.insertWidget(insert_at, stream_group)
+        layout.insertWidget(insert_at + 1, memory_group)
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setInterval(5000)
+        self._stream_timer.timeout.connect(self._refresh_stream_health)
+        self._stream_timer.start()
+        self._memory_timer = QTimer(self)
+        self._memory_timer.setInterval(10000)
+        self._memory_timer.timeout.connect(self._refresh_memory_panel)
+        self._memory_timer.start()
+        QTimer.singleShot(50, self._refresh_stream_health)
+        QTimer.singleShot(50, self._refresh_memory_panel)
 
     def _on_management_review_proposal(self, job_id: str, job_desc: str, draft: str):
         """Handle review proposal request from Management tab."""
@@ -582,14 +707,15 @@ class TabBuildersMixin:
             return w
 
     def create_logs_tab(self):
-        w   = QWidget()
+        """Live Logs tab with full information display including tokens/sec."""
+        w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(10)
 
-        # Filter row with severity combo
+        # Filter row with severity combo and category filter
         frow = QHBoxLayout()
-        frow.addWidget(QLabel("Filter text:"))
+        frow.addWidget(QLabel("Filter:"))
         self.log_filter = QLineEdit()
         self.log_filter.setPlaceholderText("Type to filter…")
         self.log_filter.textChanged.connect(self._apply_log_filter)
@@ -597,9 +723,15 @@ class TabBuildersMixin:
 
         frow.addWidget(QLabel("Severity:"))
         self.log_severity_combo = QComboBox()
-        self.log_severity_combo.addItems(["All", "BLOCKED", "ERROR", "MANAGER", "INFO", "OLLAMA"])
+        self.log_severity_combo.addItems(["All", "SUCCESS", "INFO", "WARNING", "ERROR", "BLOCKED"])
         self.log_severity_combo.currentTextChanged.connect(self._apply_log_filter)
         frow.addWidget(self.log_severity_combo)
+
+        frow.addWidget(QLabel("Category:"))
+        self.log_category_combo = QComboBox()
+        self.log_category_combo.addItems(["All", "System", "LLM", "GPU", "Earning", "Safety", "Provider"])
+        self.log_category_combo.currentTextChanged.connect(self._apply_log_filter)
+        frow.addWidget(self.log_category_combo)
 
         auto_scroll_cb = QCheckBox("Auto-scroll")
         auto_scroll_cb.setChecked(True)
@@ -612,109 +744,164 @@ class TabBuildersMixin:
         frow.addWidget(cb)
         lay.addLayout(frow)
 
-        self.log_edit = QTextEdit()
-        self.log_edit.setReadOnly(True)
-        self.log_edit.setLineWrapMode(QTextEdit.WidgetWidth)
-        self.log_edit.setStyleSheet(
+        # Table widget for structured log display
+        self.log_table = QTableWidget()
+        self.log_table.setColumnCount(5)
+        self.log_table.setHorizontalHeaderLabels(["Time", "Severity", "Source", "Message", "Tokens/s"])
+        self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.log_table.setAlternatingRowColors(True)
+        self.log_table.setStyleSheet(
             "font-family:Consolas,Monaco,monospace;font-size:11px;"
             "background:#0a0a0f;color:#d4d4d4;"
+            "QHeaderView::section { background:#1a1a1f; color:#e0e0e0; }"
         )
-        lay.addWidget(self.log_edit)
-        # v2.0.34an: replay any logs emitted before this tab was built (they were
-        # buffered in self._log_buffer but not yet shown). Without this the Live
-        # Logs tab appears empty until the next log line arrives.
+        lay.addWidget(self.log_table)
+        
+        # Replay buffered logs
         self._replay_log_buffer()
         return w
 
 
     def create_db_stats_tab(self):
-        w   = QWidget()
+        w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(12)
 
-        title = QLabel("Database & Agent Stats")
-        title.setStyleSheet("font-size:16px;font-weight:bold;color:#00b0ff;")
+        title = QLabel("📊 Database & Agent Stats")
+        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #bb86fc; padding: 10px;")
         lay.addWidget(title)
 
-        # Database overview
-        db_group = QGroupBox("Database Overview")
-        db_layout = QFormLayout(db_group)
-        db_layout.setContentsMargins(12, 12, 12, 12)
-        db_layout.setVerticalSpacing(8)
-        self.db_stats_label = QLabel("Loading…")
-        self.db_stats_label.setStyleSheet("color:#03dac6;font-size:12px;")
-        self.db_stats_label.setWordWrap(True)
-        db_layout.addRow(self.db_stats_label)
+        # Stats grid
+        stats_grid = QGridLayout()
+        stats_grid.setSpacing(8)
 
-        db_refresh_btn = QPushButton("Refresh Stats")
-        db_refresh_btn.clicked.connect(self.refresh_db_stats)
-        db_layout.addRow(db_refresh_btn)
-        lay.addWidget(db_group)
+        self.db_stat_calls = self._stat_cell("LLM Calls", "0", "#4caf50")
+        self.db_stat_errors = self._stat_cell("Errors", "0", "#ff5252")
+        self.db_stat_avg_latency = self._stat_cell("Avg Latency", "— ms", "#ff9800")
+        self.db_stat_chars = self._stat_cell("Total Chars", "0", "#2196f3")
+        self.db_stat_cost = self._stat_cell("Total Cost", "$0.00", "#9c27b0")
+        self.db_stat_tokens_sec = self._stat_cell("Avg Tokens/s", "0", "#00bcd4")
+        self.db_stat_uptime = self._stat_cell("Uptime", "0h", "#607d8b")
+        self.db_stat_db_size = self._stat_cell("DB Size", "0 MB", "#795548")
 
-        # Recent actions with color coding
-        actions_group = QGroupBox("Recent Actions")
-        actions_layout = QVBoxLayout(actions_group)
-        actions_layout.setContentsMargins(12, 12, 12, 12)
-        actions_layout.setSpacing(6)
-        self.db_actions_list = QListWidget()
-        self.db_actions_list.setStyleSheet(
-            "font-family:Consolas,Monaco,monospace;font-size:11px;"
-        )
-        actions_layout.addWidget(self.db_actions_list)
-        lay.addWidget(actions_group, stretch=1)
+        stats_grid.addWidget(self.db_stat_calls, 0, 0)
+        stats_grid.addWidget(self.db_stat_errors, 0, 1)
+        stats_grid.addWidget(self.db_stat_avg_latency, 0, 2)
+        stats_grid.addWidget(self.db_stat_chars, 0, 3)
+        stats_grid.addWidget(self.db_stat_cost, 1, 0)
+        stats_grid.addWidget(self.db_stat_tokens_sec, 1, 1)
+        stats_grid.addWidget(self.db_stat_uptime, 1, 2)
+        stats_grid.addWidget(self.db_stat_db_size, 1, 3)
+
+        stats_widget = QWidget()
+        stats_widget.setLayout(stats_grid)
+        lay.addWidget(stats_widget)
+
+        # Provider breakdown
+        provider_group = QGroupBox("Provider Breakdown")
+        provider_layout = QVBoxLayout(provider_group)
+        self.provider_table = QTableWidget()
+        self.provider_table.setColumnCount(5)
+        self.provider_table.setHorizontalHeaderLabels(["Provider", "Calls", "Errors", "Avg ms", "Tokens/s"])
+        self.provider_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.provider_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.provider_table.setMaximumHeight(150)
+        provider_layout.addWidget(self.provider_table)
+        lay.addWidget(provider_group)
+
+        # Model breakdown
+        model_group = QGroupBox("Model Breakdown")
+        model_layout = QVBoxLayout(model_group)
+        self.model_table = QTableWidget()
+        self.model_table.setColumnCount(5)
+        self.model_table.setHorizontalHeaderLabels(["Model", "Calls", "Tokens In", "Tokens Out", "Avg Tokens/s"])
+        self.model_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.model_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.model_table.setMaximumHeight(150)
+        model_layout.addWidget(self.model_table)
+        lay.addWidget(model_group)
 
         # Recent LLM calls
         calls_group = QGroupBox("Recent LLM Calls")
         calls_layout = QVBoxLayout(calls_group)
-        calls_layout.setContentsMargins(12, 12, 12, 12)
-        calls_layout.setSpacing(6)
-        self.db_calls_edit = QPlainTextEdit()
-        self.db_calls_edit.setReadOnly(True)
-        self.db_calls_edit.setStyleSheet(
-            "font-family:Consolas,Monaco,monospace;font-size:11px;"
-            "background:#0a0a0f;color:#d4d4d4;"
-        )
-        calls_layout.addWidget(self.db_calls_edit)
+        self.db_calls_table = QTableWidget()
+        self.db_calls_table.setColumnCount(7)
+        self.db_calls_table.setHorizontalHeaderLabels(["Time", "Provider", "Model", "Tokens In", "Tokens Out", "Cost", "Tokens/s"])
+        self.db_calls_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.db_calls_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        calls_layout.addWidget(self.db_calls_table, stretch=1)
         lay.addWidget(calls_group, stretch=1)
 
-        # v2.0.22 S4: Instruction Review Queue (provenance gate)
-        review_group = QGroupBox("Instruction Review Queue (untrusted SKILL.md)")
-        review_layout = QVBoxLayout(review_group)
-        review_layout.setContentsMargins(12, 12, 12, 12)
-        review_layout.setSpacing(6)
-        self.review_counts_label = QLabel("Pending: 0  Allowed: 0  Blocked: 0")
-        self.review_counts_label.setStyleSheet("color:#ffb74d;font-size:12px;")
-        review_layout.addWidget(self.review_counts_label)
-        self.review_list = QListWidget()
-        self.review_list.setStyleSheet(
-            "font-family:Consolas,Monaco,monospace;font-size:11px;")
-        review_layout.addWidget(self.review_list)
-        rbtns = QHBoxLayout()
-        self.review_approve_btn = QPushButton("Approve selected")
-        self.review_reject_btn = QPushButton("Reject (blacklist) selected")
-        self.review_approve_btn.clicked.connect(lambda: self._review_selected(True))
-        self.review_reject_btn.clicked.connect(lambda: self._review_selected(False))
-        rbtns.addWidget(self.review_approve_btn)
-        rbtns.addWidget(self.review_reject_btn)
-        review_layout.addLayout(rbtns)
-        lay.addWidget(review_group, stretch=1)
+        # Event log
+        event_group = QGroupBox("Event Log (last 100)")
+        event_layout = QVBoxLayout(event_group)
+        self.event_table = QTableWidget()
+        self.event_table.setColumnCount(4)
+        self.event_table.setHorizontalHeaderLabels(["Time", "Type", "Source", "Message"])
+        self.event_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.event_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        event_layout.addWidget(self.event_table)
+        lay.addWidget(event_group, stretch=1)
 
-        # Auto-refresh timer
-        self._db_stats_timer = QTimer(self)
-        self._db_stats_timer.timeout.connect(self.refresh_db_stats)
-        # PERF: 30s interval (was 10s) — DB stats are not time-critical
-        self._db_stats_timer.start(30000)
+        # Refresh button
+        btn_row = QHBoxLayout()
+        db_refresh_btn = QPushButton("🔄 Refresh Stats")
+        db_refresh_btn.clicked.connect(self.refresh_db_stats)
+        btn_row.addWidget(db_refresh_btn)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
 
-        # PERF: defer initial refresh so tab paints immediately
-        QTimer.singleShot(100, lambda: self.refresh_db_stats())
+        # Keep new calls and events visible without requiring a manual refresh.
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(5000)
+        self._stats_timer.timeout.connect(self.refresh_db_stats)
+        self._stats_timer.start()
+        QTimer.singleShot(0, self.refresh_db_stats)
+
         return w
 
+    def _stat_cell(self, label: str, value: str, color: str) -> QFrame:
+        """Build a bordered KPI card (QFrame) with a label and a value label.
+
+        Returns the frame; callers that need to update the value later can read
+        ``frame.value_label`` (set below) and call ``.setText(...)`` on it.
+        """
+        frame = QFrame()
+        frame.setStyleSheet(f"""
+            QFrame {{
+                background: #1a1a1a;
+                border: 2px solid {color};
+                border-radius: 8px;
+                padding: 8px;
+            }}
+        """)
+        layout = QVBoxLayout(frame)
+        layout.setSpacing(2)
+        lbl = QLabel(label)
+        lbl.setStyleSheet("color: #888; font-size: 10px; border: none;")
+        layout.addWidget(lbl)
+        val = QLabel(value)
+        val.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold; border: none;")
+        val.setAlignment(Qt.AlignCenter)
+        layout.addWidget(val)
+        # Store reference to value label for updates
+        frame.value_label = val
+        return frame
 
     def create_settings_tab(self):
         # v2.0.33: per-provider main/chat role control. Defined up-front so both
         # the LLM Providers group (OpenAI/Anthropic) and the _prov_row helper can
         # use them without a forward-reference error.
+        from gui.provider_config_widget import ProviderConfigWidget, CloudProviderPanel, LocalProviderPanel
+        
         ROLE_ITEMS = ["Both", "Main only", "Chat only", "Disabled"]
 
         def _role_from_env(env_prefix):
@@ -752,6 +939,13 @@ class TabBuildersMixin:
         lay     = QVBoxLayout(inner)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(14)
+
+        # Provider Configuration (hot-reload, no restart needed)
+        # Parent immediately so the provider surface cannot become a separate
+        # top-level Qt window while the Settings tab is being assembled.
+        provider_config = ProviderConfigWidget(inner)
+        provider_config.provider_changed.connect(self._on_provider_widget_changed)
+        lay.addWidget(provider_config)
 
         # Registration
         rg = QGroupBox("Agent Registration")
@@ -975,7 +1169,9 @@ class TabBuildersMixin:
         self._themeable.append((self.nvidia_note, "caption", "font-size:10px;padding-top:3px;"))
         self.nvidia_note.setWordWrap(True)
         cloudl.addWidget(self.nvidia_note)
-        lay.addWidget(cloudg)
+        # ProviderConfigWidget above is the single visible provider surface.
+        # Keep these controls constructed for existing save/fetch code, but do
+        # not render a second copy of the provider list.
 
         # ── Local Providers (OpenAI-compatible local servers) ──────────────
         localg = QGroupBox("Local Providers")
@@ -989,7 +1185,26 @@ class TabBuildersMixin:
             _prov_row(locall, "LM_STUDIO", "LM Studio", "", "")
         self.koboldcpp_key, self.koboldcpp_base, self.koboldcpp_model, self.koboldcpp_chat, self.koboldcpp_role, self.koboldcpp_fetch, self.koboldcpp_hide = \
             _prov_row(locall, "KOBOLDCPP", "KoboldCpp", "", "")
-        lay.addWidget(localg)
+
+        # llama.cpp is a local provider too, but its two role-specific servers
+        # are controlled by the Providers & GPU tab rather than generic rows.
+        llamacppg = QGroupBox("llama.cpp (local dual-brain)")
+        llamacppl = QFormLayout(llamacppg)
+        llamacppl.setContentsMargins(12, 12, 12, 12)
+        self.llamacpp_big_enabled = QCheckBox("Enabled")
+        self.llamacpp_big_enabled.setChecked(_env_bool("BIG_BRAIN_ENABLED", True))
+        llamacppl.addRow("Marcus / Big Brain:", self.llamacpp_big_enabled)
+        self.llamacpp_small_enabled = QCheckBox("Enabled")
+        self.llamacpp_small_enabled.setChecked(_env_bool("SMALL_BRAIN_ENABLED", True))
+        llamacppl.addRow("Alex / Small Brain:", self.llamacpp_small_enabled)
+        llamacpp_note = QLabel(
+            "Uses the llama-server processes configured in Providers & GPU. "
+            "Enable at least one role, then start that brain there. Other local "
+            "and cloud providers remain available through their role settings.")
+        llamacpp_note.setWordWrap(True)
+        llamacpp_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
+        self._themeable.append((llamacpp_note, "caption", "font-size:10px;padding-top:3px;"))
+        llamacppl.addRow(llamacpp_note)
 
         # Ollama Local (foundational local provider) — wrapped in its own outlined
         # prov-section box inside "LLM Providers", with a "Hide when disabled" toggle
@@ -1097,7 +1312,6 @@ class TabBuildersMixin:
         ollama_coll.toggled.connect(lambda *_: _ollama_refresh())
         _ollama_refresh()
 
-        lay.addWidget(ollama_box)
 
         tb = QPushButton("Test Connection")
         tb.clicked.connect(self.test_api_connection)
@@ -1307,6 +1521,14 @@ class TabBuildersMixin:
         self.pipeline_allow_selfimprove_check.setChecked(
             os.getenv("PIPELINE_ALLOW_SELF_IMPROVE", "false").lower() == "true")
         pipel.addRow("Allow self-improvement:", self.pipeline_allow_selfimprove_check)
+        for _name, _check in (
+            ("PIPELINE_ENABLED", self.pipeline_enabled_check),
+            ("PIPELINE_ALLOW_WRITE", self.pipeline_allow_write_check),
+            ("PIPELINE_ALLOW_SELF_IMPROVE", self.pipeline_allow_selfimprove_check),
+        ):
+            _check.stateChanged.connect(
+                lambda state, name=_name: os.environ.__setitem__(
+                    name, str(bool(state)).lower()))
         self_improve_note = QLabel("Allow the agent to modify its own code. Only enable if you trust the validation pipeline.")
         self_improve_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
         self._themeable.append((self_improve_note, "caption", "font-size:10px;padding-top:3px;"))
@@ -1587,6 +1809,7 @@ class TabBuildersMixin:
         
         self.paper_type_combo = QComboBox()
         self.paper_type_combo.addItems(["MARKET", "LIMIT", "STOP"])
+        self.paper_type_combo.currentTextChanged.connect(self._on_paper_order_type_changed)
         order_lay.addRow("Type:", self.paper_type_combo)
         
         self.paper_qty_spin = QSpinBox()
@@ -1601,6 +1824,18 @@ class TabBuildersMixin:
         order_lay.addRow("Price:", self.paper_price_spin)
         
         self.paper_place_btn = QPushButton("📤 Place Order")
+        self.paper_place_btn.setStyleSheet("""
+            QPushButton {
+                background: #4caf50;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #66bb6a; }
+            QPushButton:pressed { background: #388e3c; }
+        """)
         self.paper_place_btn.clicked.connect(self._on_place_paper_order)
         order_lay.addRow(self.paper_place_btn)
         
@@ -1666,6 +1901,18 @@ class TabBuildersMixin:
         
         # Report button
         self.paper_report_btn = QPushButton("📊 Generate Report")
+        self.paper_report_btn.setStyleSheet("""
+            QPushButton {
+                background: #2196f3;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #42a5f5; }
+            QPushButton:pressed { background: #1976d2; }
+        """)
         self.paper_report_btn.clicked.connect(self._on_generate_paper_report)
         lay.addWidget(self.paper_report_btn)
         
@@ -1706,6 +1953,15 @@ class TabBuildersMixin:
         self.opp_status_label.setText("Rejected (stub)")
 
     # ── Paper Trading Tab Callbacks ─────────────────────────────────────────
+
+    def _on_paper_order_type_changed(self, order_type: str):
+        """Enable/disable price field based on order type."""
+        if order_type == "MARKET":
+            self.paper_price_spin.setEnabled(False)
+            self.paper_price_spin.setStyleSheet("color: #888;")
+        else:
+            self.paper_price_spin.setEnabled(True)
+            self.paper_price_spin.setStyleSheet("color: #e0e0e0;")
 
     def _on_place_paper_order(self):
         """Place a paper order."""
@@ -1848,6 +2104,66 @@ class TabBuildersMixin:
         if not url:
             self.data_status_label.setText('Error: URL required')
             return
+        if not url.startswith(("http://", "https://")):
+            self.data_status_label.setText('Error: URL must start with http:// or https://')
+            return
         self.data_status_label.setText(f'Scraping {url}...')
-        # TODO: Use WebScraper
-        self.data_status_label.setText('Scrape complete (stub)')
+        self.data_results_edit.clear()
+        self.data_scrape_btn.setEnabled(False)
+        self._data_explorer_worker = DataExplorerWorker(url)
+        self._data_explorer_worker.finished.connect(self._on_scrape_finished)
+        self._data_explorer_worker.start()
+
+    def _on_scrape_finished(self, result: dict):
+        """Render a completed scrape in the Data Explorer results pane."""
+        self.data_scrape_btn.setEnabled(True)
+        if not result.get("ok"):
+            self.data_status_label.setText(f"Scrape failed: {result.get('error', 'unknown error')}")
+            self.data_results_edit.setPlainText("No data returned.")
+            return
+
+        lines = [f"URL: {result.get('url', '')}", ""]
+        text = (result.get("text") or "").strip()
+        if text:
+            lines.extend(["TEXT", text, ""])
+        links = result.get("links") or []
+        if links:
+            lines.append("LINKS")
+            lines.extend(f"- {link}" for link in links[:100])
+            lines.append("")
+        tables = result.get("tables") or []
+        if tables:
+            lines.append("TABLES")
+            lines.extend(str(table) for table in tables[:20])
+        self.data_results_edit.setPlainText("\n".join(lines).strip() or "(page returned no readable content)")
+        self.data_status_label.setText(
+            f"Scrape complete: {len(text)} characters, {len(links)} links, {len(tables)} tables"
+        )
+
+    def _on_provider_widget_changed(self, provider_name: str, action: str):
+        """Handle provider configuration changes from the widget."""
+        from agents.provider_manager import ProviderManager
+        pm = ProviderManager.instance()
+        
+        if action.startswith("model:"):
+            model = action[6:]
+            provider = pm.get_provider(provider_name)
+            if provider:
+                provider.selected_model = model
+        elif action.startswith("gpu:"):
+            gpu_index = int(action[4:])
+            pm.assign_provider_to_gpu(provider_name, gpu_index)
+        elif action == "toggle":
+            # ProviderConfigWidget has already applied the new state. Do not
+            # toggle it a second time here or an Enable click becomes Disabled.
+            pass
+        
+        # Keep the user's toggle/model state; probing is performed by the
+        # provider widget's refresh path and must not overwrite an enable click.
+        try:
+            from agents.base_worker import _active_worker
+            if _active_worker is not None:
+                _active_worker.invalidate_provider_registry()
+        except Exception:
+            pass
+

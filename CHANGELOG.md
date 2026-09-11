@@ -1,3 +1,41 @@
+## [2.1.1] - 2026-09-11 - Security, Dialogue, and Publishing Maintenance
+
+### Added
+- Added centralized read-only SQL enforcement for both model-facing database tools.
+- Added malformed, mutating, multi-statement, and connection-cleanup SQL tests.
+- Added explicit timeouts for OpenAI-compatible streaming requests through
+  `OPENAI_STREAM_TIMEOUT_SECONDS`.
+- Added Hugging Face download tests for untrusted redirects, oversized responses,
+  and partial-download cleanup.
+- Added `scripts/github_upload.py` with CLI and Tkinter workflows for sync, status,
+  diff, pull, commit, push, and confirmed publish operations.
+- Added `version.py` as the public release-version source of truth.
+
+### Changed
+- Dialogue now populates and shares Goals, Tasks, and Progress state with Marcus
+  and Alex instead of leaving those panels disconnected.
+- Removed the redundant Collaboration and Memory & Stream tabs; useful telemetry
+  now lives in Management while the coordinator backend remains available.
+- Added explicit SQLite shutdown handling for JobSearchWorker and exception-safe
+  self-audit queries.
+- Expanded the GitHub mirror sync to include GUI, prompts, scripts, and all safe
+  agent/test files while excluding local databases, credentials, model caches,
+  and operator-specific configuration.
+- Removed the obsolete `prep_github_upload.py` compatibility script; the
+  non-destructive synchronizer and GitHub workflow now have one canonical path.
+- Refreshed `.env.example` with current provider, Dialogue, timeout, and runtime
+  settings while keeping secrets blank.
+
+### Security
+- `query_database` now fails closed unless its SQL compiles as a read-only query.
+- Hugging Face model downloads reject redirects outside trusted Hugging Face hosts
+  and remove partial files when declared size limits are exceeded.
+
+### Verification
+- Focused security/provider/download tests pass: 23 tests plus 9 subtests.
+- Additional SQL/tool safety checks pass: 8 tests plus 5 subtests.
+- Modified modules compile cleanly and report no diagnostics.
+
 ## [2.1.0] - 2026-09-10 - Stability and Provider Routing Maintenance
 
 ### Development History for This Maintenance Cycle

@@ -65,7 +65,15 @@ class BigBrainAdapter:
     def _get_client(self):
         """Get OpenAI client for llama-server."""
         import openai
-        return openai.OpenAI(api_key="local", base_url=self.base_url)
+        timeout = float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "60"))
+        return openai.OpenAI(api_key="local", base_url=self.base_url,
+                             timeout=max(5.0, timeout))
+
+    def _dialogue_protocol(self) -> dict:
+        from agents.providers.openai_compatible import (
+            get_llama_server_capabilities, resolve_chat_protocol)
+        capabilities = get_llama_server_capabilities(self.base_url)
+        return resolve_chat_protocol(self.model, capabilities, default_tools=True)
     
     def _get_first_available_model(self) -> str:
         """Auto-detect first available model in llama-server."""
@@ -291,7 +299,7 @@ class BigBrainAdapter:
         )
     
     def chat(self, user_message: str, history: list = None,
-             system_prompt: str = None) -> str:
+             system_prompt: str = None, max_tokens: int = None) -> str:
         """Handle direct chat with tool calling support."""
         # GUI is the source of truth for model selection
         if self.model == "unknown" or not self.model:
@@ -309,7 +317,7 @@ class BigBrainAdapter:
         
         # v2.1: Use the context length from Providers_GPU settings
         # Reserve ~20% for input, rest for output
-        max_tokens = int(self.context_length * 0.8)
+        context_max_tokens = int(self.context_length * 0.8)
         
         # Cap at reasonable limits to avoid OOM
         # Scale Dialogue output with the model's configured context. A fixed
@@ -317,8 +325,12 @@ class BigBrainAdapter:
         # an explicit environment value remains available for tighter setups.
         dialogue_cap = int(os.getenv(
             "DIALOGUE_MAX_TOKENS", max(4096, min(32768, self.context_length // 2))))
-        max_tokens = min(max_tokens, dialogue_cap)
-        max_tokens = max(max_tokens, min(4096, self.context_length // 2))
+        if max_tokens is not None:
+            dialogue_cap = min(dialogue_cap, max(128, int(max_tokens)))
+        request_max_tokens = min(context_max_tokens, dialogue_cap)
+        if max_tokens is None:
+            request_max_tokens = max(
+                request_max_tokens, min(4096, self.context_length // 2))
 
         if history:
             messages = [{"role": "system", "content": full_system}]
@@ -336,14 +348,21 @@ class BigBrainAdapter:
             
             # Use tool calling
             from agents.tool_calling import chat_with_tools
+            protocol = self._dialogue_protocol()
             answer = chat_with_tools(
                 client=client,
                 model=self.model,
                 system_prompt=full_system,
                 user_message=user_message,
                 history=history,
-                max_tokens=max_tokens,
+                max_tokens=request_max_tokens,
                 temperature=0.5,
+                # One tool round lets Dialogue execute bounded read-only
+                # research instead of endlessly announcing that it will search.
+                max_iterations=2,
+                use_function_calling=protocol["use_function_calling"],
+                flatten_system_prompt=protocol["flatten_system_prompt"],
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
 
             # Log and evolve

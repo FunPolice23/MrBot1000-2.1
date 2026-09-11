@@ -56,6 +56,17 @@ class AnalyticsTab(QWidget):
         market_lay.addRow("24h Change:", self.crypto_change)
 
         self.refresh_crypto_btn = QPushButton("🔄 Refresh")
+        self.refresh_crypto_btn.setStyleSheet("""
+            QPushButton {
+                background: #4fc3f7;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #29b6f6; }
+        """)
         self.refresh_crypto_btn.clicked.connect(self._on_refresh_crypto_price)
         market_lay.addRow(self.refresh_crypto_btn)
 
@@ -76,6 +87,17 @@ class AnalyticsTab(QWidget):
         strategy_lay.addWidget(self.strategy_table, stretch=1)
 
         self.run_backtest_btn = QPushButton("📈 Run Backtest")
+        self.run_backtest_btn.setStyleSheet("""
+            QPushButton {
+                background: #ff9800;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #ffa726; }
+        """)
         self.run_backtest_btn.clicked.connect(self._on_run_backtest)
         strategy_lay.addWidget(self.run_backtest_btn)
 
@@ -96,6 +118,11 @@ class AnalyticsTab(QWidget):
             self._fetch_price(self.crypto_combo.currentText())
         except Exception:
             pass
+
+    def cleanup(self):
+        """Stop periodic refresh before the main window is torn down."""
+        if self._timer.isActive():
+            self._timer.stop()
 
     def _on_refresh_crypto_price(self):
         """Refresh crypto price on button click."""

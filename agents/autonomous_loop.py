@@ -373,7 +373,9 @@ class AutonomousLoop:
             if self._stage_request_approval(result, opportunity, facts):
                 return self._finalize(result, facts, t0, "await_approval",
                                        "Human approval required")
-            self._stage_execute(result, opportunity, facts)
+            if not self._stage_execute(result, opportunity, facts):
+                return self._finalize(result, facts, t0, "failed",
+                                      "Task execution was not completed")
             if self._stage_validate(result, opportunity, facts) is False:
                 return self._finalize(result, facts, t0, "reject",
                                        "Validation failed")
@@ -569,14 +571,14 @@ class AutonomousLoop:
                     validation_method="deterministic", human_required=False,
                     execution_mode="automated", payment_conditions={})
                 exec_result = self.task_executor.run(task)
+                self._last_exec_result = exec_result
                 executed = exec_result.success
                 if not executed:
                     error = "; ".join(exec_result.errors) if exec_result.errors else "execution failed"
             else:
-                # No executor available — record as not executed but don't crash.
-                # In test environments without a real executor, this is OK.
+                # Missing execution infrastructure must never become a success.
                 error = "no_task_executor"
-                executed = True  # treat as "executed" for loop-flow purposes when no executor exists
+                executed = False
         except Exception as e:
             error = str(e)
         if self.evidence_store is not None and executed:
@@ -596,6 +598,7 @@ class AutonomousLoop:
             opportunity_id=facts.opportunity_id, data={"executed": executed, "error": error},
             duration_s=time.time()-t0))
         if not executed: result.errors.append(error or "execution failed")
+        return executed
 
     def _stage_validate(self, result, opp, facts):
         t0 = time.time()

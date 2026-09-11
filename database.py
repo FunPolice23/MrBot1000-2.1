@@ -19,6 +19,7 @@ class AgentDB:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()
@@ -157,12 +158,14 @@ class AgentDB:
                 raw_reference   TEXT    NOT NULL DEFAULT '',
                 metadata        TEXT    NOT NULL DEFAULT '{}',
                 provenance      TEXT    NOT NULL DEFAULT '{}',
-                history         TEXT    NOT NULL DEFAULT '[]'
+                history         TEXT    NOT NULL DEFAULT '[]',
+                dup_key         TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS idx_evidence_subject ON evidence(subject_type, subject_id)",
             "CREATE INDEX IF NOT EXISTS idx_evidence_type    ON evidence(evidence_type)",
             "CREATE INDEX IF NOT EXISTS idx_evidence_status  ON evidence(status)",
             "CREATE INDEX IF NOT EXISTS idx_evidence_parent  ON evidence(parent_evidence_id)",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_dup_key ON evidence(dup_key)",
         ]
         for statement in statements:
             try:
@@ -184,6 +187,13 @@ class AgentDB:
                 self._conn.execute(f"ALTER TABLE llm_calls ADD COLUMN {col_def}")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+        try:
+            self._conn.execute("ALTER TABLE evidence ADD COLUMN dup_key TEXT")
+        except sqlite3.OperationalError:
+            pass
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_evidence_dup_key ON evidence(dup_key)"
+        )
         self._conn.commit()
 
     def get_cached_file(self, folder_path: str, relative_path: str,

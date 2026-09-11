@@ -20,13 +20,14 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 
-PROJECT_ROOT = Path(__file__).parent.parent
+from agents.tool_safety import command_argv, resolve_command_cwd, resolve_project_path
+
+PROJECT_ROOT = resolve_project_path(".")
 _instruction_gate = None
 _instruction_gate_lock = threading.Lock()
 
@@ -454,10 +455,8 @@ def _tool_workshop_payment(args: Dict[str, Any]) -> str:
 def _tool_file_read(args: Dict[str, Any]) -> str:
     """Read a file."""
     try:
-        p = Path(args["path"])
-        if not p.is_absolute():
-            p = PROJECT_ROOT / p
-        if not p.exists():
+        p = resolve_project_path(args["path"])
+        if not p.is_file():
             return f"[File not found: {args['path']}]"
         return p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
@@ -467,9 +466,7 @@ def _tool_file_read(args: Dict[str, Any]) -> str:
 def _tool_file_write(args: Dict[str, Any]) -> str:
     """Write a file."""
     try:
-        p = Path(args["path"])
-        if not p.is_absolute():
-            p = PROJECT_ROOT / p
+        p = resolve_project_path(args["path"], allow_missing=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(args["content"], encoding="utf-8")
         return f"[Wrote {p}]"
@@ -480,10 +477,8 @@ def _tool_file_write(args: Dict[str, Any]) -> str:
 def _tool_file_list(args: Dict[str, Any]) -> str:
     """List directory."""
     try:
-        p = Path(args["path"])
-        if not p.is_absolute():
-            p = PROJECT_ROOT / p
-        if not p.exists() or not p.is_dir():
+        p = resolve_project_path(args["path"])
+        if not p.is_dir():
             return f"[Directory not found: {args['path']}]"
         return "\n".join(sorted([str(x.relative_to(PROJECT_ROOT)) for x in p.iterdir()]))
     except Exception as e:
@@ -496,9 +491,9 @@ def _tool_run_command(args: Dict[str, Any]) -> str:
     """Run a shell command."""
     try:
         result = subprocess.run(
-            args["command"],
-            shell=True,
-            cwd=str(PROJECT_ROOT if not args.get("cwd") else args["cwd"]),
+            command_argv(args["command"]),
+            shell=False,
+            cwd=str(resolve_command_cwd(args.get("cwd"))),
             capture_output=True,
             text=True,
             timeout=int(args.get("timeout", 30)),
@@ -518,16 +513,11 @@ def _tool_run_command(args: Dict[str, Any]) -> str:
 def _tool_query_db(args: Dict[str, Any]) -> str:
     """Query the database."""
     try:
+        from agents.sql_safety import execute_readonly_query
         db_path = str(PROJECT_ROOT / "agent.db")
         if not os.path.exists(db_path):
             return "[Database not found]"
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(args["sql"]).fetchall()
-        conn.close()
-        limit = int(args.get("limit", 50))
-        results = [dict(row) for row in rows[:limit]]
-        return json.dumps(results, indent=2, default=str)
+        return execute_readonly_query(args["sql"], db_path, args.get("limit", 50))
     except Exception as e:
         return f"[Query error: {e}]"
 
@@ -544,6 +534,8 @@ def chat_with_tools(
     max_tokens: int = 4096,
     temperature: float = 0.5,
     use_function_calling: bool = True,
+    flatten_system_prompt: bool = False,
+    extra_body: dict | None = None,
 ) -> str:
     """
     Chat with tool calling support.
@@ -554,16 +546,23 @@ def chat_with_tools(
     """
     tools = get_all_tools() if use_function_calling else None
     
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ]
+    if flatten_system_prompt:
+        # Some local templates, notably Gemma's, reject the system role. Keep
+        # the instruction content but present it as the first user turn.
+        messages = [{
+            "role": "user",
+            "content": f"{system_prompt}\n\nCURRENT REQUEST:\n{user_message}",
+        }]
+    else:
+        messages = [{"role": "system", "content": system_prompt}]
     
     # Add history (limited to last 10 messages to save context)
     if history:
         for msg in history[-10:]:
             messages.append(msg)
     
-    messages.append({"role": "user", "content": user_message})
+    if not flatten_system_prompt:
+        messages.append({"role": "user", "content": user_message})
     executed_text_calls = set()
     executed_function_calls = set()
     
@@ -574,6 +573,8 @@ def chat_with_tools(
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if extra_body:
+            kwargs["extra_body"] = dict(extra_body)
         
         if tools:
             kwargs["tools"] = tools
@@ -584,23 +585,25 @@ def chat_with_tools(
         
         # If no tool calls via API, try to parse tool calls from text
         # This handles models that don't support function calling
+        visible_content = _visible_response_content(msg)
+
         if not msg.tool_calls:
             # Parse tool calls from text (works for all models)
-            text_tool_call = _parse_tool_call_from_text(msg.content)
+            text_tool_call = _parse_tool_call_from_text(visible_content)
             if text_tool_call and max_iterations > 1:
                 fn_name, fn_args = text_tool_call
                 call_key = (fn_name, json.dumps(fn_args, sort_keys=True))
                 if call_key in executed_text_calls:
                     # The model has already received this result. Returning
                     # the current answer prevents an endless read/search loop.
-                    return _remove_tool_syntax(msg.content)
+                    return _remove_tool_syntax(visible_content)
                 executed_text_calls.add(call_key)
                 # Execute the tool
                 try:
                     result = execute_tool(fn_name, fn_args)
                     messages.append({
                         "role": "assistant",
-                        "content": msg.content,
+                        "content": visible_content,
                     })
                     messages.append({
                         "role": "tool",
@@ -614,7 +617,7 @@ def chat_with_tools(
                         "content": f"[Tool execution error: {e}]",
                     })
                     continue
-            return _remove_tool_syntax(msg.content or "")
+            return _remove_tool_syntax(visible_content)
         
         # Add assistant message with tool calls
         messages.append({
@@ -681,7 +684,7 @@ def chat_with_tools(
         temperature=temperature,
     )
     
-    return final_response.choices[0].message.content or ""
+    return _visible_response_content(final_response.choices[0].message)
 
 
 def _remove_tool_syntax(text: str) -> str:
@@ -696,6 +699,48 @@ def _remove_tool_syntax(text: str) -> str:
         "", text, flags=re.IGNORECASE,
     ).replace("[web_search ]", "").replace("[web_read ]", "") \
      .replace("[web_check ]", "").strip()
+
+
+def _remove_reasoning_channels(text: str) -> str:
+    """Remove channel-formatted reasoning while preserving visible answer text."""
+    if not text:
+        return ""
+    # Qwen/LFM-style closed thought blocks leave the answer after the close
+    # marker; do this before handling an unclosed/reasoning-only response.
+    text = re.sub(
+        r"<\|channel\|?>\s*(?:thought|analysis)\b.*?"
+        r"<channel\|>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(
+        r"<\|channel\|?>\s*(?:thought|analysis)\b.*?"
+        r"(?:<\|channel\|?>\s*(?:final|answer)\b|$)",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r"<\|channel\|?>\s*(?:final|answer)\b", "", text,
+                  flags=re.IGNORECASE)
+    return text.replace("\\n", "\n").strip()
+
+
+def _remove_think_blocks(text: str) -> str:
+    """Remove LFM/Gemma think blocks without exposing hidden reasoning."""
+    if not text:
+        return ""
+    text = re.sub(r"<think>.*?</think>", "", text,
+                  flags=re.IGNORECASE | re.DOTALL)
+    return text.strip()
+
+
+def _visible_response_content(message: Any) -> str:
+    """Extract only user-visible answer text from an OpenAI message."""
+    content = getattr(message, "content", None) or ""
+    reasoning = getattr(message, "reasoning_content", None)
+    # A separate reasoning_content field is intentionally discarded. When the
+    # provider puts thought in content, the format-specific cleaners below do
+    # the same without requiring a model-family name.
+    if not isinstance(content, str):
+        return ""
+    return _remove_think_blocks(_remove_reasoning_channels(content))
 
 
 def _parse_tool_call_from_text(text: str) -> Optional[tuple]:

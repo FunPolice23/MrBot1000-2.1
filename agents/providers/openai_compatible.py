@@ -28,11 +28,69 @@ Streaming + reasoning (v2.0.36):
 from .context_table import lookup_context
 
 
+_CAPABILITY_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def get_llama_server_capabilities(base_url: str, timeout: float = 1.5) -> dict:
+    """Read optional llama-server chat-template capabilities.
+
+    The endpoint is intentionally best-effort: older llama-server builds do
+    not expose ``/props`` and remote OpenAI-compatible providers may not have
+    it at all. Callers must retain a conservative fallback profile.
+    """
+    import json
+    from urllib.parse import urlparse
+    from urllib.request import urlopen
+
+    base = str(base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    if not base:
+        return {}
+    import time
+    cached = _CAPABILITY_CACHE.get(base)
+    if cached and time.monotonic() - cached[0] < 10.0:
+        return dict(cached[1])
+    host = (urlparse(base).hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        _CAPABILITY_CACHE[base] = (time.monotonic(), {})
+        return {}
+    try:
+        with urlopen(f"{base}/props", timeout=timeout) as reply:
+            payload = json.loads(reply.read().decode("utf-8"))
+        result = payload if isinstance(payload, dict) else {}
+        _CAPABILITY_CACHE[base] = (time.monotonic(), result)
+        return dict(result)
+    except Exception:
+        _CAPABILITY_CACHE[base] = (time.monotonic(), {})
+        return {}
+
+
+def resolve_chat_protocol(model: str, capabilities: dict | None,
+                          default_tools: bool = False) -> dict:
+    """Resolve message/tool compatibility from server facts with safe fallback."""
+    caps = (capabilities or {}).get("chat_template_caps") or {}
+    name = (model or "").lower()
+    supports_system = caps.get("supports_system_role")
+    supports_tools = caps.get("supports_tools")
+
+    if supports_system is None:
+        supports_system = "gemma" not in name
+    if supports_tools is None:
+        supports_tools = default_tools and "gemma" not in name
+
+    return {
+        "flatten_system_prompt": not bool(supports_system),
+        "use_function_calling": bool(supports_tools) and default_tools,
+        "chat_template": str((capabilities or {}).get("chat_template", "")),
+    }
+
+
 class OpenAICompatibleAdapter:
     def __init__(self, name: str, *, api_key_env: str, base_url: str,
                  default_model: str = "", context_override: int | None = None,
                  disabled_env: str | None = None, order: int = 100,
-                 chat_model: str = ""):
+                 chat_model: str = "", require_api_key: bool = True):
         self.name = name
         self.api_key_env = api_key_env
         self.base_url = base_url
@@ -41,6 +99,7 @@ class OpenAICompatibleAdapter:
         self.disabled_env = disabled_env
         self.order = order
         self.chat_model = chat_model
+        self.require_api_key = require_api_key
 
     # ── availability / safety ──────────────────────────────────────────────
     def available(self) -> bool:
@@ -52,8 +111,9 @@ class OpenAICompatibleAdapter:
         # Explicitly disabled?
         if self.disabled_env and os_getenv(self.disabled_env, "false").lower() == "true":
             return False
-        # Key present?
-        if not os_getenv(self.api_key_env):
+        # Cloud providers require credentials; local OpenAI-compatible servers
+        # such as vLLM and LM Studio commonly run without authentication.
+        if self.require_api_key and not os_getenv(self.api_key_env):
             return False
         # SSRF: refuse loopback / metadata / private base_url.
         if not _is_safe_base_url(self.base_url):
@@ -86,8 +146,8 @@ class OpenAICompatibleAdapter:
                 chunk. Used to surface thinking in the Thought panel.
         """
         import openai
-        key = os_getenv(self.api_key_env)
-        if not key:
+        key = os_getenv(self.api_key_env) or "local"
+        if self.require_api_key and not os_getenv(self.api_key_env):
             raise RuntimeError(f"{self.name}: {self.api_key_env} not set")
         if not _is_safe_base_url(self.base_url):
             raise RuntimeError(f"{self.name}: unsafe base_url refused: {self.base_url}")
@@ -116,7 +176,12 @@ class OpenAICompatibleAdapter:
         if body:
             kwargs["extra_body"] = body
 
-        client = openai.OpenAI(api_key=key, base_url=self.base_url)
+        # Bound the whole streaming request so a stalled provider cannot hold
+        # a worker or GUI operation forever. The SDK applies this timeout to
+        # connection, read, and write operations.
+        timeout = _stream_timeout_seconds()
+        client = openai.OpenAI(api_key=key, base_url=self.base_url,
+                       timeout=timeout)
         # Stream: capture reasoning_content (Nemotron/DeepSeek thinking) and
         # accumulate the final answer. Streaming also avoids blocking the caller
         # thread for the full generation on slow reasoning models.
@@ -167,6 +232,15 @@ class OpenAICompatibleAdapter:
 def os_getenv(key: str, default: str = "") -> str:
     import os
     return os.getenv(key, default)
+
+
+def _stream_timeout_seconds() -> float:
+    """Return a bounded provider timeout from the environment."""
+    try:
+        return max(1.0, min(float(os_getenv("OPENAI_STREAM_TIMEOUT_SECONDS", "120")),
+                            3600.0))
+    except (TypeError, ValueError):
+        return 120.0
 
 
 def _is_safe_base_url(url: str) -> bool:

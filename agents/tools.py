@@ -7,47 +7,51 @@ from __future__ import annotations
 import os
 import json
 import subprocess
-import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agents.tool_safety import command_argv, resolve_command_cwd, resolve_project_path
+
 # Project root
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = resolve_project_path(".")
 
 
 def _read_file(path: str) -> str:
-    p = Path(path)
-    if not p.is_absolute():
-        p = PROJECT_ROOT / p
-    if not p.exists():
+    try:
+        p = resolve_project_path(path)
+    except FileNotFoundError:
         return f"[File not found: {path}]"
+    except ValueError as e:
+        return f"[Read error: {e}]"
     return p.read_text(encoding="utf-8", errors="replace")
 
 
 def _write_file(path: str, content: str) -> str:
-    p = Path(path)
-    if not p.is_absolute():
-        p = PROJECT_ROOT / p
+    try:
+        p = resolve_project_path(path, allow_missing=True)
+    except ValueError as e:
+        return f"[Write error: {e}]"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"[Wrote {p}]"
 
 
 def _list_dir(path: str) -> List[str]:
-    p = Path(path)
-    if not p.is_absolute():
-        p = PROJECT_ROOT / p
-    if not p.exists() or not p.is_dir():
+    try:
+        p = resolve_project_path(path)
+    except (FileNotFoundError, ValueError):
         return [f"[Directory not found: {path}]"]
     return sorted([str(x.relative_to(PROJECT_ROOT)) for x in p.iterdir()])
 
 
 def _run_command(cmd: str, cwd: Optional[str] = None) -> str:
     try:
+        argv = command_argv(cmd)
+        safe_cwd = resolve_command_cwd(cwd)
         result = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=str(PROJECT_ROOT if not cwd else cwd),
+            argv,
+            shell=False,
+            cwd=str(safe_cwd),
             capture_output=True,
             text=True,
             timeout=30,
@@ -197,18 +201,12 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             # Simple analysis - return first 2000 chars as summary
             return f"[Analysis of {arguments['path']}]\n\n{content[:2000]}..."
         elif name == "query_database":
+            from agents.sql_safety import execute_readonly_query
             db_path = str(PROJECT_ROOT / "agent.db")
             if not os.path.exists(db_path):
                 return "[Database not found]"
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(arguments["sql"]).fetchall()
-            conn.close()
-            limit = int(arguments.get("limit", 50))
-            results = []
-            for row in rows[:limit]:
-                results.append(dict(row))
-            return json.dumps(results, indent=2, default=str)
+            return execute_readonly_query(
+                arguments["sql"], db_path, arguments.get("limit", 50))
         else:
             return f"[Unknown tool: {name}]"
     except Exception as e:

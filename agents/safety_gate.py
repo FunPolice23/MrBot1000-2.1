@@ -57,6 +57,15 @@ class SafetyGate:
         
         if not rule:
             return False, f"Unknown tool: {tool_name}", SafetyDecision.BLOCKED
+
+        if tool_name == "query_database":
+            try:
+                from agents.sql_safety import validate_readonly_sql
+                from agents.tool_safety import resolve_project_path
+                validate_readonly_sql(
+                    arguments.get("sql", ""), resolve_project_path("agent.db"))
+            except (OSError, TypeError, ValueError, KeyError) as exc:
+                return False, f"Unsafe SQL blocked: {exc}", SafetyDecision.BLOCKED
         
         if rule.decision == SafetyDecision.ALLOWED:
             return True, rule.reason, SafetyDecision.ALLOWED

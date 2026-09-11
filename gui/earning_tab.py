@@ -441,6 +441,42 @@ class EarningTab(QWidget):
     def refresh(self):
         self._refresh_crypto_wallets()
 
+    def get_summary(self) -> dict:
+        """Return summary dict for the Insights panel.
+        
+        Keys: earned, pending, last30
+        """
+        earned = 0.0
+        pending = 0.0
+        last30 = 0.0
+        
+        # Try to get from earning pipeline if available
+        try:
+            from agents.earning_capability import EarningCapability
+            ec = EarningCapability.instance() if hasattr(EarningCapability, 'instance') else None
+            if ec and hasattr(ec, 'total_earned'):
+                earned = ec.total_earned
+            if ec and hasattr(ec, 'pending_amount'):
+                pending = ec.pending_amount
+        except Exception:
+            pass
+        
+        # Try to get from wallet manager
+        try:
+            wm = self._get_wallet_manager()
+            if wm:
+                for w in wm.list_wallets():
+                    if w.currency == "USD":
+                        earned += w.balance
+        except Exception:
+            pass
+        
+        return {
+            "earned": earned,
+            "pending": pending,
+            "last30": last30,
+        }
+
     def _refresh_crypto_wallets(self):
         wm = self._get_wallet_manager()
         if not wm:

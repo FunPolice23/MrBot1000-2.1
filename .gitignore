@@ -4,6 +4,7 @@
 .env
 .env.*
 !.env.example
+.env_dual_brain
 
 # Decrypted .env temp artifacts (git smudge/clean filter scratch — plaintext secrets, never commit)
 .tmp_*
@@ -86,6 +87,9 @@ cache/*-wal
 *-shm
 *.db-wal
 *.db-shm
+models_cache.json
+settings.json
+local_files_compare.txt
 
 # External publish mirror (lives at D:/github_upload, synced by scripts/sync_github_upload.py)
 github_upload/

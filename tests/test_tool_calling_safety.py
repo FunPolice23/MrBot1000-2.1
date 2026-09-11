@@ -8,6 +8,28 @@ from agents import tool_calling
 
 
 class TestToolCallingSafety(unittest.TestCase):
+    def test_account_profile_rejects_raw_secrets(self):
+        from agents.account_profile import validate_profile_data
+        result = validate_profile_data({
+            "display_name": "Operator",
+            "email": "operator@example.com",
+            "skills": ["Python"],
+            "password": "must-not-be-stored",
+        })
+        self.assertFalse(result["valid"])
+        self.assertIn("password", result["rejected_fields"])
+
+    def test_account_and_profile_actions_require_human_gates(self):
+        from agents.human_gates import HumanGateManager, HumanGateType
+        gates = HumanGateManager().assess(
+            {"task_id": "profile-1", "title": "Create account and complete profile",
+             "description": "Enter email, display name, skills, and portfolio"},
+            {},
+        )
+        gate_types = {gate.gate_type for gate in gates}
+        self.assertIn(HumanGateType.ACCOUNT_CREATION, gate_types)
+        self.assertIn(HumanGateType.PROFILE_SUBMISSION, gate_types)
+
     def test_mutating_tools_are_refused_without_human_approval(self):
         from agents.approval_queue import HumanApprovalQueue
         HumanApprovalQueue.reset_singleton()

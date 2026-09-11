@@ -188,13 +188,9 @@ class InstructionGate:
         try:
             infos = socket.getaddrinfo(host, None)
         except Exception:
-            # Cannot resolve (offline / no resolver). We cannot confirm the host
-            # is internal, so we ALLOW the fetch to proceed — the existing
-            # timeout/error handling covers genuinely unreachable hosts, and
-            # refusing here would break offline operation and legitimate public
-            # URLs. The SSRF protection still triggers when DNS *does* resolve to
-            # a loopback/private/link-local/metadata address.
-            return True
+            # A hostname that cannot be resolved cannot be proven public. Fail
+            # closed so a later resolver cannot redirect the request internally.
+            return False
         for info in infos:
             ip_str = info[4][0]
             try:

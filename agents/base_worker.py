@@ -15,6 +15,7 @@ import subprocess
 import sqlite3
 import mimetypes
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import shutil
@@ -402,6 +403,13 @@ def ts_now() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 class WorkerAgent:
     """Base class for MrBot1000 subagents with LLM integration and secure I/O."""
+
+    _ollama_executor = ThreadPoolExecutor(max_workers=2)
+
+    @classmethod
+    def shutdown_ollama_executor(cls):
+        """Cancel queued legacy Ollama calls during application shutdown."""
+        cls._ollama_executor.shutdown(wait=False, cancel_futures=True)
     
     def __init__(self, api_key: str, log_signal, db=None,
                  ollama_model: str | None = None,
@@ -596,19 +604,19 @@ class WorkerAgent:
                 name="vllm", api_key_env="VLLM_API_KEY",
                 base_url=os.getenv("VLLM_BASE_URL"), default_model=os.getenv("VLLM_MODEL", ""),
                 disabled_env="DISABLE_VLLM", order=30,
-                chat_model=os.getenv("VLLM_CHAT_MODEL", "")))
+                chat_model=os.getenv("VLLM_CHAT_MODEL", ""), require_api_key=False))
         if os.getenv("LM_STUDIO_BASE_URL"):
             regs.append(OpenAICompatibleAdapter(
                 name="lm-studio", api_key_env="LM_STUDIO_API_KEY",
                 base_url=os.getenv("LM_STUDIO_BASE_URL"), default_model=os.getenv("LM_STUDIO_MODEL", ""),
                 disabled_env="DISABLE_LM_STUDIO", order=30,
-                chat_model=os.getenv("LM_STUDIO_CHAT_MODEL", "")))
+                chat_model=os.getenv("LM_STUDIO_CHAT_MODEL", ""), require_api_key=False))
         if os.getenv("KOBOLDCPP_BASE_URL"):
             regs.append(OpenAICompatibleAdapter(
                 name="koboldcpp", api_key_env="KOBOLDCPP_API_KEY",
                 base_url=os.getenv("KOBOLDCPP_BASE_URL"), default_model=os.getenv("KOBOLDCPP_MODEL", ""),
                 disabled_env="DISABLE_KOBOLDCPP", order=30,
-                chat_model=os.getenv("KOBOLDCPP_CHAT_MODEL", "")))
+                chat_model=os.getenv("KOBOLDCPP_CHAT_MODEL", ""), require_api_key=False))
         # v2.1: dual-brain llama.cpp (llama-server). big-brain -> main,
         # small-brain -> chat by default. Registered when enabled + endpoint and
         # a model is known (env override OR auto-detected from the live server),
@@ -968,9 +976,8 @@ class WorkerAgent:
             # it with a timeout; on expiry we raise so the retry/fallback path (or
             # the heartbeat try/except) can recover. This is version-agnostic.
             ollama_timeout = float(os.getenv("OLLAMA_TIMEOUT", 180))
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TE
-            _exec = ThreadPoolExecutor(max_workers=1)
-            _fut = _exec.submit(
+            from concurrent.futures import TimeoutError as _TE
+            _fut = self._ollama_executor.submit(
                 lambda: ollama.chat(
                     model=model,
                     messages=[
@@ -991,11 +998,8 @@ class WorkerAgent:
                 _raw = _fut.result(timeout=ollama_timeout)
             except _TE:
                 _fut.cancel()
-                _exec.shutdown(wait=False)
                 raise RuntimeError(
                     f"Ollama model '{model}' timed out after {ollama_timeout:.0f}s")
-            finally:
-                _exec.shutdown(wait=False)
             content = _raw['message']['content']
             dt = time.time() - t0
             # v2.0.24: Thinking models emit <think>…</think> blocks. Split the

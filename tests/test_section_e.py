@@ -10,7 +10,7 @@ degrade to hints when Ollama is absent.
 import os
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -44,6 +44,22 @@ class TestArchDetection(unittest.TestCase):
         self.assertFalse(info["moe"])
         self.assertEqual(info["architecture"], "")
         self.assertIsNone(info["experts"])
+
+
+class TestProviderProbeCache(unittest.TestCase):
+    def test_cached_probe_and_forced_refresh(self):
+        from gui.dual_brain_control import ProviderStatusChecker
+
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"data": [{"id": "test"}]}'
+        ProviderStatusChecker.clear_cache(19999)
+        with patch("gui.dual_brain_control.urllib.request.urlopen", return_value=response) as urlopen:
+            self.assertEqual(ProviderStatusChecker.check_llama_server(19999), (True, ["test"]))
+            self.assertEqual(ProviderStatusChecker.check_llama_server(19999), (True, ["test"]))
+            self.assertEqual(urlopen.call_count, 1)
+            ProviderStatusChecker.check_llama_server(19999, refresh=True)
+            self.assertEqual(urlopen.call_count, 2)
+        ProviderStatusChecker.clear_cache(19999)
 
     def test_is_moe_convenience(self):
         from provider_models import is_moe
@@ -265,15 +281,17 @@ class TestGuiTabs(unittest.TestCase):
         self.assertIn("Collaboration", labels)
         # The current GUI includes the dual-brain and safety surfaces in addition
         # to the original ten tabs.
-        self.assertEqual(self.mw.tabs.count(), 20)
+        self.assertEqual(self.mw.tabs.count(), 21)
+        self.assertIn("Model Library", labels)
 
     def test_lazy_then_scroll_on_open(self):
         from PySide6.QtWidgets import QScrollArea
-        # Management and Providers & GPU are built eagerly at startup
+        # Management, Providers & GPU, and Model Library are built eagerly at startup
         self.assertIsInstance(self.mw.tabs.widget(0), QScrollArea)
         self.assertIsInstance(self.mw.tabs.widget(1), QScrollArea)
+        self.assertIsInstance(self.mw.tabs.widget(2), QScrollArea)
         # Others are placeholders until opened
-        for i in range(2, self.mw.tabs.count()):
+        for i in range(3, self.mw.tabs.count()):
             self.assertFalse(isinstance(self.mw.tabs.widget(i), QScrollArea))
         # Opening every tab builds it into a QScrollArea
         for i in range(self.mw.tabs.count()):

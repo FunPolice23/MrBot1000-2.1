@@ -238,6 +238,12 @@ class BrainConfig:
             from agents.gguf_meta import read_metadata
             meta = read_metadata(model_path)
             arch = meta.get("general.architecture", "")
+
+            # Gemma 4 ships a new canonical template. The older built-in
+            # ``gemma`` template silently corrupts its output (binary-looking
+            # tokens and training boilerplate), so never substitute it here.
+            if arch == "gemma4":
+                return ""
             
             # Map architectures to compatible built-in templates
             arch_template_map = {
@@ -263,6 +269,8 @@ class BrainConfig:
             
             # Fallback: try to detect from filename
             fname = os.path.basename(model_path).lower()
+            if "gemma-4" in fname or "gemma4" in fname:
+                return ""
             if "qwen" in fname:
                 return "chatml"
             if "gemma" in fname:

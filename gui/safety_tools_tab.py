@@ -6,6 +6,7 @@
 
 import os
 import sys
+import json
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -18,6 +19,9 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 
 
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "settings.json")
+
+
 class SafetyTab(QWidget):
     """Tab for viewing safety status, approvals, and configuration."""
     
@@ -26,15 +30,18 @@ class SafetyTab(QWidget):
         
         # Safety guard reference
         self.safety_guard = None
-        self.approval_queue = []
+        from agents.approval_queue import HumanApprovalQueue
+        self.approval_queue = HumanApprovalQueue.instance()
         
         # Build UI
         self.setup_ui()
+        self._load_config()
         
         # Refresh timer
-        self.refresh_timer = QTimer()
+        self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh)
         self.refresh_timer.start(2000)
+        self.refresh()
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -366,13 +373,15 @@ class SafetyTab(QWidget):
         if self.safety_guard:
             pending = self.safety_guard.get_pending_approvals()
         else:
-            pending = self.approval_queue
+            pending = [item.to_dict() for item in self.approval_queue.pending()]
         
         for i, approval in enumerate(pending):
             self.approvals_table.insertRow(i)
             self.approvals_table.setItem(i, 0, QTableWidgetItem(approval.get("id", "")))
-            self.approvals_table.setItem(i, 1, QTableWidgetItem(str(approval.get("action", ""))))
-            self.approvals_table.setItem(i, 2, QTableWidgetItem(str(approval.get("reasons", ""))))
+            action = approval.get("action") or approval.get("title", "")
+            reason = approval.get("reasons") or approval.get("description", "")
+            self.approvals_table.setItem(i, 1, QTableWidgetItem(str(action)))
+            self.approvals_table.setItem(i, 2, QTableWidgetItem(str(reason)))
             self.approvals_table.setItem(i, 3, QTableWidgetItem(
                 datetime.fromtimestamp(approval.get("requested_at", 0)).strftime("%H:%M:%S")
             ))
@@ -387,6 +396,8 @@ class SafetyTab(QWidget):
         approval_id = self.approvals_table.item(row, 0).text()
         if self.safety_guard:
             self.safety_guard.approve(approval_id)
+        else:
+            self.approval_queue.approve(approval_id, notes="Approved from Safety & Tools")
         self.refresh()
     
     def _on_reject(self):
@@ -398,9 +409,48 @@ class SafetyTab(QWidget):
         approval_id = self.approvals_table.item(row, 0).text()
         if self.safety_guard:
             self.safety_guard.reject(approval_id)
+        else:
+            self.approval_queue.deny(approval_id, notes="Rejected from Safety & Tools")
         self.refresh()
     
     def _on_save_config(self):
         """Save safety configuration."""
-        # TODO: Persist config
-        pass
+        config = {
+            "cost_guard_enabled": self.cost_guard_enabled.isChecked(),
+            "daily_budget_usd": self.daily_budget_spin.value(),
+            "recursion_detector_enabled": self.recursion_enabled.isChecked(),
+            "max_depth": self.max_depth_spin.value(),
+            "timeout_seconds": self.timeout_spin.value(),
+            "tool_firewall_enabled": self.firewall_enabled.isChecked(),
+        }
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as handle:
+                settings = json.load(handle)
+        except (OSError, ValueError):
+            settings = {}
+        settings["safety"] = config
+        try:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as handle:
+                json.dump(settings, handle, indent=2)
+            os.environ["LLM_DAILY_BUDGET_USD"] = str(config["daily_budget_usd"])
+        except OSError:
+            return
+
+    def _load_config(self):
+        """Load persisted safety settings without making startup fragile."""
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as handle:
+                config = json.load(handle).get("safety", {})
+        except (OSError, ValueError):
+            config = {}
+        self.cost_guard_enabled.setChecked(config.get("cost_guard_enabled", True))
+        self.daily_budget_spin.setValue(int(config.get("daily_budget_usd", 10)))
+        self.recursion_enabled.setChecked(config.get("recursion_detector_enabled", True))
+        self.max_depth_spin.setValue(int(config.get("max_depth", 10)))
+        self.timeout_spin.setValue(int(config.get("timeout_seconds", 30)))
+        self.firewall_enabled.setChecked(config.get("tool_firewall_enabled", True))
+
+    def cleanup(self):
+        """Stop the tab-owned refresh timer during application shutdown."""
+        if getattr(self, "refresh_timer", None) is not None:
+            self.refresh_timer.stop()

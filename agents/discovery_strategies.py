@@ -38,12 +38,19 @@ DEFAULT_EMERGING_CATEGORIES = [
 DEFAULT_PLATFORM_TERMS: Dict[str, List[str]] = {
     "upwork": ["hourly", "fixed-price", "scrape", "automation", "script"],
     "fiverr": ["gig", "bundle", "express", "bot", "scraper"],
-    "web": ["remote", "freelance", "microtask", "labeling"],
+    "web": [
+        "public job listing no account", "agent-compatible task", "bug bounty",
+        "open source bounty", "paid study", "microtask", "data labeling",
+    ],
     "ugig": ["remote", "freelance", "coding", "research", "data"],
     "microtask": ["annotation", "transcription", "classification", "eval"],
     "airdrop": ["testnet", "faucet", "quest", "galxe"],
     "defi": ["testnet", "liquidity", "audit", "bounty"],
     "social": ["ugc", "moderation", "caption", "engagement"],
+    "dynamic": [
+        "AI agent task", "autonomous agent marketplace", "public API task",
+        "open source bounty", "bug bounty", "paid research study",
+    ],
 }
 
 

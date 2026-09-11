@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 
 from agents.provenance import TruthStatus, ProvenanceRecord, InfoAtom, ProvenanceChain, FactStore
 from agents.autonomous_loop import StageStatus, AutonomousLoop, AutonomousResult
@@ -87,7 +88,8 @@ class FakeAccounting:
 
 
 class FakeTaskExecutor:
-    pass
+    def run(self, task):
+        return SimpleNamespace(success=True, errors=[], output={})
 
 
 class FakePipeline:
@@ -188,6 +190,15 @@ class TestAutonomousLoop(unittest.TestCase):
         self.assertEqual(result.decision, "completed_unpaid")
         self.assertFalse(result.paid)
         self.assertGreater(len(result.stages), 15)
+
+    def test_missing_executor_fails_without_claiming_completion(self):
+        self.pipeline.task_executor = None
+        self.loop.task_executor = None
+        result = self.loop.run(FakeOpp(advertised_amount=50))
+        self.assertEqual(result.decision, "failed")
+        self.assertFalse(result.success)
+        self.assertIn("no_task_executor", result.errors)
+        self.assertNotIn(result.decision, {"completed_unpaid", "proceed"})
 
     def test_loop_stages_recorded(self):
         """Each stage should be recorded."""
@@ -299,7 +310,7 @@ class TestGroup1DeadStages(unittest.TestCase):
         p.lifecycle = FakeLifecycle()
         p.evidence_store = FakeEvidenceStore()
         p.accounting = FakeAccounting()
-        p.task_executor = None
+        p.task_executor = FakeTaskExecutor()
         self.pipeline = p
         self.loop = AutonomousLoop(self.pipeline)
 
@@ -397,7 +408,7 @@ class TestGroup2NoFabricatedPayment(unittest.TestCase):
         p.lifecycle = type("L", (), {})()
         p.evidence_store = _MemEvidenceStore()
         p.accounting = type("A", (), {"get_profile": lambda s, o: None})()
-        p.task_executor = None
+        p.task_executor = FakeTaskExecutor()
         self.pipeline = p
         self.portfolio = port
         self.loop = AutonomousLoop(p)

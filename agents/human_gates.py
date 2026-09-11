@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional
 # ── Gate types ─────────────────────────────────────────────────────────────────
 
 class HumanGateType(str, Enum):
+    ACCOUNT_CREATION = "account_creation"
+    PROFILE_SUBMISSION = "profile_submission"
     IDENTITY_VERIFICATION = "identity_verification"
     SENSITIVE_INFORMATION = "sensitive_information"
     CONTRACTS = "contracts"
@@ -80,6 +82,20 @@ class HumanGateManager:
             gates.append(HumanGateRecord(
                 gate_type=HumanGateType.PAYMENTS,
                 description="Task involves financial commitment or payment. Human approval required.",
+                task_id=task_id,
+            ))
+
+        if self._has_account_creation(task, context):
+            gates.append(HumanGateRecord(
+                gate_type=HumanGateType.ACCOUNT_CREATION,
+                description="Creating an account or entering an email requires human review and action.",
+                task_id=task_id,
+            ))
+
+        if self._has_profile_submission(task, context):
+            gates.append(HumanGateRecord(
+                gate_type=HumanGateType.PROFILE_SUBMISSION,
+                description="Submitting a name, skills, bio, portfolio, or email requires human review.",
                 task_id=task_id,
             ))
 
@@ -183,6 +199,22 @@ class HumanGateManager:
         text = f"{task.get('description', '')} {task.get('title', '')}".lower()
         payment_keywords = ["payment", "pay", "invoice", "financial", "money", "usd", "$", "commit"]
         return any(kw in text for kw in payment_keywords)
+
+    def _task_text(self, task: Dict, context: Dict) -> str:
+        return f"{task.get('description', '')} {task.get('title', '')} {context.get('platform', '')}".lower()
+
+    def _has_account_creation(self, task: Dict, context: Dict) -> bool:
+        text = self._task_text(task, context)
+        return any(kw in text for kw in (
+            "create an account", "create account", "sign up", "signup", "register", "registration",
+            "new account", "email address", "email verification",
+        ))
+
+    def _has_profile_submission(self, task: Dict, context: Dict) -> bool:
+        text = self._task_text(task, context)
+        return any(kw in text for kw in (
+            "profile", "display name", "skills", "portfolio", "bio", "resume", "cv",
+        ))
 
     def _has_contracts(self, task: Dict, context: Dict) -> bool:
         text = f"{task.get('description', '')} {task.get('title', '')}".lower()

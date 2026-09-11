@@ -10,6 +10,7 @@ import csv
 import logging
 import os
 import sqlite3
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, List, Optional
 
@@ -45,10 +46,19 @@ class LoggingTab(QWidget):
         self._filter_path = "all"
         self._filter_date_days = 30
         self._search_query = ""
+        self._refresh_executor = ThreadPoolExecutor(max_workers=1)
+        self._refresh_future: Optional[Future] = None
         self.setup_ui()
         self._auto_refresh_timer = QTimer()
         self._auto_refresh_timer.timeout.connect(self.refresh)
         self._auto_refresh_timer.start(10000)  # refresh every 10s
+        self._search_refresh_timer = QTimer(self)
+        self._search_refresh_timer.setSingleShot(True)
+        self._search_refresh_timer.setInterval(250)
+        self._search_refresh_timer.timeout.connect(self.refresh)
+        self._refresh_poll_timer = QTimer(self)
+        self._refresh_poll_timer.setInterval(50)
+        self._refresh_poll_timer.timeout.connect(self._poll_refresh)
         self.refresh()
 
     # ── UI ────────────────────────────────────────────────
@@ -128,8 +138,13 @@ class LoggingTab(QWidget):
 
     # ── Data ───────────────────────────────────────────────
 
-    def _get_rows(self) -> List[dict]:
+    def _get_rows(self, filter_path: Optional[str] = None,
+                  filter_date_days: Optional[int] = None,
+                  search_query: Optional[str] = None) -> List[dict]:
         """Fetch log rows from AgentDB with current filters."""
+        filter_path = self._filter_path if filter_path is None else filter_path
+        filter_date_days = self._filter_date_days if filter_date_days is None else filter_date_days
+        search_query = self._search_query if search_query is None else search_query
         rows: List[dict] = []
         try:
             conn = sqlite3.connect(self.db_path)
@@ -141,12 +156,12 @@ class LoggingTab(QWidget):
             if cur.fetchone():
                 sql = "SELECT * FROM evidence WHERE 1=1"
                 params: list = []
-                if self._filter_path != "all":
+                if filter_path != "all":
                     sql += " AND path = ?"
-                    params.append(self._filter_path)
-                if self._search_query:
+                    params.append(filter_path)
+                if search_query:
                     sql += " AND (detail LIKE ? OR action LIKE ?)"
-                    params.extend([f"%{self._search_query}%", f"%{self._search_query}%"])
+                    params.extend([f"%{search_query}%", f"%{search_query}%"])
                 sql += " ORDER BY ts DESC LIMIT 200"
                 cur.execute(sql, params)
                 for r in cur.fetchall():
@@ -166,19 +181,19 @@ class LoggingTab(QWidget):
                 if cur.fetchone():
                     sql = "SELECT * FROM outcomes WHERE 1=1"
                     params = []
-                    if self._filter_path != "all":
+                    if filter_path != "all":
                         sql += " AND action LIKE ?"
-                        params.append(f"%{self._filter_path}%")
-                    if self._search_query:
+                        params.append(f"%{filter_path}%")
+                    if search_query:
                         sql += " AND (result LIKE ? OR detail LIKE ?)"
-                        params.extend([f"%{self._search_query}%", f"%{self._search_query}%"])
+                        params.extend([f"%{search_query}%", f"%{search_query}%"])
                     sql += " ORDER BY ts DESC LIMIT 200"
                     cur.execute(sql, params)
                     for r in cur.fetchall():
                         rows.append({
                             "id": str(r.get("id", "")),
                             "ts": r.get("ts", 0),
-                            "path": self._filter_path,
+                            "path": filter_path,
                             "action": r.get("action", ""),
                             "detail": r.get("result", ""),
                             "revenue": r.get("revenue_usd", 0) or 0,
@@ -193,7 +208,27 @@ class LoggingTab(QWidget):
     # ── Display ────────────────────────────────────────────
 
     def refresh(self):
-        rows = self._get_rows()
+        if self._refresh_future is not None and not self._refresh_future.done():
+            return
+        self._refresh_future = self._refresh_executor.submit(
+            self._get_rows,
+            self._filter_path,
+            self._filter_date_days,
+            self._search_query,
+        )
+        self._refresh_poll_timer.start()
+
+    def _poll_refresh(self):
+        future = self._refresh_future
+        if future is None or not future.done():
+            return
+        self._refresh_poll_timer.stop()
+        self._refresh_future = None
+        try:
+            rows = future.result()
+        except Exception as e:
+            logger.warning("LoggingTab refresh error: %s", e)
+            return
         self.table.setRowCount(len(rows))
         for i, row in enumerate(rows):
             ts = datetime.fromtimestamp(row["ts"] or 0).strftime("%Y-%m-%d %H:%M") if row["ts"] else "—"
@@ -217,7 +252,14 @@ class LoggingTab(QWidget):
 
     def _on_search(self, text: str):
         self._search_query = text.strip()
-        self.refresh()
+        self._search_refresh_timer.start()
+
+    def cleanup(self):
+        """Stop periodic and deferred refreshes during application shutdown."""
+        self._auto_refresh_timer.stop()
+        self._search_refresh_timer.stop()
+        self._refresh_poll_timer.stop()
+        self._refresh_executor.shutdown(wait=False, cancel_futures=True)
 
     def _on_export_csv(self):
         rows = self._get_rows()

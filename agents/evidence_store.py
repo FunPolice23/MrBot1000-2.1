@@ -35,8 +35,9 @@ class EvidenceStore:
                 id, source, evidence_type, subject_type, subject_id, external_id,
                 parent_evidence_id, observed_at, recorded_at, status, verification_method,
                 verification_level, amount, currency, gross_amount, fees, gas, tax_expense,
-                other_expenses, source_reference, raw_reference, metadata, provenance, history
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                other_expenses, source_reference, raw_reference, metadata, provenance, history,
+                dup_key
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 d["id"], d["source"], d["evidence_type"], d["subject_type"], d["subject_id"],
                 d["external_id"], d["parent_evidence_id"], d["observed_at"], d["recorded_at"],
@@ -44,6 +45,7 @@ class EvidenceStore:
                 d["currency"], d["gross_amount"], d["fees"], d["gas"], d["tax_expense"],
                 d["other_expenses"], d["source_reference"], d["raw_reference"],
                 json.dumps(d["metadata"], default=str), json.dumps(d["provenance"]), json.dumps(d["history"]),
+                ev.dup_key(),
             ),
             commit=True,
         )
@@ -103,8 +105,14 @@ class EvidenceStore:
         """
         dk = ev.dup_key()
         rows = self._db._execute(
-            "SELECT * FROM evidence ORDER BY recorded_at ASC",
+            "SELECT * FROM evidence WHERE dup_key = ? ORDER BY recorded_at ASC",
+            (dk,),
         ).fetchall()
+        # Legacy rows predate the indexed fingerprint column.
+        if not rows:
+            rows = self._db._execute(
+                "SELECT * FROM evidence WHERE dup_key IS NULL ORDER BY recorded_at ASC",
+            ).fetchall()
         for r in rows:
             cand = self._row_to_evidence(r)
             if cand.id != ev.id and cand.dup_key() == dk:

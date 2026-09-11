@@ -23,12 +23,14 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
+import traceback
 import urllib.request
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, QObject
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
@@ -83,6 +85,30 @@ BIG_SPIN_QSS = """
 """
 
 
+HARDWARE_PRESETS = {
+    "Safe / low VRAM": {
+        "small": (8192, 512, 4, -1, "q8_0"),
+        "big": (16384, 1024, 6, -1, "q8_0"),
+        "help": "Fits modest GPUs more easily: smaller context and batches use less VRAM, with a small quality/speed tradeoff.",
+    },
+    "Balanced": {
+        "small": (16384, 1024, 4, -1, "f16"),
+        "big": (32768, 2048, 8, -1, "f16"),
+        "help": "A practical starting point for a single mid-range GPU or the current dual-GPU setup.",
+    },
+    "CPU only": {
+        "small": (4096, 256, 4, 0, "q8_0"),
+        "big": (8192, 512, 6, 0, "q8_0"),
+        "help": "Disables GPU layers and reduces memory pressure. Expect slower generation, but it should run without CUDA.",
+    },
+    "Quality / high VRAM": {
+        "small": (32768, 2048, 6, -1, "f16"),
+        "big": (65536, 4096, 10, -1, "f16"),
+        "help": "For systems with plenty of VRAM. Larger context and batches can improve throughput but consume substantially more memory.",
+    },
+}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # GPU STATUS WORKER — runs nvidia-smi in background to avoid GUI freeze
 # ═══════════════════════════════════════════════════════════════════════════
@@ -97,13 +123,14 @@ class GPUStatusWorker(QThread):
     
     def run(self):
         """Poll GPU status every interval."""
-        while self.running:
+        while self.running and not self.isInterruptionRequested():
             try:
                 gpus = self._get_gpu_status()
                 self.status_updated.emit(gpus)
             except Exception:
                 pass  # GPU polling is best-effort; don't crash the thread
-            self.msleep(self.interval_ms)
+            if self.running and not self.isInterruptionRequested():
+                self.msleep(self.interval_ms)
     
     def _get_gpu_status(self):
         """Get GPU status via nvidia-smi."""
@@ -133,6 +160,7 @@ class GPUStatusWorker(QThread):
     def stop(self):
         """Stop the polling loop."""
         self.running = False
+        self.requestInterruption()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -140,10 +168,20 @@ class GPUStatusWorker(QThread):
 # ═══════════════════════════════════════════════════════════════════════════
 class ProviderStatusChecker:
     """Check if llama-server instances are running."""
+
+    _cache = {}
+    _cache_lock = threading.Lock()
+    _cache_ttl = float(os.getenv("DUAL_BRAIN_PROBE_CACHE_S", "2"))
     
     @staticmethod
-    def check_llama_server(port=1234, timeout=10):
+    def check_llama_server(port=1234, timeout=10, refresh=False):
         """Check if llama-server is running on the given port."""
+        now = time.monotonic()
+        if not refresh:
+            with ProviderStatusChecker._cache_lock:
+                cached = ProviderStatusChecker._cache.get(port)
+            if cached and now - cached[0] < ProviderStatusChecker._cache_ttl:
+                return cached[1]
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -152,9 +190,21 @@ class ProviderStatusChecker:
                 # ``data`` or a ``models`` list (some versions include both).
                 # Accept both so a healthy server is not shown as offline merely
                 # because its response shape changed.
-                return True, ProviderStatusChecker.extract_model_ids(data)
+                result = True, ProviderStatusChecker.extract_model_ids(data)
         except Exception:
-            return False, []  # network check is best-effort
+            result = False, []  # network check is best-effort
+        with ProviderStatusChecker._cache_lock:
+            ProviderStatusChecker._cache[port] = (time.monotonic(), result)
+        return result
+
+    @staticmethod
+    def clear_cache(port=None):
+        """Invalidate one port or all cached provider probes."""
+        with ProviderStatusChecker._cache_lock:
+            if port is None:
+                ProviderStatusChecker._cache.clear()
+            else:
+                ProviderStatusChecker._cache.pop(port, None)
 
     @staticmethod
     def extract_model_ids(data):
@@ -185,13 +235,34 @@ class ProviderStatusChecker:
 # ═══════════════════════════════════════════════════════════════════════════
 # DUAL BRAIN CONTROL PANEL — Main Widget
 # ═══════════════════════════════════════════════════════════════════════════
+class _WheelEventFilter(QObject):
+    """Event filter that blocks wheel scroll on QComboBox while dropdown is closed.
+    
+    This prevents accidental model changes when the user scrolls over the
+    combo box. The user must click to open the dropdown before scrolling
+    to change the selection.
+    """
+    def __init__(self, combo, parent=None):
+        super().__init__(parent)
+        self.combo = combo
+    
+    def eventFilter(self, obj, event):
+        # Block wheel events when dropdown is not open
+        if event.type() == event.Type.Wheel and not self.combo.view().isVisible():
+            return True  # Event handled — block it
+        return False  # Pass through
+
+
 class DualBrainControl(QWidget):
     """Control panel for dual-brain GPU orchestration."""
+
+    _restart_ready = Signal(bool)
     
     # Signals emitted when model changes
     small_brain_model_changed = Signal(str)  # model_name
     big_brain_model_changed = Signal(str)    # model_name
     provider_probed = Signal(object)         # dict from background provider probe
+    vram_warning_requested = Signal(bool, str, float, float, object)
     
     def __init__(self, parent=None, runtime=None):
         super().__init__(parent)
@@ -204,14 +275,26 @@ class DualBrainControl(QWidget):
         # endpoint/model/device config. Optional; the widget still works with
         # its own defaults when no runtime is injected (back-compat).
         self.runtime = runtime
+        self._restart_ready.connect(self._continue_model_restart)
 
         # Provider checkers
         self.provider_checker = ProviderStatusChecker()
+        self.vram_warning_requested.connect(self._show_vram_warning)
+        
+        # Initialize provider manager for dynamic provider/GPU detection
+        from agents.provider_manager import ProviderManager
+        self.provider_manager = ProviderManager.instance()
+        self.provider_manager.detect_providers()
         
         # Track which providers we started (vs already running)
         self.we_started_small = False
         self.we_started_big = False
-        
+        self._closing = False
+        self._provider_probe_thread = None
+
+        # Guard against auto-restart loops from probe-triggered combo changes
+        self._suppress_model_change_restart = False
+
         # GPU status worker (background thread)
         self.gpu_worker = GPUStatusWorker(interval_ms=2000)
         self.gpu_worker.status_updated.connect(self._on_gpu_status_updated)
@@ -220,12 +303,19 @@ class DualBrainControl(QWidget):
         self._last_small_model = None
         self._last_big_model = None
         
-        # Build the UI
+        # Build the UI — widget construction only; signal wiring deferred
+        # to _wire_all_signals via QTimer to avoid AttributeError on methods
+        # defined later in the class body.
         self.setup_ui()
 
+        # Defer all signal/slot connections to the next event-loop cycle so
+        # every handler method (defined later in the class body) is guaranteed
+        # to exist before we try to connect to it.
+        QTimer.singleShot(0, self._wire_all_signals)
+        
         # Provider probe runs on a background thread; apply results on the GUI
         # thread via this signal (v2.1 tab-switch freeze fix).
-        self.provider_probed.connect(self._apply_provider_status)
+        self.provider_probed.connect(self._safe_apply_provider_status)
 
         # Seed ctx/endpoint labels from the canonical runtime when injected.
         self._apply_runtime()
@@ -236,6 +326,229 @@ class DualBrainControl(QWidget):
         # Defer provider status refresh to next event loop cycle so the widget
         # paints first without blocking on HTTP calls to llama-server ports.
         QTimer.singleShot(0, self._refresh_provider_status)
+        
+        # Build dynamic provider panels
+        self._build_provider_panels()
+
+    def _build_provider_panels(self):
+        """Build provider-specific configuration panels with failover support."""
+        from agents.provider_manager import ProviderManager, ProviderStatus
+        
+        pm = self.provider_manager
+        providers = pm.get_providers()
+        gpus = pm.get_gpus()
+        
+        # Create provider selection panel
+        if hasattr(self, 'provider_group'):
+            # Clear existing widgets
+                pass
+        
+        # Build provider selection UI
+        self.provider_panels = {}
+        
+        for name, provider in providers.items():
+            panel = self._create_provider_panel(name, provider, gpus)
+            self.provider_panels[name] = panel
+    
+    def _create_provider_panel(self, name, provider, gpus):
+        """Create a configuration panel for a specific provider."""
+        frame = QFrame()
+        frame.setStyleSheet(f"""
+            QFrame {{
+                background: #1a1a1a;
+                border: 2px solid #333;
+                border-radius: 8px;
+                padding: 8px;
+            }}
+        """)
+        layout = QVBoxLayout(frame)
+        
+        # Provider header
+        header = QHBoxLayout()
+        status_color = "#4caf50" if provider.status == "running" else "#ff5252" if provider.status == "stopped" else "#ff9800"
+        status_label = QLabel(f"● {provider.name}")
+        status_label.setStyleSheet(f"color: {status_color}; font-weight: bold; font-size: 12px;")
+        header.addWidget(status_label)
+        
+        header.addStretch()
+        
+        # GPU assignment
+        if provider.is_local and gpus:
+            gpu_combo = QComboBox()
+            gpu_combo.addItem("Auto", -1)
+            for gpu in gpus:
+                gpu_combo.addItem(f"GPU {gpu.index}: {gpu.name}", gpu.index)
+            gpu_combo.setCurrentIndex(provider.gpu_index + 1)
+            gpu_combo.currentIndexChanged.connect(lambda idx, n=name: self._on_gpu_assignment_changed(n, idx - 1))
+            header.addWidget(QLabel("GPU:"))
+            header.addWidget(gpu_combo)
+        
+        layout.addLayout(header)
+        
+        # Model selection
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Model:"))
+        model_combo = QComboBox()
+        model_combo.setEditable(True)
+        if provider.models:
+            model_combo.addItems(provider.models)
+        if provider.selected_model:
+            model_combo.setCurrentText(provider.selected_model)
+        model_combo.currentTextChanged.connect(lambda text, n=name: self._on_model_changed(n, text))
+        model_layout.addWidget(model_combo, stretch=1)
+        layout.addLayout(model_layout)
+        
+        # Provider-specific settings
+        if provider.is_cloud:
+            # Cloud provider settings
+            settings_layout = QHBoxLayout()
+            settings_layout.addWidget(QLabel("Context:"))
+            ctx_spin = QSpinBox()
+            ctx_spin.setRange(1048576, 1048576)
+            ctx_spin.setValue(provider.context_size)
+            ctx_spin.valueChanged.connect(lambda val, n=name: self._on_context_changed(n, val))
+            settings_layout.addWidget(ctx_spin)
+            layout.addLayout(settings_layout)
+        else:
+            # Local provider settings
+            settings_layout = QGridLayout()
+            settings_layout.addWidget(QLabel("Context:"), 0, 0)
+            ctx_spin = QSpinBox()
+            ctx_spin.setRange(2048, 524288)
+            ctx_spin.setValue(provider.context_size)
+            ctx_spin.valueChanged.connect(lambda val, n=name: self._on_context_changed(n, val))
+            settings_layout.addWidget(ctx_spin, 0, 1)
+            layout.addLayout(settings_layout)
+        
+        return frame
+    
+    def _on_gpu_assignment_changed(self, provider_name, gpu_index):
+        """Handle GPU assignment change."""
+        self.provider_manager.assign_provider_to_gpu(provider_name, gpu_index)
+        self._log(f"Assigned {provider_name} to GPU {gpu_index}")
+    
+    def _on_model_changed(self, provider_name, model_name):
+        """Handle model selection change."""
+        provider = self.provider_manager.get_provider(provider_name)
+        if provider:
+            provider.selected_model = model_name
+            self._log(f"Selected model {model_name} for {provider_name}")
+    
+    def _on_context_changed(self, provider_name, context_size):
+        """Handle context size change."""
+        provider = self.provider_manager.get_provider(provider_name)
+        if provider:
+            provider.context_size = context_size
+
+    def _wire_start_stop_buttons(self):
+        """Wire up start/stop buttons after class body is fully defined.
+
+        The handler methods (_on_start_small_brain, _on_stop_small_brain,
+        _on_start_big_brain, _on_stop_big_brain) are defined later in the
+        class body. During __init__ -> setup_ui(), they don't exist yet.
+        Defer wiring to the next event-loop cycle where they're guaranteed
+        to be available.
+        """
+        if hasattr(self, "sb_start_btn"):
+            self.sb_start_btn.clicked.connect(self._on_start_small_brain)
+        if hasattr(self, "sb_stop_btn"):
+            self.sb_stop_btn.clicked.connect(self._on_stop_small_brain)
+        if hasattr(self, "bb_start_btn"):
+            self.bb_start_btn.clicked.connect(self._on_start_big_brain)
+        if hasattr(self, "bb_stop_btn"):
+            self.bb_stop_btn.clicked.connect(self._on_stop_big_brain)
+
+    def _wire_refresh_buttons(self):
+        """Wire up refresh/model buttons after class body is fully defined."""
+        if hasattr(self, "sb_refresh_models_btn"):
+            self.sb_refresh_models_btn.clicked.connect(self._refresh_small_brain_models)
+        if hasattr(self, "bb_refresh_models_btn"):
+            self.bb_refresh_models_btn.clicked.connect(self._refresh_big_brain_models)
+
+    def _apply_hardware_preset(self):
+        """Apply editable values for the selected hardware tier."""
+        preset = HARDWARE_PRESETS[self.hardware_preset_combo.currentText()]
+        for prefix, values in (("sb", preset["small"]), ("bb", preset["big"])):
+            ctx, batch, threads, gpu_layers, kv = values
+            getattr(self, f"{prefix}_ctx_spin").setValue(ctx)
+            getattr(self, f"{prefix}_batch_spin").setValue(batch)
+            getattr(self, f"{prefix}_threads_spin").setValue(threads)
+            getattr(self, f"{prefix}_gpu_layers_spin").setValue(gpu_layers)
+            getattr(self, f"{prefix}_kv_combo").setCurrentText(kv)
+        self.hardware_preset_help.setText(
+            preset["help"] + " Click Save to write these values.")
+
+    def _wire_settings_signals(self):
+        """Wire up settings spinbox/combo signals after class body is fully defined.
+
+        The signal handlers (_on_context_changed, _on_small_brain_model_changed,
+        _on_big_brain_model_changed, _on_start_all, _on_stop_all,
+        _refresh_provider_status, _persist_settings) are defined later in the
+        class body. Defer wiring to the next event-loop cycle.
+        """
+        try:
+            if hasattr(self, "sb_ctx_spin"):
+                self.sb_ctx_spin.valueChanged.connect(lambda: self._on_context_changed(False))
+            if hasattr(self, "bb_ctx_spin"):
+                self.bb_ctx_spin.valueChanged.connect(lambda: self._on_context_changed(True))
+            if hasattr(self, "sb_model_combo"):
+                self.sb_model_combo.currentTextChanged.connect(self._on_small_brain_model_changed)
+            if hasattr(self, "bb_model_combo"):
+                self.bb_model_combo.currentTextChanged.connect(self._on_big_brain_model_changed)
+            if hasattr(self, "start_all_btn"):
+                self.start_all_btn.clicked.connect(self._on_start_all)
+            if hasattr(self, "stop_all_btn"):
+                self.stop_all_btn.clicked.connect(self._on_stop_all)
+            if hasattr(self, "refresh_btn"):
+                self.refresh_btn.clicked.connect(self._refresh_provider_status)
+            if hasattr(self, "save_settings_btn"):
+                self.save_settings_btn.clicked.connect(self._persist_settings)
+        except RuntimeError:
+            # The widget may be in teardown while the delayed singleShot callback
+            # is still running; do not crash the parent app during rebuilds.
+            pass
+
+    def _wire_all_signals(self):
+        """Wire all deferred signals in one shot — called once via QTimer after
+        setup_ui() completes, when every handler method is guaranteed to exist."""
+        self._wire_start_stop_buttons()
+        self._wire_refresh_buttons()
+        self._wire_settings_signals()
+
+    def _get_fallback_provider(self, exclude_provider=None):
+        """Get a fallback provider for failover."""
+        from agents.provider_manager import ProviderStatus
+        
+        providers = self.provider_manager.get_providers()
+        
+        # Priority: local running > cloud running > local stopped
+        for name, provider in providers.items():
+            if name == exclude_provider:
+                continue
+            if provider.status == ProviderStatus.RUNNING:
+                return name
+        
+        # Try cloud providers
+        for name, provider in providers.items():
+            if name == exclude_provider:
+                continue
+            if provider.is_cloud and provider.status == ProviderStatus.RUNNING:
+                return name
+        
+        return None
+    
+    def _failover_to_cloud(self, failed_provider):
+        """Failover from failed local provider to cloud."""
+        fallback = self._get_fallback_provider(failed_provider)
+        if fallback:
+            self._log(f"⚠️ {failed_provider} failed, failing over to {fallback}")
+            # Update UI to reflect failover
+            self._apply_provider_status({
+                f"{failed_provider}_running": False,
+                f"{fallback}_running": True,
+            })
+        else:
+            self._log(f"❌ {failed_provider} failed, no fallback available!")
 
     def _apply_runtime(self):
         """Seed ctx spins + endpoint labels from the canonical runtime (if any)."""
@@ -245,6 +558,13 @@ class DualBrainControl(QWidget):
         try:
             small = self.runtime.config(BrainRole.SMALL)
             big = self.runtime.config(BrainRole.BIG)
+            detected_gpus = {
+                gpu.index: gpu.name for gpu in self.provider_manager.get_gpus()
+            }
+            if small.device in detected_gpus:
+                small.gpu_label = detected_gpus[small.device]
+            if big.device in detected_gpus:
+                big.gpu_label = detected_gpus[big.device]
             sb_spin = getattr(self, "sb_ctx_spin", None)
             bb_spin = getattr(self, "bb_ctx_spin", None)
             if sb_spin is not None:
@@ -280,16 +600,22 @@ class DualBrainControl(QWidget):
             bb_label = getattr(self, "bb_settings_label", None)
             if sb_label is not None:
                 sb_label.setText(
-                    f"🤖 Small Brain ({small.gpu_label}, port {small.port})")
+                    f"🤖 Small Brain · {small.provider.upper()} · "
+                    f"{small.gpu_label} · port {small.port}")
             if bb_label is not None:
                 bb_label.setText(
-                    f"🧠 Big Brain ({big.gpu_label}, port {big.port})")
+                    f"🧠 Big Brain · {big.provider.upper()} · "
+                    f"{big.gpu_label} · port {big.port}")
             # Route + GPU-contention guidance (v2.1): state which provider serves
             # which role and flag broken isolation so the operator can disable a
             # provider or split main/chat across GPUs.
             try:
-                route = (f"Route: Big Brain → main (device {big.device}) · "
-                         f"Small Brain → chat (device {small.device})")
+                route = (
+                    f"Route: Marcus → {big.provider.upper()} / "
+                    f"{big.model or 'auto model'} / {big.gpu_label} · "
+                    f"Alex → {small.provider.upper()} / "
+                    f"{small.model or 'auto model'} / {small.gpu_label}"
+                )
                 if hasattr(self.runtime, "validate_isolation"):
                     iso = self.runtime.validate_isolation()
                     if iso.get("isolated"):
@@ -355,7 +681,7 @@ class DualBrainControl(QWidget):
             self._log(f"Failed to persist llama.cpp settings: {e}")
 
     def setup_ui(self):
-        """Build the control panel UI."""
+        """Build the control panel UI with dynamic provider and GPU detection."""
         layout = QVBoxLayout(self)
         
         # ── Header ──────────────────────────────────────────────────────
@@ -365,19 +691,30 @@ class DualBrainControl(QWidget):
         header.setStyleSheet("color: #bb86fc; padding: 10px;")
         layout.addWidget(header)
         
-        subtitle = QLabel("GPU-Isolated Inference: 1660S (Small) + 5060Ti (Big)")
+        # Dynamic subtitle based on detected configuration
+        gpus = self.provider_manager.get_gpus()
+        providers = self.provider_manager.get_running_providers()
+        
+        if len(gpus) >= 2:
+            subtitle_text = f"GPU-Isolated Inference: {gpus[0].name} (Big) + {gpus[1].name} (Small)"
+        elif len(gpus) == 1:
+            subtitle_text = f"Single GPU: {gpus[0].name} (Cloud fallback available)"
+        else:
+            subtitle_text = "Cloud-Only Mode (No local GPUs detected)"
+        
+        subtitle = QLabel(subtitle_text)
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet("color: #888; font-size: 12px; padding-bottom: 10px;")
         layout.addWidget(subtitle)
 
-        # v2.1: live route/GPU guidance - which brain serves which role and
-        # whether two providers would contend for the same GPU.
-        self.route_label = QLabel("Route: Big Brain → main (GPU 0) · Small Brain → chat (GPU 1)")
+        # Provider status summary
+        provider_names = ", ".join([f"{p.name}: {p.status}" for p in providers.values()]) or "None detected"
+        self.route_label = QLabel(f"Providers: {provider_names}")
         self.route_label.setAlignment(Qt.AlignCenter)
         self.route_label.setWordWrap(True)
         self.route_label.setStyleSheet("color: #4fc3f7; font-size: 11px; padding-bottom: 6px;")
         layout.addWidget(self.route_label)
-        
+
         # ── GPU Status Panel ───────────────────────────────────────────
         gpu_group = QGroupBox("📊 GPU Status (Auto-Refreshing)")
         gpu_group.setStyleSheet("""
@@ -396,17 +733,25 @@ class DualBrainControl(QWidget):
             }
         """)
         gpu_layout = QHBoxLayout(gpu_group)
+
+        # Dynamic GPU widgets based on detected GPUs
+        self.gpu_widgets = {}
+        colors = ["#bb86fc", "#03dac6", "#ff9800", "#4caf50", "#e91e63", "#9c27b0"]
+        for i, gpu in enumerate(gpus):
+            color = colors[i % len(colors)]
+            widget = self._create_gpu_widget(gpu.index, gpu.name, color)
+            gpu_layout.addWidget(widget)
+            self.gpu_widgets[gpu.index] = widget
         
-        # GPU 0 (5060 Ti)
-        self.gpu0_widget = self._create_gpu_widget(0, "RTX 5060 Ti", "#bb86fc")
-        gpu_layout.addWidget(self.gpu0_widget)
-        
-        # GPU 1 (1660 Super)
-        self.gpu1_widget = self._create_gpu_widget(1, "GTX 1660 Super", "#03dac6")
-        gpu_layout.addWidget(self.gpu1_widget)
-        
+        # If no GPUs detected, show a label
+        if not gpus:
+            no_gpu_label = QLabel("No GPUs detected. Using cloud providers only.")
+            no_gpu_label.setAlignment(Qt.AlignCenter)
+            no_gpu_label.setStyleSheet("color: #ff9800; font-size: 12px; padding: 20px;")
+            gpu_layout.addWidget(no_gpu_label)
+
         layout.addWidget(gpu_group)
-        
+
         # ── Provider Control Panel ──────────────────────────────────────
         provider_group = QGroupBox("🎛️ Provider Control (One-Click Launch)")
         provider_group.setStyleSheet("""
@@ -426,8 +771,8 @@ class DualBrainControl(QWidget):
         """)
         provider_layout = QGridLayout(provider_group)
         
-        # Small Brain (llama-server on 1660 Super, port 1235)
-        sb_label = QLabel("🤖 Small Brain (1660 Super)")
+        # Labels are updated from the canonical runtime after the controls exist.
+        sb_label = QLabel("🤖 Small Brain")
         sb_label.setFont(QFont("Segoe UI", 12, QFont.Bold))
         sb_label.setStyleSheet("color: #03dac6;")
         provider_layout.addWidget(sb_label, 0, 0)
@@ -452,7 +797,6 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #03dac6cc; }
         """)
-        self.sb_start_btn.clicked.connect(self._on_start_small_brain)
         provider_layout.addWidget(self.sb_start_btn, 0, 3)
         
         self.sb_stop_btn = QPushButton("⏹ Stop")
@@ -467,12 +811,10 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #ff5252cc; }
         """)
-        self.sb_stop_btn.clicked.connect(self._on_stop_small_brain)
         self.sb_stop_btn.setEnabled(False)
         provider_layout.addWidget(self.sb_stop_btn, 0, 4)
         
-        # Big Brain (llama-server on 5060 Ti, port 1234)
-        bb_label = QLabel("🧠 Big Brain (5060 Ti)")
+        bb_label = QLabel("🧠 Big Brain")
         bb_label.setFont(QFont("Segoe UI", 12, QFont.Bold))
         bb_label.setStyleSheet("color: #bb86fc;")
         provider_layout.addWidget(bb_label, 1, 0)
@@ -497,7 +839,6 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #bb86fc88; }
         """)
-        self.bb_start_btn.clicked.connect(self._on_start_big_brain)
         provider_layout.addWidget(self.bb_start_btn, 1, 3)
         
         self.bb_stop_btn = QPushButton("⏹ Stop")
@@ -512,7 +853,6 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #ff5252cc; }
         """)
-        self.bb_stop_btn.clicked.connect(self._on_stop_big_brain)
         self.bb_stop_btn.setEnabled(False)
         provider_layout.addWidget(self.bb_stop_btn, 1, 4)
         
@@ -545,13 +885,14 @@ class DualBrainControl(QWidget):
 
         self.sb_model_combo = QComboBox()
         self.sb_model_combo.setMinimumWidth(250)
+        self.sb_model_combo.installEventFilter(_WheelEventFilter(self.sb_model_combo))
         self.sb_model_combo.setStyleSheet("""
             QComboBox {
                 background: #1a1a1a;
                 color: #e0e0e0;
                 border: 1px solid #333;
                 border-radius: 4px;
-                padding: 6px;
+                padding: 4px;
                 font-size: 11px;
             }
             QComboBox::drop-down { border: none; }
@@ -578,7 +919,6 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #03dac6cc; }
         """)
-        self.sb_refresh_models_btn.clicked.connect(self._refresh_small_brain_models)
         settings_layout.addWidget(self.sb_refresh_models_btn, 1, 1)
 
         self.sb_ctx_label = QLabel("Ctx Size:")
@@ -642,13 +982,14 @@ class DualBrainControl(QWidget):
 
         self.bb_model_combo = QComboBox()
         self.bb_model_combo.setMinimumWidth(250)
+        self.bb_model_combo.installEventFilter(_WheelEventFilter(self.bb_model_combo))
         self.bb_model_combo.setStyleSheet("""
             QComboBox {
                 background: #1a1a1a;
                 color: #e0e0e0;
                 border: 1px solid #333;
                 border-radius: 4px;
-                padding: 6px;
+                padding: 4px;
                 font-size: 11px;
             }
             QComboBox::drop-down { border: none; }
@@ -675,7 +1016,6 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #bb86fc88; }
         """)
-        self.bb_refresh_models_btn.clicked.connect(self._refresh_big_brain_models)
         settings_layout.addWidget(self.bb_refresh_models_btn, 4, 1)
 
         self.bb_ctx_label = QLabel("Ctx Size:")
@@ -700,7 +1040,6 @@ class DualBrainControl(QWidget):
         self.bb_ctx_spin.valueChanged.connect(lambda: self._on_context_changed(True))
         settings_layout.addWidget(self.bb_ctx_spin, 4, 3)
 
-        # ── Big Brain advanced llama.cpp settings (row 5) ──────────────────
         bb_adv_label = QLabel("GPU Layers / Split / Threads / KV:")
         bb_adv_label.setStyleSheet("color: #888; font-size: 11px;")
         settings_layout.addWidget(bb_adv_label, 5, 0)
@@ -774,16 +1113,36 @@ class DualBrainControl(QWidget):
         self.bb_batch_spin.setStyleSheet(BIG_SPIN_QSS)
         settings_layout.addWidget(self.bb_batch_spin, 7, 3)
 
-        layout.addWidget(settings_group)
-        # Connect model combo box signals to model change handlers
-        self.sb_model_combo.currentTextChanged.connect(self._on_small_brain_model_changed)
-        self.bb_model_combo.currentTextChanged.connect(self._on_big_brain_model_changed)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Hardware preset:"))
+        self.hardware_preset_combo = QComboBox()
+        self.hardware_preset_combo.addItems(list(HARDWARE_PRESETS))
+        self.hardware_preset_combo.setCurrentText("Balanced")
+        self.hardware_preset_combo.setToolTip(
+            "Choose a starting point for VRAM, context, batch size, and CPU/GPU use. "
+            "Save and restart both servers after applying a preset.")
+        preset_row.addWidget(self.hardware_preset_combo)
+        self.apply_hardware_preset_btn = QPushButton("Apply")
+        self.apply_hardware_preset_btn.setToolTip(
+            "Fill the llama.cpp controls with the selected hardware preset.")
+        self.apply_hardware_preset_btn.clicked.connect(self._apply_hardware_preset)
+        preset_row.addWidget(self.apply_hardware_preset_btn)
+        preset_row.addStretch(1)
+        self.hardware_preset_help = QLabel(HARDWARE_PRESETS["Balanced"]["help"])
+        self.hardware_preset_help.setWordWrap(True)
+        self.hardware_preset_help.setStyleSheet("color: #888; font-size: 10px;")
+        self.hardware_preset_combo.currentTextChanged.connect(
+            lambda name: self.hardware_preset_help.setText(HARDWARE_PRESETS[name]["help"]))
+        preset_row.addWidget(self.hardware_preset_help, 2)
+        settings_layout.addLayout(preset_row, 8, 0, 1, 4)
 
+        layout.addWidget(settings_group)
 
         # ── Provider Control Panel ──────────────────────────────────────
         
         # ── Quick Actions ───────────────────────────────────────────────
         quick_group = QGroupBox("⚡ Quick Actions")
+        quick_group.setObjectName("quickActionsGroup")
         quick_group.setStyleSheet("""
             QGroupBox {
                 color: #4caf50;
@@ -801,7 +1160,9 @@ class DualBrainControl(QWidget):
         """)
         quick_layout = QHBoxLayout(quick_group)
         
-        self.start_all_btn = QPushButton("🚀 Start All")
+        self.start_all_btn = QPushButton("🚀 Start All Brains")
+        self.start_all_btn.setObjectName("startAllBrainsButton")
+        self.start_all_btn.setToolTip("Start Small Brain and Big Brain together")
         self.start_all_btn.setStyleSheet("""
             QPushButton {
                 background: #4caf50;
@@ -814,10 +1175,11 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #45a049; }
         """)
-        self.start_all_btn.clicked.connect(self._on_start_all)
         quick_layout.addWidget(self.start_all_btn)
-        
-        self.stop_all_btn = QPushButton("🛑 Stop All")
+
+        self.stop_all_btn = QPushButton("🛑 Stop All Brains")
+        self.stop_all_btn.setObjectName("stopAllBrainsButton")
+        self.stop_all_btn.setToolTip("Stop Small Brain and Big Brain together")
         self.stop_all_btn.setStyleSheet("""
             QPushButton {
                 background: #f44336;
@@ -830,9 +1192,8 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #da190b; }
         """)
-        self.stop_all_btn.clicked.connect(self._on_stop_all)
         quick_layout.addWidget(self.stop_all_btn)
-        
+
         self.refresh_btn = QPushButton("🔄 Refresh Status")
         self.refresh_btn.setStyleSheet("""
             QPushButton {
@@ -863,9 +1224,7 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #fb8c00; }
         """)
-        self.save_settings_btn.clicked.connect(self._persist_settings)
         quick_layout.addWidget(self.save_settings_btn)
-
         layout.addWidget(quick_group)
         
         # ── Status Log ──────────────────────────────────────────────────
@@ -1052,7 +1411,7 @@ class DualBrainControl(QWidget):
 
         # Store references
         if index == 0:
-            self.gpu0_bar = est_bar
+            self.gpu0_est_bar = est_bar
             self.gpu0_act_bar = act_bar
             self.gpu0_kv_bar = kv_bar
             self.gpu0_label = name_label
@@ -1063,7 +1422,7 @@ class DualBrainControl(QWidget):
             self.gpu0_kv_detail = kv_detail
             self.gpu0_status = status_label
         else:
-            self.gpu1_bar = est_bar
+            self.gpu1_est_bar = est_bar
             self.gpu1_act_bar = act_bar
             self.gpu1_kv_bar = kv_bar
             self.gpu1_label = name_label
@@ -1125,15 +1484,15 @@ class DualBrainControl(QWidget):
                 
                 # Color-coded safety zones
                 if gpu_pct < 80:
-                    zone_color = "#4caf50"  # Green — safe
+                    zone_color = "#4caf50"  # Green — fits comfortably
                     status_text = "✅ Fits in VRAM"
-                elif gpu_pct < 95:
-                    zone_color = "#ff9800"  # Yellow — warning
+                elif gpu_pct < 100:
+                    zone_color = "#ff9800"  # Orange — fits but close to limit
                     status_text = "⚠️ Close to limit"
                 else:
-                    zone_color = "#ff5252"  # Red — danger
+                    zone_color = "#ff9800"  # Orange — spills to RAM but works
                     overflow = model_vram_gb - mem_total_gb
-                    status_text = f"⚠️ {overflow:.1f} GB will spill to RAM"
+                    status_text = f"⚠️ {overflow:.1f} GB spills to RAM"
                 
                 # Update estimated bar
                 self._set_gpu_bar(idx, "est", gpu_pct, zone_color)
@@ -1148,11 +1507,15 @@ class DualBrainControl(QWidget):
                 self._set_gpu_detail(idx, "act", f"{mem_used_gb:.1f} GB / {mem_total_gb:.1f} GB")
                 
                 # ── KV Cache bar ────────────────────────────────────────
-                # Estimate KV usage: actual - weights - overhead (rough)
-                kv_used_gb = max(0, mem_used_gb - weights_gb - overhead_gb)
-                kv_pct = min(100, int((kv_used_gb / kv_gb) * 100)) if kv_gb > 0 else 0
+                # Estimate KV usage as a fraction of total estimated VRAM,
+                # applied to actual VRAM usage (handles RAM spill correctly)
+                kv_fraction = kv_gb / model_vram_gb if model_vram_gb > 0 else 0
+                kv_used_gb = mem_used_gb * kv_fraction
+                kv_pct = min(100, int((kv_used_gb / mem_total_gb) * 100)) if mem_total_gb > 0 else 0
                 self._set_gpu_bar(idx, "kv", kv_pct, "#ff9800")
-                self._set_gpu_detail(idx, "kv", f"{kv_used_gb:.1f} GB / {kv_gb:.1f} GB allocated")
+                kv_type = model_info.get("kv_type", "f16")
+                self._set_gpu_detail(
+                    idx, "kv", f"{kv_used_gb:.1f} GB / {kv_gb:.1f} GB allocated ({kv_type})")
                 
             else:
                 # No model selected — show actual nvidia-smi usage only
@@ -1248,8 +1611,11 @@ class DualBrainControl(QWidget):
             if not model_path:
                 return {}
             
-            # Estimate VRAM
-            est = estimate_vram_gb(model_path, context=ctx)
+            kv_name = (self.sb_kv_combo.currentText() if small else self.bb_kv_combo.currentText()) or "f16"
+            kv_type_bytes = {"f32": 4, "f16": 2, "q8_0": 1, "q4_0": 0.5, "auto": 2}.get(kv_name, 2)
+            # Estimate VRAM using the selected cache precision.
+            est = estimate_vram_gb(model_path, context=ctx, kv_type_bytes=kv_type_bytes)
+            est["kv_type"] = kv_name
             return est
         except Exception:
             return {}
@@ -1268,8 +1634,10 @@ class DualBrainControl(QWidget):
             if not model_path:
                 return
             
-            # Estimate VRAM
-            est = estimate_vram_gb(model_path, context=ctx)
+            kv_name = (self.bb_kv_combo.currentText() if is_big else self.sb_kv_combo.currentText()) or "f16"
+            kv_type_bytes = {"f32": 4, "f16": 2, "q8_0": 1, "q4_0": 0.5, "auto": 2}.get(kv_name, 2)
+            # Estimate VRAM using the selected cache precision.
+            est = estimate_vram_gb(model_path, context=ctx, kv_type_bytes=kv_type_bytes)
             model_vram_gb = est.get("total_gb", 0)
             weights_gb = est.get("weights_gb", 0)
             kv_gb = est.get("kv_gb", 0)
@@ -1290,7 +1658,7 @@ class DualBrainControl(QWidget):
                 else:
                     zone_color = "#ff5252"
                     overflow = model_vram_gb - gpu_total
-                    status = f"⚠️ {overflow:.1f} GB will spill to RAM"
+                    status = f"⚠️ {overflow:.1f} GB spills to RAM"
                 
                 self._set_gpu_bar(idx, "est", gpu_pct, zone_color)
                 self._set_gpu_detail(idx, "est", f"Weights: {weights_gb:.1f}GB  KV: {kv_gb:.1f}GB  Total: {model_vram_gb:.1f}GB")
@@ -1374,6 +1742,9 @@ class DualBrainControl(QWidget):
         search = list(self._GGUF_SEARCH_DIRS)
         if extra:
             search.insert(0, extra)
+        library_dirs = os.getenv("MODEL_LIBRARY_DIR", "").strip()
+        if library_dirs:
+            search[0:0] = [item for item in library_dirs.split(os.pathsep) if item]
         for base_str in search:
             base = os.path.abspath(base_str)
             if not os.path.isdir(base):
@@ -1434,7 +1805,10 @@ class DualBrainControl(QWidget):
                 if self._norm_path(p) == target_norm:
                     select = i
             if paths:
+                # Suppress model-change auto-restart during programmatic selection
+                self._suppress_model_change_restart = True
                 combo.setCurrentIndex(select)
+                self._suppress_model_change_restart = False
         finally:
             combo.blockSignals(False)
 
@@ -1475,20 +1849,27 @@ class DualBrainControl(QWidget):
                 if not running:
                     break
                 time.sleep(0.3)
-            if small:
-                self._on_start_small_brain()
-            else:
-                self._on_start_big_brain()
+            # All Qt widget and QThread operations must happen on the GUI
+            # thread. The worker only stops the old process and waits for the
+            # port to become available.
+            self._restart_ready.emit(small)
         except Exception as e:
             self._log(f"❌ Failed to switch {label} model: {e}")
-        finally:
-            # Hide loading indicator on GUI thread
+
             from PySide6.QtCore import QTimer
             QTimer.singleShot(0, lambda: self._set_loading(small, False, ""))
+
+    def _continue_model_restart(self, small: bool):
+        """Continue a model restart on the Qt GUI thread."""
+        if small:
+            self._on_start_small_brain()
+        else:
+            self._on_start_big_brain()
 
     def _set_loading(self, small: bool, loading: bool, model_path: str):
         """Show/hide loading indicator for a brain."""
         label = "Small Brain" if small else "Big Brain"
+        idx = 0 if small else 1
         if loading:
             self._log(f"⏳ {label}: loading {os.path.basename(model_path)} into VRAM...")
             # Update status to show loading
@@ -1502,6 +1883,20 @@ class DualBrainControl(QWidget):
                 self.bb_status.setStyleSheet("color: #ffb300; font-weight: bold;")
                 self.bb_start_btn.setEnabled(False)
                 self.bb_stop_btn.setEnabled(False)
+            
+            # Update GPU bars to show loading state
+            model_info = self._get_model_vram_for_gpu(idx)
+            model_vram_gb = model_info.get("total_gb", 0)
+            if model_vram_gb > 0:
+                # Show estimated bar at 100% (model is being loaded)
+                self._set_gpu_bar(idx, "est", 100, "#ffb300")
+                self._set_gpu_detail(idx, "est", f"Loading {os.path.basename(model_path)}...")
+                # Show actual bar at 0% (will be updated by nvidia-smi polling)
+                self._set_gpu_bar(idx, "act", 0, "#4caf50")
+                self._set_gpu_detail(idx, "act", "Loading...")
+                # Show KV bar at 0%
+                self._set_gpu_bar(idx, "kv", 0, "#ff9800")
+                self._set_gpu_detail(idx, "kv", "Loading...")
         else:
             if small:
                 self.sb_status.setText("● Checking...")
@@ -1509,9 +1904,11 @@ class DualBrainControl(QWidget):
             else:
                 self.bb_status.setText("● Checking...")
                 self.bb_status.setStyleSheet("color: #ffb300; font-weight: bold;")
-            # Refresh status after a short delay
-            import threading
-            threading.Timer(1.0, self._refresh_provider_status).start()
+            # Refresh status on the Qt event loop. A threading.Timer would call
+            # QWidget methods from a Python worker thread and can leave the
+            # visible state stuck at Loading even after llama-server is ready.
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(1000, self._refresh_provider_status)
 
     def _force_stop_brain(self, small: bool):
         """Terminate a brain's server process regardless of who started it.
@@ -1625,6 +2022,148 @@ class DualBrainControl(QWidget):
                 proc.kill()
         raise RuntimeError(f"{last_error} after 15s; log={log_path}")
 
+    def _log(self, message):
+        """Append a timestamped message to the provider event log."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_display.append(f"[{ts}] {message}")
+        scrollbar = self.log_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _record_start_failure(self, phase: str, error: Exception):
+        """Persist start failures when Qt cannot deliver the visible log entry."""
+        try:
+            path = os.path.join(tempfile.gettempdir(), "mrbot-dual-brain-crash.log")
+            with open(path, "a", encoding="utf-8", errors="replace") as report:
+                report.write(f"\n[{datetime.now().isoformat()}] {phase}: {error!r}\n")
+                report.write(traceback.format_exc())
+        except Exception:
+            pass
+
+    def cleanup(self):
+        """Stop the GPU polling thread before the control is destroyed."""
+        self._closing = True
+        probe_thread = getattr(self, "_provider_probe_thread", None)
+        if probe_thread is not None and probe_thread.is_alive():
+            probe_thread.join(3000)
+        worker = getattr(self, "gpu_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            worker.wait(7000)
+        for name in (
+            "_small_probe_worker", "_big_probe_worker",
+            "_small_stop_worker", "_big_stop_worker",
+            "_small_launch_worker", "_big_launch_worker",
+        ):
+            worker = getattr(self, name, None)
+            try:
+                if worker is not None and worker.isRunning():
+                    if hasattr(worker, "stop"):
+                        worker.stop()
+                    worker.wait(3000)
+            except RuntimeError:
+                # Finished workers may already have processed deleteLater().
+                pass
+
+
+class BrainLaunchWorker(QThread):
+    """Background worker for launching llama-server - prevents GUI freeze."""
+
+    launch_finished = Signal(bool, str, object)  # success, message, process
+
+    def __init__(self, role_name: str, cmd: list, port: int, check_fn=None):
+        super().__init__()
+        self.role_name = role_name
+        self.cmd = cmd
+        self.port = port
+        self.check_fn = check_fn or self._default_check
+        self._proc = None
+        self._stop_requested = False
+
+    def stop(self):
+        """Request cancellation and terminate a process already launched."""
+        self._stop_requested = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _default_check(self, port):
+        try:
+            import urllib.request
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                return True
+        except Exception:
+            return False
+
+    def run(self):
+        """Launch server and wait for it to be ready."""
+        import time
+        log_path = os.path.join(tempfile.gettempdir(), f"mrbot-{self.role_name.lower()}-llama-server.log")
+        try:
+            log_file = open(log_path, "w", encoding="utf-8", errors="replace")
+            self._proc = subprocess.Popen(
+                self.cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception as e:
+            self._record_failure(f"Popen failed: {e}")
+            self.launch_finished.emit(False, f"Failed to start {self.role_name}: {e}", None)
+            return
+
+        self._log_file = log_file
+        self._log_path = log_path
+
+        try:
+            deadline = time.monotonic() + 120.0
+            while time.monotonic() < deadline and not self._stop_requested:
+                if self._proc.poll() is not None:
+                    log_file.close()
+                    try:
+                        with open(log_path, encoding="utf-8", errors="replace") as f:
+                            tail = f.read()[-1200:].strip()
+                    except OSError:
+                        tail = ""
+                    self.launch_finished.emit(False, f"Process exited with code {self._proc.returncode}\n{tail}", None)
+                    return
+                if self.check_fn(self.port):
+                    log_file.close()
+                    self.launch_finished.emit(True, f"{self.role_name} ready on :{self.port}", self._proc)
+                    return
+                time.sleep(1.0)
+
+            log_file.close()
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+            message = "Launch cancelled" if self._stop_requested else "Server did not respond after 120s"
+            self.launch_finished.emit(False, message, None)
+        except Exception as e:
+            self._record_failure(f"worker run failed: {e}")
+            try:
+                if self._proc is not None and self._proc.poll() is None:
+                    self._proc.terminate()
+            except Exception:
+                pass
+            self.launch_finished.emit(False, f"Launcher error: {e}", None)
+
+    def _record_failure(self, message: str):
+        try:
+            path = os.path.join(tempfile.gettempdir(), "mrbot-dual-brain-crash.log")
+            with open(path, "a", encoding="utf-8", errors="replace") as report:
+                report.write(f"\n[{datetime.now().isoformat()}] {self.role_name}: {message}\n")
+                report.write(f"command={self.cmd!r}\n")
+        except Exception:
+            pass
+
+
     def _refresh_small_brain_models(self):
         """Populate the Small Brain dropdown with ALL local .gguf, selecting the
         currently-loaded model if the server is up."""
@@ -1680,8 +2219,7 @@ class DualBrainControl(QWidget):
     # own llama-server pinned to ONE device with --split-mode none), so the guard
     # only warns when a model's estimated VRAM need exceeds the target GPU's free
     # VRAM, letting the user confirm a system-RAM spill is intended.
-    @staticmethod
-    def _gpu_free_vram_gb(device_index: int) -> Optional[float]:
+    def _gpu_free_vram_gb(self, device_index: int) -> Optional[float]:
         """Free VRAM (GB) for a CUDA device via nvidia-smi; None if unavailable.
         
         v2.1: Added timeout to prevent GUI freeze when nvidia-smi is slow.
@@ -1713,9 +2251,20 @@ class DualBrainControl(QWidget):
         Falls back to weights+margin when metadata is unreadable.
         """
         ctx = self.sb_ctx_spin.value() if small else self.bb_ctx_spin.value()
+        kv_name = (self.sb_kv_combo.currentText() if small else self.bb_kv_combo.currentText()) or "f16"
+        kv_type_bytes = {
+            "f32": 4,
+            "f16": 2,
+            "q8_0": 1,
+            "q4_0": 0.5,
+            "auto": 2,
+        }.get(kv_name, 2)
         try:
             from agents.gguf_meta import estimate_vram_gb
-            return estimate_vram_gb(model_path, context=ctx)
+            estimate = estimate_vram_gb(
+                model_path, context=ctx, kv_type_bytes=kv_type_bytes)
+            estimate["kv_type"] = kv_name
+            return estimate
         except Exception:
             try:
                 import os as _os
@@ -1751,8 +2300,9 @@ class DualBrainControl(QWidget):
                     result["value"] = True
                 else:
                     # Need exceeds free VRAM -> ask user on GUI thread
-                    from PySide6.QtCore import QTimer
-                    QTimer.singleShot(0, lambda: self._show_vram_warning(small, model_path, need, free, result))
+                    # Emit from the worker thread; Qt delivers this QWidget
+                    # slot on the GUI thread through the queued connection.
+                    self.vram_warning_requested.emit(small, model_path, need, free, result)
                     return
             except Exception:
                 result["value"] = True
@@ -1762,7 +2312,10 @@ class DualBrainControl(QWidget):
         t.start()
         
         # Wait for result (with timeout to prevent infinite freeze)
-        t.join(timeout=10)
+        # Never hold the GUI thread for the full VRAM probe. If nvidia-smi or
+        # metadata parsing is slow, the launch path continues with its loading
+        # state instead of freezing the window.
+        t.join(timeout=0.25)
         if not result["done"]:
             return True  # timeout -> proceed
         
@@ -1796,100 +2349,198 @@ class DualBrainControl(QWidget):
         started it or not (it may be a leftover from a prior run / scripts). The
         panel owns that port, so Stop always acts on it (v2.0.36s fix).
         """
-        self._log("Stopping Small Brain...")
-        self._force_stop_brain(True)
-        self._log("✅ Small Brain stopped")
+        self._begin_stop_brain(True)
+
+    def _begin_stop_brain(self, small: bool):
+        label = "Small Brain" if small else "Big Brain"
+        self._log(f"Stopping {label}...")
+        worker = ProviderStopWorker(self, small)
+        setattr(self, "_small_stop_worker" if small else "_big_stop_worker", worker)
+        worker.stop_finished.connect(lambda: self._on_brain_stopped(small))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_brain_stopped(self, small: bool):
+        label = "Small Brain" if small else "Big Brain"
+        self._log(f"✅ {label} stopped")
         self._refresh_provider_status()
 
     # ═══════════════════════════════════════════════════════════════════
     # START HANDLERS
     # ═══════════════════════════════════════════════════════════════════
     def _on_start_small_brain(self):
-        """Start Small Brain (llama-server on 1660 Super, port 1235)."""
-        # Check if already running
-        sb_port = self._brain_port(True)
-        running, models = self.provider_checker.check_llama_server(sb_port)
-        if running:
-            self._log("Small Brain already running")
-            self._refresh_provider_status()
-            return
+        self._probe_before_start(True)
 
-        self._log("Starting Small Brain (llama-server on 1660 Super)...")
-
-        # Launch llama-server on port 1235 with device 1 (1660 Super)
+    def _probe_before_start(self, small: bool):
+        label = "Small Brain" if small else "Big Brain"
         try:
-            model = self._resolve_model_path(True, self._current_model_path(True))
-            if not model:
-                self._log("❌ Small Brain: no model found. Set SMALL_BRAIN_MODEL in .env or pick a real model, then Start.")
+            port = self._brain_port(small)
+            self._log(f"Checking {label}...")
+            worker = ProviderProbeWorker(self.provider_checker, port)
+            setattr(self, "_small_probe_worker" if small else "_big_probe_worker", worker)
+            worker.probe_finished.connect(
+                lambda running, models: self._on_provider_probe_done(small, running, models)
+            )
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+        except Exception as exc:
+            self._log(f"❌ {label} start check failed: {exc}")
+            self._record_start_failure(f"{label.lower()} probe", exc)
+
+    def _on_provider_probe_done(self, small: bool, running: bool, models):
+        try:
+            if running:
+                self._log(f"{'Small' if small else 'Big'} Brain already running")
+                self._refresh_provider_status()
                 return
-            # VRAM-affinity guard (warn-but-allow) before launching.
-            if not self._check_vram_affinity(True, model):
-                self._log("⛔ Small Brain start cancelled — model exceeds the 1660 Super's VRAM (would spill to RAM).")
-                return
+            if small:
+                self._start_small_brain_after_probe()
+            else:
+                self._start_big_brain_after_probe()
+        except Exception as exc:
+            self._log(f"❌ {'Small' if small else 'Big'} Brain start failed: {exc}")
+            self._set_loading(small, False, "")
+
+    def _start_small_brain_after_probe(self):
+        """Start Small Brain (llama-server on 1660 Super, port 1235)."""
+        try:
             from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
             rt = self.runtime or DualBrainRuntime.from_env()
             cfg = rt.config(BrainRole.SMALL)
+            if not cfg.enabled:
+                self._log("ℹ️ Small Brain is disabled in Settings; no local server started.")
+                self._set_loading(True, False, "")
+                return
+            if cfg.provider != "llamacpp":
+                self._log(f"ℹ️ Small Brain uses {cfg.provider}; configure that provider instead of starting llama-server.")
+                self._set_loading(True, False, "")
+                return
+            self._log("Starting Small Brain (llama-server on 1660 Super)...")
+
+            model = self._resolve_model_path(True, self._current_model_path(True))
+            if not model:
+                self._log("❌ Small Brain: no model found. Set SMALL_BRAIN_MODEL in .env or pick a real model, then Start.")
+                self._set_loading(True, False, "")
+                return
+            # Show feedback before metadata/VRAM checks so the GUI never looks
+            # idle while launch preparation is in progress.
+            self._set_loading(True, True, model)
+            # VRAM-affinity guard (warn-but-allow) before launching.
+            if not self._check_vram_affinity(True, model):
+                self._log("⛔ Small Brain start cancelled — model exceeds the 1660 Super's VRAM (would spill to RAM).")
+                self._set_loading(True, False, "")
+                return
+            
             # Apply GUI overrides onto the canonical config.
             cfg.context = self.sb_ctx_spin.value()
             cfg.threads = self.sb_threads_spin.value()
             cfg.batch = self.sb_batch_spin.value()
             cfg.split_mode = self.sb_split_combo.currentText() or "none"
             cfg.kv_cache = self.sb_kv_combo.currentText() or "f16"
+            self._persist_settings()
             gpu_l = self.sb_gpu_layers_spin.value()
             cfg.gpu_layers = None if gpu_l < 0 else int(gpu_l)
             cfg.model = model
             cmd = cfg.build_llama_command(model_path=model)
-            proc, log_path, models = self._launch_and_wait("small", cmd, sb_port)
-            self._small_server_process = proc
-            self.we_started_small = True
-            self._log(f"Small Brain ready on :{sb_port} (1660 Super + RAM, ctx={cfg.context}, threads={cfg.threads}, gpu_layers={cfg.gpu_layers}, split={cfg.split_mode}, kv={cfg.kv_cache})\n    model={model}")
-            self._refresh_provider_status()
+            
+            # Launch asynchronously to prevent GUI freeze
+            self._small_launch_worker = BrainLaunchWorker(
+                "small", cmd, self._brain_port(True))
+            self._small_launch_worker.launch_finished.connect(self._on_small_brain_launched)
+            self._small_launch_worker.finished.connect(self._small_launch_worker.deleteLater)
+            self._small_launch_worker.start()
+            
         except Exception as e:
-            self.we_started_small = False
             self._log(f"❌ Failed to start Small Brain: {e}")
+            self._record_start_failure("small launch setup", e)
+            self._set_loading(True, False, "")
+
+    def _on_small_brain_launched(self, success: bool, message: str, proc):
+        """Handle small brain launch completion."""
+        try:
+            if success:
+                self._small_server_process = proc
+                self.we_started_small = True
+                self._log(f"✅ {message}")
+                self._refresh_provider_status()
+            else:
+                self._log(f"❌ {message}")
+                self.we_started_small = False
+            self._set_loading(True, False, "")
+        except Exception as exc:
+            self._record_start_failure("small completion", exc)
 
     def _on_start_big_brain(self):
+        self._probe_before_start(False)
+
+    def _start_big_brain_after_probe(self):
         """Start Big Brain (llama-server on 5060 Ti, port 1234)."""
-        # Check if already running
-        bb_port = self._brain_port(False)
-        running, models = self.provider_checker.check_llama_server(bb_port)
-        if running:
-            self._log("Big Brain already running")
-            self._refresh_provider_status()
-            return
-
-        self._log("Starting Big Brain (llama-server on 5060 Ti)...")
-
-        # Launch llama-server on port 1234 with device 0 (5060 Ti)
         try:
-            model = self._resolve_model_path(False, self._current_model_path(False))
-            if not model:
-                self._log("❌ Big Brain: no model found. Set BIG_BRAIN_MODEL in .env or pick a real model, then Start.")
-                return
-            # VRAM-affinity guard (warn-but-allow) before launching.
-            if not self._check_vram_affinity(False, model):
-                self._log("⛔ Big Brain start cancelled — model exceeds the 5060 Ti's free VRAM (would spill to RAM).")
-                return
             from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
             rt = self.runtime or DualBrainRuntime.from_env()
             cfg = rt.config(BrainRole.BIG)
+            if not cfg.enabled:
+                self._log("ℹ️ Big Brain is disabled in Settings; no local server started.")
+                self._set_loading(False, False, "")
+                return
+            if cfg.provider != "llamacpp":
+                self._log(f"ℹ️ Big Brain uses {cfg.provider}; configure that provider instead of starting llama-server.")
+                self._set_loading(False, False, "")
+                return
+            self._log("Starting Big Brain (llama-server on 5060 Ti)...")
+
+            model = self._resolve_model_path(False, self._current_model_path(False))
+            if not model:
+                self._log("❌ Big Brain: no model found. Set BIG_BRAIN_MODEL in .env or pick a real model, then Start.")
+                self._set_loading(False, False, "")
+                return
+            # Show feedback before metadata/VRAM checks so the GUI never looks
+            # idle while launch preparation is in progress.
+            self._set_loading(False, True, model)
+            # VRAM-affinity guard (warn-but-allow) before launching.
+            if not self._check_vram_affinity(False, model):
+                self._log("⛔ Big Brain start cancelled — model exceeds the 5060 Ti's free VRAM (would spill to RAM).")
+                self._set_loading(False, False, "")
+                return
+            
             cfg.context = self.bb_ctx_spin.value()
             cfg.threads = self.bb_threads_spin.value()
             cfg.batch = self.bb_batch_spin.value()
             cfg.split_mode = self.bb_split_combo.currentText() or "none"
             cfg.kv_cache = self.bb_kv_combo.currentText() or "f16"
+            self._persist_settings()
             gpu_l = self.bb_gpu_layers_spin.value()
             cfg.gpu_layers = None if gpu_l < 0 else int(gpu_l)
             cfg.model = model
             cmd = cfg.build_llama_command(model_path=model)
-            proc, log_path, models = self._launch_and_wait("big", cmd, bb_port)
-            self._big_server_process = proc
-            self.we_started_big = True
-            self._log(f"Big Brain ready on :{bb_port} (5060 Ti + RAM, ctx={cfg.context}, threads={cfg.threads}, gpu_layers={cfg.gpu_layers}, split={cfg.split_mode}, kv={cfg.kv_cache})\n    model={model}")
-            self._refresh_provider_status()
+            
+            # Launch asynchronously to prevent GUI freeze
+            self._big_launch_worker = BrainLaunchWorker(
+                "big", cmd, self._brain_port(False))
+            self._big_launch_worker.launch_finished.connect(self._on_big_brain_launched)
+            self._big_launch_worker.finished.connect(self._big_launch_worker.deleteLater)
+            self._big_launch_worker.start()
+            
         except Exception as e:
             self.we_started_big = False
             self._log(f"❌ Failed to start Big Brain: {e}")
+            self._record_start_failure("big launch setup", e)
+            self._set_loading(False, False, "")
+
+    def _on_big_brain_launched(self, success: bool, message: str, proc):
+        """Handle big brain launch completion."""
+        try:
+            if success:
+                self._big_server_process = proc
+                self.we_started_big = True
+                self._log(f"✅ {message}")
+                self._refresh_provider_status()
+            else:
+                self._log(f"❌ {message}")
+                self.we_started_big = False
+            self._set_loading(False, False, "")
+        except Exception as exc:
+            self._record_start_failure("big completion", exc)
 
 
     
@@ -1900,10 +2551,7 @@ class DualBrainControl(QWidget):
         started it or not (it may be a leftover from a prior run / scripts). The
         panel owns that port, so Stop always acts on it (v2.0.36s fix).
         """
-        self._log("Stopping Big Brain...")
-        self._force_stop_brain(False)
-        self._log("✅ Big Brain stopped")
-        self._refresh_provider_status()
+        self._begin_stop_brain(False)
 
     # ═══════════════════════════════════════════════════════════════════
     # STOP ALL HANDLER
@@ -1956,10 +2604,15 @@ class DualBrainControl(QWidget):
         if not path:
             return
         self.sb_model_label.setText(f"Model: {os.path.basename(path)}")
-        
+
         # Sync model to adapter
         self._sync_adapter_model(True)
-        
+        self.small_brain_model_changed.emit(model_name)
+
+        # Guard: skip auto-restart if we're currently suppressing model-change restarts
+        if getattr(self, "_suppress_model_change_restart", False):
+            return
+
         running, models = self.provider_checker.check_llama_server(self._brain_port(True), timeout=2)
         if running:
             loaded = models[0] if models else ""
@@ -1983,10 +2636,15 @@ class DualBrainControl(QWidget):
         if not path:
             return
         self.bb_model_label.setText(f"Model: {os.path.basename(path)}")
-        
+
         # Sync model to adapter
         self._sync_adapter_model(False)
-        
+        self.big_brain_model_changed.emit(model_name)
+
+        # Guard: skip auto-restart if we're currently suppressing model-change restarts
+        if getattr(self, "_suppress_model_change_restart", False):
+            return
+
         running, models = self.provider_checker.check_llama_server(self._brain_port(False), timeout=2)
         if running:
             loaded = models[0] if models else ""
@@ -1998,10 +2656,9 @@ class DualBrainControl(QWidget):
             self._last_big_model = path
 
     def _on_start_all(self):
-        """Start both Small Brain and Big Brain."""
+        """Start both brains concurrently through their non-blocking probes."""
         self._log("Starting all providers...")
         self._on_start_small_brain()
-        time.sleep(2)
         self._on_start_big_brain()
 
     # ═══════════════════════════════════════════════════════════════════
@@ -2011,10 +2668,15 @@ class DualBrainControl(QWidget):
         """Refresh the status of both providers on a background thread so the
         GUI never blocks on HTTP to the llama-server ports (tab-switch freeze fix)."""
         import threading
-        t = threading.Thread(target=self._probe_providers, daemon=True)
-        t.start()
+        if self._closing:
+            return
+        thread = threading.Thread(target=self._probe_providers, daemon=True)
+        self._provider_probe_thread = thread
+        thread.start()
 
     def _probe_providers(self):
+        if self._closing:
+            return
         sb_port = self._brain_port(True)
         bb_port = self._brain_port(False)
         try:
@@ -2025,10 +2687,15 @@ class DualBrainControl(QWidget):
             bb_running, bb_models = self.provider_checker.check_llama_server(bb_port)
         except Exception:
             bb_running, bb_models = False, []
-        self.provider_probed.emit({
-            "sb_running": sb_running, "sb_models": sb_models,
-            "bb_running": bb_running, "bb_models": bb_models,
-        })
+        if self._closing:
+            return
+        try:
+            self.provider_probed.emit({
+                "sb_running": sb_running, "sb_models": sb_models,
+                "bb_running": bb_running, "bb_models": bb_models,
+            })
+        except RuntimeError:
+            pass
 
     def _apply_provider_status(self, data):
         """Apply probe results on the GUI thread."""
@@ -2067,6 +2734,25 @@ class DualBrainControl(QWidget):
             self._repopulate_model_combo(False, "")
             self.bb_start_btn.setEnabled(True)
             self.bb_stop_btn.setEnabled(False)
+
+        # Update Start All button state
+        both_running = sb_running and bb_running
+        any_running = sb_running or bb_running
+        try:
+            if hasattr(self, "start_all_btn") and self.start_all_btn is not None:
+                self.start_all_btn.setEnabled(not both_running)
+            if hasattr(self, "stop_all_btn") and self.stop_all_btn is not None:
+                self.stop_all_btn.setEnabled(any_running)
+        except RuntimeError:
+            # Widget is already torn down during tab rebuilds; ignore late updates.
+            pass
+
+    def _safe_apply_provider_status(self, data):
+        """Keep late provider probes from escaping through a Qt signal slot."""
+        try:
+            self._apply_provider_status(data)
+        except Exception as exc:
+            self._record_start_failure("provider status refresh", exc)
     
     # ═══════════════════════════════════════════════════════════════════
     # EVENT LOG
@@ -2089,7 +2775,89 @@ class DualBrainControl(QWidget):
     def cleanup(self):
         """Stop background threads when widget is destroyed."""
         self.gpu_worker.stop()
-        self.gpu_worker.wait(1000)
+        self.gpu_worker.wait(7000)
+        for name in (
+            "_small_probe_worker", "_big_probe_worker",
+            "_small_stop_worker", "_big_stop_worker",
+            "_small_launch_worker", "_big_launch_worker",
+        ):
+            worker = getattr(self, name, None)
+            if worker is not None and worker.isRunning():
+                if hasattr(worker, "stop"):
+                    worker.stop()
+                worker.wait(3000)
+
+
+class ProviderProbeWorker(QThread):
+    """Check one provider endpoint without blocking the GUI thread."""
+
+    probe_finished = Signal(bool, object)
+
+    def __init__(self, checker, port: int):
+        super().__init__()
+        self.checker = checker
+        self.port = port
+
+    def run(self):
+        try:
+            running, models = self.checker.check_llama_server(self.port, timeout=2)
+        except Exception:
+            running, models = False, []
+        self.probe_finished.emit(running, models)
+
+
+class ProviderStopWorker(QThread):
+    """Stop one provider process without blocking the GUI thread."""
+
+    stop_finished = Signal()
+
+    def __init__(self, control, small: bool):
+        super().__init__()
+        self.control = control
+        self.small = small
+
+    def run(self):
+        self.control._force_stop_brain(self.small)
+        self.stop_finished.emit()
+
+
+# Explicit adapters keep the provider-control API owned by DualBrainControl.
+# The implementations remain on the legacy worker class temporarily; unlike
+# the old conditional alias loop, each public handler is now deliberate and
+# fails clearly if its backend is ever removed.
+def _provider_handler(name):
+    _NO_ARGUMENT_HANDLERS = {
+        "_refresh_small_brain_models", "_refresh_big_brain_models",
+        "_on_stop_small_brain", "_on_start_small_brain",
+        "_on_start_big_brain", "_on_stop_big_brain", "_on_stop_all",
+        "_on_start_all", "_refresh_provider_status", "_probe_providers",
+    }
+
+    def handler(self, *args, **kwargs):
+        implementation = getattr(BrainLaunchWorker, name, None)
+        if implementation is None:
+            raise AttributeError(f"Provider handler backend missing: {name}")
+        if name in _NO_ARGUMENT_HANDLERS:
+            args = ()
+        return implementation(self, *args, **kwargs)
+    handler.__name__ = name
+    handler.__qualname__ = f"DualBrainControl.{name}"
+    return handler
+
+
+for _handler_name in (
+    "_refresh_small_brain_models", "_refresh_big_brain_models", "_get_llama_model",
+    "_on_stop_small_brain", "_begin_stop_brain", "_on_brain_stopped",
+    "_on_start_small_brain", "_probe_before_start", "_on_provider_probe_done",
+    "_start_small_brain_after_probe", "_on_small_brain_launched",
+    "_on_start_big_brain", "_start_big_brain_after_probe", "_on_big_brain_launched",
+    "_on_stop_big_brain", "_on_stop_all", "_on_small_brain_model_changed",
+    "_on_big_brain_model_changed", "_sync_adapter_model", "_on_start_all",
+    "_gpu_free_vram_gb", "_model_vram_need_gb", "_check_vram_affinity",
+    "_show_vram_warning", "_refresh_provider_status", "_probe_providers",
+    "_apply_provider_status", "_safe_apply_provider_status",
+):
+    setattr(DualBrainControl, _handler_name, _provider_handler(_handler_name))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

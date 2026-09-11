@@ -45,6 +45,7 @@ class OpportunityScanner:
         self.intelligence = intelligence or OpportunityIntelligenceEngine()
         
         self._running = False
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._adapters: Dict[str, PlatformAdapter] = {}
         self._last_scan: float = 0
@@ -61,6 +62,7 @@ class OpportunityScanner:
         if self._running:
             return
         
+        self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -69,8 +71,13 @@ class OpportunityScanner:
     def stop(self):
         """Stop the scanner daemon."""
         self._running = False
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                logger.warning("Opportunity scanner did not stop within 10 seconds")
+            else:
+                self._thread = None
         logger.info("Opportunity scanner stopped")
     
     def is_running(self) -> bool:
@@ -103,10 +110,7 @@ class OpportunityScanner:
                 logger.error(f"Scan error: {e}")
             
             # Wait for next scan
-            for _ in range(self.config.scan_interval_seconds):
-                if not self._running:
-                    break
-                time.sleep(1)
+            self._stop_event.wait(max(0, self.config.scan_interval_seconds))
     
     def _scan_all(self) -> List[Opportunity]:
         """Scan all configured platforms."""

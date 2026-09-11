@@ -827,6 +827,12 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self._shutdown_ollama()
         except Exception:
             pass
+        try:
+            WorkerAgent.shutdown_ollama_executor()
+            from agents.providers.ollama_adapter import OllamaAdapter
+            OllamaAdapter.shutdown_executor()
+        except Exception:
+            pass
         for worker in (getattr(self, "manager", None), getattr(self, "summarizer", None)):
             if worker is None:
                 continue
@@ -840,6 +846,12 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                     worker.terminate()
             except Exception:
                 pass
+        try:
+            job_worker = getattr(self, "job_worker", None)
+            if job_worker is not None and hasattr(job_worker, "close"):
+                job_worker.close()
+        except Exception:
+            pass
         try:
             if getattr(self, "db", None) is not None:
                 self.db.close()
@@ -1224,7 +1236,11 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
 
-        title_lbl = QLabel("MrBot1000 v2.1")
+        try:
+            from version import __version__
+        except Exception:
+            __version__ = "2.1.1"
+        title_lbl = QLabel(f"MrBot1000 v{__version__}")
         title_lbl.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         title_lbl.setStyleSheet(
             "font-size:15px; font-weight:bold; padding:8px 0px; "
@@ -1246,11 +1262,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         tab_specs = [
                     ("Management",     self.create_management_tab),
                     ("Providers & GPU", self.create_providers_gpu_tab),
+                    ("Model Library",  self.create_model_library_tab),
                     ("Safety & Tools", self.create_safety_tools_tab),
                     ("Chat",           self.create_chat_tab),
                     ("Dialogue",       self.create_dialogue_tab),
-                    ("Collaboration",  self.create_collaboration_tab),
-                    ("Memory & Stream",self.create_memory_stream_tab),
                     ("Browse Root",    self.create_file_browser_tab),
                     ("Payments",       self.create_payments_tab),
                     ("Earnings",       self.create_earnings_tab),
@@ -1274,6 +1289,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # provider/GPU status surface and must never remain on a Loading label.
         self._ensure_tab_built(0)
         self._ensure_tab_built(1)
+        self._ensure_tab_built(2)
 
         # Auto-populate the Ollama model dropdowns the first time the Settings
         # tab is opened, so you don't have to click Refresh manually (v2.0.20h).

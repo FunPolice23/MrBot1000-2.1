@@ -1,15 +1,18 @@
-# MrBot1000 v2.1 — Dual-Brain AI-Powered Earning Agent
+# MrBot1000 v2.1.1 — Dual-Brain AI-Powered Earning Agent
 
 A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. Runs entirely locally — no cloud dependencies, no data sharing.
 
-## v2.1 Highlights (2026-09-06)
+## v2.1.1 Highlights (2026-09-11)
 
 - **Canonical dual-brain runtime** (`agents/dual_brain_runtime.py`): one source of truth for role→endpoint/model/device. Big Brain → RTX 5060 Ti (CUDA 0, port 1234); Small Brain → GTX 1660 Super (CUDA 1, port 1235). llama.cpp/llama-server default; Ollama/LM Studio are explicit opt-ins.
 - **Canonical cross-model collaboration** (`agents/dual_brain_coordinator.py`): deterministic plan→research→review→execute handoff on the EventBus with a durable MessageLog ledger; model_fn injected (mock-first, cycle-safe).
 - **Durable autonomous runs** (`agents/autonomous_run_store.py`): SQLite run/stage/idempotency ledger with restart recovery; autonomous-loop results now survive restarts.
 - **Unified composition root** (`agents/composition_root.py`): one shared pipeline/portfolio/run_store/lifecycle per process.
 - **First real paper/human-gated earning capability** (`agents/earning_capability.py`): produces a real TaskWorkspace deliverable, validates it deterministically, stops on human gates, packages locally, and records submission evidence — never fabricates payment or success.
-- **Collaboration / Run Monitor tab** added (now 15 tabs).
+- **Dialogue and Management consolidation**: Dialogue now tracks goals, tasks,
+  and progress; redundant Collaboration and Memory & Stream tabs are removed.
+- **Public publishing workflow**: safe mirror synchronization plus a confirmed
+  CLI/GUI GitHub upload helper.
 
 ## Quick Start
 

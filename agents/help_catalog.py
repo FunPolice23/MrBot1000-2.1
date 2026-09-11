@@ -5,14 +5,14 @@ A dependency-light, read-only catalog of the app's major features/controls so
 that a help panel, in-app search box, or automation can answer "what does this
 do?" without importing the GUI. Every entry is grounded in the real code:
 
-  - 13 main-window tabs built from ``tab_specs`` in main.py:
+    - Main-window tabs built from ``tab_specs`` in main.py:
     Management, Providers & GPU, Safety & Tools, Chat, Dialogue,
-    Collaboration, Memory & Stream, Browse Root, Payments, Earnings,
+        Browse Root, Payments, Earnings,
     Settings, Live Logs, DB Stats.
   - GUI builders in gui/tab_builders.py (create_* methods) and widgets in
     gui/ (dual_brain_control.py, dialogue_tab.py, collaboration_tab.py,
-    safety_tools_tab.py, chat_tab.py, llama_server_manager.py,
-    model_switcher.py, dual_brain_control.py).
+    safety_tools_tab.py, chat_tab.py, model_switcher.py,
+    dual_brain_control.py).
   - Worker / orchestration modules in agents/ (personas.py, dual_brain_*
     coordinator/runtime, big_brain.py, small_brain.py, gguf_meta.py, etc.)
 
@@ -210,35 +210,6 @@ FEATURES: List[dict] = [
         "example": "Click once to get a single reply from the active brain and inspect it.",
     },
 
-    # ── Collaboration tab (create_collaboration_tab + collaboration_tab.py) ──
-    {
-        "feature": "Collaboration / Run Monitor tab",
-        "category": "Collaboration",
-        "description":
-            "A monitor + manual trigger surface for the shared DualBrainCoordinator. It renders "
-            "the coordinator's run ledger (a runs_table with columns Run / Status / Goal / "
-            "Stages / Result) and lets you type a goal and launch a collaboration run. Owns the "
-            "coordinator so Chat/Dialogue/monitor observe one shared ledger.",
-        "example": "Type a goal in the input and press 'Run Collaboration' to execute it via the coordinator.",
-    },
-    {
-        "feature": "Run Collaboration (coordinator run)",
-        "category": "Collaboration",
-        "description":
-            "Runs a goal through DualBrainCoordinator.collaborate() on a background QThread "
-            "(RunCollaborationWorker). A down model server degrades the run to FAILED rather "
-            "than blocking or crashing the GUI.",
-        "example": "Launch 'find a safe freelance gig' and watch it split into Driver/Navigator stages.",
-    },
-    {
-        "feature": "Collaboration run monitor",
-        "category": "Collaboration",
-        "description":
-            "Live table of past and running collaboration runs: run id, status, goal, stage "
-            "count, and result. Each coordinator run emits its dict for the table via to_dict().",
-        "example": "Check the monitor table to see whether the last run SUCCEEDED or FAILED.",
-    },
-
     # ── Persona system (agents/personas.py) ─────────────────────────────────
     {
         "feature": "Persona system (Driver & Navigator)",
@@ -269,19 +240,19 @@ FEATURES: List[dict] = [
         "example": "A coordinator maps BrainRole.BIG to the Driver persona before inference.",
     },
 
-    # ── Dual-brain runtime / coordinator / memory & stream ──────────────────
+    # ── Dual-brain runtime / coordinator / management memory ────────────────
     {
         "feature": "Canonical DualBrainRuntime",
         "category": "Providers & GPU / Collaboration",
         "description":
             "DualBrainRuntime.from_env() is the single canonical runtime contract (endpoint, "
-            "model, device) shared across the Providers & GPU panel, the Collaboration monitor, "
+            "model, device) shared across the Providers & GPU panel and Dialogue, "
             "and the brain adapters, so every tab observes the same configuration.",
         "example": "Changing the model in Providers & GPU is reflected in the Collaboration run monitor.",
     },
     {
         "feature": "DualBrainCoordinator collaboration protocol",
-        "category": "Collaboration",
+        "category": "Dialogue / Management",
         "description":
             "agents/dual_brain_coordinator.py orchestrates a multi-stage Driver/Navigator "
             "collaboration with a run ledger and per-run status, logging messages via "
@@ -289,13 +260,13 @@ FEATURES: List[dict] = [
         "example": "The coordinator logs each Driver->Navigator exchange as a stage of a run.",
     },
     {
-        "feature": "Memory & Stream tab",
-        "category": "Memory & Stream",
+        "feature": "Management memory and stream telemetry",
+        "category": "Management",
         "description":
-            "Tab built by create_memory_stream_tab() exposing memory databases and a live stream "
-            "of agent activity/log messages. Maps to the earning_memory and dual_brain memory "
-            "stores.",
-        "example": "Open Memory & Stream to browse stored memories alongside the live log feed.",
+            "Management exposes the useful legacy memory databases and live stream health "
+            "telemetry without requiring a separate tab. Chat and CEO memory can be refreshed "
+            "or cleared explicitly.",
+        "example": "Open Management to inspect memory status and stream health.",
     },
 
     # ── Payments / Earnings / wallet (create_payments_tab/earnings_tab) ─────

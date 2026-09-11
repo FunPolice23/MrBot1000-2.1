@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import closing
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -273,14 +274,13 @@ class SelfAuditEngine:
         """Identify search strategies with poor performance."""
         try:
             # Query the database directly for worst strategies
-            conn = sqlite3.connect(self.memory.db_path)
-            rows = conn.execute(
-                """SELECT strategy_id, used_count, result_count, useful_result_count,
-                          completed, paid, net_revenue, duplicate_count
-                   FROM search_strategy WHERE used_count >= ?""",
-                (self.min_sample_size,)
-            ).fetchall()
-            conn.close()
+            with closing(sqlite3.connect(self.memory.db_path)) as conn:
+                rows = conn.execute(
+                    """SELECT strategy_id, used_count, result_count, useful_result_count,
+                              completed, paid, net_revenue, duplicate_count
+                       FROM search_strategy WHERE used_count >= ?""",
+                    (self.min_sample_size,)
+                ).fetchall()
 
             strategies = []
             for row in rows:
@@ -666,9 +666,8 @@ class SelfAuditEngine:
     def _get_all_platforms(self) -> List[str]:
         """Get all platform names from memory."""
         try:
-            conn = sqlite3.connect(self.memory.db_path)
-            rows = conn.execute("SELECT DISTINCT platform FROM reputation_memory").fetchall()
-            conn.close()
+            with closing(sqlite3.connect(self.memory.db_path)) as conn:
+                rows = conn.execute("SELECT DISTINCT platform FROM reputation_memory").fetchall()
             return [r[0] for r in rows if r[0]]
         except Exception:
             return []
@@ -676,9 +675,8 @@ class SelfAuditEngine:
     def _get_all_opportunity_ids(self) -> List[str]:
         """Get all opportunity IDs from memory."""
         try:
-            conn = sqlite3.connect(self.memory.db_path)
-            rows = conn.execute("SELECT DISTINCT id FROM opportunities").fetchall()
-            conn.close()
+            with closing(sqlite3.connect(self.memory.db_path)) as conn:
+                rows = conn.execute("SELECT DISTINCT id FROM opportunities").fetchall()
             return [r[0] for r in rows if r[0]]
         except Exception:
             return []

@@ -15,6 +15,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -285,37 +286,35 @@ class OpportunityPortfolio:
         entry.added_at = entry.added_at or time.time()
         entry.updated_at = time.time()
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("""
-                INSERT OR REPLACE INTO opportunity_portfolio
-                (opportunity_id, work_status, priority, expected_value, expected_hourly_value,
-                 deadline, confidence, risk, effort, next_action, waiting_reason, evidence_status,
-                 payment_status, blocked_reason, platform, category, task_type, skill_fit,
-                 policy_score, lifecycle_stage, added_at, updated_at, policy_version,
-                 opportunity_ref_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                entry.opportunity_id, entry.work_status.value, entry.priority,
-                entry.expected_value, entry.expected_hourly_value, entry.deadline,
-                entry.confidence, entry.risk, entry.effort, entry.next_action,
-                entry.waiting_reason, entry.evidence_status, entry.payment_status,
-                entry.blocked_reason, entry.platform, entry.category, entry.task_type,
-                entry.skill_fit, entry.policy_score, entry.lifecycle_stage,
-                entry.added_at, entry.updated_at, entry.policy_version,
-                json.dumps(entry.opportunity_ref, default=str),
-            ))
-            conn.commit()
-            conn.close()
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                with conn:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO opportunity_portfolio
+                        (opportunity_id, work_status, priority, expected_value, expected_hourly_value,
+                         deadline, confidence, risk, effort, next_action, waiting_reason, evidence_status,
+                         payment_status, blocked_reason, platform, category, task_type, skill_fit,
+                         policy_score, lifecycle_stage, added_at, updated_at, policy_version,
+                         opportunity_ref_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        entry.opportunity_id, entry.work_status.value, entry.priority,
+                        entry.expected_value, entry.expected_hourly_value, entry.deadline,
+                        entry.confidence, entry.risk, entry.effort, entry.next_action,
+                        entry.waiting_reason, entry.evidence_status, entry.payment_status,
+                        entry.blocked_reason, entry.platform, entry.category, entry.task_type,
+                        entry.skill_fit, entry.policy_score, entry.lifecycle_stage,
+                        entry.added_at, entry.updated_at, entry.policy_version,
+                        json.dumps(entry.opportunity_ref, default=str),
+                    ))
 
     def get(self, opportunity_id: str) -> Optional[PortfolioEntry]:
         """Get a single entry by ID."""
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            row = conn.execute(
-                "SELECT * FROM opportunity_portfolio WHERE opportunity_id=?",
-                (opportunity_id,)
-            ).fetchone()
-            conn.close()
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                row = conn.execute(
+                    "SELECT * FROM opportunity_portfolio WHERE opportunity_id=?",
+                    (opportunity_id,)
+                ).fetchone()
         if row is None:
             return None
         return self._row_to_entry(row)
@@ -327,17 +326,15 @@ class OpportunityPortfolio:
     def remove(self, opportunity_id: str) -> None:
         """Delete an entry."""
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("DELETE FROM opportunity_portfolio WHERE opportunity_id=?", (opportunity_id,))
-            conn.commit()
-            conn.close()
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                with conn:
+                    conn.execute("DELETE FROM opportunity_portfolio WHERE opportunity_id=?", (opportunity_id,))
 
     def list_all(self) -> List[PortfolioEntry]:
         """List all entries."""
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute("SELECT * FROM opportunity_portfolio ORDER BY added_at").fetchall()
-            conn.close()
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                rows = conn.execute("SELECT * FROM opportunity_portfolio ORDER BY added_at").fetchall()
         return [self._row_to_entry(r) for r in rows]
 
     def list_work(self, status: Optional[WorkStatus] = None) -> List[PortfolioEntry]:
@@ -345,12 +342,11 @@ class OpportunityPortfolio:
         if status is None:
             return self.list_all()
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute(
-                "SELECT * FROM opportunity_portfolio WHERE work_status=? ORDER BY added_at",
-                (status.value,)
-            ).fetchall()
-            conn.close()
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT * FROM opportunity_portfolio WHERE work_status=? ORDER BY added_at",
+                    (status.value,)
+                ).fetchall()
         return [self._row_to_entry(r) for r in rows]
 
     def count_by_status(self) -> Dict[str, int]:

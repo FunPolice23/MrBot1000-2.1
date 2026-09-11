@@ -22,6 +22,13 @@ def _normalize_keep_alive(v: str) -> str | int:
 
 
 class OllamaAdapter:
+    _executor = ThreadPoolExecutor(max_workers=2)
+
+    @classmethod
+    def shutdown_executor(cls):
+        """Cancel queued calls during application shutdown."""
+        cls._executor.shutdown(wait=False, cancel_futures=True)
+
     def __init__(self, name: str = "ollama", *, disabled_env: str = "DISABLE_OLLAMA",
                  order: int = 0, chat_model: str = ""):
         self.name = name
@@ -53,8 +60,7 @@ class OllamaAdapter:
             else:
                 options["num_gpu"] = 0
         ollama_timeout = float(os.getenv("OLLAMA_TIMEOUT", 180))
-        _exec = ThreadPoolExecutor(max_workers=1)
-        _fut = _exec.submit(
+        _fut = self._executor.submit(
             lambda: ollama.chat(
                 model=model,
                 messages=[
@@ -69,8 +75,6 @@ class OllamaAdapter:
             _raw = _fut.result(timeout=ollama_timeout)
         except _TE:
             raise RuntimeError(f"ollama call timed out after {ollama_timeout}s")
-        finally:
-            _exec.shutdown(wait=False)
         return _raw["message"]["content"]
 
     def context_for(self, model: str) -> int:

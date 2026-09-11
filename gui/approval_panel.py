@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem,
-    QMessageBox, QComboBox, QSplitter, QFrame, QSizePolicy,
+    QMessageBox, QInputDialog, QComboBox, QSplitter, QFrame, QSizePolicy,
 )
 from PySide6.QtGui import QFont, QColor
 
@@ -153,6 +153,11 @@ class ApprovalPanel(QWidget):
                 self.list_widget.addItem(item)
         except Exception as e:
             logger.warning("approval panel refresh failed: %s", e)
+
+    def cleanup(self):
+        """Stop periodic queue polling before the main window is torn down."""
+        if self._timer.isActive():
+            self._timer.stop()
 
     def _on_selection_changed(self):
         sel = self.list_widget.selectedItems()

@@ -41,9 +41,13 @@ INCLUDE = [
     "earning_memory.py",
     "library.py",
     "startup_validation.py",
+    "version.py",
     "__init__.py",
     # Tests
     "tests",
+    "gui",
+    "prompts",
+    "scripts",
     # Agents
     "agents/__init__.py",
     "agents/base_worker.py",
@@ -95,6 +99,11 @@ EXCLUDE_PATTERNS = [
     "*.pyc", "*.pyo",
     "__pycache__",
     "*.log",
+    "models_cache.json", "settings.json", "local_files_compare.txt",
+    "wallet.key", "wallets.json", "gas_ledger.json",
+    "AUDIT_REPORT.md", "ai-copyright-report.md", "CURRENT_STATE.md",
+    "IMPROVEMENTS.md", "GITHUB_EARNING_ANALYSIS.md", "COMMS_REDESIGN.md",
+    "BLUEPRINT_v2.md", "CHANGELOG_2.0-2.0.34au.md", "CHANGELOG_NEW_SECTION.md",
     ".hermes",
     "CanvasHudController.cs",
     "clawgig_client.py",
@@ -103,6 +112,10 @@ EXCLUDE_PATTERNS = [
 
 SKIP_DIRS = {".hermes", "__pycache__", ".git", "github_upload"}
 SKIP_FILES = {"CanvasHudController.cs", "clawgig_client.py"}
+STALE_DESTINATION_FILES = {
+    "gui/llama_server_manager.py",
+    "prep_github_upload.py",
+}
 
 
 def should_skip(path: Path) -> bool:
@@ -115,6 +128,12 @@ def should_skip(path: Path) -> bool:
         if path.match(pat):
             return True
     return False
+
+
+def ignore_names(directory: str, names: list[str]) -> list[str]:
+    """Filter excluded files and directories for shutil.copytree."""
+    base = Path(directory)
+    return [name for name in names if should_skip(base / name)]
 
 
 def sync() -> None:
@@ -138,7 +157,7 @@ def sync() -> None:
         if src.is_dir():
             if dst.exists() and dst.is_file():
                 dst.unlink()
-            shutil.copytree(src, dst, ignore=lambda d, f: [], dirs_exist_ok=True)
+            shutil.copytree(src, dst, ignore=ignore_names, dirs_exist_ok=True)
         else:
             shutil.copy2(src, dst)
         copied.append(rel)
@@ -146,7 +165,7 @@ def sync() -> None:
     # Also copy any new root-level .py files plus agent/skill/test files that weren't listed explicitly
     candidates = []
     candidates.extend(ROOT.glob("*.py"))
-    for folder in ("agents", "skills", "tests"):
+    for folder in ("agents", "gui", "prompts", "scripts", "skills", "tests"):
         base = ROOT / folder
         if base.exists():
             candidates.extend(base.rglob("*"))
@@ -161,6 +180,14 @@ def sync() -> None:
             shutil.copy2(src, dst)
             copied.append(str(rel))
 
+    # Remove files explicitly retired from the public source tree. Never touch
+    # .git or unrelated repository metadata.
+    for rel in STALE_DESTINATION_FILES:
+        stale = DEST / rel
+        if stale.is_file():
+            stale.unlink()
+            print(f"Removed stale mirror file: {rel}")
+
     print(f"\nCopied {len(copied)} files to {DEST}")
     if skipped:
         print(f"Skipped {len(skipped)} items")
@@ -171,13 +198,13 @@ def sync() -> None:
         text = env_src.read_text(encoding="utf-8")
         text = text.replace("OLLAMA_CHAT_MODEL=llama3.2", "OLLAMA_CHAT_MODEL=your-chat-model-here")
         text = text.replace("OLLAMA_MODEL=llama3.2", "OLLAMA_MODEL=your-main-model-here")
-        # Replace any obvious placeholder keys
+        # Replace only secret-like values; preserve safe model/provider defaults.
+        sensitive = ("KEY", "TOKEN", "SECRET", "PASSWORD", "WALLET", "ADDRESS", "TAG")
         lines = []
         for line in text.splitlines():
             if "=" in line and not line.strip().startswith("#"):
                 k, v = line.split("=", 1)
-                v = v.strip()
-                if v and not v.startswith("your-") and not v.startswith("#"):
+                if any(part in k.upper() for part in sensitive):
                     lines.append(f"{k}=your-{k.lower().replace('_','-')}-here")
                     continue
             lines.append(line)

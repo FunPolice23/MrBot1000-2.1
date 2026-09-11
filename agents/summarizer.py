@@ -563,38 +563,43 @@ class SummarizerThread(QThread):
 
     def run(self):
         self.status_changed.emit("Idle", "Watching thoughts…")
+        try:
+            while self.running and not self.isInterruptionRequested():
+                # 1. Handle direct human chat (always, even when paused)
+                try:
+                    item = self._chat_queue.get_nowait()
+                    if isinstance(item, Message):
+                        self._handle_chat(item.text(), bus_msg=item)
+                    else:
+                        self._handle_chat(item)
+                except queue.Empty:
+                    pass
 
-        while self.running:
-            # 1. Handle direct human chat (always, even when paused)
+                if not self.paused:
+                    for q in (self.manager_queue, self.agent_queue,
+                              self.comms_queue):
+                        while True:
+                            try:
+                                _source, text = q.get_nowait()
+                                self.pending_thoughts.append(text)
+                            except queue.Empty:
+                                break
+
+                    now = time.time()
+                    if (len(self.pending_thoughts) >= self.min_thoughts
+                            and (now - self.last_thought_time) >= self.cooldown):
+                        self._summarize()
+
+                # Short waits make stop responsive without busy-spinning.
+                deadline = time.monotonic() + max(0.05, float(self.interval))
+                while (self.running and not self.isInterruptionRequested()
+                       and time.monotonic() < deadline):
+                    time.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
+        finally:
             try:
-                item = self._chat_queue.get_nowait()
-                # P2 (comms redesign): a structured Message carries correlation;
-                # a plain str is the legacy direct-call path.
-                if isinstance(item, Message):
-                    self._handle_chat(item.text(), bus_msg=item)
-                else:
-                    self._handle_chat(item)
-            except queue.Empty:
+                self.summ_db.close()
+            except Exception:
                 pass
-
-            if not self.paused:
-                # 2. Drain thought queues
-                for q in (self.manager_queue, self.agent_queue,
-                          self.comms_queue):
-                    while True:
-                        try:
-                            _source, text = q.get_nowait()
-                            self.pending_thoughts.append(text)
-                        except queue.Empty:
-                            break
-
-                # 3. Check summarization trigger
-                now = time.time()
-                if (len(self.pending_thoughts) >= self.min_thoughts
-                        and (now - self.last_thought_time) >= self.cooldown):
-                    self._summarize()
-
-            time.sleep(self.interval)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Summarization
@@ -882,7 +887,4 @@ class SummarizerThread(QThread):
 
     def stop(self):
         self.running = False
-        try:
-            self.summ_db.close()
-        except Exception:
-            pass
+        self.requestInterruption()
