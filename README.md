@@ -1,6 +1,6 @@
 # MrBot1000 v2.1.1 — Dual-Brain AI-Powered Earning Agent
 
-A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. Runs entirely locally — no cloud dependencies, no data sharing.
+A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. It is local-first: the default dual-brain runtime runs on your machine, while optional cloud providers are explicitly configured by the operator.
 
 ## v2.1.1 Highlights (2026-09-11)
 
@@ -137,9 +137,10 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 - **Big Brain / Marcus Rivera**: llama-server on port 1234, normally GPU device 0 — planning, coding, deep research, and review
 - **Small Brain / Alex Vega**: llama-server on port 1235, normally GPU device 1 — human chat, triage, and lightweight coordination
 - **Optional providers**: Ollama, LM Studio, vLLM, and supported cloud providers can be selected explicitly; they are not silent defaults
-- **Multi-agent system**: Manager (CEO), Coder, Analyst, JobSearch, Summarizer
-- **Message routing**: Agents-tab chat is answered by the **Summarizer thread** (independent QThread, chat model) so replies are never blocked by the Manager's main-model work; task/command intents are forwarded to the Manager.
-- **Cross-model communication**: EventBus (structured messages) + legacy SharedContext JSON (read-only fallback)
+- **Two-persona model runtime**: Marcus Rivera (Driver/Big Brain) plans and pushes work forward; Alex Vega (Navigator/Small Brain) handles chat, triage, risk checks, and verification
+- **Application services**: Management coordinates earning workflows, approvals, payouts, memory, and operational controls; specialized workers handle discovery, analysis, coding, and platform tasks
+- **Message routing**: Chat and Dialogue use the configured brain adapters; task and command intents are routed through the Manager and deterministic service boundaries
+- **Cross-model communication**: EventBus typed handoffs plus the durable collaboration/message ledger
 - **Opportunity lifecycle tracking**: Explicit, auditable stage transitions for discovered, researched, applied, in progress, submitted, paid, and failed opportunities
 - **Startup validation**: Checks configuration, provider availability, and safe-mode status before workflows begin
 - **Secure execution**: 14-step action pipeline with validation + human gates
@@ -155,49 +156,38 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 - **Win-rate guard** (v2.0.34aq): auto-decline platforms below configured success threshold; cold-start safe
 - **Cost guard** (v2.0.34y): daily LLM budget cap that skips billable providers when exceeded
 
-## UI Layout
-
-The Agents tab contains:
-
-1. **Chat Window** (center) — Conversational interface with main model
-2. **Agent Roster** (right side) — Live agent status indicators
-3. **Notifications Panel** (collapsible) — Agent actions, heartbeat logs, system events
-
-> **Change in v2.0**: Notifications and agent actions are now separated from the chat window into a collapsible side panel. The chat window remains clean for conversational flow with the main AI model.
-
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Application entry point, UI setup, theme system, settings persistence |
-| `manager.py` | CEO ManagerThread — agent orchestration, intent routing, chat handling, heartbeat loop, per-role memory |
-| `earning_pipeline.py` | Earning pipeline engine — discovery, evaluation, filtering, execution, economic accounting, self-audit, autonomous loop |
-| `agents/base_worker.py` | Shared worker base: LLM calling with multi-provider fallback, secure file I/O, research utilities, provider registry |
-| `agents/opportunity_models.py` | Canonical structured Opportunity model, flexible taxonomy, pluggable source interface, dedup, validation |
-| `agents/discovery_sources.py` | Existing platform integrations as pluggable sources (Upwork, Fiverr, Social, Airdrop, DeFi, Microtask, Dynamic, WebDiscovery) |
-| `agents/opportunity_lifecycle.py` | Opportunity lifecycle state machine with evidence-gated transitions |
-| `agents/economic_accounting.py` | Unified Economic Accounting Layer (v2.0.36j) |
-| `agents/self_audit.py` | Self-Audit Engine (v2.0.36j-T4) |
-| `agents/autonomous_loop.py` | Unified 24-stage autonomous planning loop (v2.0.36k) |
-| `agents/task_executor.py` | Generalized Task Executor — 14-step pipeline with validators + human gates (v2.0.36i) |
-| `agents/opportunity_portfolio.py` | Opportunity Portfolio & Work Queue (v2.0.36h) |
-| `agents/discovery_scheduler.py` | Dynamic Discovery Scheduler (v2.0.36f) |
-| `agents/earning_discoverer.py` | Dynamic earning opportunity discovery (Reddit, GitHub bounties, referral programs) |
-| `agents/airdrop_scanner.py` | Crypto airdrop monitoring from RSS feeds |
-| `agents/social_earning_platform.py` | Social layer — Reddit, Twitter, LinkedIn, forum job discovery |
-| `agents/evidence_store.py` | Evidence & Verification subsystem (v2.0.34au) |
-| `agents/instruction_gate.py` | v2.0.22 provenance gate (untrusted SKILL.md) |
-| `agents/trust_boundary.py` | v2.0.22 high-trust action boundary |
-| `agents/platforms/` | v2.0.22 platform adapter skeleton (Fiverr/Reddit) |
-| `action_pipeline.py` | Secure code execution with validation |
-| `database.py` | AgentDB — SQLite database for thoughts, actions, LLM stats, evidence |
-| `theme_config.py` | Theme system — presets + env-driven Custom theme |
-| `gui/tab_builders.py` | GUI tab builders (extracted from main.py) |
-| `ui.py` | Animated agent sprites, theme-aware widget styling |
-| `Agent.md` | Agent runtime contract & rules |
-| `ARCHITECTURE.md` | Full system architecture documentation |
-| `CHANGELOG.md` | Change history through the current 2.1.1 release |
-| `tests/__main__.py` | Test suite runner |
+| `main.py` | Application entry point, window setup, lazy tab loading, settings, and version display |
+| `manager.py` | Manager orchestration, intent routing, heartbeat, approvals, memory, and service coordination |
+| `agents/dual_brain_runtime.py` | Canonical Big Brain/Small Brain provider, endpoint, device, and model configuration |
+| `agents/dual_brain_coordinator.py` | Typed plan → research → review → execute collaboration handoff and run ledger |
+| `agents/personas.py` | Marcus Rivera and Alex Vega persona contracts and guardrails |
+| `agents/base_worker.py` | Shared worker behavior, provider calls, secure file I/O, and research utilities |
+| `agents/composition_root.py` | Shared process-level pipeline, portfolio, lifecycle, and run-store wiring |
+| `earning_pipeline.py` | Opportunity discovery, evaluation, filtering, execution, accounting, and audit integration |
+| `agents/autonomous_loop.py` | Unified 24-stage opportunity planning loop |
+| `agents/task_executor.py` | Deterministic task execution pipeline with validators and human gates |
+| `agents/opportunity_portfolio.py` | Persistent opportunity work queue and capacity controls |
+| `agents/opportunity_lifecycle.py` | Evidence-gated opportunity state transitions |
+| `agents/economic_accounting.py` | Verified revenue, costs, ROI, and net-hourly accounting |
+| `agents/evidence_store.py` | Evidence storage, verification, reconciliation, and payout truth status |
+| `agents/discovery_scheduler.py` | History-driven source/category/strategy scheduling |
+| `agents/self_audit.py` | Structured operational findings without security-policy mutation |
+| `agents/instruction_gate.py` / `agents/trust_boundary.py` | Untrusted-instruction provenance and high-trust action boundaries |
+| `gui/tab_builders.py` | Current visible tab construction and lazy-loading orchestration |
+| `gui/dialogue_tab.py` | Goal-driven Marcus/Alex Dialogue with bounded history and progress tracking |
+| `gui/management_tab.py` | Operational controls, earning workflows, approvals, payouts, memory, and stream health |
+| `gui/provider_config_widget.py` | Local/cloud provider configuration and role assignment |
+| `gui/model_library_tab.py` | Local model discovery and managed downloads |
+| `action_pipeline.py` | Proposal validation and controlled execution safeguards |
+| `database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
+| `theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
+| `version.py` | Public application version source (`2.1.1`) |
+| `Agent.md` / `ARCHITECTURE.md` / `CHANGELOG.md` | Runtime contract, system design, and release history |
+| `tests/` | Focused regression and subsystem tests |
 
 ## Configuration
 
@@ -249,15 +239,14 @@ Memory and stream-health controls are integrated into **Management**. The
 Collaboration coordinator remains a backend capability used by the runtime, but
 it is not a separate visible tab.
 
-## Agent Roster
+## Runtime Roles
 
-| Agent | Role | Model | Purpose |
-|-------|------|-------|---------|
-| Manager (CEO) | Coordinator | Main | Primary chat/task ingress, orchestrates tasks, routes to workers, runs heartbeat strategy |
-| Coder | Coding | Main | Code refactoring, bug fixes, implementation |
-| Summarizer | Chat | Chat | Summarizes thought streams, maintains chat memory, provides contextual reply support |
-| JobSearch | Job Discovery | Main | Finds gigs on Reddit, Fiverr, Upwork |
-| Analyst | Analysis | Main | Proposal metrics, job evaluation |
+| Role | Identity | Responsibility |
+|------|----------|----------------|
+| Big Brain | Marcus Rivera, Driver | Planning, opportunity sizing, coding, deep research, negotiation, and review |
+| Small Brain | Alex Vega, Navigator | Human chat, triage, risk assessment, source verification, and detail checking |
+| Manager services | Deterministic application layer | Routes intents, coordinates workers, enforces approvals, persists state, and runs heartbeat workflows |
+| Specialized workers | Discovery, analysis, coding, platform, and accounting services | Perform bounded tasks through validated tools and human-gated execution |
 
 ## Security
 
