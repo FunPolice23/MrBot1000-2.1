@@ -541,6 +541,7 @@ def chat_with_tools(
     use_function_calling: bool = True,
     flatten_system_prompt: bool = False,
     extra_body: dict | None = None,
+    tool_trace: list | None = None,
 ) -> str:
     """
     Chat with tool calling support.
@@ -606,6 +607,14 @@ def chat_with_tools(
                 # Execute the tool
                 try:
                     result = execute_tool(fn_name, fn_args)
+                    if tool_trace is not None:
+                        tool_trace.append({
+                            "name": fn_name,
+                            "arguments": fn_args,
+                            "status": "completed",
+                            "result_preview": str(result)[:800],
+                            "source": "text_call",
+                        })
                     messages.append({
                         "role": "assistant",
                         "content": visible_content,
@@ -617,6 +626,14 @@ def chat_with_tools(
                     # Continue to get final answer
                     continue
                 except Exception as e:
+                    if tool_trace is not None:
+                        tool_trace.append({
+                            "name": fn_name,
+                            "arguments": fn_args,
+                            "status": "error",
+                            "result_preview": str(e)[:800],
+                            "source": "text_call",
+                        })
                     messages.append({
                         "role": "tool",
                         "content": f"[Tool execution error: {e}]",
@@ -665,7 +682,20 @@ def chat_with_tools(
                 continue
             executed_function_calls.add(call_key)
             
-            result = execute_tool(fn_name, fn_args)
+            try:
+                result = execute_tool(fn_name, fn_args)
+                tool_status = "completed"
+            except Exception as exc:
+                result = f"[Tool execution error: {exc}]"
+                tool_status = "error"
+            if tool_trace is not None:
+                tool_trace.append({
+                    "name": fn_name,
+                    "arguments": fn_args,
+                    "status": tool_status,
+                    "result_preview": str(result)[:800],
+                    "source": "function_call",
+                })
             
             messages.append({
                 "tool_call_id": tc.id,

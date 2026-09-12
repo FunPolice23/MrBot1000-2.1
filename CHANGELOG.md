@@ -1,4 +1,28 @@
-## [Unreleased] - 2026-09-11
+## [Unreleased] - 2026-09-12
+
+### Added
+- Dialogue now displays dispatcher-confirmed tool events separately from persona
+  narration, including the tool name, arguments, execution source, status, and a
+  bounded result preview.
+- Dialogue context now receives a read-only snapshot of candidates stored by the
+  Opportunities tab after a scan, including opportunity ID, title, platform,
+  category, expected value, status, and URL.
+- Dialogue now tracks narrated tool intent separately from actual tool evidence;
+  narrated calls remain visible for insight but cannot establish that a tool ran.
+- Added semantic decision and shared terminal-block regression coverage for
+  repeated pivots, missing targets, and evidence-gated stopping.
+
+### Fixed
+- Live Dialogue now stops when Edward Hurst and Jacob Stanley reach the same
+  categorized terminal block, such as a required human target, missing evidence,
+  or approval requirement. Auto-Step and single Step limits are unchanged, and
+  Live remains intentionally unlimited until stopped or terminally blocked.
+- Empty or failed model output no longer becomes a fake persona turn that the
+  other brain can evaluate as a proposal.
+- Empty provider responses now expose the selected model and endpoint so model
+  and chat-template failures can be diagnosed directly.
+- Actual tool execution traces are reset per adapter request, preventing stale
+  events from appearing to belong to a later dialogue turn.
 
 ### Fixed
 - The canonical persona names are now Edward Hurst for Big Brain/Driver and

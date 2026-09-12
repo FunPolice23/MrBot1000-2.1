@@ -56,6 +56,7 @@ class BigBrainAdapter:
         # We intentionally avoid a blocking HTTP call in __init__ so tab
         # construction stays fast even when llama-server is not yet running.
         self.model = model or os.getenv("BIG_BRAIN_MODEL", "").strip() or ""
+        self.last_tool_trace = []
         
         # Load system prompt
         prompt_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts", "big_brain.txt")
@@ -357,6 +358,7 @@ class BigBrainAdapter:
             # Use tool calling
             from agents.tool_calling import chat_with_tools
             protocol = self._dialogue_protocol()
+            self.last_tool_trace = []
             answer = chat_with_tools(
                 client=client,
                 model=self.model,
@@ -371,6 +373,7 @@ class BigBrainAdapter:
                 use_function_calling=protocol["use_function_calling"],
                 flatten_system_prompt=protocol["flatten_system_prompt"],
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                tool_trace=self.last_tool_trace,
             )
             if not str(answer or "").strip():
                 return (

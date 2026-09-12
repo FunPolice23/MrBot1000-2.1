@@ -175,6 +175,11 @@ class DialogueTab(QWidget):
         self._question_count = 0  # Track questions to prevent loops
         self._last_response = ""  # Track last response for repetition
         self._duplicate_retry_count = 0
+        self._semantic_retry_count = 0
+        self._blocked_personas = set()
+        self._blocked_states = {}
+        self._dialogue_decisions = []
+        self._dialogue_control_ledger = []
         self._generation_id = 0
         self._busy_label = None
         self._completed_phase_count = 0
@@ -727,10 +732,44 @@ class DialogueTab(QWidget):
             getattr(self, "_driver_dialogue_blocked" if self.current_speaker == "Edward Hurst"
                 else "_navigator_dialogue_blocked", False))
         self.worker.done.connect(self._on_worker_done)
+        self.worker.tool_activity.connect(self._on_tool_activity)
         self.worker.finished.connect(
             lambda response, speaker, generation=generation_id:
             self._on_response_ready(response, speaker, generation))
         self.worker.start()
+
+    def _on_tool_activity(self, speaker: str, event: object):
+        """Display and retain dispatcher-confirmed tool execution separately."""
+        if not isinstance(event, dict):
+            return
+        name = str(event.get("name", "unknown"))
+        status = str(event.get("status", "unknown"))
+        source = str(event.get("source", "unknown"))
+        arguments = event.get("arguments", {})
+        preview = str(event.get("result_preview", ""))[:800]
+        self.append_system(
+            f"🔧 {speaker} actual tool call: {name}({arguments}) [{status}; {source}]"
+        )
+        if preview:
+            self.append_system(f"   Tool result preview: {preview}")
+        self.conversation_history.append({
+            "role": "system",
+            "speaker": "Tool",
+            "content": (
+                f"ACTUAL TOOL EVENT for {speaker}: {name} arguments={arguments}; "
+                f"status={status}; result={preview}"
+            ),
+        })
+        self._trim_conversation_history()
+        ledger = getattr(self, "_dialogue_control_ledger", [])
+        ledger.append({
+            "speaker": speaker,
+            "tool": name,
+            "narrated_tool": False,
+            "real_evidence": status == "completed",
+            "terminal_blocked": False,
+        })
+        self._dialogue_control_ledger = ledger[-12:]
 
     def _on_worker_done(self, worker):
         """Release completed workers and resume a deferred live generation."""
@@ -807,6 +846,31 @@ class DialogueTab(QWidget):
                 )
             return
 
+        if self._is_semantic_duplicate(response, speaker):
+            self._duplicate_retry_count += 1
+            self.worker = None
+            self.append_system(
+                f"{speaker} repeated the same decision or target; the repeated "
+                "turn was not added to the shared conversation.")
+            if self._duplicate_retry_count <= 1 and (self.live_running or self.is_running):
+                self.conversation_history.append({
+                    "role": "system",
+                    "speaker": "System",
+                    "content": (
+                        f"Do not repeat {speaker}'s earlier decision. Use the current "
+                        "opportunity evidence, identify one new fact, or state BLOCKED "
+                        "and wait for the human."
+                    ),
+                })
+                self._trim_conversation_history()
+                QTimer.singleShot(250, self.respond)
+            elif self.live_running or self.is_running:
+                self.stop_live()
+                self.append_system(
+                    "Dialogue paused after repeated semantic non-progress. Review the "
+                    "opportunity evidence or provide a new instruction.")
+            return
+
         # A transient server restart or connection failure must not turn off a
         # long-running Live session. Retry the same persona after a short pause
         # so the other model does not receive an error string as context.
@@ -850,9 +914,19 @@ class DialogueTab(QWidget):
         self._trim_conversation_history()
         self._persist_dialogue_turn(speaker, response)
         self._update_sidebar_from_turn(response)
+        terminal_blocked = self._record_dialogue_control_state(speaker, response)
         self._empty_response_retries = 0
         self._duplicate_retry_count = 0
+        self._semantic_retry_count = 0
         self.worker = None
+
+        if terminal_blocked and (self.live_running or self.is_running):
+            self.stop_live()
+            self.append_system(
+                "Dialogue paused: both personas reached the same blocked terminal "
+                "state. No further action will be proposed until new human direction "
+                "or opportunity evidence is provided.")
+            return
 
         # Toggle speaker for next turn
         self.current_speaker = "Jacob Stanley" if speaker == "Edward Hurst" else "Edward Hurst"
@@ -885,6 +959,98 @@ class DialogueTab(QWidget):
         
         if chained:
             self.respond()
+
+    @staticmethod
+    def _decision_signature(response: str) -> str:
+        """Extract a compact semantic target/decision fingerprint."""
+        text = " ".join((response or "").lower().split())
+        match = re.search(
+            r"(?:decision|action|next step|pivot|propose|proposal|target)\s*:\s*(.+)",
+            text,
+        )
+        candidate = match.group(1) if match else text
+        candidate = re.split(r"\|\s*(?:platform|expected|action)\s*:", candidate)[0]
+        candidate = re.sub(r"https?://\S+", "url", candidate)
+        candidate = re.sub(r"[^a-z0-9_$#.-]+", " ", candidate)
+        words = [word for word in candidate.split() if word not in {
+            "i", "we", "will", "would", "should", "now", "immediately",
+            "check", "fetch", "review", "search", "look", "at", "for",
+        }]
+        return " ".join(words[:24])
+
+    def _is_semantic_duplicate(self, response: str, speaker: str) -> bool:
+        signature = self._decision_signature(response)
+        if len(signature.split()) < 3:
+            return False
+        import difflib
+        for prior_speaker, prior_signature in getattr(
+                self, "_dialogue_decisions", []):
+            if prior_speaker != speaker:
+                continue
+            if signature == prior_signature or difflib.SequenceMatcher(
+                    None, signature, prior_signature).ratio() >= 0.78:
+                return True
+        return False
+
+    def _record_dialogue_control_state(self, speaker: str, response: str) -> bool:
+        """Track narrated intent separately from evidence and terminal state."""
+        text = " ".join((response or "").lower().split())
+        narrated_tool = bool(re.search(
+            r"(?:calling tool|action\s*:\s*(?:web_|workshop_|run_command)|"
+            r"i (?:will|ll|am going to) (?:execute|run|call|fetch|search|check))",
+            text,
+        ))
+        real_evidence = bool(re.search(
+            r"(?:tool result|retrieved at|source url|citation|evidence:\s*|"
+            r"returned:\s*|http[s]?://\S+)", text,
+        )) and not narrated_tool
+        terminal_markers = (
+            "awaiting human", "no further action", "specific target required",
+            "human input is required", "provide a direct link", "cannot proceed",
+            "end here", "stop here", "wait for your decision",
+        )
+        blocked = "blocked" in text or any(marker in text for marker in terminal_markers)
+        blocked_state = ""
+        if blocked:
+            if any(marker in text for marker in (
+                    "specific target", "direct link", "new target", "human input",
+                    "awaiting human", "no viable")):
+                blocked_state = "target_required"
+            elif any(marker in text for marker in (
+                    "missing evidence", "no evidence", "cannot verify", "verify")):
+                blocked_state = "evidence_missing"
+            elif any(marker in text for marker in (
+                    "approval", "register", "account", "credential")):
+                blocked_state = "approval_required"
+            else:
+                blocked_state = "blocked"
+        if blocked:
+            self._blocked_personas.add(speaker)
+            blocked_states = getattr(self, "_blocked_states", {})
+            blocked_states[speaker] = blocked_state
+            self._blocked_states = blocked_states
+        else:
+            self._blocked_personas.discard(speaker)
+            blocked_states = getattr(self, "_blocked_states", {})
+            blocked_states.pop(speaker, None)
+            self._blocked_states = blocked_states
+        signature = self._decision_signature(response)
+        decisions = getattr(self, "_dialogue_decisions", [])
+        if signature:
+            decisions.append((speaker, signature))
+            self._dialogue_decisions = decisions[-12:]
+        ledger = getattr(self, "_dialogue_control_ledger", [])
+        ledger.append({
+            "speaker": speaker,
+            "narrated_tool": narrated_tool,
+            "real_evidence": real_evidence,
+            "terminal_blocked": blocked,
+        })
+        self._dialogue_control_ledger = ledger[-12:]
+        return (
+            len(self._blocked_states) >= 2
+            and len(set(self._blocked_states.values())) == 1
+        )
 
     @staticmethod
     def _clean_model_response(response: str) -> str:
@@ -980,6 +1146,11 @@ class DialogueTab(QWidget):
         self.progress_list.clear()
         self.goals_list.clear()
         self._completed_phase_count = 0
+        self._semantic_retry_count = 0
+        self._blocked_personas.clear()
+        self._blocked_states.clear()
+        self._dialogue_decisions.clear()
+        self._dialogue_control_ledger.clear()
 
     def _open_help(self):
         """Open the in-app feature help dialog."""
@@ -1052,6 +1223,55 @@ class DialogueTab(QWidget):
             self.tasks_list.addItem(item)
             self.tasks_list.scrollToBottom()
 
+    def _get_opportunity_context(self) -> str:
+        """Return a read-only snapshot of opportunities discovered by the app."""
+        owner = self
+        while owner is not None and not hasattr(owner, "opportunity_portfolio"):
+            try:
+                owner = owner.parent() if hasattr(owner, "parent") else None
+            except RuntimeError:
+                owner = None
+        portfolio = getattr(owner, "opportunity_portfolio", None)
+        if portfolio is None:
+            return "OPPORTUNITIES TAB: No scanned opportunities are available."
+        try:
+            entries = portfolio.list_all()
+        except Exception as exc:
+            return f"OPPORTUNITIES TAB: Snapshot unavailable ({type(exc).__name__})."
+        rows = []
+        for entry in entries[:12]:
+            ref = getattr(entry, "opportunity_ref", None) or {}
+            rows.append(
+                f"- id={getattr(entry, 'opportunity_id', '')}; "
+                f"title={str(ref.get('title', ''))[:120]}; "
+                f"platform={getattr(entry, 'platform', '') or ref.get('source', '')}; "
+                f"category={getattr(entry, 'category', '') or ref.get('category', '')}; "
+                f"value=${float(getattr(entry, 'expected_value', 0) or 0):.2f}; "
+                f"status={getattr(getattr(entry, 'work_status', None), 'value', '')}; "
+                f"url={str(ref.get('url', ref.get('source_url', '')))[:240]}"
+            )
+        if not rows:
+            return "OPPORTUNITIES TAB: The last scan returned no stored opportunities."
+        return (
+            "OPPORTUNITIES TAB (read-only scanned candidates; not proof of availability, "
+            "payout, or approval):\n" + "\n".join(rows)
+        )
+
+    def _get_control_context(self) -> str:
+        ledger = getattr(self, "_dialogue_control_ledger", [])[-6:]
+        if not ledger:
+            return "DIALOGUE CONTROL: No tool intent or evidence has been recorded yet."
+        lines = [
+            f"- {item['speaker']}: narrated_tool={item['narrated_tool']}; "
+            f"real_evidence={item['real_evidence']}; "
+            f"terminal_blocked={item['terminal_blocked']}"
+            for item in ledger
+        ]
+        return (
+            "DIALOGUE CONTROL (narrated tool calls are visible intent only; they are "
+            "not tool execution or evidence):\n" + "\n".join(lines)
+        )
+
     # ── context builder ─────────────────────────────────────────────────
     def get_dialogue_context(self) -> str:
         """Build context for the dialogue.
@@ -1093,6 +1313,8 @@ class DialogueTab(QWidget):
             "local FIX, or state BLOCKED with the missing evidence. Do not silently continue the defect, "
             "claim that you fixed an external system, or ask for repeated 'YEP'/'GO' confirmation.\n"
         )
+        opportunity_context = self._get_opportunity_context()
+        control_context = self._get_control_context()
         if not self.conversation_history:
             if self.goal:
                 return (
@@ -1102,6 +1324,7 @@ class DialogueTab(QWidget):
                     f"The human is a third participant and never needs to speak as either persona. "
                     f"PHASE INSTRUCTION: {self._phase_instruction()}\n"
                     f"{mode_instruction}"
+                    f"{opportunity_context}\n{control_context}\n"
                     f"Use first person ('I', 'me', 'my'). "
                     f"When you need data, CALL A READ-ONLY TOOL NOW; do not say you "
                     f"will search later. If the phase requires research, use one read-only tool "
@@ -1119,6 +1342,7 @@ class DialogueTab(QWidget):
                     f"Work with {'Jacob Stanley' if self.current_speaker == 'Edward Hurst' else 'Edward Hurst'} and the human user. "
                 f"The human is a third participant and never needs to speak as either persona. "
                 f"{mode_instruction}"
+                f"{opportunity_context}\n{control_context}\n"
                 f"Use first person ('I', 'me', 'my'). "
                 f"When you need data, CALL A READ-ONLY TOOL NOW; do not say you "
                 f"will search later. If the phase requires research, use one read-only tool "
@@ -1221,6 +1445,7 @@ class DialogueTab(QWidget):
             f"{goal_line}{phase_line}\n\n"
             f"{mode_instruction}"
             f"{history_block}\n\n"
+            f"{opportunity_context}\n{control_context}\n\n"
             f"{tracker_line}"
             f"Respond AS {self.current_speaker} in first person ('I', 'me', 'my'). "
             f"When you need data, CALL A READ-ONLY TOOL NOW; do not say you "
@@ -1307,6 +1532,7 @@ class DialogueWorker(QThread):
     """Background worker for dialogue inference (persona-driven)."""
 
     finished = Signal(str, str)  # response, speaker
+    tool_activity = Signal(str, object)  # speaker, dispatcher-confirmed event
     done = Signal(object)
 
     def __init__(self, brain, context, history, speaker, system_prompt=None,
@@ -1351,6 +1577,8 @@ class DialogueWorker(QThread):
             kwargs["max_tokens"] = self.max_tokens
             kwargs["dialogue_mode"] = True
             response = self.brain.chat(self.context, self.history, **kwargs)
+            for event in getattr(self.brain, "last_tool_trace", []) or []:
+                self.tool_activity.emit(self.speaker, event)
             if self._cancelled:
                 return
             

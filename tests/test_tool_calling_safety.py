@@ -2,7 +2,8 @@
 
 import json
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from agents import tool_calling
 
@@ -99,6 +100,35 @@ class TestToolCallingSafety(unittest.TestCase):
         self.assertIn("read and summarize the playbook", result["allowed_next_steps"])
         self.assertIn("UNTRUSTED", result["content"])
         self.assertIn("not an API key", result["warning"])
+
+    def test_function_tool_execution_populates_verified_trace(self):
+        tool_call = SimpleNamespace(
+            id="call-1",
+            function=SimpleNamespace(
+                name="web_search", arguments='{"query": "active bounty"}'))
+        first_message = SimpleNamespace(content="", tool_calls=[tool_call])
+        final_message = SimpleNamespace(
+            content="The tool returned the available evidence.", tool_calls=None)
+        client = SimpleNamespace()
+        client.chat = SimpleNamespace(completions=SimpleNamespace(create=Mock(
+            side_effect=[
+                SimpleNamespace(choices=[SimpleNamespace(message=first_message)]),
+                SimpleNamespace(choices=[SimpleNamespace(message=final_message)]),
+            ])))
+        trace = []
+        with patch.object(tool_calling, "execute_tool", return_value="RESULT evidence"):
+            answer = tool_calling.chat_with_tools(
+                client=client,
+                model="test-model",
+                system_prompt="test",
+                user_message="search",
+                max_iterations=1,
+                tool_trace=trace,
+            )
+        self.assertIn("available evidence", answer)
+        self.assertEqual(trace[0]["name"], "web_search")
+        self.assertEqual(trace[0]["status"], "completed")
+        self.assertEqual(trace[0]["result_preview"], "RESULT evidence")
 
 
 if __name__ == "__main__":

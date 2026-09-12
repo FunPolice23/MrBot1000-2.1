@@ -42,6 +42,7 @@ class SmallBrainAdapter:
         # We intentionally avoid a blocking HTTP call in __init__ so tab
         # construction stays fast even when llama-server is not yet running.
         self.model = model or os.getenv("SMALL_BRAIN_MODEL", "").strip() or ""
+        self.last_tool_trace = []
         
         # Load system prompt
         prompt_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts", "small_brain.txt")
@@ -191,6 +192,7 @@ class SmallBrainAdapter:
             # with compact local models and provider templates.
             from agents.tool_calling import chat_with_tools
             protocol = self._dialogue_protocol()
+            self.last_tool_trace = []
             answer = chat_with_tools(
                 client=client,
                 model=self.model,
@@ -205,6 +207,7 @@ class SmallBrainAdapter:
                 use_function_calling=False,
                 flatten_system_prompt=protocol["flatten_system_prompt"],
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                tool_trace=self.last_tool_trace,
             )
             if not str(answer or "").strip():
                 return (

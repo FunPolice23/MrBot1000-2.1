@@ -2,6 +2,7 @@
 
 import unittest
 import os
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from gui.dialogue_tab import DialogueTab, DialogueWorker, LIFECYCLE
@@ -454,6 +455,67 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         self.assertIn("model returned an empty response", response)
         self.assertIn("served-model", response)
         self.assertIn("127.0.0.1:1234/v1", response)
+
+    def test_narrated_tool_intent_is_tracked_without_becoming_evidence(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        tab._dialogue_control_ledger = []
+        tab._blocked_personas = set()
+        tab._dialogue_decisions = []
+
+        self.assertFalse(tab._record_dialogue_control_state(
+            "Edward Hurst", "CALLING TOOL: web_search for active bounties."))
+        self.assertFalse(tab._dialogue_control_ledger[-1]["real_evidence"])
+        self.assertTrue(tab._dialogue_control_ledger[-1]["narrated_tool"])
+        self.assertFalse(tab._record_dialogue_control_state(
+            "Jacob Stanley", "Tool result: https://example.test/bounty returned no match."))
+        self.assertTrue(tab._dialogue_control_ledger[-1]["real_evidence"])
+
+    def test_both_personas_terminal_block_stops_control_state(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        tab._dialogue_control_ledger = []
+        tab._blocked_personas = set()
+        tab._dialogue_decisions = []
+
+        self.assertFalse(tab._record_dialogue_control_state(
+            "Edward Hurst", "BLOCKED: awaiting human input for a specific target."))
+        self.assertTrue(tab._record_dialogue_control_state(
+            "Jacob Stanley", "No further action; a specific target is required."))
+
+    def test_verified_tool_event_is_rendered_separately_from_persona_text(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        tab.conversation_history = []
+        tab._dialogue_control_ledger = []
+        tab._history_limit = 20
+        tab.append_system = Mock()
+        tab._on_tool_activity("Edward Hurst", {
+            "name": "web_search",
+            "arguments": {"query": "active bounty"},
+            "status": "completed",
+            "source": "function_call",
+            "result_preview": "RESULT evidence",
+        })
+        self.assertIn("actual tool call: web_search", tab.append_system.call_args_list[0].args[0])
+        self.assertIn("Tool result preview: RESULT evidence", tab.append_system.call_args_list[1].args[0])
+        self.assertEqual(tab.conversation_history[0]["speaker"], "Tool")
+        self.assertTrue(tab._dialogue_control_ledger[0]["real_evidence"])
+
+    def test_opportunity_snapshot_is_read_only_prompt_context(self):
+        entry = SimpleNamespace(
+            opportunity_id="opp-1",
+            opportunity_ref={"title": "Fix slugify", "url": "https://example.test/1"},
+            platform="github",
+            category="coding",
+            expected_value=125.0,
+            work_status=SimpleNamespace(value="evaluating"),
+        )
+        owner = SimpleNamespace(
+            opportunity_portfolio=SimpleNamespace(list_all=lambda: [entry]))
+        tab = DialogueTab.__new__(DialogueTab)
+        tab.parent = lambda: owner
+        context = tab._get_opportunity_context()
+        self.assertIn("opp-1", context)
+        self.assertIn("Fix slugify", context)
+        self.assertIn("not proof of availability", context)
 
     def test_dialogue_context_has_a_bounded_prompt(self):
         tab = DialogueTab.__new__(DialogueTab)

@@ -13,6 +13,12 @@ A real-time AI agent system for automated earning opportunity discovery, executi
   and progress; redundant Collaboration and Memory & Stream tabs are removed.
 - **Custom brain names**: Big Brain and Small Brain display names can be edited
   and saved in Provider Configuration. Internal role keys remain stable.
+- **Dialogue evidence visibility**: Edward Hurst and Jacob Stanley retain their
+  natural narrated reasoning, while dispatcher-confirmed tool calls appear as
+  separate events with arguments, status, source, and a bounded result preview.
+- **Opportunity-aware Dialogue**: scanned candidates from the Opportunities tab
+  are supplied to both personas as read-only context, clearly separated from
+  verified evidence, approval, and execution.
 
 ## Quick Start
 
@@ -57,6 +63,11 @@ Safe mode can also be toggled from the Management tab at runtime.
 - Surfaces startup warnings and runtime issues so configuration gaps are visible early
 - Supports a safe mode that validates actions and skips real file changes while the workflow is being exercised
 - Shares research snapshots across the manager and chat-side runtime context so both models can benefit from the same knowledge base
+- Supplies the Dialogue tab with read-only scanned opportunity candidates so the
+  personas can inspect, compare, and propose work from the current opportunity
+  queue
+- Distinguishes narrated tool intent from actual dispatcher-confirmed tool calls;
+  only real returned tool results count as evidence
 - Tracks earnings and payouts locally in SQLite with **Unified Economic Accounting** (verified vs unverified revenue, LLM cost, gas, net profit, ROI, net hourly rate)
 - Runs a self-audit engine that identifies improvement opportunities across 14 categories without mutating safety constraints
 - Supports llama.cpp, Ollama, LM Studio, vLLM, KoboldCpp, and supported cloud providers through the Settings and Providers & GPU surfaces. The interface adapts to whichever enabled provider is active; if none is enabled, it reports that no provider is in use.
@@ -64,6 +75,30 @@ Safe mode can also be toggled from the Management tab at runtime.
 - Dynamically schedules discovery sources based on historical performance (exploration/exploitation balance)
 
 ## Current Workflow
+
+### Dialogue Control and Evidence
+
+Dialogue supports three operator modes:
+
+- **Step** runs one persona turn.
+- **Auto-Step** runs its bounded ten-turn pass.
+- **Live** continues without an exchange limit until the operator stops it or
+  both personas reach the same terminal block.
+
+Persona narration remains visible so the operator can understand why a model is
+proposing a search or action. When a tool actually executes, Dialogue adds a
+separate dispatcher-confirmed event with the tool name, arguments, execution
+status, source, and a bounded result preview. A narrated statement such as “I
+will search” is never treated as proof that a search occurred.
+
+After an Opportunities scan, Dialogue receives a read-only snapshot of stored
+candidates. Candidate records help the personas select and research targets,
+but do not prove that a listing is active, payable, approved, or completed.
+
+If both personas converge on the same terminal condition, such as a missing
+target, missing evidence, or required human approval, Live pauses and waits for
+new human direction or new opportunity evidence. Semantic repetition is also
+detected when the wording changes but the target or decision remains the same.
 
 ### Unified Autonomous Planning Loop (24 stages)
 
@@ -180,7 +215,7 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 | `agents/self_audit.py` | Structured operational findings without security-policy mutation |
 | `agents/instruction_gate.py` / `agents/trust_boundary.py` | Untrusted-instruction provenance and high-trust action boundaries |
 | `gui/tab_builders.py` | Current visible tab construction and lazy-loading orchestration |
-| `gui/dialogue_tab.py` | Goal-driven Edward/Jacob Dialogue with bounded history and progress tracking |
+| `gui/dialogue_tab.py` | Goal-driven Edward/Jacob Dialogue, opportunity context, terminal control, and verified tool-event display |
 | `gui/management_tab.py` | Operational controls, earning workflows, approvals, payouts, memory, and stream health |
 | `gui/provider_config_widget.py` | Local/cloud provider configuration and role assignment |
 | `gui/model_library_tab.py` | Local model discovery and managed downloads |
