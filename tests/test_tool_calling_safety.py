@@ -130,6 +130,29 @@ class TestToolCallingSafety(unittest.TestCase):
         self.assertEqual(trace[0]["status"], "completed")
         self.assertEqual(trace[0]["result_preview"], "RESULT evidence")
 
+    def test_pending_approval_is_not_reported_as_completed(self):
+        from agents.approval_queue import HumanApprovalQueue
+        HumanApprovalQueue.reset_singleton()
+        trace = []
+        with patch.object(tool_calling, "execute_tool", return_value=(
+                "[PENDING APPROVAL] request_id=req-1; workshop_proposal was not "
+                "executed. Tell the human that this request is awaiting review.")):
+            client = SimpleNamespace()
+            client.chat = SimpleNamespace(completions=SimpleNamespace(create=Mock(
+                return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content='ACTION: workshop_proposal("Draft","Client","Desc")',
+                    tool_calls=None))]))))
+            tool_calling.chat_with_tools(
+                client=client,
+                model="test-model",
+                system_prompt="test",
+                user_message="draft",
+                max_iterations=1,
+                tool_trace=trace,
+            )
+        self.assertEqual(trace[0]["status"], "pending_approval")
+        HumanApprovalQueue.reset_singleton()
+
 
 if __name__ == "__main__":
     unittest.main()

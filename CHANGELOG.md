@@ -11,6 +11,10 @@
   narrated calls remain visible for insight but cannot establish that a tool ran.
 - Added semantic decision and shared terminal-block regression coverage for
   repeated pivots, missing targets, and evidence-gated stopping.
+- Approvals now sits directly beside Dialogue so the human can inspect a
+  request without navigating across unrelated operational tabs.
+- Approval details now expose a persistent, scrollable read-only view of the
+  description, structured details, payload, and notes while the queue refreshes.
 
 ### Fixed
 - Live Dialogue now stops when Edward Hurst and Jacob Stanley reach the same
@@ -23,6 +27,12 @@
   and chat-template failures can be diagnosed directly.
 - Actual tool execution traces are reset per adapter request, preventing stale
   events from appearing to belong to a later dialogue turn.
+- Mutating tool requests that enter the approval queue are recorded as
+  `pending_approval`, not completed execution, and pause the active Dialogue
+  run until the human reviews them.
+- Dialogue now makes up to three bounded recovery attempts after semantic
+  repetition, directing the personas toward one read-only inspection, existing
+  local evidence, or a precise blocker before pausing Live.
 
 ### Fixed
 - The canonical persona names are now Edward Hurst for Big Brain/Driver and
@@ -68,6 +78,8 @@
   diagnostics in the touched modules.
 - Focused autonomous-loop regression suite passes (`27 passed`).
 - Full test runner passes (`62 passed`, including auto-discovered modules).
+- Focused Dialogue and tool-control regressions pass (`53 passed`); the touched
+  GUI modules compile cleanly.
 - Startup validation tests pass (`4 passed`).
 - Runtime, dialogue, and startup regression tests pass (`51 passed` after the
   configurable-name coverage was added).

@@ -6,12 +6,13 @@ Shows pending submissions, payments, and gate clearances from
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
-    QLabel, QPushButton, QListWidget, QListWidgetItem,
+    QLabel, QPushButton, QListWidget, QListWidgetItem, QPlainTextEdit,
     QMessageBox, QInputDialog, QComboBox, QSplitter, QFrame, QSizePolicy,
 )
 from PySide6.QtGui import QFont, QColor
@@ -74,9 +75,12 @@ class ApprovalPanel(QWidget):
         self.detail_title.setFont(QFont("Segoe UI", 11, QFont.Bold))
         detail_lay.addWidget(self.detail_title)
 
-        self.detail_desc = QLabel("—")
-        self.detail_desc.setWordWrap(True)
-        detail_lay.addWidget(self.detail_desc)
+        self.detail_request = QPlainTextEdit()
+        self.detail_request.setReadOnly(True)
+        self.detail_request.setPlaceholderText("Select an approval to inspect its full request.")
+        self.detail_request.setMinimumHeight(180)
+        self.detail_request.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        detail_lay.addWidget(self.detail_request, stretch=1)
 
         self.detail_kind = QLabel("Kind: —")
         detail_lay.addWidget(self.detail_kind)
@@ -126,6 +130,11 @@ class ApprovalPanel(QWidget):
 
     def _refresh(self):
         try:
+            selected_id = None
+            if self._selected_item is not None:
+                selected_id = self._selected_item.id
+            elif self.list_widget.currentItem() is not None:
+                selected_id = self.list_widget.currentItem().data(Qt.UserRole)
             self._pending = self.approval_queue.pending()
             self.list_widget.clear()
             if not self._pending:
@@ -151,6 +160,14 @@ class ApprovalPanel(QWidget):
                 item.setForeground(QColor(color))
                 item.setData(Qt.UserRole, it.id)
                 self.list_widget.addItem(item)
+            if selected_id:
+                for row in range(self.list_widget.count()):
+                    item = self.list_widget.item(row)
+                    if item.data(Qt.UserRole) == selected_id:
+                        self.list_widget.setCurrentRow(row)
+                        break
+            if self.list_widget.currentItem() is None and self._pending:
+                self.list_widget.setCurrentRow(0)
         except Exception as e:
             logger.warning("approval panel refresh failed: %s", e)
 
@@ -171,7 +188,14 @@ class ApprovalPanel(QWidget):
             return
         self._selected_item = it
         self.detail_title.setText(it.title)
-        self.detail_desc.setText(it.description)
+        request = {
+            "description": it.description,
+            "details": it.details,
+            "payload": it.payload,
+            "notes": it.notes,
+        }
+        self.detail_request.setPlainText(json.dumps(
+            request, indent=2, ensure_ascii=True, default=str))
         self.detail_kind.setText(f"Kind: {it.kind.value}")
         self.detail_req.setText(f"Requested by: {it.requested_by}")
         self.detail_time.setText(f"Requested at: {it.requested_at:.0f}")
@@ -184,7 +208,7 @@ class ApprovalPanel(QWidget):
     def _clear_detail(self):
         self._selected_item = None
         self.detail_title.setText("—")
-        self.detail_desc.setText("—")
+        self.detail_request.setPlainText("—")
         self.detail_kind.setText("Kind: —")
         self.detail_req.setText("Requested by: —")
         self.detail_time.setText("Requested at: —")

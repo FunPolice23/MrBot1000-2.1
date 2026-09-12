@@ -19,6 +19,10 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 - **Opportunity-aware Dialogue**: scanned candidates from the Opportunities tab
   are supplied to both personas as read-only context, clearly separated from
   verified evidence, approval, and execution.
+- **Human approval visibility**: Approvals is directly beside Dialogue, and a
+  selected request stays highlighted while the queue refreshes. The detail view
+  shows the complete read-only request, including structured arguments and
+  payload data.
 
 ## Quick Start
 
@@ -99,6 +103,14 @@ If both personas converge on the same terminal condition, such as a missing
 target, missing evidence, or required human approval, Live pauses and waits for
 new human direction or new opportunity evidence. Semantic repetition is also
 detected when the wording changes but the target or decision remains the same.
+After repetition, Dialogue makes up to three bounded recovery attempts: one
+permitted read-only inspection, a review of existing local evidence, or a
+precise BLOCKED state. It pauses only after those recovery paths fail.
+
+Mutating tool requests never execute directly from Dialogue. When one enters the
+approval queue, the tool event is marked `pending_approval`, the active run
+pauses, and the operator can open the adjacent Approvals tab to read the full
+request before choosing Approve, Deny, or Defer.
 
 ### Unified Autonomous Planning Loop (24 stages)
 
@@ -215,7 +227,8 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 | `agents/self_audit.py` | Structured operational findings without security-policy mutation |
 | `agents/instruction_gate.py` / `agents/trust_boundary.py` | Untrusted-instruction provenance and high-trust action boundaries |
 | `gui/tab_builders.py` | Current visible tab construction and lazy-loading orchestration |
-| `gui/dialogue_tab.py` | Goal-driven Edward/Jacob Dialogue, opportunity context, terminal control, and verified tool-event display |
+| `gui/dialogue_tab.py` | Goal-driven Edward/Jacob Dialogue, opportunity context, bounded recovery, terminal control, and verified tool-event display |
+| `gui/approval_panel.py` | Human approval queue with persistent selection and full request inspection |
 | `gui/management_tab.py` | Operational controls, earning workflows, approvals, payouts, memory, and stream health |
 | `gui/provider_config_widget.py` | Local/cloud provider configuration and role assignment |
 | `gui/model_library_tab.py` | Local model discovery and managed downloads |
@@ -263,7 +276,7 @@ Key settings:
 8. **Payments** — Balance and payout verification
 9. **Earnings** — Income tracking, verified revenue, costs, gas, net profit, ROI
 10. **Insights** — Reports and operational summaries
-11. **Approvals** — Human approval queue
+11. **Approvals** — Human approval queue beside Dialogue, with full request inspection
 12. **Opportunities** — Opportunity portfolio and work queue
 13. **Paper Trading** — Risk-contained trading simulation tools
 14. **Analytics** — Performance and economic analytics

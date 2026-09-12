@@ -291,6 +291,16 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
         return f"[Tool error: {e}]"
 
 
+def _tool_result_status(result: str) -> str:
+    """Classify the dispatcher result for the UI and dialogue ledger."""
+    text = str(result or "")
+    if "[PENDING APPROVAL]" in text or "[Approval unavailable:" in text:
+        return "pending_approval"
+    if text.startswith("[Tool error:") or text.startswith("[Search error:"):
+        return "error"
+    return "completed"
+
+
 # ── Web Tool Implementations ──────────────────────────────────────────────
 
 def _tool_web_search(args: Dict[str, Any]) -> str:
@@ -611,7 +621,7 @@ def chat_with_tools(
                         tool_trace.append({
                             "name": fn_name,
                             "arguments": fn_args,
-                            "status": "completed",
+                            "status": _tool_result_status(result),
                             "result_preview": str(result)[:800],
                             "source": "text_call",
                         })
@@ -684,7 +694,7 @@ def chat_with_tools(
             
             try:
                 result = execute_tool(fn_name, fn_args)
-                tool_status = "completed"
+                tool_status = _tool_result_status(result)
             except Exception as exc:
                 result = f"[Tool execution error: {exc}]"
                 tool_status = "error"

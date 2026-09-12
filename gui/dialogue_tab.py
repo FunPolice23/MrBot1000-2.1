@@ -178,6 +178,7 @@ class DialogueTab(QWidget):
         self._semantic_retry_count = 0
         self._blocked_personas = set()
         self._blocked_states = {}
+        self._pending_tool_blocked = False
         self._dialogue_decisions = []
         self._dialogue_control_ledger = []
         self._generation_id = 0
@@ -765,11 +766,21 @@ class DialogueTab(QWidget):
         ledger.append({
             "speaker": speaker,
             "tool": name,
+            "arguments": arguments,
+            "status": status,
             "narrated_tool": False,
             "real_evidence": status == "completed",
             "terminal_blocked": False,
         })
         self._dialogue_control_ledger = ledger[-12:]
+        if status == "pending_approval":
+            self._pending_tool_blocked = True
+            self._blocked_personas.add(speaker)
+            self._blocked_states[speaker] = "approval_required"
+            self.append_system(
+                "Dialogue paused after the tool request entered the human approval "
+                "queue. Review or deny the request before continuing."
+            )
 
     def _on_worker_done(self, worker):
         """Release completed workers and resume a deferred live generation."""
@@ -852,14 +863,18 @@ class DialogueTab(QWidget):
             self.append_system(
                 f"{speaker} repeated the same decision or target; the repeated "
                 "turn was not added to the shared conversation.")
-            if self._duplicate_retry_count <= 1 and (self.live_running or self.is_running):
+            if self._duplicate_retry_count <= 3 and (self.live_running or self.is_running):
                 self.conversation_history.append({
                     "role": "system",
                     "speaker": "System",
                     "content": (
-                        f"Do not repeat {speaker}'s earlier decision. Use the current "
-                        "opportunity evidence, identify one new fact, or state BLOCKED "
-                        "and wait for the human."
+                        f"RECOVERY ATTEMPT {self._duplicate_retry_count}/3: Do not repeat "
+                        f"{speaker}'s earlier decision or target. Learn from the repeated "
+                        "turn and choose one recovery path: call exactly one permitted "
+                        "read-only tool now, inspect the existing local evidence/template, "
+                        "or state BLOCKED with the precise missing evidence or human approval. "
+                        "Do not claim that a message was posted, a proposal was created, or "
+                        "an external action completed without an actual tool result."
                     ),
                 })
                 self._trim_conversation_history()
@@ -867,8 +882,8 @@ class DialogueTab(QWidget):
             elif self.live_running or self.is_running:
                 self.stop_live()
                 self.append_system(
-                    "Dialogue paused after repeated semantic non-progress. Review the "
-                    "opportunity evidence or provide a new instruction.")
+                    "Dialogue paused after three bounded recovery attempts failed. "
+                    "Review the opportunity evidence or provide a new instruction.")
             return
 
         # A transient server restart or connection failure must not turn off a
@@ -920,12 +935,18 @@ class DialogueTab(QWidget):
         self._semantic_retry_count = 0
         self.worker = None
 
-        if terminal_blocked and (self.live_running or self.is_running):
+        pending_tool_blocked = getattr(self, "_pending_tool_blocked", False)
+        if (terminal_blocked or pending_tool_blocked) and (self.live_running or self.is_running):
             self.stop_live()
-            self.append_system(
-                "Dialogue paused: both personas reached the same blocked terminal "
-                "state. No further action will be proposed until new human direction "
-                "or opportunity evidence is provided.")
+            if pending_tool_blocked:
+                self.append_system(
+                    "Dialogue paused: the requested action is awaiting human approval. "
+                    "No completion or external action was recorded.")
+            else:
+                self.append_system(
+                    "Dialogue paused: both personas reached the same blocked terminal "
+                    "state. No further action will be proposed until new human direction "
+                    "or opportunity evidence is provided.")
             return
 
         # Toggle speaker for next turn
@@ -1149,6 +1170,7 @@ class DialogueTab(QWidget):
         self._semantic_retry_count = 0
         self._blocked_personas.clear()
         self._blocked_states.clear()
+        self._pending_tool_blocked = False
         self._dialogue_decisions.clear()
         self._dialogue_control_ledger.clear()
 
@@ -1261,12 +1283,24 @@ class DialogueTab(QWidget):
         ledger = getattr(self, "_dialogue_control_ledger", [])[-6:]
         if not ledger:
             return "DIALOGUE CONTROL: No tool intent or evidence has been recorded yet."
-        lines = [
-            f"- {item['speaker']}: narrated_tool={item['narrated_tool']}; "
-            f"real_evidence={item['real_evidence']}; "
-            f"terminal_blocked={item['terminal_blocked']}"
-            for item in ledger
-        ]
+        lines = []
+        for item in ledger:
+            line = (
+                f"- {item['speaker']}: narrated_tool={item['narrated_tool']}; "
+                f"real_evidence={item['real_evidence']}; "
+                f"terminal_blocked={item['terminal_blocked']}"
+            )
+            if item.get("tool"):
+                line += (
+                    f"; tool={item['tool']}; status={item.get('status', 'unknown')}"
+                    f"; arguments={item.get('arguments', {})}"
+                )
+            lines.append(line)
+        if getattr(self, "_pending_tool_blocked", False):
+            lines.append(
+                "- CONTROL STOP: a tool request is pending human approval; do not "
+                "repeat it, claim completion, or propose another commitment."
+            )
         return (
             "DIALOGUE CONTROL (narrated tool calls are visible intent only; they are "
             "not tool execution or evidence):\n" + "\n".join(lines)

@@ -499,6 +499,28 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         self.assertEqual(tab.conversation_history[0]["speaker"], "Tool")
         self.assertTrue(tab._dialogue_control_ledger[0]["real_evidence"])
 
+    def test_pending_tool_event_blocks_follow_up_action_loop(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        tab.conversation_history = []
+        tab._dialogue_control_ledger = []
+        tab._history_limit = 20
+        tab._blocked_personas = set()
+        tab._blocked_states = {}
+        tab._pending_tool_blocked = False
+        tab.append_system = Mock()
+        tab._on_tool_activity("Edward Hurst", {
+            "name": "workshop_proposal",
+            "arguments": {"title": "Draft"},
+            "status": "pending_approval",
+            "source": "text_call",
+            "result_preview": "[PENDING APPROVAL] request_id=req-1",
+        })
+        context = tab._get_control_context()
+        self.assertTrue(tab._pending_tool_blocked)
+        self.assertIn("status=pending_approval", context)
+        self.assertIn("do not repeat it", context)
+        self.assertEqual(tab._blocked_states["Edward Hurst"], "approval_required")
+
     def test_opportunity_snapshot_is_read_only_prompt_context(self):
         entry = SimpleNamespace(
             opportunity_id="opp-1",
