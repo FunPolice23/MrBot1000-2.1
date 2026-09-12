@@ -1,3 +1,45 @@
+## [Unreleased] - 2026-09-11
+
+### Fixed
+- LM Studio model IDs with namespaces, such as `qwen/qwen3.5-9b`, are now
+  preserved when Dialogue synchronizes adapter models instead of being reduced
+  to a basename that LM Studio cannot resolve.
+- Providers & GPU now displays external-provider model IDs on GPU cards while
+  continuing to display filenames for local `.gguf` selections. The actual
+  `nvidia-smi` bar remains documented as total GPU-memory usage; it cannot
+  identify which model owns that memory.
+- Dialogue no longer records its malformed-output diagnostic as a persona turn,
+  preventing the diagnostic from being detected as a repeated answer and
+  causing a false non-progress loop.
+- Dialogue capability gating now permits the loaded 3B Ministral chat model;
+  sub-2B models and base/embedding models remain blocked as unsuitable for
+  persona dialogue.
+- Autonomous-loop payment verification now consults the central evidence
+  transition policy instead of treating a single L3 payment record as sufficient.
+- `payment_gross` is recognized as a payment evidence type for policy-gated
+  transitions.
+- L1 self-reported submission evidence cannot establish a paid outcome.
+- The test runner now auto-discovers `test_*.py` unittest modules so new suites
+  cannot be silently omitted from the default run.
+- Startup validation now reports whether wallet key files are protected by
+  `.gitignore`; missing protection produces a warning without blocking startup.
+- Big Brain and Small Brain now have editable, persisted display names in
+  Provider Configuration. Custom names are used in runtime metadata and persona
+  prompts without changing stable internal role identifiers.
+
+### Verification
+- Live LM Studio probes confirmed that `qwen/qwen3.5-9b` and
+  `mistralai/ministral-3-3b` were loaded through `/api/v1/models`; both exact
+  namespaced IDs were accepted by `/v1/chat/completions` when given a suitable
+  dialogue token budget.
+- Provider and dialogue regression suites pass (`36 passed`), with no
+  diagnostics in the touched modules.
+- Focused autonomous-loop regression suite passes (`27 passed`).
+- Full test runner passes (`62 passed`, including auto-discovered modules).
+- Startup validation tests pass (`4 passed`).
+- Runtime, dialogue, and startup regression tests pass (`51 passed` after the
+  configurable-name coverage was added).
+
 ## [2.1.1] - 2026-09-11 - Security, Dialogue, and Publishing Maintenance
 
 ### Added
@@ -12,6 +54,54 @@
 - Added `version.py` as the public release-version source of truth.
 
 ### Changed
+- Provider and model lifecycle handling now supports Ollama, LM Studio, vLLM,
+  KoboldCpp, and llama.cpp without routing external providers through llama.cpp
+  ports or treating provider model IDs as GGUF file paths.
+- LM Studio and Ollama now use their native load/unload APIs. Providers & GPU
+  checks loaded model state instead of considering a reachable provider server
+  to be a running brain.
+- Big Brain and Small Brain can use different local models. Settings now expose
+  independent Main model and Chat model selectors, persisting to
+  `BIG_BRAIN_MODEL` and `SMALL_BRAIN_MODEL` without overwriting the other role.
+- Dialogue adapters now follow the canonical runtime endpoint for external
+  providers, preventing stale llama.cpp role URLs from breaking LM Studio
+  dialogue requests.
+- Dialogue persona turns now use a dialogue-only protocol that prevents small
+  local models from leaking SQL or tool-call syntax into the conversation while
+  preserving tool support for normal agent chat and analysis.
+- External model load/unload completion now returns to the Qt GUI thread through
+  a queued signal, preventing Providers & GPU from remaining stuck on
+  `Loading...` after LM Studio finishes a request.
+- Provider registry and runtime state are invalidated or rebuilt after live
+  Settings changes so model and endpoint changes take effect without an
+  application restart.
+
+### Provider, Model Lifecycle, and Dialogue Fixes
+- Added provider-aware model discovery and endpoint normalization for Ollama,
+  LM Studio, vLLM, and KoboldCpp, including LM Studio native model status.
+- Fixed LM Studio URL precedence so stale `BIG_BRAIN_URL` and `SMALL_BRAIN_URL`
+  values cannot override the shared external-provider endpoint.
+- Added role-specific external start and stop behavior for shared providers;
+  Start Small Brain and Start Big Brain now load their configured model instead
+  of attempting to launch an unnecessary llama-server.
+- Fixed the public `DualBrainControl` handler bridge so external lifecycle
+  helpers and completion callbacks are available to the active GUI class.
+- Fixed status refresh so each brain is marked running only when its own
+  configured model is loaded, even when both roles share one provider.
+- Fixed dialogue model routing for LM Studio by using the canonical provider
+  endpoint in both Big Brain and Small Brain adapters.
+- Added bounded dialogue-mode prompts and disabled tool parsing for persona
+  turns to prevent malformed outputs such as partial `query_db` SQL from being
+  inserted into the shared dialogue transcript.
+
+### Provider Verification
+- Provider and runtime regression tests pass (`27 passed`).
+- Modified provider, adapter, and GUI modules compile cleanly and report no
+  diagnostics.
+- Live LM Studio validation confirmed separate loaded instances, successful
+  model generation, and successful direct Alex dialogue generation.
+
+### Existing Maintenance Changes
 - Dialogue now populates and shares Goals, Tasks, and Progress state with Marcus
   and Alex instead of leaving those panels disconnected.
 - Removed the redundant Collaboration and Memory & Stream tabs; useful telemetry

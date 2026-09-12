@@ -685,23 +685,29 @@ class AutonomousLoop:
             if self.evidence_store is not None and hasattr(self.evidence_store, 'for_subject'):
                 evidence = self.evidence_store.for_subject("opportunity", opp.id or opp.opportunity_id)
                 from agents.evidence import EvidenceStatus, VerificationLevel
+                from agents.evidence_policy import is_transition_eligible
+                # Payment evidence alone is not enough. The policy owns the complete
+                # transition contract, including submission, completion, payment type,
+                # and verification level.
+                eligible = (
+                    is_transition_eligible("SUBMITTED->PAID", evidence)
+                    or is_transition_eligible("CLAIMED->REVENUE_REALIZED", evidence)
+                )
                 for ev in evidence:
-                    # C-2 fix: payment is only 'verified' when there is an actual payment-type
-                    # evidence at L3+ EXTERNAL verification. A self-reported L1 submission is NOT
-                    # payment proof - the prior code treated any VERIFIED evidence (incl. that L1
-                    # submission) as paid, fabricating success with no money.
-                    if (ev.evidence_type in ("payment_gross", "balance_delta", "platform_transaction")
-                            and ev.status == EvidenceStatus.VERIFIED
-                            and ev.verification_level >= VerificationLevel.L3_EXTERNAL_SOURCE):
-                        verified = True; evidence_found = True
+                    if ev.evidence_type in ("payment_gross", "balance_delta", "platform_transaction",
+                                             "payment_confirmation", "external_reconciliation"):
+                        if ev.status == EvidenceStatus.VERIFIED and ev.verification_level >= VerificationLevel.L3_EXTERNAL_SOURCE:
+                            evidence_found = True
+                        if eligible and ev.status == EvidenceStatus.VERIFIED:
+                            verified = True
                         payment_amount = float(getattr(ev, "amount", 0) or 0) or float(getattr(opp, "advertised_amount", 0) or 0)
-                        break
                     elif ev.status == EvidenceStatus.VERIFIED:
                         evidence_found = True
             if verified and self.lifecycle is not None and hasattr(self.lifecycle, 'mark_paid_verified'):
                 try:
-                    self.lifecycle.mark_paid_verified(opp.id or opp.opportunity_id,
+                    lifecycle_state = self.lifecycle.mark_paid_verified(opp.id or opp.opportunity_id,
                         amount=payment_amount or float(getattr(opp, "advertised_amount", 0) or 0))
+                    verified = getattr(lifecycle_state, "status", "paid") == "paid"
                 except Exception: pass
             result.paid = verified
             result.payment_amount = payment_amount

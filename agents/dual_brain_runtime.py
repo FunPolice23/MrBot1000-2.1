@@ -346,6 +346,7 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
         return raw in ("1", "true", "yes", "on")
 
     provider = _g("PROVIDER", defaults["provider"]).lower()
+    display_name = _g("NAME", defaults["display_name"])
     if provider not in SUPPORTED_PROVIDERS:
         provider = PROVIDER_LLAMACPP
     endpoint_default = defaults["endpoint"]
@@ -389,6 +390,7 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
         port=_i("PORT", defaults["port"]),
         context=_i("CONTEXT", context_default),
         gpu_layers=gpu_layers,
+        display_name=display_name,
         enabled=_b("ENABLED", True),
         kv_cache=_g("KV_CACHE", defaults.get("kv_cache", "f16")),
         split_mode=_g("SPLIT_MODE", defaults.get("split_mode", "none")),

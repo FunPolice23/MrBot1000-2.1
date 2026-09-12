@@ -33,6 +33,8 @@ from PySide6.QtWidgets import (
 )
 import os
 
+from agents.personas import DRIVER, NAVIGATOR
+
 
 # Driver (big, Marcus Rivera) is the ambitious strategist; Navigator (small, Alex Vega) is the cautious checker.
 DRIVER_COLOR = "#4fc3f7"    # blue  -> Driver (Marcus Rivera)
@@ -43,14 +45,16 @@ SYS_COLOR = "#9e9e9e"
 
 def _persona_name(speaker: str) -> str:
     """Map legacy/alias speaker keys to canonical persona display names."""
+    driver_name = DRIVER.current_name
+    navigator_name = NAVIGATOR.current_name
     s = (speaker or "").lower()
     if s in ("big", "big brain", "driver", "driver (big)", "marcus", "marcus rivera", "rivera"):
-        return "Marcus Rivera"
+        return driver_name
     if s in ("small", "small brain", "navigator", "navigator (small)", "alex", "alex vega", "vega"):
-        return "Alex Vega"
+        return navigator_name
     if s == "human":
         return "Human"
-    return speaker or "Marcus Rivera"
+    return speaker or driver_name
 
 
 def _emoji(speaker: str) -> str:
@@ -217,7 +221,7 @@ class DialogueTab(QWidget):
         # that cannot reliably follow the dialogue contract are stopped before
         # they can inject unrelated text into the shared transcript.
         min_size = min(driver_size, navigator_size)
-        if min_size < 4:
+        if min_size < 2:
             self.active_lifecycle = LIFECYCLE_SIMPLE
         else:
             self.active_lifecycle = LIFECYCLE
@@ -238,8 +242,8 @@ class DialogueTab(QWidget):
         """Return whether a model should be excluded from autonomous dialogue."""
         name = str(model_name or "").lower()
         size = self._estimate_model_size(name)
-        if size < 4:
-            return True, f"{os.path.basename(name) or 'model'} is below 4B"
+        if size < 2:
+            return True, f"{os.path.basename(name) or 'model'} is below 2B"
         if any(marker in name for marker in ("embedding", "reranker", "rerank", "-base", ":base")):
             return True, "base/embedding models are not dialogue-tuned"
         return False, ""
@@ -328,11 +332,11 @@ class DialogueTab(QWidget):
             return
 
         def model_id_for(brain, path: str) -> str:
-            """Use llama-server's path model id; use names for other APIs."""
+            """Preserve provider model IDs, including LM Studio namespaces."""
             base_url = str(getattr(brain, "base_url", "")).lower()
             if "127.0.0.1:1234" in base_url or "127.0.0.1:1235" in base_url:
                 return path
-            return os.path.basename(path)
+            return path
 
         def running_model_id(brain) -> str:
             """Read the already-loaded llama-server model once during init."""
@@ -425,7 +429,7 @@ class DialogueTab(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        header = QLabel("🚀 Marcus Rivera ⇄ Alex Vega  ·  Goal-Driven Dialogue")
+        header = QLabel(f"🚀 {DRIVER.current_name} ⇄ {NAVIGATOR.current_name}  ·  Goal-Driven Dialogue")
         header.setStyleSheet("font-size: 15px; font-weight: bold; color: #ffb300; padding: 6px;")
         layout.addWidget(header)
 
@@ -538,12 +542,12 @@ class DialogueTab(QWidget):
 
         controls.addWidget(QLabel("Send as:"))
         self.speaker_combo = QComboBox()
-        self.speaker_combo.addItems(["Human (you)", "Marcus Rivera", "Alex Vega"])
+        self.speaker_combo.addItems(["Human (you)", DRIVER.current_name, NAVIGATOR.current_name])
         self.speaker_combo.setFixedWidth(140)
         controls.addWidget(self.speaker_combo)
         controls.addWidget(QLabel("Next reply:"))
         self.reply_combo = QComboBox()
-        self.reply_combo.addItems(["Marcus Rivera", "Alex Vega"])
+        self.reply_combo.addItems([DRIVER.current_name, NAVIGATOR.current_name])
         self.reply_combo.setFixedWidth(140)
         controls.addWidget(self.reply_combo)
         layout.addLayout(controls)
@@ -609,7 +613,8 @@ class DialogueTab(QWidget):
         # Instruction of the phase most recently consumed by _current_phase_speaker.
         lifecycle = getattr(self, "active_lifecycle", LIFECYCLE)
         idx = (self._phase_index - 1) % len(lifecycle)
-        return lifecycle[idx][2]
+        return lifecycle[idx][2].replace("Marcus Rivera", DRIVER.current_name).replace(
+            "Alex Vega", NAVIGATOR.current_name)
 
     # ── actions ─────────────────────────────────────────────────────────
     def on_send(self):
@@ -738,6 +743,23 @@ class DialogueTab(QWidget):
             return
         speaker = _persona_name(speaker)
         response = self._clean_model_response(response)
+
+        # A failed worker retry returns this fixed marker. It is diagnostic
+        # state, not a persona turn, so do not let duplicate detection feed it
+        # back into the shared conversation.
+        if "[dialogue model returned malformed or non-conversational output" in (
+                response or "").lower():
+            self.worker = None
+            self.append_system(
+                f"{speaker} could not produce a conversational response after retries. "
+                "Check the loaded model and chat template before continuing."
+            )
+            if self.live_running or self.is_running:
+                self.stop_live()
+                self.append_system(
+                    "Dialogue paused because the model response was not conversational."
+                )
+            return
 
         # Do not let an instruction-sensitive local model keep replaying an
         # earlier turn into the shared transcript and feed that loop forward.

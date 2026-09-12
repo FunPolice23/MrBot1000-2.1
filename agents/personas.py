@@ -23,6 +23,16 @@ _ROLE_DB_KEY = {
     PersonaRole.DRIVER: "big_brain",
     PersonaRole.NAVIGATOR: "small_brain",
 }
+_ROLE_NAME_ENV = {
+    PersonaRole.DRIVER: "BIG_BRAIN_NAME",
+    PersonaRole.NAVIGATOR: "SMALL_BRAIN_NAME",
+}
+
+
+def display_name_for(role: PersonaRole) -> str:
+    """Return the configured display name for a stable persona role."""
+    persona = DRIVER if role is PersonaRole.DRIVER else NAVIGATOR
+    return persona.current_name
 
 
 @dataclass
@@ -40,6 +50,17 @@ class Persona:
     @property
     def db_key(self) -> str:
         return _ROLE_DB_KEY[self.role]
+
+    @property
+    def current_name(self) -> str:
+        """Return the user-configured name while preserving the role default."""
+        configured = os.getenv(_ROLE_NAME_ENV[self.role], "").strip()
+        return configured or self.name
+
+    @property
+    def current_identity(self) -> str:
+        """Update the identity sentence without changing the stable persona role."""
+        return self.identity.replace(self.name, self.current_name)
 
     def personality_addon(self) -> str:
         try:
@@ -79,7 +100,7 @@ class Persona:
 
         if prompt_tier == "tiny":
             return (
-                f"# IDENTITY\nYou are {self.name}. Speak only as {self.name} in first person.\n"
+                f"# IDENTITY\nYou are {self.current_name}. Speak only as {self.current_name} in first person.\n"
                 f"ACTIVE GOAL: {goal}\n"
                 "Answer only the current phase in 1-3 short sentences. Do not mention "
                 "models, Gemma, training, tools, or internet access. Do not invent facts. "
@@ -89,10 +110,10 @@ class Persona:
 
         if prompt_tier == "compact":
             return (
-                f"# IDENTITY\nYou are {self.name}, {self.tagline}\n"
-                f"{self.identity}\nPersonality: {self.personality_type}\n"
+                f"# IDENTITY\nYou are {self.current_name}, {self.tagline}\n"
+                f"{self.current_identity}\nPersonality: {self.personality_type}\n"
                 f"Strengths: {strengths}\nGuardrails: {guardrails}\n"
-                f"Speak as {self.name} in first person.\n"
+                f"Speak as {self.current_name} in first person.\n"
                 f"ACTIVE GOAL: {goal}\n{mem_block}{personality_block}\n"
                 f"# TASK\nFollow the current phase instruction in the user message. "
                 f"Give one concrete, honest decision. Do not expose hidden reasoning, "
@@ -101,14 +122,14 @@ class Persona:
 
         return (
             f"# IDENTITY\n"
-            f"You are {self.name}. {self.tagline}\n"
-            f"{self.identity}\n"
+            f"You are {self.current_name}. {self.tagline}\n"
+            f"{self.current_identity}\n"
             f"Personality: {self.personality_type}\n"
             f"Style: {self.style_notes}\n"
             f"Strengths: {strengths}\n"
             f"Abilities: {abilities}\n"
             f"Guardrails: {guardrails}\n"
-            f"Speak in FIRST PERSON ('I', 'me', 'my'). NEVER use third person.\n"
+            f"Speak as {self.current_name} in FIRST PERSON ('I', 'me', 'my'). NEVER use third person.\n"
             f"You are an AI assistant that helps find earning opportunities.\n"
             f"You have REAL tools. When you need data, CALL A TOOL.\n"
             f"NEVER make up data. NEVER say 'I will search' without calling the tool.\n"

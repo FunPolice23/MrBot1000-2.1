@@ -116,6 +116,21 @@ class ProviderConfigWidget(QWidget):
         self.fallback_check = QCheckBox("Auto-failover to cloud when local fails")
         self.fallback_check.setChecked(True)
         settings_layout.addWidget(self.fallback_check, 2, 1)
+        settings_layout.addWidget(QLabel("Big Brain name:"), 3, 0)
+        self.big_brain_name = QLineEdit(os.getenv("BIG_BRAIN_NAME", "").strip())
+        self.big_brain_name.setPlaceholderText("Big Brain")
+        self.big_brain_name.setToolTip("Custom display name for the Big Brain role")
+        self.big_brain_name.editingFinished.connect(
+            lambda: self._persist_brain_name("BIG_BRAIN_NAME", self.big_brain_name))
+        settings_layout.addWidget(self.big_brain_name, 3, 1)
+
+        settings_layout.addWidget(QLabel("Small Brain name:"), 4, 0)
+        self.small_brain_name = QLineEdit(os.getenv("SMALL_BRAIN_NAME", "").strip())
+        self.small_brain_name.setPlaceholderText("Small Brain")
+        self.small_brain_name.setToolTip("Custom display name for the Small Brain role")
+        self.small_brain_name.editingFinished.connect(
+            lambda: self._persist_brain_name("SMALL_BRAIN_NAME", self.small_brain_name))
+        settings_layout.addWidget(self.small_brain_name, 4, 1)
         
         layout.addWidget(settings_group)
         
@@ -182,6 +197,25 @@ class ProviderConfigWidget(QWidget):
                 _active_worker.invalidate_provider_registry()
         except Exception:
             pass
+
+    def _persist_brain_name(self, key: str, widget: QLineEdit):
+        """Persist a custom role name without altering the stable brain key."""
+        value = widget.text().strip()
+        if not value:
+            widget.clear()
+            os.environ.pop(key, None)
+            values = {key: ""}
+        else:
+            os.environ[key] = value
+            values = {key: value}
+        try:
+            from main import set_env_values
+            set_env_values(values)
+        except Exception:
+            pass
+        self.status_label.setText(f"Saved {key.replace('_', ' ').title()}")
+        self.status_label.setStyleSheet("color: #4caf50;")
+        self.provider_changed.emit("persona", key)
     
     def _build_provider_list(self, provider_type: str):
         """Build provider list for cloud or local."""

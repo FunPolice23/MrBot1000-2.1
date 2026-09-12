@@ -128,8 +128,17 @@ TEST_CATEGORIES = {
     }
 }
 
-# Get all individual test names (excluding bundle tests)
-ALL_TESTS = [t for cat in TEST_CATEGORIES.values() for t in cat['tests'] if not t.startswith('run_')]
+# Get all individual test names (excluding bundle tests). Keep the curated
+# categories for documentation, but automatically include every unittest file
+# so a new test module cannot silently disappear from the default run.
+_CURATED_TESTS = [
+    t for cat in TEST_CATEGORIES.values()
+    for t in cat['tests'] if not t.startswith('run_')
+]
+_DISCOVERED_TESTS = sorted(
+    path.stem for path in Path(__file__).parent.glob('test_*.py')
+)
+ALL_TESTS = list(dict.fromkeys(_CURATED_TESTS + _DISCOVERED_TESTS))
 
 RESULTS_DIR = Path(__file__).parent / 'test_results'
 RESULTS_FILE = RESULTS_DIR / f'test_run_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
@@ -156,6 +165,12 @@ def list_tests():
         for test in info['tests']:
             builtin = " (runs other tests)" if test.startswith('run_') else ""
             print(f"    • {test}{builtin}")
+    categorized = set(_CURATED_TESTS)
+    discovered_only = [name for name in _DISCOVERED_TESTS if name not in categorized]
+    if discovered_only:
+        print("\n  [AUTO-DISCOVERED] unittest modules not yet assigned to a category")
+        for test in discovered_only:
+            print(f"    • {test}")
     print()
     print("Examples:")
     print("  python -m tests                    # Run all tests")
@@ -249,6 +264,10 @@ def run_test(test_name: str) -> tuple:
     elif test_name == 'run_full_suite':
         return run_tests(ALL_TESTS)
     else:
+        # Any test_*.py module is a valid unittest target, including modules
+        # added after the curated category map was written.
+        if test_name.startswith('test_'):
+            return run_unittest_file(f"{test_name}.py")
         return False, f"Unknown test: {test_name}"
 
 

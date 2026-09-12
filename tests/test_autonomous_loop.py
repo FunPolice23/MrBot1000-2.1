@@ -444,9 +444,39 @@ class TestGroup2NoFabricatedPayment(unittest.TestCase):
         self.assertFalse(verify.data["paid"], "L1 submission was treated as payment")
         self.assertFalse(result.paid)
 
+    def test_payment_only_does_not_pass_real_lifecycle_policy(self):
+        """Payment evidence alone must not bypass the lifecycle transition contract."""
+        from agents.opportunity_lifecycle import OpportunityLifecycleTracker
+
+        self.pipeline.lifecycle = OpportunityLifecycleTracker(
+            evidence_store=self.pipeline.evidence_store)
+        self.pipeline.evidence_store.record(
+            self.ev.create(source="system", evidence_type="payment_gross",
+                           subject_type="opportunity", subject_id="opp-g2",
+                           external_id="ext-1", amount=180.0, currency="usd",
+                           verification_method="authenticated_api",
+                           verification_level=self.VL.L3_EXTERNAL_SOURCE,
+                           status=self.EST.VERIFIED,
+                           provenance={"producer": "payment_provider"}))
+
+        result = self.loop.run(self._opp())
+
+        self.assertFalse(result.paid)
+        self.assertEqual(result.decision, "completed_unpaid")
+        self.assertNotEqual(
+            self.pipeline.lifecycle._ensure("opp-g2").status, "paid")
+
     def test_verified_l3_payment_reports_paid(self):
-        """Positive control: a real L3+ payment_gross evidence flips the loop to paid."""
+        """Positive control: the complete externally verified payment chain flips the loop to paid."""
         opp = self._opp(advertised_amount=50)
+        for evidence_type in ("platform_submission", "completion_confirmation"):
+            self.pipeline.evidence_store.record(
+                self.ev.create(source="platform", evidence_type=evidence_type,
+                               subject_type="opportunity", subject_id="opp-g2",
+                               external_id="ext-1", verification_method="authenticated_api",
+                               verification_level=self.VL.L3_EXTERNAL_SOURCE,
+                               status=self.EST.VERIFIED,
+                               provenance={"producer": "payment_provider"}))
         self.pipeline.evidence_store.record(
             self.ev.create(source="system", evidence_type="payment_gross",
                            subject_type="opportunity", subject_id="opp-g2",

@@ -81,6 +81,28 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         self.assertIn("jurisdiction", fallback)
         self.assertIn("BLOCKED:", fallback)
 
+    def test_malformed_fallback_is_not_added_as_persona_turn(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        tab._generation_id = 1
+        tab.conversation_history = []
+        tab.worker = object()
+        tab.live_running = False
+        tab.is_running = False
+        tab.append_system = Mock()
+
+        tab._on_response_ready(
+            "[Dialogue model returned malformed or non-conversational output "
+            "after retries. Check the loaded model and chat template before continuing.]",
+            "Edward Hurst",
+            1,
+        )
+
+        self.assertEqual(tab.conversation_history, [])
+        self.assertIsNone(tab.worker)
+        tab.append_system.assert_called_once()
+        self.assertIn("could not produce a conversational response", 
+                      tab.append_system.call_args.args[0])
+
     def test_non_progress_and_unrequested_image_continuations_are_rejected(self):
         worker = DialogueWorker.__new__(DialogueWorker)
         worker.context = "CURRENT PHASE: discover\nPHASE INSTRUCTION: approve or block."
@@ -131,7 +153,10 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         tab = DialogueTab.__new__(DialogueTab)
         blocked, reason = tab._dialogue_model_blocked("granite-1b-tiny")
         self.assertTrue(blocked)
-        self.assertIn("below 4B", reason)
+        self.assertIn("below 2B", reason)
+        blocked, reason = tab._dialogue_model_blocked("mistralai/ministral-3-3b")
+        self.assertFalse(blocked)
+        self.assertEqual(reason, "")
         blocked, reason = tab._dialogue_model_blocked("llama-3.1-8b-base")
         self.assertTrue(blocked)
         self.assertIn("not dialogue-tuned", reason)

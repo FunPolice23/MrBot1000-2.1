@@ -44,7 +44,7 @@ class EvidenceRequirement:
 # The gate only checks "payment happened"; revenue_eligibility() downstream keeps manual/L1
 # money in "pending" until reconciled, and METHOD_CONFIDENCE keeps manual strictly below
 # independently verified payment (manual 0.30 < authenticated_api 0.70 < crypto 1.0).
-_PAYMENT_SLOT = ("payment_confirmation", "balance_delta", "platform_transaction",
+_PAYMENT_SLOT = ("payment_confirmation", "payment_gross", "balance_delta", "platform_transaction",
                  "manual_attestation", "external_reconciliation")
 
 REQUIREMENTS: Dict[str, EvidenceRequirement] = {

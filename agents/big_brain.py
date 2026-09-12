@@ -26,6 +26,7 @@ from agents.program_knowledge import (
 from agents.prompt_assembly import assemble_role_prompt
 from agents.task_router import classify_task, get_tools_for_task, get_specialization_prompt
 from agents.safety_gate import SafetyGate, SafetyDecision
+from agents.personas import DRIVER
 
 
 class BigBrainAdapter:
@@ -297,7 +298,7 @@ class BigBrainAdapter:
         """Handle direct chat with tool calling support."""
         # GUI is the source of truth for model selection
         if self.model == "unknown" or not self.model:
-            return "[Marcus Rivera: No model selected. Please choose a model in the Providers & GPU tab.]"
+            return f"[{DRIVER.current_name}: No model selected. Please choose a model in the Providers & GPU tab.]"
 
         # Build system prompt
         if system_prompt:
@@ -310,7 +311,7 @@ class BigBrainAdapter:
         full_system = add_anti_hallucination_rules(full_system)
         if dialogue_mode:
             full_system += (
-                "\n\nDIALOGUE-ONLY MODE: Reply as Marcus Rivera in natural language. "
+                f"\n\nDIALOGUE-ONLY MODE: Reply as {DRIVER.current_name} in natural language. "
                 "Do not call tools, write SQL, emit function names, or describe a "
                 "tool call. Use the evidence already present in the conversation. "
                 "If evidence is missing, say BLOCKED in one or two sentences."

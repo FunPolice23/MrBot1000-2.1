@@ -17,6 +17,7 @@ from agents.program_knowledge import (
     ProgramKnowledge
 )
 from agents.prompt_assembly import assemble_role_prompt
+from agents.personas import DRIVER, NAVIGATOR
 
 
 class SmallBrainAdapter:
@@ -104,7 +105,7 @@ class SmallBrainAdapter:
         if tier == "tiny":
             return self.base_system_prompt + (
                 "\n\n# OPERATING CONTRACT\n"
-                "You are Alex Vega, the concise chat and triage assistant for MrBot1000.\n"
+                f"You are {NAVIGATOR.current_name}, the concise chat and triage assistant for MrBot1000.\n"
                 "Answer the user's current question directly in 1-3 short paragraphs.\n"
                 "Do not invent facts. Say UNKNOWN when evidence is missing.\n"
                 "Never spend, submit, sign, share secrets, or claim payment without human approval.\n"
@@ -113,8 +114,8 @@ class SmallBrainAdapter:
         # Compact retains the parts that shape behavior, not the full program manual.
         extra = (
             "\n\n# ABOUT MRBOT1000\n"
-            "MrBot1000 is a local-first earning assistant. Alex handles chat, triage,\n"
-            "status, and lightweight risk checks; Marcus handles complex planning and review.\n"
+            f"MrBot1000 is a local-first earning assistant. {NAVIGATOR.current_name} handles chat, triage,\n"
+            f"status, and lightweight risk checks; {DRIVER.current_name} handles complex planning and review.\n"
             "The human operator approves spending, contracts, credentials, submissions,\n"
             "and irreversible actions. Never invent results or payment.\n"
         )
@@ -136,7 +137,7 @@ class SmallBrainAdapter:
         """Handle conversation with tool calling support."""
         # GUI is the source of truth for model selection
         if self.model == "unknown" or not self.model:
-            return "[Alex Vega: No model selected. Please choose a model in the Providers & GPU tab.]"
+            return f"[{NAVIGATOR.current_name}: No model selected. Please choose a model in the Providers & GPU tab.]"
 
         # Build system prompt
         if system_prompt:
@@ -149,7 +150,7 @@ class SmallBrainAdapter:
         full_system = add_anti_hallucination_rules(full_system)
         if dialogue_mode:
             full_system += (
-                "\n\nDIALOGUE-ONLY MODE: Reply as Alex Vega in natural language. "
+                f"\n\nDIALOGUE-ONLY MODE: Reply as {NAVIGATOR.current_name} in natural language. "
                 "Do not call tools, write SQL, emit function names, or describe a "
                 "tool call. Use the evidence already present in the conversation. "
                 "If evidence is missing, say BLOCKED in one or two sentences."
@@ -213,7 +214,7 @@ class SmallBrainAdapter:
 
             return answer
         except Exception as e:
-            return f"[Alex Vega Error: {str(e)[:200]}]"
+            return f"[{NAVIGATOR.current_name} Error: {str(e)[:200]}]"
     
     def review(self, plan: str) -> str:
         """Review Big Brain's plan for red flags."""

@@ -11,6 +11,8 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 - **First real paper/human-gated earning capability** (`agents/earning_capability.py`): produces a real TaskWorkspace deliverable, validates it deterministically, stops on human gates, packages locally, and records submission evidence — never fabricates payment or success.
 - **Dialogue and Management consolidation**: Dialogue now tracks goals, tasks,
   and progress; redundant Collaboration and Memory & Stream tabs are removed.
+- **Custom brain names**: Big Brain and Small Brain display names can be edited
+  and saved in Provider Configuration. Internal role keys remain stable.
 
 ## Quick Start
 
@@ -284,4 +286,3 @@ it is not a separate visible tab.
 - RAM: 16GB minimum, 32GB recommended
 - Storage: 5GB+ for models and databases
 - Local endpoints and controls come from the enabled provider in Settings; llama.cpp uses the role ports by default, while Ollama, LM Studio, vLLM, and KoboldCpp use their configured endpoints
-- 

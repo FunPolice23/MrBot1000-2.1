@@ -50,6 +50,13 @@ class _Server:
 
 
 class TestRoleDefaults(unittest.TestCase):
+    def test_custom_display_names_are_role_specific(self):
+        big = build_config(BrainRole.BIG, {"BIG_BRAIN_NAME": "Orion"})
+        small = build_config(BrainRole.SMALL, {"SMALL_BRAIN_NAME": "Lumen"})
+
+        self.assertEqual(big.display_name, "Orion")
+        self.assertEqual(small.display_name, "Lumen")
+
     def test_big_brain_defaults_device0_port1234(self):
         cfg = build_config(BrainRole.BIG, {})
         self.assertEqual(cfg.device, 0)

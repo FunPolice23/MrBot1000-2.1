@@ -2156,7 +2156,14 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         (main_enabled, chat_enabled)."""
         if role_combo is None:
             return (True, True)
-        txt = role_combo.currentText().strip()
+        # Settings can rebuild its provider rows while a queued connection test
+        # is still running. The Python wrapper then outlives the Qt C++ widget.
+        # Treat that stale row as disabled; the next Settings build supplies the
+        # live controls and avoids dereferencing a deleted QObject.
+        try:
+            txt = role_combo.currentText().strip()
+        except RuntimeError:
+            return (False, False)
         if txt == "Disabled":
             return (False, False)
         if txt == "Main only":

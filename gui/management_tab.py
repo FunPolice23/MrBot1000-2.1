@@ -15,12 +15,16 @@ Sections:
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QGroupBox, QGridLayout, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QPlainTextEdit, QListWidget, QWidget, QMessageBox,
 )
+
+from agents.personas import DRIVER, NAVIGATOR
 
 
 class ManagementTab(QWidget):
@@ -61,6 +65,30 @@ class ManagementTab(QWidget):
         title.setFont(QFont("Segoe UI", 18, QFont.Bold))
         title.setStyleSheet("color: #ffb300;")
         layout.addWidget(title)
+
+        # ── Persona Names ────────────────────────────────────────────────
+        names_group = QGroupBox("Persona Names")
+        names_layout = QGridLayout(names_group)
+        names_layout.setSpacing(8)
+
+        names_layout.addWidget(QLabel("Big Brain display name:"), 0, 0)
+        self.big_brain_name = QLineEdit(os.getenv("BIG_BRAIN_NAME", "").strip())
+        self.big_brain_name.setPlaceholderText(DRIVER.name)
+        self.big_brain_name.editingFinished.connect(
+            lambda: self._persist_persona_name("BIG_BRAIN_NAME", self.big_brain_name))
+        names_layout.addWidget(self.big_brain_name, 0, 1)
+
+        names_layout.addWidget(QLabel("Small Brain display name:"), 1, 0)
+        self.small_brain_name = QLineEdit(os.getenv("SMALL_BRAIN_NAME", "").strip())
+        self.small_brain_name.setPlaceholderText(NAVIGATOR.name)
+        self.small_brain_name.editingFinished.connect(
+            lambda: self._persist_persona_name("SMALL_BRAIN_NAME", self.small_brain_name))
+        names_layout.addWidget(self.small_brain_name, 1, 1)
+
+        self.persona_name_status = QLabel("Names apply to new messages immediately.")
+        self.persona_name_status.setStyleSheet("font-size: 11px; color: #888;")
+        names_layout.addWidget(self.persona_name_status, 2, 0, 1, 2)
+        layout.addWidget(names_group)
 
         # ── Section 1: Earnings Pipeline ──────────────────────────────────
         pipeline_group = QGroupBox("Earnings Pipeline")
@@ -235,6 +263,22 @@ class ManagementTab(QWidget):
         layout.addWidget(system_group)
 
         layout.addStretch()
+
+    def _persist_persona_name(self, key: str, widget: QLineEdit):
+        """Persist a display name while retaining stable internal role keys."""
+        value = widget.text().strip()
+        if value:
+            os.environ[key] = value
+        else:
+            os.environ.pop(key, None)
+        try:
+            from main import set_env_values
+            set_env_values({key: value})
+        except Exception:
+            pass
+        self.persona_name_status.setText(
+            "Saved. New messages use the updated name."
+            if value else "Cleared. The default persona name will be used.")
 
     # ── Public API (called by main window) ──────────────────────────────────
 

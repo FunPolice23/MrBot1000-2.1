@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 
@@ -20,6 +21,21 @@ def validate_startup_environment(env: Optional[Dict[str, str]] = None, log_fn: O
     warnings: List[str] = []
     errors: List[str] = []
     details: Dict[str, object] = {}
+
+    gitignore_path = Path(__file__).with_name(".gitignore")
+    try:
+        gitignore_text = gitignore_path.read_text(encoding="utf-8")
+    except OSError:
+        gitignore_text = ""
+    wallet_key_ignored = any(
+        line.strip() in {"wallet.key", "wallets.json"}
+        for line in gitignore_text.splitlines()
+    )
+    details["wallet_key_ignored"] = wallet_key_ignored
+    if not wallet_key_ignored:
+        warnings.append(
+            "Wallet key files are not protected by .gitignore; review secret-file handling before use."
+        )
 
     safe_mode = str(env.get("MRBOT_SAFE_MODE", "")).lower() in {"1", "true", "yes", "on"}
     details["safe_mode"] = safe_mode

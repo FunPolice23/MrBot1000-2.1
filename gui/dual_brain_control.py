@@ -342,6 +342,7 @@ class DualBrainControl(QWidget):
     """Control panel for dual-brain GPU orchestration."""
 
     _restart_ready = Signal(bool)
+    _external_lifecycle_finished = Signal(bool, bool, str)
     
     # Signals emitted when model changes
     small_brain_model_changed = Signal(str)  # model_name
@@ -361,6 +362,7 @@ class DualBrainControl(QWidget):
         # its own defaults when no runtime is injected (back-compat).
         self.runtime = runtime
         self._restart_ready.connect(self._continue_model_restart)
+        self._external_lifecycle_finished.connect(self._finish_external_lifecycle)
 
         # Provider checkers
         self.provider_checker = ProviderStatusChecker()
@@ -1714,11 +1716,18 @@ class DualBrainControl(QWidget):
     def _get_model_name_for_gpu(self, idx):
         """Get the model name for a GPU."""
         try:
-            from agents.dual_brain_runtime import BrainRole
+            from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
             role = BrainRole.BIG if idx == 0 else BrainRole.SMALL
             model_path = self._current_model_path(role == BrainRole.SMALL)
             if model_path:
-                return os.path.basename(model_path)
+                # External providers use IDs such as ``qwen/qwen3.5-9b``;
+                # only local filesystem selections should be reduced to a
+                # filename.
+                return os.path.basename(model_path) if os.path.exists(model_path) else model_path
+            runtime = self.runtime or DualBrainRuntime.from_env()
+            configured = runtime.config(role).model
+            if configured:
+                return configured
             return "—"
         except Exception:
             return "—"
@@ -2763,20 +2772,19 @@ class BrainLaunchWorker(QThread):
     def _unload_external_model(self, small, provider, endpoint, model, label):
         ok, message = self.provider_checker.unload_provider_model(
             provider, endpoint, model)
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: self._finish_external_lifecycle(
-            small, ok, f"{label} {message}"))
+        self._external_lifecycle_finished.emit(
+            small, ok, f"{label} {message}")
 
     def _load_external_model(self, small, provider, endpoint, model, label):
         ok, message = self.provider_checker.load_provider_model(
             provider, endpoint, model)
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: self._finish_external_lifecycle(
-            small, ok, f"{label} {message}"))
+        self._external_lifecycle_finished.emit(
+            small, ok, f"{label} {message}")
 
     def _finish_external_lifecycle(self, small, ok, message):
         prefix = "✅" if ok else "❌"
         self._log(f"{prefix} {message}")
+        self._set_loading(small, False, "")
         self._refresh_provider_status()
 
     # ═══════════════════════════════════════════════════════════════════

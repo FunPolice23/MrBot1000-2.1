@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, QThread, Qt
 from PySide6.QtGui import QFont
 
+from agents.personas import DRIVER, NAVIGATOR
+
 
 class ThinkingBox(QFrame):
     """Collapsible thinking box with toggle button."""
@@ -111,7 +113,7 @@ class ChatTab(QWidget):
         layout = QVBoxLayout(self)
         
         # Header
-        header = QLabel("💬 Chat with Alex Vega (1660 Super)")
+        header = QLabel(f"💬 Chat with {NAVIGATOR.current_name} (1660 Super)")
         header.setStyleSheet("font-size: 16px; font-weight: bold; color: #03dac6; padding: 10px;")
         layout.addWidget(header)
         
@@ -253,7 +255,7 @@ class ChatTab(QWidget):
         
         # Display thinking if present and enabled
         if thinking and self.show_thinking:
-            thinking_box = ThinkingBox(thinking, "🧠 Alex Vega Thinking")
+            thinking_box = ThinkingBox(thinking, f"🧠 {NAVIGATOR.current_name} Thinking")
             self.thinking_boxes.append(thinking_box)
             # Insert into chat display using HTML wrapper
             self.chat_display.append(
@@ -264,7 +266,7 @@ class ChatTab(QWidget):
             )
         
         # Display clean response
-        self.append_message("Alex Vega", clean_response, "#03dac6")
+        self.append_message(NAVIGATOR.current_name, clean_response, "#03dac6")
         
         # Update history
         self.conversation_history.append({"role": "user", "content": self.worker.user_msg})
@@ -272,7 +274,8 @@ class ChatTab(QWidget):
         
         # Check escalation
         if self.small_brain.should_escalate(self.worker.user_msg):
-            self.chat_display.append("<i style='color: #ffb300;'>[Consulting Marcus Rivera...]</i>")
+            self.chat_display.append(
+                f"<i style='color: #ffb300;'>[Consulting {DRIVER.current_name}...]</i>")
             self._start_escalation(self.worker.user_msg)
         
         # Notify any bridge (e.g. Dialogue tab) of the completed exchange so it can
@@ -290,7 +293,7 @@ class ChatTab(QWidget):
         thread never blocks on the (slow) 27B model (v2.0.36y)."""
         if self.big_brain is None:
             self.chat_display.append(
-                "<i style='color: #ff5252;'>[Big Brain unavailable — not configured]</i>")
+                f"<i style='color: #ff5252;'>[{DRIVER.current_name} unavailable — not configured]</i>")
             return
         self.escalation_worker = EscalationWorker(
             self.small_brain, self.big_brain, user_msg, list(self.conversation_history))
@@ -302,7 +305,7 @@ class ChatTab(QWidget):
     def _on_big_brain_answer(self, bb_clean: str):
         """Show the Marcus Rivera answer once it returns (GUI thread)."""
         self.chat_display.append(
-            f"<i style='color: #bb86fc;'>[Marcus Rivera: {bb_clean[:300]}...]</i>")
+            f"<i style='color: #bb86fc;'>[{DRIVER.current_name}: {bb_clean[:300]}...]</i>")
 
     def _on_escalation_summary(self, summary: str):
         """Append the Alex Vega re-summary (GUI thread)."""

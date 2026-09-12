@@ -4,6 +4,16 @@ from startup_validation import validate_startup_environment
 
 
 class StartupValidationTests(unittest.TestCase):
+    def test_wallet_key_files_are_gitignored(self):
+        report = validate_startup_environment({
+            "DISABLE_OLLAMA": "true",
+            "DISABLE_OPENAI": "true",
+            "DISABLE_ANTHROPIC": "true",
+        })
+
+        self.assertTrue(report.details["wallet_key_ignored"])
+        self.assertFalse(any("wallet key files" in item.lower() for item in report.warnings))
+
     def test_default_dual_brain_counts_as_local_provider(self):
         report = validate_startup_environment({
             "DISABLE_OLLAMA": "true",
