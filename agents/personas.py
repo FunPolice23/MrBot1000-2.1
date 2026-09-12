@@ -19,6 +19,32 @@ class PersonaRole(str, Enum):
     NAVIGATOR = "navigator"
 
 
+@dataclass(frozen=True)
+class RoleContract:
+    """Machine-readable responsibilities shared by prompts and orchestration."""
+
+    role: PersonaRole
+    responsibilities: List[str] = field(default_factory=list)
+    required_checks: List[str] = field(default_factory=list)
+    default_reasoning_modes: List[str] = field(default_factory=list)
+    prohibited_authorities: List[str] = field(default_factory=lambda: [
+        "human approval", "tool execution", "verified completion", "policy changes",
+    ])
+
+    def prompt_block(self) -> str:
+        responsibilities = "; ".join(self.responsibilities)
+        checks = "; ".join(self.required_checks)
+        modes = ", ".join(self.default_reasoning_modes)
+        prohibited = "; ".join(self.prohibited_authorities)
+        return (
+            f"ROLE CONTRACT ({self.role.value}):\n"
+            f"Responsibilities: {responsibilities}\n"
+            f"Required checks: {checks}\n"
+            f"Preferred modes: {modes}\n"
+            f"You cannot authorize or claim: {prohibited}.\n"
+        )
+
+
 _ROLE_DB_KEY = {
     PersonaRole.DRIVER: "big_brain",
     PersonaRole.NAVIGATOR: "small_brain",
@@ -46,6 +72,7 @@ class Persona:
     abilities: List[str] = field(default_factory=list)
     rules_guardrails: List[str] = field(default_factory=list)
     style_notes: str = ""
+    contract: Optional[RoleContract] = None
 
     @property
     def db_key(self) -> str:
@@ -91,6 +118,7 @@ class Persona:
         strengths = ", ".join(self.strengths)
         abilities = ", ".join(self.abilities)
         guardrails = "; ".join(self.rules_guardrails)
+        contract_block = self.contract.prompt_block() if self.contract else ""
         if compact and len(mem) > 1600:
             mem = mem[-1600:]
         mem_block = f"\n# MEMORY\n{mem}" if mem else ""
@@ -113,6 +141,7 @@ class Persona:
                 f"# IDENTITY\nYou are {self.current_name}, {self.tagline}\n"
                 f"{self.current_identity}\nPersonality: {self.personality_type}\n"
                 f"Strengths: {strengths}\nGuardrails: {guardrails}\n"
+                f"{contract_block}"
                 f"Speak as {self.current_name} in first person.\n"
                 f"ACTIVE GOAL: {goal}\n{mem_block}{personality_block}\n"
                 f"# TASK\nFollow the current phase instruction in the user message. "
@@ -129,6 +158,7 @@ class Persona:
             f"Strengths: {strengths}\n"
             f"Abilities: {abilities}\n"
             f"Guardrails: {guardrails}\n"
+            f"{contract_block}"
             f"Speak as {self.current_name} in FIRST PERSON ('I', 'me', 'my'). NEVER use third person.\n"
             f"You are an AI assistant that helps find earning opportunities.\n"
             f"You have REAL tools. When you need data, CALL A TOOL.\n"
@@ -183,6 +213,17 @@ DRIVER = Persona(
     abilities=["Opportunity sizing", "Plan generation", "Negotiation"],
     rules_guardrails=["Never propose illegal actions", "Let Jacob flag risk", "Be honest about what I don't know"],
     style_notes="Direct, confident, sometimes cocky. Use short sentences.",
+    contract=RoleContract(
+        role=PersonaRole.DRIVER,
+        responsibilities=[
+            "select and size opportunities", "generate options", "create ordered plans",
+            "state the next useful step",
+        ],
+        required_checks=[
+            "label assumptions", "link factual claims to evidence", "surface expected risk",
+        ],
+        default_reasoning_modes=["skeleton", "tree", "graph"],
+    ),
 )
 
 NAVIGATOR = Persona(
@@ -195,6 +236,17 @@ NAVIGATOR = Persona(
     abilities=["Risk assessment", "Cost/benefit analysis", "Source verification"],
     rules_guardrails=["Never approve money without human confirmation", "Flag unrealistic payouts", "Admit when Edward is right"],
     style_notes="Dry, precise, grounded. Use data and specifics.",
+    contract=RoleContract(
+        role=PersonaRole.NAVIGATOR,
+        responsibilities=[
+            "retrieve and assess evidence", "detect contradictions", "check feasibility",
+            "identify risk and blockers",
+        ],
+        required_checks=[
+            "distinguish facts from hypotheses", "check freshness", "state missing evidence",
+        ],
+        default_reasoning_modes=["react", "graph", "tree"],
+    ),
 )
 
 PERSONAS: Dict[PersonaRole, Persona] = {
@@ -238,6 +290,7 @@ def all_personas() -> List[Persona]:
 __all__ = [
     "Persona",
     "PersonaRole",
+    "RoleContract",
     "DRIVER",
     "NAVIGATOR",
     "PERSONAS",

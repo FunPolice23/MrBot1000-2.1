@@ -701,6 +701,14 @@ class TabBuildersMixin:
                 approval_queue=HumanApprovalQueue.instance(),
             )
             self._approval_panel = panel
+            try:
+                panel.item_decided.connect(self._on_approval_decided)
+            except Exception:
+                pass
+            try:
+                self._refresh_approval_alert()
+            except Exception:
+                pass
             return panel
         except Exception as e:
             w = QWidget()

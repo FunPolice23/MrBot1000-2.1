@@ -523,7 +523,9 @@ class DualBrainRuntime:
             model_status = "unselected"
             selected_model_available = None
         elif models:
-            selected_model_available = selected_model in models
+            selected_model_available = any(
+                self._model_ids_match(selected_model, model) for model in models
+            )
             model_status = "available" if selected_model_available else "stale"
         else:
             selected_model_available = None
@@ -543,6 +545,17 @@ class DualBrainRuntime:
             "models": models,
             "latency_ms": latency_ms,
         }
+
+    @staticmethod
+    def _model_ids_match(selected: str, reported: str) -> bool:
+        def variants(value: str) -> set[str]:
+            text = str(value or "").strip().replace("\\", "/").casefold()
+            if not text:
+                return set()
+            base = text.rsplit("/", 1)[-1]
+            return {text, base, base.removesuffix(".gguf")}
+
+        return bool(variants(selected) & variants(reported))
 
     # ── GUI snapshot ─────────────────────────────────────────────────────────
     def snapshot(self, refresh_health: bool = False) -> Dict[str, Any]:

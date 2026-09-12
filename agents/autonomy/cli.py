@@ -201,6 +201,7 @@ def cmd_self_improve_run() -> int:
         opportunity_id="cli-1", strategy="freelance_bidding", platform="upwork",
         outcome=Outcome.SUCCESS.value, revenue=100.0, cost=5.0,
         tags=["data"], timestamp=datetime.now().timestamp(),
+        verified=True, evidence_ids=["cli-outcome-proof"],
     ))
     rec = engine.get_recommendation()
     print("[self-improve] Pass complete:")

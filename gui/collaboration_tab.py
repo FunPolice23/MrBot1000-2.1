@@ -44,6 +44,9 @@ class CollaborationWorker(QThread):
 class CollaborationTab(QWidget):
     """Monitor + manual trigger for the dual-brain collaboration coordinator."""
 
+    ACTIVE_REFRESH_MS = 1500
+    BACKGROUND_REFRESH_MS = 15000
+
     # Emitted when a goal is submitted here so the Dialogue tab can mirror it.
     goal_changed = Signal(str)
 
@@ -54,7 +57,7 @@ class CollaborationTab(QWidget):
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
-        self._refresh_timer.start(1500)
+        self._refresh_timer.setInterval(self.ACTIVE_REFRESH_MS)
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -111,6 +114,17 @@ class CollaborationTab(QWidget):
 
         self.runs_table.itemSelectionChanged.connect(self._show_selected_detail)
         self.refresh()
+
+    def showEvent(self, event):
+        self.refresh()
+        self._refresh_timer.setInterval(self.ACTIVE_REFRESH_MS)
+        self._refresh_timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._refresh_timer.setInterval(self.BACKGROUND_REFRESH_MS)
+        self._refresh_timer.start()
+        super().hideEvent(event)
 
     # ── actions ─────────────────────────────────────────────────────────────
     def _run_collaboration(self):

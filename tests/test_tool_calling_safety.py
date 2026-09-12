@@ -128,6 +128,9 @@ class TestToolCallingSafety(unittest.TestCase):
         self.assertIn("available evidence", answer)
         self.assertEqual(trace[0]["name"], "web_search")
         self.assertEqual(trace[0]["status"], "completed")
+        self.assertEqual(trace[0]["action_state"], "completed")
+        self.assertTrue(trace[0]["executed"])
+        self.assertTrue(trace[0]["execution_id"].startswith("exe_"))
         self.assertEqual(trace[0]["result_preview"], "RESULT evidence")
 
     def test_pending_approval_is_not_reported_as_completed(self):
@@ -151,6 +154,9 @@ class TestToolCallingSafety(unittest.TestCase):
                 tool_trace=trace,
             )
         self.assertEqual(trace[0]["status"], "pending_approval")
+        self.assertEqual(trace[0]["action_state"], "proposed")
+        self.assertFalse(trace[0]["executed"])
+        self.assertEqual(trace[0]["execution_id"], "")
         HumanApprovalQueue.reset_singleton()
 
 

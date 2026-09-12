@@ -121,6 +121,19 @@ class TestProviderSelection(unittest.TestCase):
         self.assertTrue(running)
         self.assertEqual(models, ["granite-new"])
 
+    def test_model_selection_does_not_persist_without_explicit_save(self):
+        from gui.dual_brain_control import DualBrainControl
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+
+        control = DualBrainControl.__new__(DualBrainControl)
+        with patch.dict(os.environ, {}, clear=True):
+            runtime = DualBrainRuntime.from_env()
+            cfg = runtime.config(BrainRole.BIG)
+            control._persist_role_model(
+                False, r"D:\\models\qwen3.gguf", runtime, cfg, persist=False)
+            self.assertEqual(runtime.model(BrainRole.BIG), r"D:\\models\qwen3.gguf")
+            self.assertEqual(os.environ["BIG_BRAIN_MODEL"], r"D:\\models\qwen3.gguf")
+
     def test_external_model_lifecycle_uses_native_endpoints(self):
         response = MagicMock()
         response.__enter__.return_value = response
@@ -132,6 +145,14 @@ class TestProviderSelection(unittest.TestCase):
         request = open_url.call_args.args[0]
         self.assertEqual(request.full_url, "http://localhost:1236/api/v1/models/load")
         self.assertEqual(json.loads(request.data), {"model": "granite-new"})
+
+    def test_model_matching_accepts_full_gguf_path_and_server_basename(self):
+        self.assertTrue(ProviderStatusChecker.model_ids_match(
+            r"D:\\LMStudio\\models\\gemma-4-12b-it-Q4_K_M.gguf",
+            "gemma-4-12b-it-Q4_K_M.gguf",
+        ))
+        self.assertTrue(ProviderStatusChecker.model_ids_match("qwen3.gguf", "qwen3"))
+        self.assertFalse(ProviderStatusChecker.model_ids_match("gemma.gguf", "qwen3.gguf"))
 
 
 if __name__ == "__main__":

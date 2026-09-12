@@ -19,6 +19,9 @@ from PySide6.QtGui import QFont, QColor
 class PaymentsTab(QWidget):
     """Tab for managing wallets, payments, and escrow."""
 
+    ACTIVE_REFRESH_MS = 3000
+    BACKGROUND_REFRESH_MS = 15000
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.wallet_manager = None
@@ -26,9 +29,20 @@ class PaymentsTab(QWidget):
         self.escrow_manager = None
         self.automated_payout = None
         self.setup_ui()
-        self.refresh_timer = QTimer()
+        self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh)
-        self.refresh_timer.start(3000)
+        self.refresh_timer.start(self.ACTIVE_REFRESH_MS)
+
+    def showEvent(self, event):
+        self.refresh()
+        self.refresh_timer.setInterval(self.ACTIVE_REFRESH_MS)
+        self.refresh_timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self.refresh_timer.setInterval(self.BACKGROUND_REFRESH_MS)
+        self.refresh_timer.start()
+        super().hideEvent(event)
 
     def setup_ui(self):
         layout = QVBoxLayout(self)

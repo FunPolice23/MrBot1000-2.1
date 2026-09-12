@@ -302,6 +302,18 @@ class ProviderStatusChecker:
             elif isinstance(item, dict):
                 result.append(item.get("id") or item.get("name") or item.get("model") or "unknown")
         return result
+
+    @staticmethod
+    def model_ids_match(selected, reported):
+        """Match configured GGUF paths to server-reported model identifiers."""
+        def variants(value):
+            text = str(value or "").strip().replace("\\", "/").casefold()
+            if not text:
+                return set()
+            base = text.rsplit("/", 1)[-1]
+            return {text, base, base.removesuffix(".gguf")}
+
+        return bool(variants(selected) & variants(reported))
     
     @staticmethod
     def check_llama_process(port=None):
@@ -776,6 +788,8 @@ class DualBrainControl(QWidget):
                 return str(w.value()) if w is not None else os.getenv(name.upper().replace("sb_", "SMALL_BRAIN_").replace("bb_", "BIG_BRAIN_").replace("_spin", "").replace("_combo", ""), default)
 
             values = {
+                "SMALL_BRAIN_MODEL": self._current_model_path(True),
+                "BIG_BRAIN_MODEL": self._current_model_path(False),
                 "SMALL_BRAIN_CONTEXT": str(self.sb_ctx_spin.value()),
                 "BIG_BRAIN_CONTEXT": str(self.bb_ctx_spin.value()),
                 "SMALL_BRAIN_GPU_LAYERS": str(self.sb_gpu_layers_spin.value()),
@@ -809,7 +823,9 @@ class DualBrainControl(QWidget):
                     lines = [l for l in lines if not l.startswith(f"{k}=")]
                     lines.append(f"{k}={v}")
                 env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            self._log("💾 llama.cpp settings saved to .env")
+            os.environ["SMALL_BRAIN_MODEL"] = values["SMALL_BRAIN_MODEL"]
+            os.environ["BIG_BRAIN_MODEL"] = values["BIG_BRAIN_MODEL"]
+            self._log("💾 llama.cpp settings and model defaults saved to .env")
         except Exception as e:
             self._log(f"Failed to persist llama.cpp settings: {e}")
 
@@ -1573,20 +1589,22 @@ class DualBrainControl(QWidget):
     # GPU STATUS UPDATES
     # ═══════════════════════════════════════════════════════════════════
     def pause_background(self):
-        """Stop the nvidia-smi polling worker when the tab is hidden (GUI perf)."""
+        """Reduce nvidia-smi polling while the tab is hidden."""
         try:
             w = getattr(self, "gpu_worker", None)
             if w is not None:
-                w.stop()
+                w.interval_ms = 15000
         except Exception:
             pass
 
     def resume_background(self):
-        """Restart the nvidia-smi polling worker when the tab is shown again."""
+        """Restore fast nvidia-smi polling when the tab is shown again."""
         try:
             w = getattr(self, "gpu_worker", None)
-            if w is not None and not w.isRunning():
-                w.start()
+            if w is not None:
+                w.interval_ms = 2000
+                if not w.isRunning():
+                    w.start()
         except Exception:
             pass
 
@@ -2807,20 +2825,23 @@ class BrainLaunchWorker(QThread):
             if self.big_brain is not None:
                 self.big_brain.model = model_name
 
-    def _persist_role_model(self, small: bool, model_name: str, runtime, cfg):
-        """Persist an explicit role selection for the next runtime rebuild."""
+    def _persist_role_model(self, small: bool, model_name: str, runtime, cfg, *, persist=True):
+        """Apply a model selection, optionally saving it as the next default."""
         model_name = str(model_name or "").strip()
         if not model_name:
             return
         role_key = "SMALL_BRAIN_MODEL" if small else "BIG_BRAIN_MODEL"
         cfg.model = model_name
         runtime.set_model(cfg.role, model_name)
-        os.environ[role_key] = model_name
+        if not persist:
+            os.environ[role_key] = model_name
+            return
         try:
             from main import set_env_values
             set_env_values({role_key: model_name})
         except Exception:
             pass
+        os.environ[role_key] = model_name
 
     def _on_small_brain_model_changed(self, model_name: str):
         """Handle Small Brain model change — restart the brain with the new
@@ -2837,7 +2858,7 @@ class BrainLaunchWorker(QThread):
         path = self._current_model_path(True)
         if not path:
             return
-        self._persist_role_model(True, path, runtime, cfg)
+        self._persist_role_model(True, path, runtime, cfg, persist=False)
         self.sb_model_label.setText(f"Model: {os.path.basename(path)}")
 
         # Sync model to adapter
@@ -2876,7 +2897,7 @@ class BrainLaunchWorker(QThread):
         path = self._current_model_path(False)
         if not path:
             return
-        self._persist_role_model(False, path, runtime, cfg)
+        self._persist_role_model(False, path, runtime, cfg, persist=False)
         self.bb_model_label.setText(f"Model: {os.path.basename(path)}")
 
         # Sync model to adapter
@@ -2899,7 +2920,7 @@ class BrainLaunchWorker(QThread):
 
     def _select_external_model(self, small: bool, model_name: str, runtime, cfg):
         """Persist an external model ID without treating it as a GGUF path."""
-        self._persist_role_model(small, model_name, runtime, cfg)
+        self._persist_role_model(small, model_name, runtime, cfg, persist=False)
         try:
             from agents.base_worker import _active_worker
             if _active_worker is not None:
@@ -2992,9 +3013,14 @@ class BrainLaunchWorker(QThread):
         sb_external = data.get("sb_external", False)
         sb_selected = data.get("sb_selected", "")
         if sb_running:
-            sb_selected_available = not sb_selected or sb_selected in sb_models
+            sb_selected_available = (
+                not sb_selected or not sb_models
+                or any(self.provider_checker.model_ids_match(sb_selected, model)
+                       for model in sb_models)
+            )
             self.sb_status.setText(
-                "● Running" if sb_selected_available else "● Running · selected model unavailable")
+                "● Running" if sb_selected_available
+                else "● Running · selected model differs from loaded")
             self.sb_status.setStyleSheet(
                 "color: #4caf50; font-weight: bold;" if sb_selected_available
                 else "color: #ffb74d; font-weight: bold;")
@@ -3016,9 +3042,14 @@ class BrainLaunchWorker(QThread):
         bb_external = data.get("bb_external", False)
         bb_selected = data.get("bb_selected", "")
         if bb_running:
-            bb_selected_available = not bb_selected or bb_selected in bb_models
+            bb_selected_available = (
+                not bb_selected or not bb_models
+                or any(self.provider_checker.model_ids_match(bb_selected, model)
+                       for model in bb_models)
+            )
             self.bb_status.setText(
-                "● Running" if bb_selected_available else "● Running · selected model unavailable")
+                "● Running" if bb_selected_available
+                else "● Running · selected model differs from loaded")
             self.bb_status.setStyleSheet(
                 "color: #4caf50; font-weight: bold;" if bb_selected_available
                 else "color: #ffb74d; font-weight: bold;")

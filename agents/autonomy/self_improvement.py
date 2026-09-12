@@ -38,6 +38,8 @@ class OutcomeRecord:
     success_probability: float = 0.0
     tags: List[str] = field(default_factory=list)
     timestamp: float = 0.0
+    verified: bool = False
+    evidence_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -117,6 +119,9 @@ class SelfImprovementEngine:
 
     def record_outcome(self, record: OutcomeRecord) -> None:
         """Record a completed opportunity outcome and trigger learning."""
+        if not record.verified or not record.evidence_ids:
+            logger.warning("Ignoring unverified outcome for learning: %s", record.opportunity_id)
+            return
         self.state.outcomes.append(record)
         self.state.total_outcomes += 1
         if record.outcome == Outcome.SUCCESS.value:
@@ -188,6 +193,8 @@ class SelfImprovementEngine:
                     "success_probability": o.success_probability,
                     "tags": o.tags,
                     "timestamp": o.timestamp,
+                    "verified": o.verified,
+                    "evidence_ids": o.evidence_ids,
                 }
                 for o in self.state.outcomes
             ],

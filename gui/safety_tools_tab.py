@@ -24,6 +24,9 @@ SETTINGS_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "settin
 
 class SafetyTab(QWidget):
     """Tab for viewing safety status, approvals, and configuration."""
+
+    ACTIVE_REFRESH_MS = 2000
+    BACKGROUND_REFRESH_MS = 15000
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -40,8 +43,19 @@ class SafetyTab(QWidget):
         # Refresh timer
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh)
-        self.refresh_timer.start(2000)
+        self.refresh_timer.start(self.ACTIVE_REFRESH_MS)
         self.refresh()
+
+    def showEvent(self, event):
+        self.refresh()
+        self.refresh_timer.setInterval(self.ACTIVE_REFRESH_MS)
+        self.refresh_timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self.refresh_timer.setInterval(self.BACKGROUND_REFRESH_MS)
+        self.refresh_timer.start()
+        super().hideEvent(event)
     
     def setup_ui(self):
         layout = QVBoxLayout(self)

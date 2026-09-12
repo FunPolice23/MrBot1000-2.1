@@ -30,6 +30,9 @@ from PySide6.QtGui import QFont, QColor
 class EarningTab(QWidget):
     """Unified Earning tab for Paths 1-4."""
 
+    ACTIVE_REFRESH_MS = 3000
+    BACKGROUND_REFRESH_MS = 15000
+
     log_signal = Signal(str)
 
     def __init__(self, parent=None):
@@ -47,9 +50,20 @@ class EarningTab(QWidget):
         self._init_backends()
 
         # Auto-refresh
-        self.refresh_timer = QTimer()
+        self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh)
-        self.refresh_timer.start(3000)
+        self.refresh_timer.setInterval(self.ACTIVE_REFRESH_MS)
+
+    def showEvent(self, event):
+        self.refresh()
+        self.refresh_timer.setInterval(self.ACTIVE_REFRESH_MS)
+        self.refresh_timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self.refresh_timer.setInterval(self.BACKGROUND_REFRESH_MS)
+        self.refresh_timer.start()
+        super().hideEvent(event)
 
     # ── Backend wiring ─────────────────────────────────────────────────────
     def _init_backends(self):
@@ -302,14 +316,21 @@ class EarningTab(QWidget):
             return
         self.status_label.setText("Searching...")
         try:
-            opportunities = self.freelance_finder.search(query)
+            search_result = self.freelance_finder.search(query)
+            opportunities = search_result.get("results", [])
             self.freelance_table.setRowCount(len(opportunities))
             for i, opp in enumerate(opportunities):
                 self.freelance_table.setItem(i, 0, QTableWidgetItem(opp.get("title", "")))
                 self.freelance_table.setItem(i, 1, QTableWidgetItem(opp.get("platform", "")))
-                self.freelance_table.setItem(i, 2, QTableWidgetItem(str(opp.get("budget_usd", ""))))
+                self.freelance_table.setItem(i, 2, QTableWidgetItem(opp.get("budget", "Not specified")))
                 self.freelance_table.setItem(i, 3, QTableWidgetItem(opp.get("url", "")))
-            self.status_label.setText(f"Found {len(opportunities)} opportunities")
+            errors = search_result.get("errors", [])
+            status = f"Found {len(opportunities)} opportunities"
+            if errors:
+                status += f" ({len(errors)} sources unavailable)"
+            self.status_label.setText(status)
+            if errors:
+                self.log_signal.emit("[EarningTab] " + "; ".join(errors))
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             self.status_label.setText("Search failed")
@@ -322,7 +343,7 @@ class EarningTab(QWidget):
         opp = {
             "title": self.freelance_table.item(row, 0).text(),
             "platform": self.freelance_table.item(row, 1).text(),
-            "budget_usd": self.freelance_table.item(row, 2).text(),
+            "budget": self.freelance_table.item(row, 2).text(),
         }
         try:
             proposal = self.proposal_writer.draft(opp)

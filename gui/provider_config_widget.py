@@ -21,6 +21,9 @@ from agents.personas import DRIVER, NAVIGATOR
 
 class ProviderConfigWidget(QWidget):
     """Dynamic provider configuration widget with hot-reload support."""
+
+    ACTIVE_REFRESH_MS = 3000
+    BACKGROUND_REFRESH_MS = 15000
     
     provider_changed = Signal(str, str)  # provider_name, action
     
@@ -29,17 +32,18 @@ class ProviderConfigWidget(QWidget):
         self._setup_ui()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
-        self._refresh_timer.start(3000)
+        self._refresh_timer.start(self.ACTIVE_REFRESH_MS)
 
     def pause_background(self):
-        """Pause provider polling while the Settings tab is hidden."""
-        self._refresh_timer.stop()
+        """Reduce provider polling while the Settings tab is hidden."""
+        self._refresh_timer.setInterval(self.BACKGROUND_REFRESH_MS)
+        self._refresh_timer.start()
 
     def resume_background(self):
-        """Resume provider polling and refresh once after the tab is shown."""
-        if not self._refresh_timer.isActive():
-            self.refresh()
-            self._refresh_timer.start(3000)
+        """Restore active polling and refresh once after the tab is shown."""
+        self.refresh()
+        self._refresh_timer.setInterval(self.ACTIVE_REFRESH_MS)
+        self._refresh_timer.start()
     
     def _setup_ui(self):
         layout = QVBoxLayout(self)

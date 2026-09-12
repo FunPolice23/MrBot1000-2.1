@@ -29,6 +29,7 @@ class ModelContext:
     model_name: str
     timestamp: float = field(default_factory=time.time)
     current_task: str = ""
+    # Coordination metadata only; cognition records are canonical elsewhere.
     reasoning_chain: List[str] = field(default_factory=list)
     key_decisions: List[Dict] = field(default_factory=list)
     pending_actions: List[str] = field(default_factory=list)

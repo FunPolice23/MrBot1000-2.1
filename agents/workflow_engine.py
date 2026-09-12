@@ -85,6 +85,22 @@ class WorkflowState:
         if new_phase in (WorkflowPhase.COMPLETED, WorkflowPhase.FAILED, WorkflowPhase.REJECTED):
             self.completed_at = time.time()
 
+    def transition_requirements_met(self, new_phase: WorkflowPhase, data: Dict) -> bool:
+        """Require observable proof before entering consequential phases."""
+        payload = data or {}
+        if new_phase == WorkflowPhase.VETTING:
+            return bool(payload.get("evidence_ids"))
+        if new_phase == WorkflowPhase.PROPOSAL:
+            return bool(payload.get("proposal") or payload.get("decision"))
+        if new_phase == WorkflowPhase.EXECUTION:
+            approval = payload.get("approval_state", "")
+            return approval in ("approved", "not_required") and bool(payload.get("action_id"))
+        if new_phase == WorkflowPhase.REVIEW:
+            return bool(payload.get("execution_id"))
+        if new_phase == WorkflowPhase.COMPLETED:
+            return bool(payload.get("outcome_verified")) and bool(payload.get("evidence_ids"))
+        return True
+
 
 # ── Workflow Engine ───────────────────────────────────────────────────────
 
@@ -137,6 +153,10 @@ class WorkflowEngine:
         # Check if transition is allowed
         if new_phase not in ALLOWED_TRANSITIONS.get(state.current_phase, set()):
             logger.warning(f"Invalid transition: {state.current_phase} -> {new_phase}")
+            return False
+
+        if not state.transition_requirements_met(new_phase, data or {}):
+            logger.warning("Missing invariants for transition to %s", new_phase)
             return False
         
         # Check cost budget for expensive phases

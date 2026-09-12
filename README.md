@@ -22,7 +22,17 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 - **Human approval visibility**: Approvals is directly beside Dialogue, and a
   selected request stays highlighted while the queue refreshes. The detail view
   shows the complete read-only request, including structured arguments and
-  payload data.
+  payload data. When requests are pending, the tab label shows the count and
+  changes to an amber alert color with a review tooltip; it clears after the
+  human decides.
+- **Explicit local model selection**: Big Brain and Small Brain model fields are
+  blank by default. The application never guesses a local `.gguf` filename or
+  launches a nonexistent model; choose a real model and save it when a role
+  should have a persistent default.
+- **Performance-aware freshness**: active GUI tabs use fast refresh intervals,
+  while hidden operational tabs continue polling every 15 seconds so shared
+  state remains current for Edward and Jacob without keeping every view at full
+  polling cost.
 
 ## Quick Start
 
@@ -42,7 +52,13 @@ This is equivalent to setting `MRBOT_SAFE_MODE=true` for the session.
 
 Requires: Python 3.11+, the packages listed in `requirements.txt`, and either
 the default local llama.cpp servers or another configured provider. The default
-dual-brain contract uses llama-server on ports 1234 and 1235.
+dual-brain contract uses llama-server on ports 1234 and 1235. Anthropic and
+OpenAI are optional cloud integrations; install them only when those providers
+are enabled:
+
+```bash
+python -m pip install -r requirements-cloud.txt
+```
 
 ### Safe Mode
 
@@ -60,7 +76,7 @@ Safe mode can also be toggled from the Management tab at runtime.
 
 ## What It Does
 
-- Scans Reddit, Fiverr, Upwork, airdrop feeds, DeFi protocols, microtask platforms, and web search for earning opportunities
+- Scans Reddit, Fiverr, Upwork, airdrop feeds, DeFi protocols, microtask platforms, and web-search targets across freelance marketplaces, AI-agent work, crypto/Web3 jobs, open-source/security bounties, user testing, and paid studies. Web-search findings remain human-review-only until separately approved for action.
 - Evaluates and ranks opportunities using the configured Big Brain/Small Brain runtime **plus** a deterministic Opportunity Intelligence Engine (LLM scores feed it as semantic estimates only — never the sole decision-maker)
 - Executes safe, repeatable actions with full validation through a 14-step Task Execution pipeline with deterministic validators + human gates
 - Tracks opportunities through discovery → researched → applied → in_progress → submitted → paid/failed with explicit, auditable stage transitions
@@ -111,6 +127,10 @@ Mutating tool requests never execute directly from Dialogue. When one enters the
 approval queue, the tool event is marked `pending_approval`, the active run
 pauses, and the operator can open the adjacent Approvals tab to read the full
 request before choosing Approve, Deny, or Defer.
+
+The tab bar reserves this alert treatment for actionable queues with a clear
+operator response. Other tabs remain neutral until they have an equivalent
+pending state and decision workflow.
 
 ### Unified Autonomous Planning Loop (24 stages)
 
@@ -251,11 +271,16 @@ Key settings:
 - `BIG_BRAIN_PROVIDER`, `BIG_BRAIN_URL`, `BIG_BRAIN_PORT` — Big Brain provider and endpoint (default llama-server on 1234)
 - `SMALL_BRAIN_PROVIDER`, `SMALL_BRAIN_URL`, `SMALL_BRAIN_PORT` — Small Brain provider and endpoint (default llama-server on 1235)
 - `BIG_BRAIN_DEVICE` / `SMALL_BRAIN_DEVICE` — GPU device assignment for the two local brains
+- `BIG_BRAIN_MODEL` / `SMALL_BRAIN_MODEL` — optional explicit local model paths
+  or provider model IDs; blank means no model is selected and no local launch is
+  attempted
 - `SMALL_BRAIN_GPU_LAYERS=0` — optional CPU/system-RAM mode for Jacob when a second GPU is unavailable
 - `BIG_BRAIN_CONTEXT` / `SMALL_BRAIN_CONTEXT` — per-role context limits
 - `OLLAMA_MAIN_MODEL` / `OLLAMA_CHAT_MODEL` — optional Ollama fallback model names
 - `OPENAI_STREAM_TIMEOUT_SECONDS` — bounded streaming timeout for OpenAI-compatible providers
 - `DIALOGUE_HISTORY_LIMIT`, `DIALOGUE_CONTEXT_CHAR_LIMIT`, `DIALOGUE_TURN_MAX_TOKENS` — Dialogue resource limits
+- SQLite local stores use bounded lock waits and WAL mode for better concurrent
+  GUI/backend access; keep databases on a local writable filesystem
 - `PIPELINE_ALLOW_SELF_IMPROVE` — Enable/disable auto code updates
 - `LLM_DAILY_BUDGET_USD` — Daily cloud-LLM spend cap (0 = off)
 - `WINRATE_DECLINE_BELOW` — Auto-decline platform if win-rate below this %
@@ -326,7 +351,7 @@ it is not a separate visible tab.
   - python-dotenv for .env-based configuration
   - requests for HTTP/network access
   - httpx for async HTTP (evaluation pipeline)
-  - anthropic and openai for optional cloud-provider integrations
+  - Optional cloud-provider SDKs: install `requirements-cloud.txt` for Anthropic/OpenAI
   - feedparser and beautifulsoup4 for feed and HTML-based discovery
   - PyYAML for theme/config
   - sqlite3 (stdlib) for local databases

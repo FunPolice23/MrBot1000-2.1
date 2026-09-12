@@ -27,6 +27,9 @@ from agents.approval_queue import (
 class ApprovalPanel(QWidget):
     """In-app panel listing pending approvals with Approve / Deny / Defer."""
 
+    ACTIVE_REFRESH_MS = 2500
+    BACKGROUND_REFRESH_MS = 15000
+
     item_decided = Signal(str, ApprovalStatus, str)  # item_id, status, notes
 
     def __init__(self, parent: Optional[QWidget] = None,
@@ -38,7 +41,18 @@ class ApprovalPanel(QWidget):
         self._setup_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
-        self._timer.start(2500)
+        self._timer.start(self.ACTIVE_REFRESH_MS)
+
+    def showEvent(self, event):
+        self._refresh()
+        self._timer.setInterval(self.ACTIVE_REFRESH_MS)
+        self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._timer.setInterval(self.BACKGROUND_REFRESH_MS)
+        self._timer.start()
+        super().hideEvent(event)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 

@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 
@@ -299,6 +300,24 @@ def _tool_result_status(result: str) -> str:
     if text.startswith("[Tool error:") or text.startswith("[Search error:"):
         return "error"
     return "completed"
+
+
+def _tool_trace_entry(name: str, arguments: Dict[str, Any], result: str,
+                      source: str) -> Dict[str, Any]:
+    """Build an explicit proposal/execution trace from the dispatcher result."""
+    status = _tool_result_status(result)
+    executed = status == "completed"
+    return {
+        "name": name,
+        "arguments": arguments,
+        "status": status,
+        "action_state": "completed" if executed else "proposed",
+        "executed": executed,
+        "execution_id": ("exe_" + uuid.uuid4().hex[:20]) if executed else "",
+        "action_id": "act_" + uuid.uuid4().hex[:20],
+        "result_preview": str(result)[:800],
+        "source": source,
+    }
 
 
 # ── Web Tool Implementations ──────────────────────────────────────────────
@@ -618,13 +637,8 @@ def chat_with_tools(
                 try:
                     result = execute_tool(fn_name, fn_args)
                     if tool_trace is not None:
-                        tool_trace.append({
-                            "name": fn_name,
-                            "arguments": fn_args,
-                            "status": _tool_result_status(result),
-                            "result_preview": str(result)[:800],
-                            "source": "text_call",
-                        })
+                        tool_trace.append(_tool_trace_entry(
+                            fn_name, fn_args, result, "text_call"))
                     messages.append({
                         "role": "assistant",
                         "content": visible_content,
@@ -637,13 +651,8 @@ def chat_with_tools(
                     continue
                 except Exception as e:
                     if tool_trace is not None:
-                        tool_trace.append({
-                            "name": fn_name,
-                            "arguments": fn_args,
-                            "status": "error",
-                            "result_preview": str(e)[:800],
-                            "source": "text_call",
-                        })
+                        tool_trace.append(_tool_trace_entry(
+                            fn_name, fn_args, f"[Tool error: {e}]", "text_call"))
                     messages.append({
                         "role": "tool",
                         "content": f"[Tool execution error: {e}]",
@@ -694,18 +703,11 @@ def chat_with_tools(
             
             try:
                 result = execute_tool(fn_name, fn_args)
-                tool_status = _tool_result_status(result)
             except Exception as exc:
                 result = f"[Tool execution error: {exc}]"
-                tool_status = "error"
             if tool_trace is not None:
-                tool_trace.append({
-                    "name": fn_name,
-                    "arguments": fn_args,
-                    "status": tool_status,
-                    "result_preview": str(result)[:800],
-                    "source": "function_call",
-                })
+                tool_trace.append(_tool_trace_entry(
+                    fn_name, fn_args, result, "function_call"))
             
             messages.append({
                 "tool_call_id": tc.id,

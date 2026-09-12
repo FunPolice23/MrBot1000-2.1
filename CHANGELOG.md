@@ -1,6 +1,20 @@
 ## [Unreleased] - 2026-09-12
 
 ### Added
+- Expanded the Earning Center's web-search discovery targets to include
+  AI-agent marketplaces, crypto/Web3 work, open-source and security bounties,
+  user testing, paid studies, Contra, Freelancer, Toptal, and PeoplePerHour,
+  alongside the existing Upwork, Fiverr, Reddit, Prolific, and general search
+  paths. These remain research-only results until a separate approved platform
+  action is available.
+- Added regression coverage for the expanded freelance and marketplace search
+  families.
+- Added explicit blank-by-default local model selection for Edward Hurst and
+  Jacob Stanley. A model is used only after the operator selects it, and an
+  unset role cannot silently fall back to a guessed or nonexistent `.gguf`
+  filename.
+- Added optional cloud-provider packaging through `requirements-cloud.txt` so
+  Anthropic and OpenAI SDKs are not required for local-provider installations.
 - Dialogue now displays dispatcher-confirmed tool events separately from persona
   narration, including the tool name, arguments, execution source, status, and a
   bounded result preview.
@@ -15,8 +29,49 @@
   request without navigating across unrelated operational tabs.
 - Approval details now expose a persistent, scrollable read-only view of the
   description, structured details, payload, and notes while the queue refreshes.
+- The Approvals tab now shows the number of pending requests in its label,
+  changes to an amber alert color, and provides a pending-review tooltip. The
+  indicator initializes from existing queue state and clears after a decision.
+
+### Changed
+- Added a two-tier GUI refresh policy across Collaboration, Earnings, Provider
+  Configuration, Providers & GPU, Approvals, Notifications, Payments, and
+  Safety. Active views retain their responsive polling cadence; hidden views
+  continue at a bounded 15-second cadence so shared state remains available to
+  both brains without paying the full active-view polling cost.
+- Provider configuration and GPU telemetry now reduce background work instead
+  of stopping state updates entirely. Provider probes and `nvidia-smi` polling
+  resume at their fast cadence when the view becomes active, with an immediate
+  refresh on activation.
+- GUI timers now use their owning widgets where applicable, allowing Qt to
+  clean them up with the view and preventing orphaned polling timers during tab
+  rebuilds.
+- Local model resolution now treats the model combo and explicit environment
+  value as candidates only when they point to an existing file. External
+  provider IDs remain valid identifiers, while an empty local selection stays
+  empty rather than being replaced by the first detected model.
+- SQLite connection setup for the persistent program-knowledge store is now
+  centralized, making timeout, WAL, and synchronous-mode behavior consistent
+  across memory reads, writes, searches, conversations, personality, and
+  decision records.
+- Core installation requirements now remain local-provider friendly; Anthropic
+  and OpenAI are isolated in the optional cloud requirements file and guarded
+  imports allow local operation without either SDK installed.
 
 ### Fixed
+- Fixed the Earning Center search handler consuming the freelance finder response
+  as a list instead of reading its `results` payload. Search results now render
+  with their budget, partial source failures remain visible, and proposal drafts
+  receive the correct budget field.
+- Removed the stale `D:\\models\\qwen3.gguf` Big Brain default from `.env`.
+  Local launch now remains blocked with a clear message until a real model is
+  selected or saved.
+- SQLite memory access now uses a bounded busy timeout, WAL mode, and
+  `synchronous=NORMAL` through one connection factory to improve local
+  read/write contention behavior.
+- GUI operational tabs now keep shared state fresh while hidden: active tabs
+  use their normal fast interval, while hidden tabs poll every 15 seconds and
+  refresh immediately when shown.
 - Live Dialogue now stops when Edward Hurst and Jacob Stanley reach the same
   categorized terminal block, such as a required human target, missing evidence,
   or approval requirement. Auto-Step and single Step limits are unchanged, and
@@ -70,6 +125,13 @@
   backend is unavailable instead of silently presenting the failure as no evidence.
 
 ### Verification
+- Provider/model-selection regressions pass (`13 passed`), including blank
+  model defaults and rejection of unselected local launches.
+- Focused GUI regressions pass (`26 passed`) after the active/background polling
+  lifecycle changes; touched GUI modules compile cleanly and report no
+  diagnostics.
+- Focused memory, promotion, and learning regressions pass (`37 passed`) after
+  the SQLite connection tuning.
 - Live LM Studio probes confirmed that `qwen/qwen3.5-9b` and
   `mistralai/ministral-3-3b` were loaded through `/api/v1/models`; both exact
   namespaced IDs were accepted by `/v1/chat/completions` when given a suitable

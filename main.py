@@ -996,11 +996,51 @@ class MainWindow(TabBuildersMixin, QMainWindow):
     def _on_approval_queue_change(self, item):
         """Called when an approval item is enqueued. Refresh GUI panels."""
         try:
-            approval_panel = getattr(self, "_approval_panel", None)
-            if approval_panel and hasattr(approval_panel, "refresh_now"):
-                approval_panel.refresh_now()
+            QTimer.singleShot(0, self._refresh_approval_panel_and_alert)
         except Exception:
             pass
+
+    def _refresh_approval_panel_and_alert(self):
+        """Refresh the approval list and its tab-level alert on the GUI thread."""
+        approval_panel = getattr(self, "_approval_panel", None)
+        if approval_panel and hasattr(approval_panel, "refresh_now"):
+            approval_panel.refresh_now()
+        self._refresh_approval_alert()
+
+    def _on_approval_decided(self, item_id, status, notes):
+        """Refresh the approval tab alert after a human decision."""
+        self._refresh_approval_alert()
+
+    def _refresh_approval_alert(self):
+        """Update the Approvals tab label, color, and pending-count tooltip."""
+        try:
+            queue = getattr(self, "approval_queue", None)
+            pending_count = len(queue.pending()) if queue is not None else 0
+            index = self._tab_index_by_label("Approvals")
+            if index < 0:
+                return
+            label = "Approvals" if pending_count == 0 else f"Approvals ({pending_count})"
+            self.tabs.setTabText(index, label)
+            if pending_count:
+                self.tabs.setTabToolTip(
+                    index, f"{pending_count} approval request(s) awaiting human review")
+                self.tabs.tabBar().setTabTextColor(index, QColor("#ffb300"))
+            else:
+                self.tabs.setTabToolTip(index, "No pending approval requests")
+                self.tabs.tabBar().setTabTextColor(index, QColor("#e0e0e0"))
+            self.tabs.tabBar().update()
+        except Exception:
+            pass
+
+    def _tab_index_by_label(self, label):
+        """Find a tab by its stable base label, ignoring an alert count suffix."""
+        if not hasattr(self, "tabs"):
+            return -1
+        for index in range(self.tabs.count()):
+            text = self.tabs.tabText(index)
+            if text == label or text.startswith(f"{label} ("):
+                return index
+        return -1
 
     def _on_event_logged(self, event):
         """Called when an event is logged. Evaluate alerting rules."""
@@ -1294,6 +1334,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self._ensure_tab_built(0)
         self._ensure_tab_built(1)
         self._ensure_tab_built(2)
+        self._refresh_approval_alert()
 
         # Auto-populate the Ollama model dropdowns the first time the Settings
         # tab is opened, so you don't have to click Refresh manually (v2.0.20h).

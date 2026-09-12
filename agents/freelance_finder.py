@@ -4,12 +4,10 @@ agents/freelance_finder.py — Real freelance opportunity hunter (v2.1 Path 1).
 Searches real freelance platforms for live paying gigs using the web controller.
 Does NOT submit or apply — only researches and ranks opportunities.
 
-Platforms searched:
-- Upwork (via web search + direct API if configured)
-- Fiverr (via web search)
-- Reddit r/forhire, r/freelance
-- Prolific (academic micro-tasks)
-- General web search for "freelance [skill] gigs"
+The default search targets cover freelance, AI-agent, research, bounty, and
+crypto-work marketplaces. These are web-search targets, not authenticated
+integrations: results remain human-review-only until a separate platform
+adapter and approval-gated action exists.
 """
 
 from __future__ import annotations
@@ -39,6 +37,33 @@ class FreelanceOpportunity:
 class FreelanceFinder:
     """Find real freelance opportunities using web search."""
 
+    DEFAULT_PLATFORMS = [
+        "upwork", "fiverr", "contra", "freelancer", "toptal", "peopleperhour",
+        "reddit", "prolific", "user_testing", "bounty", "ai_agent", "crypto_work",
+        "general",
+    ]
+    TARGETED_SEARCH_TERMS = {
+        "ai_agent": (
+            "AI agent marketplace agent tasks automation contracts "
+            "site:virtuals.io OR site:olas.network OR site:singularitynet.io "
+            "OR site:fetch.ai OR site:rentahuman.ai"
+        ),
+        "crypto_work": (
+            "crypto web3 DAO jobs grants bounties "
+            "site:laborx.com OR site:cryptotask.org OR site:gitcoin.co "
+            "OR site:immunefi.com OR site:code4rena.com OR site:sherlock.xyz"
+        ),
+        "bounty": (
+            "bug bounty open source bounty "
+            "site:gitcoin.co OR site:immunefi.com OR site:code4rena.com "
+            "OR site:sherlock.xyz OR site:onlydust.com OR site:dorahacks.io"
+        ),
+        "user_testing": (
+            "user testing paid studies "
+            "site:usertesting.com OR site:userinterviews.com OR site:prolific.com"
+        ),
+    }
+
     def __init__(self, web: Optional[WebController] = None):
         self.web = web or WebController()
         self._cache: Dict[str, List[FreelanceOpportunity]] = {}
@@ -46,7 +71,7 @@ class FreelanceFinder:
 
     def search(self, query: str, max_results: int = 10, platforms: Optional[List[str]] = None) -> Dict[str, Any]:
         """Search for freelance opportunities."""
-        platforms = platforms or ["upwork", "fiverr", "reddit", "prolific", "general"]
+        platforms = platforms or list(self.DEFAULT_PLATFORMS)
         results: List[FreelanceOpportunity] = []
         errors: List[str] = []
 
@@ -89,8 +114,40 @@ class FreelanceFinder:
             return self._search_reddit(query, max_results)
         elif platform == "prolific":
             return self._search_prolific(query, max_results)
+        elif platform == "user_testing":
+            return self._search_targeted(
+                query, max_results, self.TARGETED_SEARCH_TERMS[platform], "user testing")
+        elif platform == "bounty":
+            return self._search_targeted(
+                query, max_results, self.TARGETED_SEARCH_TERMS[platform], "bounty")
+        elif platform == "ai_agent":
+            return self._search_targeted(
+                query, max_results, self.TARGETED_SEARCH_TERMS[platform], "ai-agent marketplace")
+        elif platform == "crypto_work":
+            return self._search_targeted(
+                query, max_results, self.TARGETED_SEARCH_TERMS[platform], "crypto/web3")
+        elif platform in {"contra", "freelancer", "toptal", "peopleperhour"}:
+            return self._search_targeted(query, max_results, f"{platform} freelance jobs", platform)
         else:
             return self._search_general(query, max_results)
+
+    def _search_targeted(self, query: str, max_results: int,
+                         search_terms: str, platform: str) -> List[FreelanceOpportunity]:
+        """Search a marketplace family without pretending it has an API adapter."""
+        result = self.web.search(f"{search_terms} {query}", max_results=max_results)
+        if not result.get("ok"):
+            return []
+        return [
+            FreelanceOpportunity(
+                title=r.get("title", ""), platform=platform, url=r.get("url", ""),
+                description=r.get("snippet", ""),
+                budget=self._extract_budget(r.get("snippet", "")),
+                skills=self._extract_skills(f"{r.get('title', '')} {r.get('snippet', '')}"),
+                source="web_search", raw=r,
+            )
+            for r in result.get("results", [])
+            if r.get("title") and r.get("url")
+        ]
 
     def _search_upwork(self, query: str, max_results: int) -> List[FreelanceOpportunity]:
         """Search Upwork via web search."""

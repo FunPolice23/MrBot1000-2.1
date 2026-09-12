@@ -121,6 +121,8 @@ class NotificationsTab(QWidget):
     """
 
     log_signal = Signal(str)
+    ACTIVE_REFRESH_MS = 5000
+    BACKGROUND_REFRESH_MS = 15000
 
     def __init__(self, parent=None, db_path: Optional[str] = None):
         super().__init__(parent)
@@ -130,10 +132,21 @@ class NotificationsTab(QWidget):
         )
         self.notif_manager = NotificationManager(enabled=True, sound=True)
         self.setup_ui()
-        self._refresh_timer = QTimer()
+        self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh)
-        self._refresh_timer.start(5000)  # refresh every 5s
+        self._refresh_timer.start(self.ACTIVE_REFRESH_MS)
         self.refresh()
+
+    def showEvent(self, event):
+        self.refresh()
+        self._refresh_timer.setInterval(self.ACTIVE_REFRESH_MS)
+        self._refresh_timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._refresh_timer.setInterval(self.BACKGROUND_REFRESH_MS)
+        self._refresh_timer.start()
+        super().hideEvent(event)
 
     # ── UI ────────────────────────────────────────────
 

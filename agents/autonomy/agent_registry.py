@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import uuid
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -58,7 +59,21 @@ class AgentSpec:
     tasks_completed: int = 0
     tasks_failed: int = 0
     registered_at: float = 0.0
+    lease_id: str = ""
+    lease_expires_at: float = 0.0
+    cancel_requested: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DelegationResult:
+    task_id: str
+    assigned: bool
+    agent_id: str = ""
+    lease_id: str = ""
+    reason: str = ""
+    required_capabilities: List[str] = field(default_factory=list)
+    matched_capabilities: List[str] = field(default_factory=list)
 
 
 class AgentRegistry:
@@ -145,32 +160,138 @@ class AgentRegistry:
     def get_busy_agents(self) -> List[AgentSpec]:
         return [a for a in self._agents.values() if a.status == AgentStatus.BUSY.value]
 
+    def delegate_task(self, task_id: str, required_capabilities: List[str] = None,
+                      required_categories: List[CapabilityCategory] = None,
+                      lease_seconds: float = 300.0) -> DelegationResult:
+        """Assign work to the first idle agent matching every requirement."""
+        required_names = sorted({str(name).lower() for name in (required_capabilities or [])})
+        categories = set(required_categories or [])
+        candidates = []
+        for agent in self._agents.values():
+            self._reclaim_expired(agent)
+            if agent.status != AgentStatus.IDLE.value:
+                continue
+            names = {capability.name.lower() for capability in agent.capabilities}
+            agent_categories = {capability.category for capability in agent.capabilities}
+            if not set(required_names).issubset(names) or not categories.issubset(agent_categories):
+                continue
+            candidates.append((agent, names))
+
+        if not candidates:
+            requirements = required_names + [category.value for category in categories]
+            return DelegationResult(
+                task_id=task_id,
+                assigned=False,
+                reason="no idle agent satisfies all required capabilities",
+                required_capabilities=requirements,
+            )
+
+        agent, names = sorted(candidates, key=lambda item: (
+            item[0].tasks_failed, item[0].tasks_completed, item[0].agent_id))[0]
+        if not self.assign_task(agent.agent_id, task_id, lease_seconds):
+            return DelegationResult(
+                task_id=task_id,
+                assigned=False,
+                reason="candidate became unavailable before lease assignment",
+                required_capabilities=required_names,
+            )
+        assigned = self.get_agent(agent.agent_id)
+        return DelegationResult(
+            task_id=task_id,
+            assigned=True,
+            agent_id=agent.agent_id,
+            lease_id=assigned.lease_id,
+            reason="assigned to idle agent matching all requirements",
+            required_capabilities=required_names + [category.value for category in categories],
+            matched_capabilities=sorted(names.intersection(required_names)),
+        )
+
     # ── Workload assignment ─────────────────────────────────────
 
-    def assign_task(self, agent_id: str, task_id: str) -> bool:
-        """Assign a task to an agent. Returns False if agent not found or busy."""
+    def assign_task(self, agent_id: str, task_id: str, lease_seconds: float = 300.0) -> bool:
+        """Assign a task with an expiring lease. Returns False if unavailable."""
         agent = self._agents.get(agent_id)
+        self._reclaim_expired(agent)
         if agent is None or agent.status == AgentStatus.BUSY.value:
             return False
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         agent.status = AgentStatus.BUSY.value
         agent.current_task = task_id
+        agent.lease_id = uuid.uuid4().hex
+        agent.lease_expires_at = time.time() + lease_seconds
+        agent.cancel_requested = False
         self._save()
         logger.info("Assigned task %s to agent %s", task_id, agent_id)
         return True
 
-    def complete_task(self, agent_id: str, success: bool = True) -> bool:
-        """Mark an agent's current task as complete."""
+    def renew_lease(self, agent_id: str, lease_id: str, lease_seconds: float = 300.0) -> bool:
+        """Renew an owned, unexpired lease."""
         agent = self._agents.get(agent_id)
-        if agent is None:
+        if (agent is None or agent.status != AgentStatus.BUSY.value
+                or agent.lease_id != lease_id or agent.lease_expires_at <= time.time()):
+            self._reclaim_expired(agent)
             return False
-        agent.status = AgentStatus.IDLE.value
-        agent.current_task = ""
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        agent.lease_expires_at = time.time() + lease_seconds
+        agent.last_heartbeat = time.time()
+        self._save()
+        return True
+
+    def request_cancellation(self, agent_id: str, lease_id: str) -> bool:
+        """Request cooperative cancellation for the current lease."""
+        agent = self._agents.get(agent_id)
+        if agent is None or agent.lease_id != lease_id:
+            return False
+        agent.cancel_requested = True
+        self._save()
+        return True
+
+    def is_cancellation_requested(self, agent_id: str, lease_id: str) -> bool:
+        agent = self._agents.get(agent_id)
+        return bool(agent and agent.lease_id == lease_id and agent.cancel_requested)
+
+    def release_task(self, agent_id: str, lease_id: str) -> bool:
+        """Release a task lease without recording success or failure."""
+        agent = self._agents.get(agent_id)
+        if agent is None or agent.lease_id != lease_id:
+            return False
+        self._clear_lease(agent)
+        self._save()
+        return True
+
+    def complete_task(self, agent_id: str, success: bool = True, lease_id: str = "") -> bool:
+        """Complete only the currently owned, unexpired lease."""
+        agent = self._agents.get(agent_id)
+        if agent is None or agent.status != AgentStatus.BUSY.value:
+            return False
+        if lease_id and agent.lease_id != lease_id:
+            return False
+        if agent.lease_expires_at and agent.lease_expires_at <= time.time():
+            self._reclaim_expired(agent)
+            return False
+        self._clear_lease(agent)
         if success:
             agent.tasks_completed += 1
         else:
             agent.tasks_failed += 1
         self._save()
         return True
+
+    @staticmethod
+    def _clear_lease(agent: AgentSpec) -> None:
+        agent.status = AgentStatus.IDLE.value
+        agent.current_task = ""
+        agent.lease_id = ""
+        agent.lease_expires_at = 0.0
+        agent.cancel_requested = False
+
+    def _reclaim_expired(self, agent: Optional[AgentSpec]) -> None:
+        if (agent is not None and agent.status == AgentStatus.BUSY.value
+                and agent.lease_expires_at > 0 and agent.lease_expires_at <= time.time()):
+            agent.tasks_failed += 1
+            self._clear_lease(agent)
 
     # ── Health ──────────────────────────────────────────────────
 
@@ -182,6 +303,7 @@ class AgentRegistry:
         offline = []
 
         for agent in self._agents.values():
+            self._reclaim_expired(agent)
             if agent.status == AgentStatus.OFFLINE.value:
                 offline.append(agent.agent_id)
             elif now - agent.last_heartbeat > stale_seconds:
@@ -221,6 +343,9 @@ class AgentRegistry:
                     tasks_completed=spec_data.get("tasks_completed", 0),
                     tasks_failed=spec_data.get("tasks_failed", 0),
                     registered_at=spec_data.get("registered_at", 0.0),
+                    lease_id=spec_data.get("lease_id", ""),
+                    lease_expires_at=spec_data.get("lease_expires_at", 0.0),
+                    cancel_requested=spec_data.get("cancel_requested", False),
                     metadata=spec_data.get("metadata", {}),
                 )
                 self._agents[aid] = spec
@@ -247,6 +372,9 @@ class AgentRegistry:
                     "tasks_completed": a.tasks_completed,
                     "tasks_failed": a.tasks_failed,
                     "registered_at": a.registered_at,
+                    "lease_id": a.lease_id,
+                    "lease_expires_at": a.lease_expires_at,
+                    "cancel_requested": a.cancel_requested,
                     "metadata": a.metadata,
                 }
                 for aid, a in self._agents.items()
@@ -261,5 +389,6 @@ __all__ = [
     "CapabilityCategory",
     "CapabilitySpec",
     "AgentSpec",
+    "DelegationResult",
     "AgentRegistry",
 ]

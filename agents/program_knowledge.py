@@ -102,10 +102,18 @@ class MemoryDatabase:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
         self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open a short-lived connection tuned for concurrent local access."""
+        conn = sqlite3.connect(self.db_path, timeout=2.0)
+        conn.execute("PRAGMA busy_timeout=2000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
     
     def _init_db(self):
         """Initialize the database tables."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,7 +168,7 @@ class MemoryDatabase:
         if expires_days:
             expires_at = (datetime.now() + timedelta(days=expires_days)).isoformat()
         
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO memories (timestamp, category, title, content, importance, source, tags, expires_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -169,7 +177,7 @@ class MemoryDatabase:
     def get_memories(self, category: str = None, limit: int = 10,
                      min_importance: float = 0.0) -> List[Dict]:
         """Retrieve memories, optionally filtered by category."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             query = "SELECT * FROM memories WHERE importance >= ?"
             params = [min_importance]
@@ -186,7 +194,7 @@ class MemoryDatabase:
     
     def search_memories(self, query: str, limit: int = 5) -> List[Dict]:
         """Search memories by content."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
                 SELECT * FROM memories 
@@ -197,7 +205,7 @@ class MemoryDatabase:
     
     def log_conversation(self, brain: str, role: str, message: str, context: str = ""):
         """Log a conversation turn."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO conversations (timestamp, brain, role, message, context)
                 VALUES (?, ?, ?, ?, ?)
@@ -205,7 +213,7 @@ class MemoryDatabase:
     
     def get_conversation_history(self, brain: str, limit: int = 20) -> List[Dict]:
         """Get recent conversation history for a brain."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
                 SELECT * FROM conversations 
@@ -216,7 +224,7 @@ class MemoryDatabase:
     
     def update_personality(self, brain: str, trait: str, value: float):
         """Update a personality trait for a brain."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO personality_traits (brain, trait, value, last_updated)
                 VALUES (?, ?, ?, ?)
@@ -224,7 +232,7 @@ class MemoryDatabase:
     
     def get_personality(self, brain: str) -> Dict[str, float]:
         """Get all personality traits for a brain."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
                 SELECT trait, value FROM personality_traits WHERE brain = ?
@@ -233,7 +241,7 @@ class MemoryDatabase:
     
     def log_decision(self, decision: str, outcome: str = None, success: int = None, lesson: str = ""):
         """Log a decision and its outcome for learning."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO decisions (timestamp, decision, outcome, success, lesson)
                 VALUES (?, ?, ?, ?, ?)
