@@ -5,7 +5,7 @@ import os
 from unittest.mock import Mock, patch
 
 from gui.dialogue_tab import DialogueTab, DialogueWorker, LIFECYCLE
-from agents.personas import persona_for_key
+from agents.personas import DRIVER, NAVIGATOR, persona_for_key
 from agents.tool_calling import (
     chat_with_tools,
     _remove_reasoning_channels,
@@ -103,16 +103,128 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         self.assertIn("could not produce a conversational response", 
                       tab.append_system.call_args.args[0])
 
+    @patch("gui.dialogue_tab.QTimer.singleShot")
+    def test_empty_response_retries_same_speaker_without_transcript_turn(self, single_shot):
+        tab = DialogueTab.__new__(DialogueTab)
+        tab._generation_id = 1
+        tab.conversation_history = []
+        tab.worker = object()
+        tab.live_running = False
+        tab.is_running = False
+        tab.append_system = Mock()
+        tab.respond = Mock()
+
+        tab._on_response_ready("(empty)", "Edward Hurst", 1)
+
+        self.assertEqual(tab.conversation_history, [])
+        self.assertIsNone(tab.worker)
+        self.assertEqual(tab._empty_response_retries, 1)
+        single_shot.assert_called_once_with(250, tab.respond)
+        self.assertIn("retrying the same turn", tab.append_system.call_args.args[0])
+
+    def test_repeated_empty_response_pauses_without_fake_persona_turn(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        tab._generation_id = 1
+        tab.conversation_history = []
+        tab.worker = object()
+        tab.live_running = True
+        tab.is_running = False
+        tab._empty_response_retries = 1
+        tab.append_system = Mock()
+        tab.stop_live = Mock()
+
+        tab._on_response_ready("", "Edward Hurst", 1)
+
+        self.assertEqual(tab.conversation_history, [])
+        self.assertIsNone(tab.worker)
+        self.assertEqual(tab._empty_response_retries, 0)
+        tab.stop_live.assert_called_once_with()
+        self.assertIn("no usable response after a retry", tab.append_system.call_args.args[0])
+
     def test_non_progress_and_unrequested_image_continuations_are_rejected(self):
         worker = DialogueWorker.__new__(DialogueWorker)
         worker.context = "CURRENT PHASE: discover\nPHASE INSTRUCTION: approve or block."
         self.assertTrue(worker._is_bad_dialogue_response(
-            "I'm ready to help Alex and the human user move forward with the current phase. "
+            "I'm ready to help Jacob and the human user move forward with the current phase. "
             "I'll rely on the read-only tools that are available."
         ))
         self.assertTrue(worker._is_bad_dialogue_response(
             "The image you sent is a depiction of a detailed surreal portrait."
         ))
+
+    def test_pseudo_tool_requests_and_unverified_external_claims_are_rejected(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "ACTION: CALL TOOL | PLATFORM: Freelancer.com Tool request: "
+            '{"query": {"endpoint": "/api/v1/payouts"}}'
+        ))
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "The platform has confirmed visibility and I've submitted your profile."
+        ))
+        self.assertFalse(worker._is_bad_dialogue_response(
+            "I cannot verify the platform rules from the available evidence; BLOCKED."
+        ))
+
+    def test_narrated_tool_calls_and_unreturned_evidence_are_rejected(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "ACTION: CALL `web_read` to fetch the official policy page."
+        ))
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "The returned evidence confirms the platform enforces this $500K cap."
+        ))
+
+    def test_retired_persona_names_are_rejected_from_model_output(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "Marcus on the ground while Jacob flags the risk."
+        ))
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "Alex Vega should review this before continuing."
+        ))
+
+    def test_failed_full_model_retry_returns_safe_transcript_response(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        worker.context = "CURRENT PHASE: discover\nPHASE INSTRUCTION: approve or block."
+        worker.max_tokens = 768
+        fallback = worker._safe_fallback_response()
+        self.assertTrue(fallback.startswith("BLOCKED:"))
+        self.assertNotIn("Check the loaded model", fallback)
+
+    def test_repeated_tool_intent_across_personas_is_rejected(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        worker.history = [
+            {"role": "assistant", "content": "I will review the returned policy."},
+            {"role": "assistant", "content": "I will fetch the official policy."},
+        ]
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "I’ll call one read-only tool now to fetch the official policy."
+        ))
+
+    def test_text_tool_calls_execute_with_single_dialogue_iteration(self):
+        first = Mock(
+            content='I will check this: web_search("Freelancer.com payout fees")',
+            tool_calls=None,
+        )
+        final = Mock(content="The search returned no verified result.", tool_calls=None)
+        client = Mock()
+        client.chat.completions.create.side_effect = [
+            Mock(choices=[Mock(message=first)]),
+            Mock(choices=[Mock(message=final)]),
+        ]
+        with patch("agents.tool_calling.execute_tool", return_value="[no result]") as execute:
+            result = chat_with_tools(
+                client=client,
+                model="ministral-3b",
+                system_prompt="Persona",
+                user_message="Verify the payout terms.",
+                max_tokens=128,
+                max_iterations=1,
+                use_function_calling=False,
+            )
+        execute.assert_called_once_with(
+            "web_search", {"query": "Freelancer.com payout fees"})
+        self.assertEqual(result, "The search returned no verified result.")
 
     def test_registration_research_never_grants_account_approval(self):
         self.assertIn(
@@ -140,7 +252,7 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         )
 
     def test_persona_prompts_have_distinct_parameter_tiers(self):
-        persona = persona_for_key("Alex Vega")
+        persona = persona_for_key("Jacob Stanley")
         tiny = persona.build_system_prompt(goal="Choose one action", tier="tiny")
         compact = persona.build_system_prompt(goal="Choose one action", tier="compact")
         full = persona.build_system_prompt(goal="Choose one action", tier="full")
@@ -148,6 +260,22 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         self.assertIn("Follow the current phase instruction", compact)
         self.assertIn("# RESPONSE PROCESS", full)
         self.assertNotIn("# MEMORY", tiny)
+
+    def test_persona_names_default_when_custom_settings_are_blank(self):
+        with patch.dict(os.environ, {
+            "BIG_BRAIN_NAME": "   ",
+            "SMALL_BRAIN_NAME": "",
+        }, clear=False):
+            self.assertEqual(DRIVER.current_name, "Edward Hurst")
+            self.assertEqual(NAVIGATOR.current_name, "Jacob Stanley")
+
+    def test_persona_names_use_nonblank_custom_settings(self):
+        with patch.dict(os.environ, {
+            "BIG_BRAIN_NAME": "E. Hurst",
+            "SMALL_BRAIN_NAME": "J. Stanley",
+        }, clear=False):
+            self.assertEqual(DRIVER.current_name, "E. Hurst")
+            self.assertEqual(NAVIGATOR.current_name, "J. Stanley")
 
     def test_dialogue_capability_gate_rejects_tiny_and_base_models(self):
         tab = DialogueTab.__new__(DialogueTab)
@@ -185,7 +313,7 @@ class TestDialogueResponseCorruption(unittest.TestCase):
             result = chat_with_tools(
                 client=client,
                 model="gemma 4 12b it qat q4",
-                system_prompt="You are Marcus Rivera.",
+                system_prompt="You are Edward Hurst.",
                 user_message="Choose one action.",
                 use_function_calling=False,
                 flatten_system_prompt=True,
@@ -195,7 +323,7 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         self.assertEqual(result, "A valid answer")
         self.assertNotIn("tools", request)
         self.assertEqual(request["messages"][0]["role"], "user")
-        self.assertIn("You are Marcus Rivera.", request["messages"][0]["content"])
+        self.assertIn("You are Edward Hurst.", request["messages"][0]["content"])
         self.assertNotIn("system", {item["role"] for item in request["messages"]})
 
     def test_gemma4_is_not_forced_onto_legacy_template(self):
@@ -234,7 +362,7 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         worker.brain = Mock(model="granite-1b-tiny")
         with patch.dict(os.environ, {"DIALOGUE_TURN_MAX_TOKENS": "512"}):
             DialogueWorker.__init__(
-                worker, worker.brain, "context", [], "Alex Vega")
+                worker, worker.brain, "context", [], "Jacob Stanley")
         self.assertEqual(worker.max_tokens, 128)
 
     def test_dialogue_worker_keeps_normal_budget_for_larger_models(self):
@@ -243,7 +371,7 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         worker.brain = Mock(model="granite-8b-instruct")
         with patch.dict(os.environ, {"DIALOGUE_TURN_MAX_TOKENS": "512"}):
             DialogueWorker.__init__(
-                worker, worker.brain, "context", [], "Alex Vega")
+                worker, worker.brain, "context", [], "Jacob Stanley")
         self.assertEqual(worker.max_tokens, 512)
 
     def test_local_client_timeout_is_bounded(self):
@@ -318,15 +446,24 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         message = Mock(content="", reasoning_content="private notes")
         self.assertEqual(_visible_response_content(message), "")
 
+    def test_empty_provider_response_becomes_model_diagnostic(self):
+        from agents.big_brain import BigBrainAdapter
+        brain = BigBrainAdapter(model="served-model", base_url="http://127.0.0.1:1234/v1")
+        with patch("agents.tool_calling.chat_with_tools", return_value=""):
+            response = brain.chat("Give one decision.", dialogue_mode=True)
+        self.assertIn("model returned an empty response", response)
+        self.assertIn("served-model", response)
+        self.assertIn("127.0.0.1:1234/v1", response)
+
     def test_dialogue_context_has_a_bounded_prompt(self):
         tab = DialogueTab.__new__(DialogueTab)
         tab.conversation_history = [
-            {"speaker": "Marcus Rivera", "content": "x" * 1000}
+            {"speaker": "Edward Hurst", "content": "x" * 1000}
             for _ in range(200)
         ]
         tab._context_char_limit = 12000
         tab.goal = "Choose one action"
-        tab.current_speaker = "Marcus Rivera"
+        tab.current_speaker = "Edward Hurst"
         tab._phase_index = 0
         tab.active_lifecycle = []
         context = tab.get_dialogue_context()
@@ -336,7 +473,7 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         tab = DialogueTab.__new__(DialogueTab)
         tab.conversation_history = []
         tab.goal = "Evaluate a potential platform"
-        tab.current_speaker = "Marcus Rivera"
+        tab.current_speaker = "Edward Hurst"
         tab._phase_index = 0
         from gui.dialogue_tab import LIFECYCLE
         tab.active_lifecycle = LIFECYCLE
@@ -346,6 +483,21 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         self.assertIn("use one read-only tool and rely only on its returned evidence", context)
         self.assertIn("Do not invent sources or results", context)
         self.assertIn("stop for human approval before", context)
+
+    def test_dialogue_context_requires_self_check_and_recovery(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        tab.conversation_history = []
+        tab.goal = "Diagnose a broken dialogue"
+        tab.current_speaker = "Edward Hurst"
+        tab._phase_index = 0
+        from gui.dialogue_tab import LIFECYCLE
+        tab.active_lifecycle = LIFECYCLE
+        context = tab.get_dialogue_context()
+        self.assertIn("SELF-CHECK THE DIALOGUE", context)
+        self.assertIn("CORRECT", context)
+        self.assertIn("INVESTIGATE", context)
+        self.assertIn("bounded local FIX", context)
+        self.assertIn("repeating confirmation loop", context)
 
     def test_reasoning_mode_router_matches_task_shape(self):
         self.assertEqual(

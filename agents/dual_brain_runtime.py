@@ -92,7 +92,7 @@ ROLE_DEFAULTS: Dict[BrainRole, Dict[str, Any]] = {
         "port": 1234,
         "context": 32768,
         "gpu_layers": None,
-        "display_name": "Marcus Rivera",
+        "display_name": "Edward Hurst",
         "gpu_label": "RTX 5060 Ti 16 GB",
         "kv_cache": "f16",
         "split_mode": "none",
@@ -106,7 +106,7 @@ ROLE_DEFAULTS: Dict[BrainRole, Dict[str, Any]] = {
         "port": 1235,
         "context": 32768,
         "gpu_layers": None,
-        "display_name": "Alex Vega",
+        "display_name": "Jacob Stanley",
         "gpu_label": "CPU / System RAM",
         "kv_cache": "f16",
         "split_mode": "none",
@@ -518,6 +518,16 @@ class DualBrainRuntime:
         t0 = time.time()
         models = self.list_models(role, refresh=refresh)
         latency_ms = int((time.time() - t0) * 1000)
+        selected_model = cfg.model.strip()
+        if not selected_model:
+            model_status = "unselected"
+            selected_model_available = None
+        elif models:
+            selected_model_available = selected_model in models
+            model_status = "available" if selected_model_available else "stale"
+        else:
+            selected_model_available = None
+            model_status = "server_unavailable"
         return {
             "role": role.value,
             "display_name": cfg.display_name,
@@ -525,6 +535,8 @@ class DualBrainRuntime:
             "endpoint": cfg.endpoint,
             "device": cfg.device,
             "model": cfg.model,
+            "selected_model_available": selected_model_available,
+            "model_status": model_status,
             "enabled": cfg.enabled,
             "reachable": bool(models),
             "model_count": len(models),

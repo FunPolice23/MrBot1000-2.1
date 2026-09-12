@@ -1,7 +1,7 @@
 """
 agents/web_eyes.py — Web browsing and search capabilities for MrBot1000 personas.
 
-Gives Marcus Rivera and Alex Vega real-time web abilities:
+Gives Edward Hurst and Jacob Stanley real-time web abilities:
 - Web search via DuckDuckGo
 - Browser automation via Playwright (headless)
 - Read web pages (HTML to text)
@@ -17,6 +17,7 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -33,7 +34,12 @@ class WebEyes:
     # ── Search ─────────────────────────────────────────────────────────────
     
     def search(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
-        """Search the web via DuckDuckGo."""
+        """Search the web with a dependency fallback.
+
+        Search results are discovery evidence only. Callers should read the
+        source URL before treating a current or consequential claim as
+        verified.
+        """
         try:
             from ddgs import DDGS
             results = []
@@ -43,10 +49,29 @@ class WebEyes:
                         "title": r.get("title", ""),
                         "url": r.get("href", ""),
                         "snippet": r.get("body", ""),
+                        "backend": "ddgs",
                     })
             return results
-        except Exception as e:
-            return [{"error": str(e)}]
+        except Exception as primary_error:
+            try:
+                from duckduckgo_search import DDGS
+                results = []
+                with DDGS() as ddgs:
+                    for r in ddgs.text(query, max_results=max_results):
+                        results.append({
+                            "title": r.get("title", ""),
+                            "url": r.get("href", ""),
+                            "snippet": r.get("body", ""),
+                            "backend": "duckduckgo_search-fallback",
+                        })
+                return results
+            except Exception as fallback_error:
+                return [{
+                    "error": (
+                        f"Search backends unavailable: primary={primary_error}; "
+                        f"fallback={fallback_error}"
+                    )
+                }]
     
     def search_news(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
         """Search news via DuckDuckGo."""
@@ -286,15 +311,21 @@ class WebEyes:
     def format_search_results(self, results: List[Dict[str, str]]) -> str:
         """Format search results for display."""
         if not results:
-            return "No results found."
+            return "No results found. Search did not verify the claim."
         
-        parts = []
+        retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        parts = [
+            "SEARCH RESULTS (discovery evidence; read the source before stating a current fact):",
+            f"Retrieved at: {retrieved_at}",
+        ]
         for i, r in enumerate(results, 1):
             if "error" in r:
                 parts.append(f"Error: {r['error']}")
             else:
                 parts.append(f"**{i}. {r.get('title', 'No title')}**")
                 parts.append(f"   URL: {r.get('url', '')}")
+                if r.get("backend"):
+                    parts.append(f"   Backend: {r['backend']}")
                 parts.append(f"   {r.get('snippet', '')[:150]}")
                 parts.append("")
         

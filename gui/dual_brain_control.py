@@ -738,9 +738,9 @@ class DualBrainControl(QWidget):
                 if active_local:
                     route_provider_name = provider_names.get(active_local, active_local)
                     route = (
-                        f"Route: Marcus → {route_provider_name} / "
+                        f"Route: Edward → {route_provider_name} / "
                         f"{big.model or 'auto model'} / {big.gpu_label} · "
-                        f"Alex → {route_provider_name} / "
+                        f"Jacob → {route_provider_name} / "
                         f"{small.model or 'auto model'} / {small.gpu_label}"
                     )
                 elif active_cloud and active_cloud.lower() != "auto":
@@ -1422,7 +1422,7 @@ class DualBrainControl(QWidget):
         layout.setSpacing(4)
 
         # GPU name + assigned brain
-        brain_name = "Marcus (Big Brain)" if index == 0 else "Alex (Small Brain)"
+        brain_name = "Edward (Big Brain)" if index == 0 else "Jacob (Small Brain)"
         name_label = QLabel(f"GPU {index}: {name} — {brain_name}")
         name_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
         name_label.setStyleSheet(f"color: {color};")
@@ -1827,23 +1827,15 @@ class DualBrainControl(QWidget):
         except Exception:
             return 1235 if small else 1234
 
-    # Default .gguf model paths — mirror the start_*_brain.ps1 scripts so a
-    # launched server always gets a REAL model file, never a placeholder/UI
-    # string (v2.1 fix: Start was passing "⚠️ llama-server offline…" as --model).
-    _DEFAULT_MODEL_PATHS = {
-        True: "D:/LMStudio/models/lmstudio-community/Qwen3-4B-Thinking-2507-GGUF/Qwen3-4B-Thinking-2507-Q6_K.gguf",
-        False: "D:/LMStudio/models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf",
-    }
     _PLACEHOLDER_MARKERS = ("⚠️", "Error", "No models found")
 
     def _resolve_model_path(self, small: bool, combo_text: str) -> str:
         """Return a real .gguf path to launch for a brain, or '' if none.
 
-        Resolution order (first non-placeholder, existing file wins):
+                Resolution order (first non-placeholder, existing file wins):
           1. combo text IF it is a real model id/path (not a placeholder)
           2. env BIG/SMALL_BRAIN_MODEL
-          3. the default .gguf path from the start scripts
-          4. '' (caller aborts launch with a clear log)
+                    3. '' (caller aborts launch with a clear log)
         """
         cands = []
         if combo_text and not combo_text.startswith(self._PLACEHOLDER_MARKERS):
@@ -1852,7 +1844,6 @@ class DualBrainControl(QWidget):
         env_model = os.getenv(env_key, "").strip()
         if env_model:
             cands.append(env_model)
-        cands.append(self._DEFAULT_MODEL_PATHS[small])
         for c in cands:
             if os.path.exists(c):
                 return c
@@ -1917,10 +1908,10 @@ class DualBrainControl(QWidget):
         """Fill a brain's dropdown with ALL local .gguf (display name, full path
         in item data).
 
-        Selection policy: GUI combo is the SOURCE OF TRUTH. The user's selection
-        is NEVER overridden by what the server reports as loaded. The only time
-        we auto-select the loaded model is on first population when the user
-        hasn't made a selection yet.
+        Selection policy: GUI combo is the SOURCE OF TRUTH. A role remains
+        unselected until the user chooses a model or an explicit saved value
+        selects one. A running model is shown in the list but never silently
+        becomes the next launch selection.
         """
         combo = self._model_combo(small)
         prev = self._current_model_path(small)  # what the user has selected (may be "")
@@ -1933,20 +1924,17 @@ class DualBrainControl(QWidget):
         try:
             combo.clear()
             paths = list(models or []) if external else self._discover_gguf_models()
-            if external and cfg.model and cfg.model not in paths:
+            if cfg.model and cfg.model not in paths:
                 paths.insert(0, cfg.model)
             if loaded_path and self._norm_path(loaded_path) not in {self._norm_path(p) for p in paths}:
                 paths.insert(0, loaded_path)  # running model not under scanned dirs
-            # Decide the target selection:
-            #   1. ALWAYS keep the user's previous valid selection if it exists in the list;
-            #   2. else auto-select the loaded model (first-time population only);
-            #   3. else first entry.
+            # Keep an existing user selection or explicit saved model only.
             target_norm = ""
             if prev_norm and prev_norm in {self._norm_path(p) for p in paths}:
                 target_norm = prev_norm
-            elif loaded_path and not prev_norm:
-                target_norm = self._norm_path(loaded_path)
-            select = 0
+            elif cfg.model and self._norm_path(cfg.model) in {self._norm_path(p) for p in paths}:
+                target_norm = self._norm_path(cfg.model)
+            select = -1
             for i, p in enumerate(paths):
                 combo.addItem(p if external else os.path.basename(p), p)
                 if self._norm_path(p) == target_norm:
@@ -2819,6 +2807,21 @@ class BrainLaunchWorker(QThread):
             if self.big_brain is not None:
                 self.big_brain.model = model_name
 
+    def _persist_role_model(self, small: bool, model_name: str, runtime, cfg):
+        """Persist an explicit role selection for the next runtime rebuild."""
+        model_name = str(model_name or "").strip()
+        if not model_name:
+            return
+        role_key = "SMALL_BRAIN_MODEL" if small else "BIG_BRAIN_MODEL"
+        cfg.model = model_name
+        runtime.set_model(cfg.role, model_name)
+        os.environ[role_key] = model_name
+        try:
+            from main import set_env_values
+            set_env_values({role_key: model_name})
+        except Exception:
+            pass
+
     def _on_small_brain_model_changed(self, model_name: str):
         """Handle Small Brain model change — restart the brain with the new
         model when it is running, else just record the selection for next Start."""
@@ -2834,6 +2837,7 @@ class BrainLaunchWorker(QThread):
         path = self._current_model_path(True)
         if not path:
             return
+        self._persist_role_model(True, path, runtime, cfg)
         self.sb_model_label.setText(f"Model: {os.path.basename(path)}")
 
         # Sync model to adapter
@@ -2872,6 +2876,7 @@ class BrainLaunchWorker(QThread):
         path = self._current_model_path(False)
         if not path:
             return
+        self._persist_role_model(False, path, runtime, cfg)
         self.bb_model_label.setText(f"Model: {os.path.basename(path)}")
 
         # Sync model to adapter
@@ -2894,15 +2899,7 @@ class BrainLaunchWorker(QThread):
 
     def _select_external_model(self, small: bool, model_name: str, runtime, cfg):
         """Persist an external model ID without treating it as a GGUF path."""
-        role_key = "SMALL_BRAIN_MODEL" if small else "BIG_BRAIN_MODEL"
-        cfg.model = model_name
-        runtime.set_model(cfg.role, model_name)
-        os.environ[role_key] = model_name
-        try:
-            from main import set_env_values
-            set_env_values({role_key: model_name})
-        except Exception:
-            pass
+        self._persist_role_model(small, model_name, runtime, cfg)
         try:
             from agents.base_worker import _active_worker
             if _active_worker is not None:
@@ -2995,9 +2992,13 @@ class BrainLaunchWorker(QThread):
         sb_external = data.get("sb_external", False)
         sb_selected = data.get("sb_selected", "")
         if sb_running:
-            self.sb_status.setText("● Running")
-            self.sb_status.setStyleSheet("color: #4caf50; font-weight: bold;")
-            model_name = sb_selected if sb_selected in sb_models else (sb_models[0] if sb_models else "")
+            sb_selected_available = not sb_selected or sb_selected in sb_models
+            self.sb_status.setText(
+                "● Running" if sb_selected_available else "● Running · selected model unavailable")
+            self.sb_status.setStyleSheet(
+                "color: #4caf50; font-weight: bold;" if sb_selected_available
+                else "color: #ffb74d; font-weight: bold;")
+            model_name = sb_selected or (sb_models[0] if sb_models else "")
             if model_name:
                 self.sb_model_label.setText(f"Model: {os.path.basename(model_name)}")
             self._repopulate_model_combo(True, model_name, sb_models)
@@ -3015,9 +3016,13 @@ class BrainLaunchWorker(QThread):
         bb_external = data.get("bb_external", False)
         bb_selected = data.get("bb_selected", "")
         if bb_running:
-            self.bb_status.setText("● Running")
-            self.bb_status.setStyleSheet("color: #4caf50; font-weight: bold;")
-            model_name = bb_selected if bb_selected in bb_models else (bb_models[0] if bb_models else "")
+            bb_selected_available = not bb_selected or bb_selected in bb_models
+            self.bb_status.setText(
+                "● Running" if bb_selected_available else "● Running · selected model unavailable")
+            self.bb_status.setStyleSheet(
+                "color: #4caf50; font-weight: bold;" if bb_selected_available
+                else "color: #ffb74d; font-weight: bold;")
+            model_name = bb_selected or (bb_models[0] if bb_models else "")
             if model_name:
                 self.bb_model_label.setText(f"Model: {os.path.basename(model_name)}")
             self._repopulate_model_combo(False, model_name, bb_models)
@@ -3162,7 +3167,8 @@ for _handler_name in (
     "_on_start_big_brain", "_start_big_brain_after_probe", "_on_big_brain_launched",
     "_on_stop_big_brain", "_on_stop_all", "_on_small_brain_model_changed",
     "_on_big_brain_model_changed", "_sync_adapter_model", "_on_start_all",
-    "_unload_external_model", "_load_external_model", "_finish_external_lifecycle",
+    "_persist_role_model", "_select_external_model", "_unload_external_model",
+    "_load_external_model", "_finish_external_lifecycle",
     "_gpu_free_vram_gb", "_model_vram_need_gb", "_check_vram_affinity",
     "_show_vram_warning", "_refresh_provider_status", "_probe_providers",
     "_apply_provider_status", "_safe_apply_provider_status",

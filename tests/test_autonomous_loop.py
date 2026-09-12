@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from agents.provenance import TruthStatus, ProvenanceRecord, InfoAtom, ProvenanceChain, FactStore
 from agents.autonomous_loop import StageStatus, AutonomousLoop, AutonomousResult
+from agents.evidence import Evidence, EvidenceStatus, VerificationLevel, VerificationResult
 
 
 # ── Fake Opportunity ───────────────────────────────────────────────────────────
@@ -82,6 +83,15 @@ class FakeEvidenceStore:
     pass
 
 
+class SubjectEvidenceStore:
+    def __init__(self, evidence):
+        self.evidence = evidence
+
+    def for_subject(self, subject_type, subject_id):
+        return [e for e in self.evidence
+                if e.subject_type == subject_type and e.subject_id == subject_id]
+
+
 class FakeAccounting:
     def get_profile(self, opp_id):
         return None
@@ -89,7 +99,18 @@ class FakeAccounting:
 
 class FakeTaskExecutor:
     def run(self, task):
-        return SimpleNamespace(success=True, errors=[], output={})
+        return SimpleNamespace(
+            success=True,
+            errors=[],
+            output={
+                "text": "Overview\n"
+                "This test artifact contains enough structured words to represent a completed task "
+                "with a clear heading and meaningful content for deterministic validation. "
+                "It remains intentionally simple while proving that the executor returned real output. "
+                "The additional detail documents the expected result, preserves provenance, and "
+                "gives downstream stages a concrete artifact to inspect and reason about.",
+            },
+        )
 
 
 class FakePipeline:
@@ -191,6 +212,34 @@ class TestAutonomousLoop(unittest.TestCase):
         self.assertFalse(result.paid)
         self.assertGreater(len(result.stages), 15)
 
+    def test_advertised_amount_never_becomes_payment_amount(self):
+        opp = FakeOpp(advertised_amount=500)
+        def verified(evidence_type):
+            evidence = Evidence.create(
+                source="test", evidence_type=evidence_type,
+                subject_type="opportunity", subject_id=opp.id,
+            )
+            return evidence.verify(VerificationResult(
+                status=EvidenceStatus.VERIFIED,
+                method="test_api", level=VerificationLevel.L3_EXTERNAL_SOURCE,
+                actor="test",
+            ))
+
+        unverified_payment = Evidence.create(
+            source="test", evidence_type="payment_gross",
+            subject_type="opportunity", subject_id=opp.id, amount=500.0,
+        )
+        self.loop.evidence_store = SubjectEvidenceStore([
+            verified("platform_submission"),
+            verified("completion_confirmation"),
+            unverified_payment,
+        ])
+        result = AutonomousResult(opportunity_id=opp.id)
+        self.loop._stage_verify(result, opp, SimpleNamespace(opportunity_id=opp.id))
+
+        self.assertFalse(result.paid)
+        self.assertEqual(result.payment_amount, 0.0)
+
     def test_missing_executor_fails_without_claiming_completion(self):
         self.pipeline.task_executor = None
         self.loop.task_executor = None
@@ -271,6 +320,38 @@ class TestAutonomousLoop(unittest.TestCase):
         self.assertEqual(dedup_stage.status, StageStatus.COMPLETED)
         self.assertFalse(dedup_stage.data["is_duplicate"])
 
+    def test_lifecycle_sync_failure_is_reported(self):
+        class FailingLifecycle:
+            def mark_final_outcome(self, *args, **kwargs):
+                raise RuntimeError("lifecycle unavailable")
+
+        result = AutonomousResult(opportunity_id="opp-sync")
+        result.decision = "reject"
+        loop = AutonomousLoop(SimpleNamespace(lifecycle=FailingLifecycle()))
+        loop._sync_final_state(result, SimpleNamespace(opportunity_id="opp-sync"))
+        self.assertTrue(any("Lifecycle sync error" in error for error in result.errors))
+
+    def test_portfolio_sync_failure_is_reported(self):
+        class FailingPortfolio:
+            def load_all(self):
+                raise RuntimeError("portfolio unavailable")
+
+        result = AutonomousResult(opportunity_id="opp-sync")
+        result.decision = "completed_unpaid"
+        loop = AutonomousLoop(SimpleNamespace(portfolio=FailingPortfolio()))
+        loop._sync_final_state(result, SimpleNamespace(opportunity_id="opp-sync"))
+        self.assertTrue(any("Portfolio sync error" in error for error in result.errors))
+
+    def test_run_persistence_failure_is_reported(self):
+        class FailingRunStore:
+            def save_run(self, *args, **kwargs):
+                raise RuntimeError("run store unavailable")
+
+        result = AutonomousResult(opportunity_id="opp-sync")
+        loop = AutonomousLoop(SimpleNamespace(), run_store=FailingRunStore())
+        loop._persist_run(result, SimpleNamespace(opportunity_id="opp-sync"))
+        self.assertTrue(any("Run persistence error" in error for error in result.errors))
+
 
 # ── Group 1 regression tests: dead stages must now actually run ───────────────
 
@@ -350,8 +431,8 @@ class TestGroup1DeadStages(unittest.TestCase):
                         f"RERANK stage did not persist; errors={result.errors}")
         entry = self.portfolio.get("opp-g1")
         self.assertIsNotNone(entry)
-        # result.success is True for a terminal non-failure (completed_unpaid), so priority increments.
-        self.assertEqual(entry.priority, 11, "priority should have incremented on completed_unpaid")
+        # Operational completion without verified payment must not improve priority.
+        self.assertEqual(entry.priority, 9, "completed_unpaid must not improve priority")
 
     def test_sync_final_state_updates_portfolio(self):
         """H-2: _sync_final_state must update the portfolio via update() (not save())."""
@@ -360,7 +441,7 @@ class TestGroup1DeadStages(unittest.TestCase):
         self.assertEqual(result.decision, "completed_unpaid")
         entry = self.portfolio.get("opp-g1")
         self.assertIsNotNone(entry)
-        self.assertEqual(entry.policy_score, True)
+        self.assertEqual(entry.policy_score, False)
         from agents.opportunity_portfolio import WorkStatus
         self.assertIn(entry.work_status, (WorkStatus.IN_PROGRESS, WorkStatus.AWAITING_APPROVAL, WorkStatus.EVALUATING))
 

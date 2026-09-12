@@ -235,7 +235,8 @@ class EarningPipeline:
 
     # ── Stage 1: DISCOVER ──────────────────────────────────
 
-    def discover(self, sources: List[str] = None
+    def discover(self, sources: List[str] = None,
+                 on_found=None
                   ) -> List[Opportunity]:
         """Run discovery sources and return raw opportunities.
 
@@ -288,7 +289,10 @@ class EarningPipeline:
                 "min_amount": o.advertised_amount,
                 "provenance": o.provenance,
             }, o.category)
-            all_opps.append(self._adapt_to_legacy(o))
+            adapted = self._adapt_to_legacy(o)
+            all_opps.append(adapted)
+            if on_found is not None:
+                on_found(adapted)
             self._log(f"[Discover] Found {o.title!r} ({o.category}) from {o.source}")
             time.sleep(0.2)
 

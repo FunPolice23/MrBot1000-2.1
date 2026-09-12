@@ -194,6 +194,29 @@ class TestLiveHealth(unittest.TestCase):
         health = rt.health(BrainRole.BIG)
         self.assertTrue(health["reachable"])
         self.assertEqual(health["model_count"], 2)
+        self.assertIsNone(health["selected_model_available"])
+        self.assertEqual(health["model_status"], "unselected")
+
+    def test_health_marks_selected_model_available_without_changing_selection(self):
+        rt = DualBrainRuntime.from_env({
+            "BIG_BRAIN_URL": f"http://127.0.0.1:{self._server.port}/v1",
+            "BIG_BRAIN_MODEL": "qwen3-27b",
+        })
+        health = rt.health(BrainRole.BIG)
+        self.assertTrue(health["selected_model_available"])
+        self.assertEqual(health["model_status"], "available")
+        self.assertEqual(rt.model(BrainRole.BIG), "qwen3-27b")
+
+    def test_health_marks_stale_selected_model_without_silent_fallback(self):
+        rt = DualBrainRuntime.from_env({
+            "BIG_BRAIN_URL": f"http://127.0.0.1:{self._server.port}/v1",
+            "BIG_BRAIN_MODEL": "stale-model",
+        })
+        health = rt.health(BrainRole.BIG)
+        self.assertFalse(health["selected_model_available"])
+        self.assertEqual(health["model_status"], "stale")
+        self.assertEqual(health["model"], "stale-model")
+        self.assertEqual(rt.model(BrainRole.BIG), "stale-model")
 
     def test_snapshot_contains_isolation_and_both_roles(self):
         rt = DualBrainRuntime.from_env(

@@ -1,7 +1,7 @@
 """
 agents/tool_calling.py — Unified tool calling system for MrBot1000 personas.
 
-Gives Marcus Rivera and Alex Vega real tool-calling abilities:
+Gives Edward Hurst and Jacob Stanley real tool-calling abilities:
 - Web search, browse, read pages
 - Workshop operations (proposals, research, accounts, payments)
 - File operations (read, write, list, search)
@@ -74,11 +74,16 @@ def get_all_tools() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search the web for information. Returns titles, URLs, and snippets.",
+                "description": (
+                    "Search the web for candidate sources. Returns titles, URLs, and snippets; "
+                    "search results are discovery evidence, not verification. Read a source URL "
+                    "before making a current or consequential factual claim."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Search query"}
+                        "query": {"type": "string", "description": "Search query"},
+                        "limit": {"type": "integer", "description": "Maximum results, usually 3-8"}
                     },
                     "required": ["query"]
                 }
@@ -590,7 +595,7 @@ def chat_with_tools(
         if not msg.tool_calls:
             # Parse tool calls from text (works for all models)
             text_tool_call = _parse_tool_call_from_text(visible_content)
-            if text_tool_call and max_iterations > 1:
+            if text_tool_call:
                 fn_name, fn_args = text_tool_call
                 call_key = (fn_name, json.dumps(fn_args, sort_keys=True))
                 if call_key in executed_text_calls:

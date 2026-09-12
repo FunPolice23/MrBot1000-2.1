@@ -261,6 +261,8 @@ class EarningInsightsPanel(QWidget):
     def set_events(self, events: List[Dict[str, Any]]):
         self.event_list.clear()
         for ev in events[-50:]:
+            if hasattr(ev, "to_dict"):
+                ev = ev.to_dict()
             ts = ev.get("ts", 0)
             text = ev.get("message", "")
             lvl = ev.get("level", "")
@@ -309,10 +311,10 @@ class EarningInsightsPanel(QWidget):
         self._reputation_score = score
         if self._reputation_label:
             try:
-                self._reputation_label.setText(f"Reputation: {score:.2f}/5.0")
+                self._reputation_label.setText(f"Reputation: {score:.1f}/100")
                 self._reputation_label.setStyleSheet(
                     "color: %s; font-weight: bold;"
-                    % ("#4caf50" if score >= 4.5 else "#ff9800" if score >= 3.0 else "#ff5555")
+                    % ("#4caf50" if score >= 80 else "#ff9800" if score >= 50 else "#ff5555")
                 )
             except RuntimeError:
                 self._reputation_label = None
@@ -386,6 +388,20 @@ class TabAwareInsightsPanel(EarningInsightsPanel):
         try:
             if self.event_logger:
                 self.set_events(self.event_logger.recent(limit=50))
+                earning_events = self.event_logger.recent(
+                    event_type="earning", limit=50)
+                outcomes = []
+                for event in earning_events:
+                    item = event.to_dict() if hasattr(event, "to_dict") else event
+                    details = item.get("details", {}) or {}
+                    outcomes.append({
+                        "time": item.get("ts", ""),
+                        "action": item.get("message", ""),
+                        "platform": details.get("platform", item.get("source", "")),
+                        "revenue": details.get("amount", details.get("revenue", 0)),
+                        "status": details.get("status", "completed"),
+                    })
+                self.set_outcomes(outcomes)
         except Exception:
             pass
 
@@ -410,9 +426,11 @@ class TabAwareInsightsPanel(EarningInsightsPanel):
         try:
             if self._llm_spend > 0:
                 roi = (self._total_earned - self._llm_spend) / self._llm_spend * 100
+                self.set_roi(roi)
             else:
-                roi = self._total_earned * 100  # free spend = infinite roi, just show earnings
-            self.set_roi(roi)
+                if self._roi_label:
+                    self._roi_label.setText("ROI: N/A (no tracked LLM spend)")
+                    self._roi_label.setStyleSheet("color: #9e9e9e; font-weight: bold;")
         except Exception:
             pass
 

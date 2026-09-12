@@ -12,6 +12,7 @@ Simulates trading without real money:
 import time
 import json
 import os
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
@@ -71,19 +72,29 @@ class Trade:
 
 class PaperTradingEngine:
     """Paper trading engine with virtual portfolio."""
+
+    EXTERNAL_EXECUTION_ENABLED = False
     
-    def __init__(self, initial_balance: float = 10000.0, config_path: str = ""):
+    def __init__(self, initial_balance: float = 10000.0, config_path: str = "",
+                 audit_path: str = ""):
+        if initial_balance < 0:
+            raise ValueError("initial_balance cannot be negative")
         self.initial_balance = initial_balance
         self.cash = initial_balance
         self.positions: Dict[str, Position] = {}
         self.orders: List[Order] = []
         self.trades: List[Trade] = []
         self.equity_curve: List[Tuple[float, float]] = []  # (timestamp, equity)
+        self.audit_log: List[Dict] = []
+        self.simulation_only = True
+        self.audit_path = audit_path
+        self._load_audit_log()
         
         # Configuration
         self.slippage_pct = 0.001  # 0.1% slippage
         self.fee_pct = 0.001  # 0.1% trading fee
         self.min_order_size = 1.0
+        self.max_order_notional = 100000.0
         
         # Load config if provided
         if config_path and os.path.exists(config_path):
@@ -92,6 +103,45 @@ class PaperTradingEngine:
                 self.slippage_pct = config.get("slippage_pct", self.slippage_pct)
                 self.fee_pct = config.get("fee_pct", self.fee_pct)
                 self.min_order_size = config.get("min_order_size", self.min_order_size)
+                self.max_order_notional = config.get(
+                    "max_order_notional", self.max_order_notional)
+        if not 0 <= self.slippage_pct or not math.isfinite(self.slippage_pct):
+            raise ValueError("slippage_pct must be finite and nonnegative")
+        if not 0 <= self.fee_pct or not math.isfinite(self.fee_pct):
+            raise ValueError("fee_pct must be finite and nonnegative")
+        if self.min_order_size <= 0 or not math.isfinite(self.min_order_size):
+            raise ValueError("min_order_size must be finite and positive")
+        if self.max_order_notional <= 0 or not math.isfinite(self.max_order_notional):
+            raise ValueError("max_order_notional must be finite and positive")
+
+    def _load_audit_log(self) -> None:
+        if not self.audit_path or not os.path.exists(self.audit_path):
+            return
+        try:
+            with open(self.audit_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    event = json.loads(line)
+                    if event.get("simulation_only") is True:
+                        self.audit_log.append(event)
+        except (OSError, ValueError, TypeError):
+            self.audit_log = []
+
+    def _audit(self, event: str, **details) -> None:
+        record = {
+            "timestamp": time.time(),
+            "event": event,
+            "simulation_only": True,
+            **details,
+        }
+        self.audit_log.append(record)
+        if self.audit_path:
+            try:
+                parent = os.path.dirname(os.path.abspath(self.audit_path))
+                os.makedirs(parent, exist_ok=True)
+                with open(self.audit_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+            except OSError:
+                pass
     
     def get_equity(self) -> float:
         """Calculate total equity (cash + positions)."""
@@ -108,6 +158,8 @@ class PaperTradingEngine:
     
     def update_price(self, symbol: str, price: float):
         """Update current price for a symbol."""
+        if not symbol or not math.isfinite(price) or price <= 0:
+            raise ValueError("symbol must be nonempty and price must be finite and positive")
         if symbol in self.positions:
             pos = self.positions[symbol]
             pos.current_price = price
@@ -120,23 +172,33 @@ class PaperTradingEngine:
                     order_type: OrderType = OrderType.MARKET, price: float = 0.0) -> Optional[Order]:
         """Place an order."""
         # Validate
-        if quantity < self.min_order_size:
+        if (not symbol or not math.isfinite(quantity) or quantity < self.min_order_size
+                or not isinstance(side, OrderSide) or not isinstance(order_type, OrderType)):
+            self._audit("order_rejected", symbol=symbol, reason="invalid_order")
+            return None
+        if not math.isfinite(price) or price <= 0 or quantity * price > self.max_order_notional:
+            self._audit("order_rejected", symbol=symbol, reason="invalid_price_or_notional")
             return None
         
         # For market orders, use current price
         if order_type == OrderType.MARKET:
             pos = self.positions.get(symbol)
             price = pos.current_price if pos else price
+            if not math.isfinite(price) or price <= 0:
+                self._audit("order_rejected", symbol=symbol, reason="missing_market_price")
+                return None
         
         # Check buying power
         if side == OrderSide.BUY:
             cost = quantity * price * (1 + self.fee_pct)
             if cost > self.cash:
+                self._audit("order_rejected", symbol=symbol, reason="insufficient_cash")
                 return None  # Insufficient funds
         else:
             # Check position exists
             pos = self.positions.get(symbol)
             if not pos or pos.quantity < quantity:
+                self._audit("order_rejected", symbol=symbol, reason="insufficient_position")
                 return None  # Insufficient position
         
         # Create order
@@ -154,6 +216,8 @@ class PaperTradingEngine:
             self._execute_order(order)
         else:
             self.orders.append(order)
+            self._audit("order_accepted", order_id=order.id, symbol=symbol,
+                        order_type=order_type.value)
         
         return order
     
@@ -218,8 +282,12 @@ class PaperTradingEngine:
             price=fill_price,
             fees=fees,
             timestamp=time.time(),
+            pnl=pnl if order.side == OrderSide.SELL else 0.0,
         )
         self.trades.append(trade)
+        self._audit("order_filled", order_id=order.id, symbol=order.symbol,
+                side=order.side.value, quantity=order.quantity,
+                price=fill_price, fees=fees)
         
         # Update order status
         order.status = "filled"
@@ -252,7 +320,10 @@ class PaperTradingEngine:
     def get_performance(self) -> Dict:
         """Get performance metrics."""
         equity = self.get_equity()
-        total_return = (equity / self.initial_balance - 1) * 100
+        total_return = (
+            (equity / self.initial_balance - 1) * 100
+            if self.initial_balance > 0 else 0.0
+        )
         
         # Calculate Sharpe ratio (simplified)
         returns = []
@@ -272,11 +343,13 @@ class PaperTradingEngine:
         for _, equity in self.equity_curve:
             if equity > peak:
                 peak = equity
-            drawdown = (peak - equity) / peak
+            drawdown = (peak - equity) / peak if peak > 0 else 0.0
             if drawdown > max_drawdown:
                 max_drawdown = drawdown
         
         return {
+            "simulation_only": True,
+            "execution_mode": "virtual",
             "initial_balance": self.initial_balance,
             "current_equity": equity,
             "cash": self.cash,
@@ -287,7 +360,7 @@ class PaperTradingEngine:
             "total_trades": len(self.trades),
             "open_positions": len(self.positions),
             "total_fees": sum(t.fees for t in self.trades),
-            "realized_pnl": sum(p.realized_pnl for p in self.positions.values()),
+            "realized_pnl": sum(t.pnl for t in self.trades),
             "unrealized_pnl": sum(p.unrealized_pnl for p in self.positions.values()),
         }
     
@@ -300,6 +373,7 @@ class PaperTradingEngine:
 ║              PAPER TRADING PERFORMANCE REPORT               ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Initial Balance:    ${perf['initial_balance']:>12,.2f}                  ║
+║  Execution Mode:     VIRTUAL / SIMULATION ONLY             ║
 ║  Current Equity:     ${perf['current_equity']:>12,.2f}                  ║
 ║  Total Return:        {perf['total_return_pct']:>11.2f}%                  ║
 ║  Sharpe Ratio:        {perf['sharpe_ratio']:>11.4f}                  ║

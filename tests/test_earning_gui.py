@@ -29,3 +29,13 @@ def test_tab_builder_delegates_earning_tab():
     mixin = TabBuildersMixin()
     tab = mixin.create_earnings_tab()
     assert tab is not None
+
+
+def test_insights_renders_structured_events(qt_app):
+    from agents.event_logger import Event
+    from gui.earning_insights import EarningInsightsPanel
+
+    panel = EarningInsightsPanel()
+    panel.set_events([Event(source="test", message="earning recorded")])
+    assert panel.event_list.count() == 1
+    assert "earning recorded" in panel.event_list.item(0).text()

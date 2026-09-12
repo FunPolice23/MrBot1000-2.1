@@ -1,7 +1,7 @@
 """
 agents/workshop.py — Workshop workspace manager for MrBot1000 personas.
 
-Gives Marcus Rivera and Alex Vega a real workspace at D:\ai_workshop for:
+Gives Edward Hurst and Jacob Stanley a real workspace at D:\ai_workshop for:
 - Proposals: create, store, manage client proposals
 - Research: read/write research files, PDFs, documents
 - Scripts: create scripts for automation, data processing
@@ -533,7 +533,7 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 """,
             "invoice": """# Invoice
 
-**From:** MrBot1000 (Marcus Rivera + Alex Vega)
+**From:** MrBot1000 (Edward Hurst + Jacob Stanley)
 **To:** [CLIENT]
 **Date:** [DATE]
 

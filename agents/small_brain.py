@@ -37,11 +37,11 @@ class SmallBrainAdapter:
         self.personality = get_personality_engine()
         self.knowledge = get_knowledge_context()
         
-        # Auto-detect model: use provided, env var, or "unknown" (populated later
-        # by _refresh_small_brain_models / UI when llama-server is reachable).
+        # A model is never selected implicitly. The user must choose or save one;
+        # the dialogue UI may later replace this with the live server model.
         # We intentionally avoid a blocking HTTP call in __init__ so tab
         # construction stays fast even when llama-server is not yet running.
-        self.model = model or os.getenv("SMALL_BRAIN_MODEL") or _cfg.model or "unknown"
+        self.model = model or os.getenv("SMALL_BRAIN_MODEL", "").strip() or ""
         
         # Load system prompt
         prompt_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts", "small_brain.txt")
@@ -206,6 +206,12 @@ class SmallBrainAdapter:
                 flatten_system_prompt=protocol["flatten_system_prompt"],
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
+            if not str(answer or "").strip():
+                return (
+                    f"[{NAVIGATOR.current_name} Error: model returned an empty response "
+                    f"for '{self.model}' at {self.base_url}. Check the loaded model "
+                    "and chat template.]"
+                )
 
             # Log and evolve
             self.db.log_conversation("small_brain", "user", user_message)
@@ -214,7 +220,20 @@ class SmallBrainAdapter:
 
             return answer
         except Exception as e:
-            return f"[{NAVIGATOR.current_name} Error: {str(e)[:200]}]"
+                error_msg = str(e)
+                if "not found" in error_msg.lower() or "404" in error_msg:
+                    available = self.get_available_models()
+                    if available:
+                        return (
+                            f"[{NAVIGATOR.current_name}: Selected model '{self.model}' "
+                            f"is unavailable. Available models: {', '.join(available)}. "
+                            "Choose one explicitly in Providers & GPU.]"
+                        )
+                    return (
+                        f"[{NAVIGATOR.current_name}: Selected model '{self.model}' is unavailable "
+                        "and no models were reported by the configured server.]"
+                    )
+                return f"[{NAVIGATOR.current_name} Error: {error_msg[:200]}]"
     
     def review(self, plan: str) -> str:
         """Review Big Brain's plan for red flags."""

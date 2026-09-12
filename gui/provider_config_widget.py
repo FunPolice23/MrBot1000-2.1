@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QFrame, QScrollArea, QTabWidget,
     QSlider, QSpinBox, QLineEdit, QCheckBox, QProgressBar, QSizePolicy,
 )
+from agents.personas import DRIVER, NAVIGATOR
 
 
 class ProviderConfigWidget(QWidget):
@@ -118,16 +119,16 @@ class ProviderConfigWidget(QWidget):
         settings_layout.addWidget(self.fallback_check, 2, 1)
         settings_layout.addWidget(QLabel("Big Brain name:"), 3, 0)
         self.big_brain_name = QLineEdit(os.getenv("BIG_BRAIN_NAME", "").strip())
-        self.big_brain_name.setPlaceholderText("Big Brain")
-        self.big_brain_name.setToolTip("Custom display name for the Big Brain role")
+        self.big_brain_name.setPlaceholderText(DRIVER.name)
+        self.big_brain_name.setToolTip("Optional custom name; blank uses Edward Hurst")
         self.big_brain_name.editingFinished.connect(
             lambda: self._persist_brain_name("BIG_BRAIN_NAME", self.big_brain_name))
         settings_layout.addWidget(self.big_brain_name, 3, 1)
 
         settings_layout.addWidget(QLabel("Small Brain name:"), 4, 0)
         self.small_brain_name = QLineEdit(os.getenv("SMALL_BRAIN_NAME", "").strip())
-        self.small_brain_name.setPlaceholderText("Small Brain")
-        self.small_brain_name.setToolTip("Custom display name for the Small Brain role")
+        self.small_brain_name.setPlaceholderText(NAVIGATOR.name)
+        self.small_brain_name.setToolTip("Optional custom name; blank uses Jacob Stanley")
         self.small_brain_name.editingFinished.connect(
             lambda: self._persist_brain_name("SMALL_BRAIN_NAME", self.small_brain_name))
         settings_layout.addWidget(self.small_brain_name, 4, 1)

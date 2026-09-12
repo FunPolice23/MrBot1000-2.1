@@ -136,10 +136,10 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 
 ## Architecture
 
-- **Big Brain / Marcus Rivera**: uses the active provider and available primary GPU — planning, coding, deep research, and review
-- **Small Brain / Alex Vega**: uses the active provider, a second GPU, CPU/system RAM, or can be disabled — human chat, triage, and lightweight coordination
+- **Big Brain / Edward Hurst**: uses the active provider and available primary GPU — planning, coding, deep research, and review
+- **Small Brain / Jacob Stanley**: uses the active provider, a second GPU, CPU/system RAM, or can be disabled — human chat, triage, and lightweight coordination
 - **Provider selection**: llama.cpp, Ollama, LM Studio, vLLM, KoboldCpp, and cloud providers are selected explicitly from Settings; provider-specific controls appear only for the active backend
-- **Two-persona model runtime**: Marcus Rivera (Driver/Big Brain) plans and pushes work forward; Alex Vega (Navigator/Small Brain) handles chat, triage, risk checks, and verification
+- **Two-persona model runtime**: Edward Hurst (Driver/Big Brain) plans and pushes work forward; Jacob Stanley (Navigator/Small Brain) handles chat, triage, risk checks, and verification
 - **Application services**: Management coordinates earning workflows, approvals, payouts, memory, and operational controls; specialized workers handle discovery, analysis, coding, and platform tasks
 - **Message routing**: Chat and Dialogue use the configured brain adapters; task and command intents are routed through the Manager and deterministic service boundaries
 - **Cross-model communication**: EventBus typed handoffs plus the durable collaboration/message ledger
@@ -166,7 +166,7 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 | `manager.py` | Manager orchestration, intent routing, heartbeat, approvals, memory, and service coordination |
 | `agents/dual_brain_runtime.py` | Canonical Big Brain/Small Brain provider, endpoint, device, and model configuration |
 | `agents/dual_brain_coordinator.py` | Typed plan → research → review → execute collaboration handoff and run ledger |
-| `agents/personas.py` | Marcus Rivera and Alex Vega persona contracts and guardrails |
+| `agents/personas.py` | Edward Hurst and Jacob Stanley persona contracts and guardrails |
 | `agents/base_worker.py` | Shared worker behavior, provider calls, secure file I/O, and research utilities |
 | `agents/composition_root.py` | Shared process-level pipeline, portfolio, lifecycle, and run-store wiring |
 | `earning_pipeline.py` | Opportunity discovery, evaluation, filtering, execution, accounting, and audit integration |
@@ -180,7 +180,7 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 | `agents/self_audit.py` | Structured operational findings without security-policy mutation |
 | `agents/instruction_gate.py` / `agents/trust_boundary.py` | Untrusted-instruction provenance and high-trust action boundaries |
 | `gui/tab_builders.py` | Current visible tab construction and lazy-loading orchestration |
-| `gui/dialogue_tab.py` | Goal-driven Marcus/Alex Dialogue with bounded history and progress tracking |
+| `gui/dialogue_tab.py` | Goal-driven Edward/Jacob Dialogue with bounded history and progress tracking |
 | `gui/management_tab.py` | Operational controls, earning workflows, approvals, payouts, memory, and stream health |
 | `gui/provider_config_widget.py` | Local/cloud provider configuration and role assignment |
 | `gui/model_library_tab.py` | Local model discovery and managed downloads |
@@ -203,7 +203,7 @@ Key settings:
 - `BIG_BRAIN_PROVIDER`, `BIG_BRAIN_URL`, `BIG_BRAIN_PORT` — Big Brain provider and endpoint (default llama-server on 1234)
 - `SMALL_BRAIN_PROVIDER`, `SMALL_BRAIN_URL`, `SMALL_BRAIN_PORT` — Small Brain provider and endpoint (default llama-server on 1235)
 - `BIG_BRAIN_DEVICE` / `SMALL_BRAIN_DEVICE` — GPU device assignment for the two local brains
-- `SMALL_BRAIN_GPU_LAYERS=0` — optional CPU/system-RAM mode for Alex when a second GPU is unavailable
+- `SMALL_BRAIN_GPU_LAYERS=0` — optional CPU/system-RAM mode for Jacob when a second GPU is unavailable
 - `BIG_BRAIN_CONTEXT` / `SMALL_BRAIN_CONTEXT` — per-role context limits
 - `OLLAMA_MAIN_MODEL` / `OLLAMA_CHAT_MODEL` — optional Ollama fallback model names
 - `OPENAI_STREAM_TIMEOUT_SECONDS` — bounded streaming timeout for OpenAI-compatible providers
@@ -223,7 +223,7 @@ Key settings:
 3. **Model Library** — Local model discovery and download management
 4. **Safety & Tools** — Tool registry, safety rules, and approval queue
 5. **Chat** — Human conversation with the configured Small Brain
-6. **Dialogue** — Goal-driven Marcus/Alex conversation with Goals, Tasks, and Progress tracking
+6. **Dialogue** — Goal-driven Edward/Jacob conversation with Goals, Tasks, and Progress tracking
 7. **Browse Root** — File explorer
 8. **Payments** — Balance and payout verification
 9. **Earnings** — Income tracking, verified revenue, costs, gas, net profit, ROI
@@ -246,8 +246,8 @@ it is not a separate visible tab.
 
 | Role | Identity | Responsibility |
 |------|----------|----------------|
-| Big Brain | Marcus Rivera, Driver | Planning, opportunity sizing, coding, deep research, negotiation, and review |
-| Small Brain | Alex Vega, Navigator | Human chat, triage, risk assessment, source verification, and detail checking |
+| Big Brain | Edward Hurst, Driver | Planning, opportunity sizing, coding, deep research, negotiation, and review |
+| Small Brain | Jacob Stanley, Navigator | Human chat, triage, risk assessment, source verification, and detail checking |
 | Manager services | Deterministic application layer | Routes intents, coordinates workers, enforces approvals, persists state, and runs heartbeat workflows |
 | Specialized workers | Discovery, analysis, coding, platform, and accounting services | Perform bounded tasks through validated tools and human-gated execution |
 

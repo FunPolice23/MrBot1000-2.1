@@ -22,8 +22,8 @@ cloud provider):
 
 | Brain | Role | GPU / CUDA | Port | Typical size |
 |-------|------|-----------|------|--------------|
-| **Big / Marcus Rivera** | planning, coding, deep research, review/verification | primary GPU, or active provider | provider-configured | provider-configured |
-| **Small / Alex Vega** | human chat, triage, summarise, lightweight coordination | secondary GPU, CPU/RAM, or disabled | provider-configured | provider-configured |
+| **Big / Edward Hurst** | planning, coding, deep research, review/verification | primary GPU, or active provider | provider-configured | provider-configured |
+| **Small / Jacob Stanley** | human chat, triage, summarise, lightweight coordination | secondary GPU, CPU/RAM, or disabled | provider-configured | provider-configured |
 
 - The canonical runtime (`agents/dual_brain_runtime.py`) is the single source of truth for role → provider/endpoint/model/device. A model call never assumes a role/GPU of its own choosing.
 - `BIG_BRAIN_*` and `SMALL_BRAIN_*` environment variables configure each role. Provider-specific model variables are used when that provider is active.
@@ -43,13 +43,13 @@ they are not additional model personas:
 
 | Runtime role | Responsibility |
 |-------------|----------------|
-| Marcus Rivera / Big Brain | Planning, coding, deep research, analysis, and review |
-| Alex Vega / Small Brain | Human chat, triage, summarisation, risk checks, and lightweight coordination |
+| Edward Hurst / Big Brain | Planning, coding, deep research, analysis, and review |
+| Jacob Stanley / Small Brain | Human chat, triage, summarisation, risk checks, and lightweight coordination |
 | Manager and specialized workers | Intent routing, discovery, platform clients, task execution, accounting, and UI coordination |
 
 ### Model Routing Strategy
-- **Chat/Questions** → Small Brain / Alex with the configured chat-capable provider
-- **Tasks/Work** → Big Brain / Marcus with the configured main-capable provider
+- **Chat/Questions** → Small Brain / Jacob with the configured chat-capable provider
+- **Tasks/Work** → Big Brain / Edward with the configured main-capable provider
 - **Lifecycle/Status Questions** → Small Brain with bounded runtime and memory context
 - **Cross-model collaboration** → typed EventBus handoffs through `DualBrainCoordinator`, not unconstrained model-to-model chat
 - **Provider selection** → explicit Settings configuration; the selected local backend is preferred while configured cloud providers remain available for fallback

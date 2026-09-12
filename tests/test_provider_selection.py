@@ -81,6 +81,33 @@ class TestProviderSelection(unittest.TestCase):
         self.assertEqual(big.model, "qwen2.5-7b-instruct")
         self.assertEqual(small.model, "llama3.2:3b")
 
+    def test_role_model_is_empty_without_explicit_selection(self):
+        with patch.dict(os.environ, {}, clear=True):
+            big = build_config(BrainRole.BIG)
+            small = build_config(BrainRole.SMALL)
+        self.assertEqual(big.model, "")
+        self.assertEqual(small.model, "")
+
+    def test_local_launch_requires_selected_or_saved_model(self):
+        from gui.dual_brain_control import DualBrainControl
+        control = DualBrainControl.__new__(DualBrainControl)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(control._resolve_model_path(False, ""), "")
+            self.assertEqual(control._resolve_model_path(True, ""), "")
+
+    def test_local_model_selection_updates_runtime_and_environment(self):
+        from gui.dual_brain_control import DualBrainControl
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+
+        control = DualBrainControl.__new__(DualBrainControl)
+        with patch.dict(os.environ, {}, clear=True):
+            runtime = DualBrainRuntime.from_env()
+            cfg = runtime.config(BrainRole.BIG)
+            control._persist_role_model(False, r"D:\\models\\qwen3.gguf", runtime, cfg)
+            self.assertEqual(runtime.model(BrainRole.BIG), r"D:\\models\\qwen3.gguf")
+            self.assertEqual(cfg.model, r"D:\\models\\qwen3.gguf")
+            self.assertEqual(os.environ["BIG_BRAIN_MODEL"], r"D:\\models\\qwen3.gguf")
+
     def test_lm_studio_loaded_instances_are_detected(self):
         response = MagicMock()
         response.__enter__.return_value = response

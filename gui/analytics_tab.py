@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -20,7 +21,7 @@ class AnalyticsTab(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self._price_cache: Dict[str, float] = {}
+        self._price_cache: Dict[str, tuple] = {}
         self._setup_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._auto_refresh)
@@ -32,7 +33,7 @@ class AnalyticsTab(QWidget):
         root.setSpacing(8)
 
         # Header
-        header = QLabel("📊 Analytics")
+        header = QLabel("📊 Market Information & Backtesting")
         header.setFont(QFont("Segoe UI", 18, QFont.Bold))
         header.setAlignment(Qt.AlignCenter)
         header.setStyleSheet("color: #bb86fc; padding: 10px;")
@@ -41,7 +42,7 @@ class AnalyticsTab(QWidget):
         splitter = QSplitter(Qt.Vertical)
 
         # Market data section
-        market_box = QGroupBox("Market Data")
+        market_box = QGroupBox("Crypto Market Information (CoinGecko)")
         market_lay = QFormLayout(market_box)
 
         self.crypto_combo = QComboBox()
@@ -69,11 +70,14 @@ class AnalyticsTab(QWidget):
         """)
         self.refresh_crypto_btn.clicked.connect(self._on_refresh_crypto_price)
         market_lay.addRow(self.refresh_crypto_btn)
+        market_lay.addRow(QLabel(
+            "Information only. This tab does not place orders or connect to a broker."
+        ))
 
         splitter.addWidget(market_box)
 
         # Strategy performance section
-        strategy_box = QGroupBox("Strategy Performance")
+        strategy_box = QGroupBox("Crypto Strategy Backtesting (90-day history)")
         strategy_lay = QVBoxLayout(strategy_box)
 
         self.strategy_table = QTableWidget()
@@ -142,8 +146,13 @@ class AnalyticsTab(QWidget):
         import json
 
         # Check cache first (60s TTL)
-        if symbol in self._price_cache:
-            self.crypto_price.setText(f"${self._price_cache[symbol]:,.2f}")
+        cached = self._price_cache.get(symbol)
+        if cached and time.time() - cached[0] < 60:
+            self.crypto_price.setText(f"${cached[1]:,.2f}")
+            change = cached[2]
+            color = "#00ff88" if change >= 0 else "#ff5252"
+            self.crypto_change.setText(f"{change:+.2f}%")
+            self.crypto_change.setStyleSheet(f"color: {color};")
             return
 
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol}&vs_currencies=usd&include_24hr_change=true"
@@ -154,19 +163,54 @@ class AnalyticsTab(QWidget):
         if symbol in data:
             price = data[symbol].get("usd", 0)
             change = data[symbol].get("usd_24h_change", 0)
-            self._price_cache[symbol] = price
+            self._price_cache[symbol] = (time.time(), price, change)
             self.crypto_price.setText(f"${price:,.2f}")
             color = "#00ff88" if change >= 0 else "#ff5252"
             self.crypto_change.setText(f"{change:+.2f}%")
             self.crypto_change.setStyleSheet(f"color: {color};")
 
     def _on_run_backtest(self):
-        """Run strategy backtest (stub — needs BacktestEngine integration)."""
+        """Run the built-in strategies against recent public market history."""
         self.status_label.setText("Running backtest...")
         self.status_label.setStyleSheet("color: #ffb300;")
-        # TODO: Integrate with BacktestEngine
-        self.status_label.setText("Backtest complete (stub)")
-        self.status_label.setStyleSheet("color: #888;")
+        try:
+            import json
+            import urllib.request
+            from agents.backtesting import (
+                BacktestEngine, MovingAverageCrossover, RSIStrategy)
+            symbol = self.crypto_combo.currentText()
+            url = (
+                f"https://api.coingecko.com/api/v3/coins/{symbol}/market_chart"
+                "?vs_currency=usd&days=90&interval=daily")
+            request = urllib.request.Request(url, headers={"User-Agent": "MrBot1000"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read().decode())
+            data = [
+                {"timestamp": ts / 1000, "date": time.strftime("%Y-%m-%d", time.localtime(ts / 1000)), "close": price}
+                for ts, price in payload.get("prices", [])
+            ]
+            if len(data) < 30:
+                raise ValueError("Not enough historical data returned")
+            engine = BacktestEngine()
+            engine.run(MovingAverageCrossover(), data, symbol)
+            engine.run(RSIStrategy(), data, symbol)
+            rows = engine.compare_strategies()
+            self.strategy_table.setRowCount(0)
+            for result in rows:
+                row = self.strategy_table.rowCount()
+                self.strategy_table.insertRow(row)
+                values = (
+                    result["strategy"], f"{result['return_pct']:.2f}%",
+                    f"{result['sharpe']:.2f}", f"{result['win_rate'] * 100:.1f}%",
+                    str(result["trades"]), f"{result['max_drawdown']:.2f}%",
+                )
+                for column, value in enumerate(values):
+                    self.strategy_table.setItem(row, column, QTableWidgetItem(value))
+            self.status_label.setText(f"Backtest complete: {len(rows)} strategies, 90-day history")
+            self.status_label.setStyleSheet("color: #4caf50;")
+        except Exception as exc:
+            self.status_label.setText(f"Backtest unavailable: {exc}")
+            self.status_label.setStyleSheet("color: #ff5252;")
 
 
 __all__ = ["AnalyticsTab"]

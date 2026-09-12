@@ -1,6 +1,9 @@
 ## [Unreleased] - 2026-09-11
 
 ### Fixed
+- The canonical persona names are now Edward Hurst for Big Brain/Driver and
+  Jacob Stanley for Small Brain/Navigator. Stable `big_brain` and `small_brain`
+  role keys are unchanged.
 - LM Studio model IDs with namespaces, such as `qwen/qwen3.5-9b`, are now
   preserved when Dialogue synchronizes adapter models instead of being reduced
   to a basename that LM Studio cannot resolve.
@@ -26,6 +29,11 @@
 - Big Brain and Small Brain now have editable, persisted display names in
   Provider Configuration. Custom names are used in runtime metadata and persona
   prompts without changing stable internal role identifiers.
+- Dialogue web research now marks search results as discovery evidence, includes
+  retrieval/backend metadata, and directs personas to read source pages before
+  treating current or consequential claims as verified.
+- Web search now falls back from `ddgs` to `duckduckgo_search` when the primary
+  backend is unavailable instead of silently presenting the failure as no evidence.
 
 ### Verification
 - Live LM Studio probes confirmed that `qwen/qwen3.5-9b` and
@@ -39,6 +47,7 @@
 - Startup validation tests pass (`4 passed`).
 - Runtime, dialogue, and startup regression tests pass (`51 passed` after the
   configurable-name coverage was added).
+- Web evidence and dialogue self-check regression tests pass (`37 passed`).
 
 ## [2.1.1] - 2026-09-11 - Security, Dialogue, and Publishing Maintenance
 
@@ -99,11 +108,11 @@
 - Modified provider, adapter, and GUI modules compile cleanly and report no
   diagnostics.
 - Live LM Studio validation confirmed separate loaded instances, successful
-  model generation, and successful direct Alex dialogue generation.
+  model generation, and successful direct Jacob Stanley dialogue generation.
 
 ### Existing Maintenance Changes
-- Dialogue now populates and shares Goals, Tasks, and Progress state with Marcus
-  and Alex instead of leaving those panels disconnected.
+- Dialogue now populates and shares Goals, Tasks, and Progress state with Edward
+  and Jacob instead of leaving those panels disconnected.
 - Removed the redundant Collaboration and Memory & Stream tabs; useful telemetry
   now lives in Management while the coordinator backend remains available.
 - Added explicit SQLite shutdown handling for JobSearchWorker and exception-safe
@@ -206,7 +215,7 @@ This section records the work completed from the initial provider/GPU report thr
 - Fixed the Providers & GPU layout omission that constructed the Quick Actions group but never added it to the rendered layout, so Start All Brains and Stop All Brains are now visible after a clean launch.
 
 ### Agent Collaboration and Trust Boundaries
-- Fixed the ordinary Marcus/Alex chat tool loop so shell commands, file writes, account/payment changes, and proposal creation are refused unless an approval-capable workflow handles them.
+- Fixed the ordinary Edward/Jacob chat tool loop so shell commands, file writes, account/payment changes, and proposal creation are refused unless an approval-capable workflow handles them.
 - Routed remote `skill.md` reads through the instruction provenance gate; fetched documents are labeled untrusted and require human review before any action is based on them.
 - Updated typed dual-brain collaboration handoffs so research, review, and execution receive labeled results from preceding stages instead of only the original goal.
 - Routed refused Dialogue actions into the visible approval queue, strengthened receipt-based rules against fabricated credentials or completed actions, and stopped duplicate/empty model output from feeding endless Live-mode loops.

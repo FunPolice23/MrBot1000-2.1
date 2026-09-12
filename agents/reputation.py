@@ -46,6 +46,7 @@ class PlatformMetrics:
     failed_tasks: int = 0
     rejected_tasks: int = 0
     total_earnings: float = 0.0
+    verified_earnings: float = 0.0
     total_costs: float = 0.0
     average_rating: float = 0.0
     ratings_count: int = 0
@@ -61,12 +62,22 @@ class PlatformMetrics:
     @property
     def net_earnings(self) -> float:
         return self.total_earnings - self.total_costs
+
+    @property
+    def verified_net_earnings(self) -> float:
+        return self.verified_earnings - self.total_costs
     
     @property
     def roi(self) -> float:
         if self.total_costs == 0:
             return 0.0
         return (self.total_earnings - self.total_costs) / self.total_costs * 100
+
+    @property
+    def verified_roi(self) -> float:
+        if self.total_costs == 0:
+            return 0.0
+        return (self.verified_earnings - self.total_costs) / self.total_costs * 100
 
 
 @dataclass
@@ -159,6 +170,8 @@ class ReputationTracker:
         if record.status == "completed":
             metrics.successful_tasks += 1
             metrics.total_earnings += record.payout
+            if record.verified:
+                metrics.verified_earnings += record.payout
         elif record.status == "failed":
             metrics.failed_tasks += 1
         elif record.status == "rejected":
@@ -196,6 +209,7 @@ class ReputationTracker:
         failed = sum(m.failed_tasks for m in self._platforms.values())
         earnings = sum(m.total_earnings for m in self._platforms.values())
         costs = sum(m.total_costs for m in self._platforms.values())
+        verified_earnings = sum(m.verified_earnings for m in self._platforms.values())
         
         return {
             "total_tasks": total_tasks,
@@ -203,8 +217,15 @@ class ReputationTracker:
             "failed_tasks": failed,
             "success_rate": successful / total_tasks if total_tasks > 0 else 0,
             "total_earnings": earnings,
+            "recorded_earnings": earnings,
+            "verified_earnings": verified_earnings,
+            "unverified_completed_records": sum(
+                1 for r in self._work_history
+                if r.status == "completed" and not r.verified
+            ),
             "total_costs": costs,
             "net_earnings": earnings - costs,
+            "verified_net_earnings": verified_earnings - costs,
             "roi": ((earnings - costs) / costs * 100) if costs > 0 else 0,
             "platforms_count": len(self._platforms),
             "badges_count": len(self._badges),
@@ -231,7 +252,7 @@ class ReputationTracker:
             "platforms": list(self._platforms.keys()),
             "top_platform": max(
                 self._platforms.items(),
-                key=lambda x: x[1].total_earnings,
+                key=lambda x: x[1].verified_earnings,
                 default=(None, None)
             )[0],
         }
@@ -252,14 +273,14 @@ class ReputationTracker:
              metrics["total_tasks"] >= 100),
             ("high_success", "Reliable", "Achieve 90%+ success rate", BadgeTier.SILVER, "⭐",
              metrics["success_rate"] >= 0.9 and metrics["total_tasks"] >= 10),
-            ("earner_100", "Earner", "Earn $100+", BadgeTier.BRONZE, "$",
-             metrics["total_earnings"] >= 100),
+            ("earner_100", "Earner", "Earn $100+ (verified)", BadgeTier.BRONZE, "$",
+             metrics["verified_earnings"] >= 100),
             ("earner_1000", "High Earner", "Earn $1,000+", BadgeTier.GOLD, "$$$",
-             metrics["total_earnings"] >= 1000),
+             metrics["verified_earnings"] >= 1000),
             ("multi_platform", "Multi-Platform", "Work on 3+ platforms", BadgeTier.SILVER, "🌐",
              metrics["platforms_count"] >= 3),
             ("roi_positive", "Profitable", "Achieve positive ROI", BadgeTier.GOLD, "📈",
-             metrics["roi"] > 0 and metrics["total_earnings"] > 0),
+             metrics["verified_net_earnings"] > 0 and metrics["verified_earnings"] > 0),
             ("verified_pro", "Verified Pro", "Get 10+ verified completions", BadgeTier.PLATINUM, "✅",
              sum(1 for r in self._work_history if r.verified) >= 10),
         ]
@@ -286,7 +307,11 @@ class ReputationTracker:
         # Components
         success_score = metrics["success_rate"] * 40  # 40 points max
         volume_score = min(metrics["total_tasks"] / 100, 1.0) * 20  # 20 points max
-        roi_score = min(max(metrics["roi"], 0) / 100, 1.0) * 20  # 20 points max
+        roi_score = min(max(
+            metrics["verified_net_earnings"] / metrics["total_costs"] * 100
+            if metrics["total_costs"] > 0 else 0,
+            0,
+        ) / 100, 1.0) * 20  # 20 points max
         diversity_score = min(metrics["platforms_count"] / 5, 1.0) * 10  # 10 points max
         badge_score = min(metrics["badges_count"] / 10, 1.0) * 10  # 10 points max
         

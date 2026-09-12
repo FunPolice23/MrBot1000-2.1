@@ -673,6 +673,7 @@ class TabBuildersMixin:
             from gui.earning_insights import TabAwareInsightsPanel
             from agents.event_logger import StructuredEventLogger
             from agents.approval_queue import HumanApprovalQueue
+            from agents.workspace_context import register_component
 
             panel = TabAwareInsightsPanel(
                 parent=self,
@@ -681,6 +682,7 @@ class TabBuildersMixin:
                 event_logger=StructuredEventLogger.instance(),
             )
             self._insights_panel = panel
+            register_component("insights", panel)
             return panel
         except Exception as e:
             w = QWidget()
@@ -1193,10 +1195,10 @@ class TabBuildersMixin:
         llamacppl.setContentsMargins(12, 12, 12, 12)
         self.llamacpp_big_enabled = QCheckBox("Enabled")
         self.llamacpp_big_enabled.setChecked(_env_bool("BIG_BRAIN_ENABLED", True))
-        llamacppl.addRow("Marcus / Big Brain:", self.llamacpp_big_enabled)
+        llamacppl.addRow("Edward / Big Brain:", self.llamacpp_big_enabled)
         self.llamacpp_small_enabled = QCheckBox("Enabled")
         self.llamacpp_small_enabled.setChecked(_env_bool("SMALL_BRAIN_ENABLED", True))
-        llamacppl.addRow("Alex / Small Brain:", self.llamacpp_small_enabled)
+        llamacppl.addRow("Jacob / Small Brain:", self.llamacpp_small_enabled)
         llamacpp_note = QLabel(
             "Uses the llama-server processes configured in Providers & GPU. "
             "Enable at least one role, then start that brain there. Other local "
@@ -1648,6 +1650,13 @@ class TabBuildersMixin:
         """Create the Opportunities tab — browse, search, and manage discovered opportunities."""
         from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
         from PySide6.QtCore import QTimer
+        from agents.opportunity_portfolio import OpportunityPortfolio
+        from agents.workspace_context import register_component
+
+        portfolio_path = os.path.join(
+            os.path.expanduser("~"), ".mrbot1000", "opportunities.db")
+        self.opportunity_portfolio = OpportunityPortfolio(portfolio_path)
+        register_component("opportunity_portfolio", self.opportunity_portfolio)
         
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -1668,12 +1677,16 @@ class TabBuildersMixin:
         
         self.opp_auto_scan_cb = QCheckBox("Auto-scan")
         self.opp_auto_scan_cb.setChecked(False)
+        self.opp_auto_scan_cb.toggled.connect(self._configure_opportunity_auto_scan)
         controls.addWidget(self.opp_auto_scan_cb)
         
         self.opp_scan_interval_spin = QSpinBox()
         self.opp_scan_interval_spin.setRange(1, 60)
         self.opp_scan_interval_spin.setValue(5)
         self.opp_scan_interval_spin.setSuffix(" min")
+        self.opp_scan_interval_spin.valueChanged.connect(
+            lambda _value: self._configure_opportunity_auto_scan(
+                self.opp_auto_scan_cb.isChecked()))
         controls.addWidget(QLabel("Interval:"))
         controls.addWidget(self.opp_scan_interval_spin)
         
@@ -1747,13 +1760,24 @@ class TabBuildersMixin:
         self.opp_refresh_timer = QTimer()
         self.opp_refresh_timer.timeout.connect(self._refresh_opportunities)
         self.opp_refresh_timer.start(30000)  # 30s
+        self.opp_scan_timer = QTimer()
+        self.opp_scan_timer.timeout.connect(self._on_scan_opportunities)
+        self._refresh_opportunities()
         
         return w
     
     def create_paper_trading_tab(self):
         """Create the Paper Trading tab — virtual portfolio and strategy testing."""
-        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
+        from PySide6.QtWidgets import (
+            QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+            QDoubleSpinBox,
+        )
         from PySide6.QtCore import QTimer
+        from agents.paper_trading import PaperTradingEngine
+        from agents.workspace_context import register_component
+
+        self.paper_engine = PaperTradingEngine()
+        register_component("paper_trading", self.paper_engine)
         
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -1766,16 +1790,16 @@ class TabBuildersMixin:
         lay.addWidget(header)
         
         # Portfolio summary
-        summary_group = QGroupBox("Portfolio Summary")
+        summary_group = QGroupBox("Virtual Portfolio Summary")
         summary_lay = QFormLayout(summary_group)
         
         self.paper_equity_label = QLabel("$10,000.00")
         self.paper_equity_label.setStyleSheet("font-size: 18pt; font-weight: bold; color: #00ff88;")
-        summary_lay.addRow("Total Equity:", self.paper_equity_label)
+        summary_lay.addRow("Simulated Equity:", self.paper_equity_label)
         
         self.paper_cash_label = QLabel("$10,000.00")
         self.paper_cash_label.setStyleSheet("font-size: 12pt; color: #88aaff;")
-        summary_lay.addRow("Cash:", self.paper_cash_label)
+        summary_lay.addRow("Virtual Cash:", self.paper_cash_label)
         
         self.paper_return_label = QLabel("0.00%")
         self.paper_return_label.setStyleSheet("font-size: 12pt; color: #00ff88;")
@@ -1794,6 +1818,10 @@ class TabBuildersMixin:
         summary_lay.addRow("Total Trades:", self.paper_trades_label)
         
         lay.addWidget(summary_group)
+        lay.addWidget(QLabel(
+            "Simulation only: no bank, broker, wallet, exchange, or live order connection. "
+            "Prices are entered manually for paper testing."
+        ))
         
         # Order entry
         order_group = QGroupBox("Place Order")
@@ -1817,10 +1845,11 @@ class TabBuildersMixin:
         self.paper_qty_spin.setValue(1)
         order_lay.addRow("Quantity:", self.paper_qty_spin)
         
-        self.paper_price_spin = QSpinBox()
-        self.paper_price_spin.setRange(1, 100000)
-        self.paper_price_spin.setValue(100)
-        self.paper_price_spin.setSuffix(" cents")
+        self.paper_price_spin = QDoubleSpinBox()
+        self.paper_price_spin.setRange(0.01, 1000000.0)
+        self.paper_price_spin.setDecimals(2)
+        self.paper_price_spin.setValue(100.0)
+        self.paper_price_spin.setPrefix("$")
         order_lay.addRow("Price:", self.paper_price_spin)
         
         self.paper_place_btn = QPushButton("📤 Place Order")
@@ -1933,24 +1962,152 @@ class TabBuildersMixin:
     def _on_scan_opportunities(self):
         """Scan for opportunities now."""
         self.opp_status_label.setText("Scanning...")
-        # TODO: Implement actual scan via OpportunityScanner
-        self.opp_status_label.setText("Scan complete (stub)")
+        try:
+            from earning_pipeline import EarningPipeline
+            from agents.opportunity_portfolio import PortfolioEntry, WorkStatus
+            source = self.opp_source_combo.currentText()
+            sources = None if source == "all" else [source]
+            pipeline = EarningPipeline(portfolio=self.opportunity_portfolio)
+
+            def add_found_opportunity(opportunity):
+                opportunity_id = getattr(opportunity, "id", "")
+                if not opportunity_id:
+                    return
+                existing = self.opportunity_portfolio.get(opportunity_id)
+                if existing is not None:
+                    return
+                self.opportunity_portfolio.add(PortfolioEntry(
+                    opportunity_id=opportunity_id,
+                    opportunity_ref={
+                        "id": opportunity_id,
+                        "title": getattr(opportunity, "title", ""),
+                        "description": getattr(opportunity, "description", ""),
+                        "url": getattr(opportunity, "url", ""),
+                        "source": getattr(opportunity, "source", ""),
+                        "platform": getattr(opportunity, "platform", ""),
+                        "category": getattr(opportunity, "type", ""),
+                    },
+                    work_status=WorkStatus.EVALUATING,
+                    expected_value=float(getattr(opportunity, "estimated_usd_value", 0.0) or 0.0),
+                    platform=getattr(opportunity, "platform", "") or "",
+                    category=getattr(opportunity, "type", "") or "",
+                    next_action="Review evidence and score before approval",
+                ))
+                self._refresh_opportunities()
+
+            found = pipeline.discover(sources=sources, on_found=add_found_opportunity)
+            self._refresh_opportunities()
+            self.opp_status_label.setText(f"Scan complete: {len(found)} opportunities found")
+        except Exception as exc:
+            self.opp_status_label.setText(f"Scan failed: {exc}")
+
+    def _configure_opportunity_auto_scan(self, enabled: bool):
+        """Start or stop the user-configured opportunity scan timer."""
+        timer = getattr(self, "opp_scan_timer", None)
+        if timer is None:
+            return
+        if enabled:
+            timer.setInterval(self.opp_scan_interval_spin.value() * 60 * 1000)
+            timer.start()
+            self.opp_status_label.setText("Auto-scan enabled")
+        else:
+            timer.stop()
+            self.opp_status_label.setText("Auto-scan disabled")
 
     def _refresh_opportunities(self):
         """Refresh opportunities table."""
-        pass  # TODO: Load from database
+        from PySide6.QtCore import Qt
+        entries = self.opportunity_portfolio.list_all()
+        minimum = self.opp_min_score_spin.value() / 100
+        source = self.opp_source_combo.currentText()
+        self.opp_table.setRowCount(0)
+        for entry in entries:
+            if source != "all" and entry.platform.lower() != source.lower():
+                continue
+            if entry.policy_score and entry.policy_score < minimum:
+                continue
+            ref = entry.opportunity_ref or {}
+            row = self.opp_table.rowCount()
+            self.opp_table.insertRow(row)
+            values = (
+                ref.get("title", entry.opportunity_id), entry.platform or ref.get("source", ""),
+                entry.category or ref.get("category", ""),
+                f"${entry.expected_value:,.2f}", f"{entry.policy_score * 100:.0f}%",
+                entry.work_status.value, ref.get("url", ref.get("source_url", "")),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.UserRole, entry.opportunity_id)
+                self.opp_table.setItem(row, column, item)
 
     def _on_research_opportunity(self):
         """Research selected opportunity."""
-        self.opp_status_label.setText("Researching (stub)...")
+        entry = self._selected_opportunity_entry()
+        if entry is None:
+            self.opp_status_label.setText("Select an opportunity first")
+            return
+        from agents.opportunity_portfolio import WorkStatus
+        try:
+            self.opportunity_portfolio.transition_work_status(
+                entry.opportunity_id, WorkStatus.EVALUATING)
+            self._refresh_opportunities()
+            self.opp_status_label.setText("Opportunity marked for evaluation")
+        except Exception as exc:
+            self.opp_status_label.setText(f"Research unavailable: {exc}")
 
     def _on_apply_opportunity(self):
         """Apply to selected opportunity."""
-        self.opp_status_label.setText("Applying (stub)...")
+        entry = self._selected_opportunity_entry()
+        if entry is None:
+            self.opp_status_label.setText("Select an opportunity first")
+            return
+        from agents.opportunity_portfolio import WorkStatus
+        try:
+            if entry.work_status == WorkStatus.NEW:
+                self.opportunity_portfolio.transition_work_status(
+                    entry.opportunity_id, WorkStatus.EVALUATING)
+                entry = self.opportunity_portfolio.get(entry.opportunity_id)
+            if entry.work_status == WorkStatus.EVALUATING:
+                self.opportunity_portfolio.transition_work_status(
+                    entry.opportunity_id, WorkStatus.QUALIFIED)
+                entry = self.opportunity_portfolio.get(entry.opportunity_id)
+            self.opportunity_portfolio.transition_work_status(
+                entry.opportunity_id, WorkStatus.AWAITING_APPROVAL)
+            self._refresh_opportunities()
+            self.opp_status_label.setText(
+                "Application queued for human approval; nothing was submitted")
+        except Exception as exc:
+            self.opp_status_label.setText(f"Apply unavailable: {exc}")
 
     def _on_reject_opportunity(self):
         """Reject selected opportunity."""
-        self.opp_status_label.setText("Rejected (stub)")
+        entry = self._selected_opportunity_entry()
+        if entry is None:
+            self.opp_status_label.setText("Select an opportunity first")
+            return
+        from agents.opportunity_portfolio import WorkStatus
+        try:
+            if entry.work_status == WorkStatus.NEW:
+                self.opportunity_portfolio.transition_work_status(
+                    entry.opportunity_id, WorkStatus.ABANDONED)
+            else:
+                self.opportunity_portfolio.transition_work_status(
+                    entry.opportunity_id, WorkStatus.REJECTED)
+            self._refresh_opportunities()
+            self.opp_status_label.setText("Opportunity rejected")
+        except Exception as exc:
+            self.opp_status_label.setText(f"Reject unavailable: {exc}")
+
+    def _selected_opportunity_entry(self):
+        """Return the portfolio entry represented by the selected table row."""
+        row = self.opp_table.currentRow()
+        if row < 0:
+            return None
+        item = self.opp_table.item(row, 0)
+        if item is None:
+            return None
+        return self.opportunity_portfolio.get(item.data(Qt.UserRole))
 
     # ── Paper Trading Tab Callbacks ─────────────────────────────────────────
 
@@ -1969,26 +2126,87 @@ class TabBuildersMixin:
         if not symbol:
             self.paper_status_label.setText("Error: Symbol required")
             return
-        self.paper_status_label.setText(f"Order placed (stub): {symbol}")
+        from agents.paper_trading import OrderSide, OrderType
+        side = OrderSide.BUY if self.paper_side_combo.currentText() == "BUY" else OrderSide.SELL
+        order_type = OrderType(self.paper_type_combo.currentText().lower())
+        price = float(self.paper_price_spin.value())
+        if order_type == OrderType.MARKET:
+            self.paper_engine.update_price(symbol.upper(), price)
+        order = self.paper_engine.place_order(
+            symbol.upper(), side, float(self.paper_qty_spin.value()), order_type, price)
+        if order is None:
+            self.paper_status_label.setText(
+                "Order rejected: check price, cash, position, and quantity")
+        else:
+            self.paper_status_label.setText(
+                f"Order {order.status}: {order.symbol} {order.filled:g} @ ${order.average_price:,.2f}")
+        self._refresh_paper_trading()
 
     def _on_generate_paper_report(self):
         """Generate paper trading report."""
-        self.paper_status_label.setText("Report generated (stub)")
+        report = self.paper_engine.get_report()
+        self.paper_status_label.setText(
+            f"Report ready: {self.paper_engine.get_performance()['total_trades']} trades")
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self.paper_report_btn.window(), "Paper Trading Report", report)
+        except Exception:
+            pass
 
     def _refresh_paper_trading(self):
         """Refresh paper trading display."""
-        pass  # TODO: Load from PaperTradingEngine
+        perf = self.paper_engine.get_performance()
+        self.paper_equity_label.setText(f"${perf['current_equity']:,.2f}")
+        self.paper_cash_label.setText(f"${perf['cash']:,.2f}")
+        self.paper_return_label.setText(f"{perf['total_return_pct']:.2f}%")
+        self.paper_sharpe_label.setText(f"{perf['sharpe_ratio']:.2f}")
+        self.paper_drawdown_label.setText(f"{perf['max_drawdown_pct']:.2f}%")
+        self.paper_trades_label.setText(str(perf['total_trades']))
+
+        positions = self.paper_engine.get_all_positions()
+        self.paper_positions_table.setRowCount(0)
+        for position in positions:
+            row = self.paper_positions_table.rowCount()
+            self.paper_positions_table.insertRow(row)
+            values = (
+                position.symbol, f"{position.quantity:g}",
+                f"${position.average_price:,.2f}", f"${position.current_price:,.2f}",
+                f"${position.unrealized_pnl:,.2f}",
+                f"${position.quantity * position.current_price:,.2f}",
+            )
+            for column, value in enumerate(values):
+                self.paper_positions_table.setItem(row, column, QTableWidgetItem(value))
+
+        trades = list(reversed(self.paper_engine.trades))
+        self.paper_history_table.setRowCount(0)
+        from datetime import datetime
+        for trade in trades[-100:]:
+            row = self.paper_history_table.rowCount()
+            self.paper_history_table.insertRow(row)
+            values = (
+                datetime.fromtimestamp(trade.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+                trade.symbol, trade.side.value.upper(), f"{trade.quantity:g}",
+                f"${trade.price:,.2f}", f"${trade.fees:,.2f}",
+                f"${trade.pnl:,.2f}",
+            )
+            for column, value in enumerate(values):
+                self.paper_history_table.setItem(row, column, QTableWidgetItem(value))
 
     # ── Analytics Tab ─────────────────────────────────────────────────────
 
     def create_analytics_tab(self):
         """Create the Analytics tab — market data and strategy performance."""
         from gui.analytics_tab import AnalyticsTab
+        from agents.workspace_context import register_component
         self.analytics_tab = AnalyticsTab(parent=self)
+        register_component("analytics", self.analytics_tab)
         return self.analytics_tab
     
     def create_reputation_tab(self):
         """Create the Reputation tab — track agent reputation across platforms."""
+        from agents.reputation import ReputationTracker
+
+        self.reputation_tracker = ReputationTracker()
         w = QWidget()
         lay = QVBoxLayout(w)
         
@@ -2005,14 +2223,14 @@ class TabBuildersMixin:
         
         self.reputation_score_label = QLabel("0.0")
         self.reputation_score_label.setStyleSheet("font-size: 24pt; font-weight: bold; color: #ffcc44;")
-        score_lay.addRow("Score:", self.reputation_score_label)
+        score_lay.addRow("Internal Score:", self.reputation_score_label)
         
         self.reputation_tasks_label = QLabel("0")
         score_lay.addRow("Total Tasks:", self.reputation_tasks_label)
         
         self.reputation_earnings_label = QLabel("$0.00")
         self.reputation_earnings_label.setStyleSheet("color: #00ff88;")
-        score_lay.addRow("Total Earnings:", self.reputation_earnings_label)
+        score_lay.addRow("Verified Payments:", self.reputation_earnings_label)
         
         self.reputation_roi_label = QLabel("0%")
         score_lay.addRow("ROI:", self.reputation_roi_label)
@@ -2032,7 +2250,7 @@ class TabBuildersMixin:
         
         self.reputation_platform_table = QTableWidget()
         self.reputation_platform_table.setColumnCount(5)
-        self.reputation_platform_table.setHorizontalHeaderLabels(["Platform", "Tasks", "Success Rate", "Earnings", "ROI"])
+        self.reputation_platform_table.setHorizontalHeaderLabels(["Platform", "Tasks", "Success Rate", "Recorded Value", "ROI"])
         self.reputation_platform_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.reputation_platform_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         platform_lay.addWidget(self.reputation_platform_table)
@@ -2043,6 +2261,8 @@ class TabBuildersMixin:
         self.reputation_refresh_btn = QPushButton("🔄 Refresh")
         self.reputation_refresh_btn.clicked.connect(self._on_refresh_reputation)
         lay.addWidget(self.reputation_refresh_btn)
+
+        self._on_refresh_reputation()
         
         return w
     
@@ -2093,8 +2313,42 @@ class TabBuildersMixin:
 
     def _on_refresh_reputation(self):
         """Refresh reputation display."""
-        # TODO: Load from ReputationTracker
-        pass
+        tracker = getattr(self, "reputation_tracker", None)
+        if tracker is None:
+            return
+        overall = tracker.get_overall_metrics()
+        self.reputation_score_label.setText(f"{tracker.get_reputation_score():.1f}/100")
+        self.reputation_tasks_label.setText(str(overall["total_tasks"]))
+        self.reputation_earnings_label.setText(f"${overall['verified_earnings']:,.2f}")
+        self.reputation_roi_label.setText(
+            "N/A" if overall["total_costs"] <= 0 else f"{overall['roi']:.1f}%")
+
+        while self.reputation_badges_layout.count():
+            item = self.reputation_badges_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        badges = tracker.get_badges()
+        if not badges:
+            self.reputation_badges_layout.addWidget(QLabel("No badges earned yet"))
+        else:
+            for badge in badges:
+                label = QLabel(f"{badge.icon} {badge.name}")
+                label.setToolTip(badge.description)
+                self.reputation_badges_layout.addWidget(label)
+        self.reputation_badges_layout.addStretch()
+
+        metrics = tracker.get_all_metrics()
+        self.reputation_platform_table.setRowCount(0)
+        for platform, item in sorted(metrics.items()):
+            row = self.reputation_platform_table.rowCount()
+            self.reputation_platform_table.insertRow(row)
+            values = (
+                platform, str(item.total_tasks), f"{item.success_rate * 100:.1f}%",
+                f"${item.total_earnings:,.2f}",
+                "N/A" if item.total_costs <= 0 else f"{item.roi:.1f}%",
+            )
+            for column, value in enumerate(values):
+                self.reputation_platform_table.setItem(row, column, QTableWidgetItem(value))
 
     # ── Data Explorer Tab Callbacks ────────────────────────────────────────
 

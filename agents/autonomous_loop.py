@@ -602,40 +602,37 @@ class AutonomousLoop:
 
     def _stage_validate(self, result, opp, facts):
         t0 = time.time()
-        # Default: pass when there is nothing real to validate (no executor output captured).
-        valid = True
+        # Validation must prove a real executor artifact. Missing validators,
+        # empty output, and validator errors fail closed rather than becoming
+        # a synthetic completion.
+        valid = False
+        validation_error = ""
         try:
             from agents.task_validators import get_validator
             validator = get_validator(getattr(opp, "task_type", "GENERAL"))
             if validator is None or not hasattr(validator, "validate"):
-                # No validator for this task type — pass by default (not a failure).
-                pass
+                validation_error = "no_validator"
+            elif self.task_executor is None or not hasattr(self.task_executor, "run"):
+                validation_error = "no_task_executor"
             else:
-                # Validate the EXECUTOR's real output, never a synthetic placeholder.
-                # When there is no task_executor (e.g. test/headless env) we have nothing
-                # genuine to validate, so we must NOT fail the opportunity on a fabricated
-                # output. C-1 honesty rule: only validate real produced artifacts.
-                if self.task_executor is None or not hasattr(self.task_executor, "run"):
-                    valid = True  # no executor -> nothing to validate -> pass
+                exec_result = getattr(self, "_last_exec_result", None)
+                output = getattr(exec_result, "output", None) or {}
+                if not output:
+                    validation_error = "no_executor_output"
                 else:
-                    exec_result = getattr(self, "_last_exec_result", None)
-                    output = getattr(exec_result, "output", None) or {}
-                    if not output:
-                        # Executor ran but produced no validatable artifact — cannot prove
-                        # validity, so we do NOT fail the loop on a vacuous check.
-                        valid = True
-                    else:
-                        try:
-                            report = validator.validate({}, output, {})
-                            valid = bool(report.passed)
-                        except Exception:
-                            valid = True  # can't validate — pass, don't abort
+                    report = validator.validate({}, output, {})
+                    valid = bool(report.passed)
+                    if not valid:
+                        validation_error = "validator_rejected_output"
         except Exception as e:
-            result.errors.append(f"Validation error: {e}")
-            valid = True  # don't abort the loop on validation errors
+            validation_error = f"validator_error: {e}"
+        if not valid:
+            result.errors.append(validation_error or "validation failed")
         result.stages.append(StageResult(stage="validate",
             status=StageStatus.COMPLETED if valid else StageStatus.FAILED,
-            opportunity_id=facts.opportunity_id, data={"valid": valid}, duration_s=time.time()-t0))
+            opportunity_id=facts.opportunity_id,
+            data={"valid": valid, "error": validation_error},
+            duration_s=time.time()-t0))
         return valid
 
     def _stage_submit(self, result, opp, facts):
@@ -696,11 +693,15 @@ class AutonomousLoop:
                 for ev in evidence:
                     if ev.evidence_type in ("payment_gross", "balance_delta", "platform_transaction",
                                              "payment_confirmation", "external_reconciliation"):
-                        if ev.status == EvidenceStatus.VERIFIED and ev.verification_level >= VerificationLevel.L3_EXTERNAL_SOURCE:
+                        externally_verified = (
+                            ev.status == EvidenceStatus.VERIFIED
+                            and ev.verification_level >= VerificationLevel.L3_EXTERNAL_SOURCE
+                        )
+                        if externally_verified:
                             evidence_found = True
-                        if eligible and ev.status == EvidenceStatus.VERIFIED:
+                        if eligible and externally_verified:
                             verified = True
-                        payment_amount = float(getattr(ev, "amount", 0) or 0) or float(getattr(opp, "advertised_amount", 0) or 0)
+                            payment_amount += float(getattr(ev, "amount", 0) or 0)
                     elif ev.status == EvidenceStatus.VERIFIED:
                         evidence_found = True
             if verified and self.lifecycle is not None and hasattr(self.lifecycle, 'mark_paid_verified'):
@@ -728,8 +729,11 @@ class AutonomousLoop:
                 from agents.evidence import Evidence, EvidenceStatus, VerificationLevel
                 existing = self.evidence_store.for_subject("opportunity", opp_id)
                 has_verified_payment = any(
-                    ev.evidence_type in ("payment_gross", "balance_delta", "platform_transaction")
-                    and ev.status == EvidenceStatus.VERIFIED for ev in existing)
+                    ev.evidence_type in ("payment_gross", "balance_delta", "platform_transaction",
+                                         "payment_confirmation", "external_reconciliation")
+                    and ev.status == EvidenceStatus.VERIFIED
+                    and ev.verification_level >= VerificationLevel.L3_EXTERNAL_SOURCE
+                    for ev in existing)
                 if has_verified_payment:
                     expense_ev = Evidence.create(source="system", evidence_type="payment_llm_cost",
                         subject_type="opportunity", subject_id=opp_id, amount=0.0, currency="usd",
@@ -782,7 +786,9 @@ class AutonomousLoop:
                 opp_id = opp.id or opp.opportunity_id
                 for entry in self.portfolio.load_all():
                     if entry.opportunity_id == opp_id:
-                        if result.success:
+                        # Operational completion is not verified economic success.
+                        # Only a verified payment may improve opportunity priority.
+                        if result.paid:
                             entry.priority = min(getattr(entry, 'priority', 0) + 1, 100)
                         else:
                             entry.priority = max(getattr(entry, 'priority', 0) - 1, 0)
@@ -828,8 +834,8 @@ class AutonomousLoop:
                 return
             run_id = store.save_run(result, opp_id)
             store.mark_idempotent(f"opportunity:{opp_id}", run_id, opp_id)
-        except Exception:
-            pass  # durable logging is best-effort
+        except Exception as exc:
+            result.errors.append(f"Run persistence error: {exc}")
 
     def _sync_final_state(self, result: AutonomousResult, facts: Any) -> None:
         """Sync the loop's final decision to the lifecycle and portfolio."""
@@ -854,8 +860,8 @@ class AutonomousLoop:
                         self.lifecycle.mark_final_outcome(
                             result.opportunity_id, outcome_state="submitted",
                             revenue=0.0, reason="Awaiting human approval")
-            except Exception:
-                pass  # lifecycle sync is best-effort
+            except Exception as exc:
+                result.errors.append(f"Lifecycle sync error: {exc}")
 
         if self.portfolio is not None and result.opportunity_id:
             try:
@@ -869,12 +875,14 @@ class AutonomousLoop:
                             entry.work_status = WorkStatus.FAILED
                         elif result.decision == "await_approval":
                             entry.work_status = WorkStatus.AWAITING_APPROVAL
-                        entry.policy_score = result.success
+                        # Keep policy scoring truthful: completed-unpaid runs are not
+                        # successful paid outcomes.
+                        entry.policy_score = result.paid
                         entry.explanation = result.explanation
                         self.portfolio.update(entry)
                         break
-            except Exception:
-                pass  # portfolio sync is best-effort
+            except Exception as exc:
+                result.errors.append(f"Portfolio sync error: {exc}")
 
     def _get_opp_from_facts(self, facts: Any):
         """Extract opportunity from facts store."""

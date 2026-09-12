@@ -28,7 +28,7 @@ class ProposalDraft:
 class ProposalWriter:
     """Write tailored proposals for freelance opportunities."""
 
-    def __init__(self, persona_name: str = "Alex"):
+    def __init__(self, persona_name: str = "Jacob"):
         self.persona_name = persona_name
 
     def write(self, opportunity: Dict[str, Any], tone: str = "professional") -> ProposalDraft:

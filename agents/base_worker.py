@@ -617,10 +617,9 @@ class WorkerAgent:
                 base_url=os.getenv("KOBOLDCPP_BASE_URL"), default_model=os.getenv("KOBOLDCPP_MODEL", ""),
                 disabled_env="DISABLE_KOBOLDCPP", order=30,
                 chat_model=os.getenv("KOBOLDCPP_CHAT_MODEL", ""), require_api_key=False))
-        # v2.1: dual-brain llama.cpp (llama-server). big-brain -> main,
-        # small-brain -> chat by default. Registered when enabled + endpoint and
-        # a model is known (env override OR auto-detected from the live server),
-        # so an offline server simply yields no adapter (graceful, never a crash).
+        # v2.1: dual-brain llama.cpp (llama-server). Register a role only when
+        # the user has explicitly saved a model; a live server's first model is
+        # not an implicit selection.
         try:
             from agents.dual_brain_runtime import (BrainRole, DualBrainRuntime,
                                                    PROVIDER_LLAMACPP)
@@ -635,15 +634,6 @@ class WorkerAgent:
                 if not (_cfg.provider == PROVIDER_LLAMACPP and _cfg.enabled and _cfg.endpoint):
                     continue
                 _model = _cfg.model or os.getenv(_env_model, "").strip()
-                if not _model:
-                    # Auto-detect the loaded model from the live server. Bounded;
-                    # returns [] if offline -> adapter stays unregistered.
-                    try:
-                        _det = _rt.list_models(_role)
-                        if _det:
-                            _model = _det[0]
-                    except Exception:
-                        _model = ""
                 if not _model:
                     continue
                 _name = "big-brain" if _role is BrainRole.BIG else "small-brain"

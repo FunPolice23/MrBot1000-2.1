@@ -8,6 +8,46 @@ from agents import tool_calling
 
 
 class TestToolCallingSafety(unittest.TestCase):
+    def test_web_search_result_contract_marks_discovery_and_backend(self):
+        from agents.web_eyes import WebEyes
+
+        eyes = WebEyes()
+        formatted = eyes.format_search_results([{
+            "title": "Official terms",
+            "url": "https://example.test/terms",
+            "snippet": "Payout information",
+            "backend": "ddgs",
+        }])
+        self.assertIn("discovery evidence", formatted)
+        self.assertIn("https://example.test/terms", formatted)
+        self.assertIn("Backend: ddgs", formatted)
+
+    def test_web_search_falls_back_when_primary_backend_fails(self):
+        from agents.web_eyes import WebEyes
+
+        class PrimaryFailure:
+            def __enter__(self):
+                raise RuntimeError("primary unavailable")
+
+            def __exit__(self, *args):
+                return False
+
+        class Fallback:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def text(self, query, max_results):
+                return [{"title": "Fallback", "href": "https://example.test", "body": "result"}]
+
+        with patch.dict("sys.modules", {
+            "ddgs": type("Module", (), {"DDGS": PrimaryFailure}),
+            "duckduckgo_search": type("Module", (), {"DDGS": Fallback}),
+        }):
+            results = WebEyes().search("current terms", 3)
+        self.assertEqual(results[0]["backend"], "duckduckgo_search-fallback")
     def test_account_profile_rejects_raw_secrets(self):
         from agents.account_profile import validate_profile_data
         result = validate_profile_data({

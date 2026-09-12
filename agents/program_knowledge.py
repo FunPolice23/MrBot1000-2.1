@@ -370,6 +370,14 @@ class KnowledgeContext:
             context_parts.append("\n## RECENT CONVERSATION")
             for h in reversed(history):
                 context_parts.append(f"{h['role']}: {h['message'][:100]}")
+
+        # Domain state is read-only and bounded so both brains can reason from
+        # the same live workspace without gaining a second action pathway.
+        try:
+            from agents.workspace_context import build_workspace_context
+            context_parts.append(build_workspace_context())
+        except Exception:
+            pass
         
         return "\n".join(context_parts)
 

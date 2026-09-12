@@ -303,13 +303,13 @@ class ChatTab(QWidget):
         self.escalation_worker.start()
 
     def _on_big_brain_answer(self, bb_clean: str):
-        """Show the Marcus Rivera answer once it returns (GUI thread)."""
+        """Show the Edward Hurst answer once it returns (GUI thread)."""
         self.chat_display.append(
             f"<i style='color: #bb86fc;'>[{DRIVER.current_name}: {bb_clean[:300]}...]</i>")
 
     def _on_escalation_summary(self, summary: str):
-        """Append the Alex Vega re-summary (GUI thread)."""
-        self.append_message("Alex Vega", summary, "#03dac6")
+        """Append the Jacob Stanley re-summary (GUI thread)."""
+        self.append_message("Jacob Stanley", summary, "#03dac6")
 
     def _on_escalation_failed(self, error: str):
         """Surface an escalation error without freezing (GUI thread)."""

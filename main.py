@@ -1133,8 +1133,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             severity = "BLOCKED"
         elif "ERROR" in msg or "❌" in msg or "fail" in msg.lower():
             severity = "ERROR"
-        elif "Ollama" in msg or "LLM" in msg or "llm" in msg.lower():
+        elif "Ollama" in msg or "OLLAMA" in msg:
             severity = "OLLAMA"
+        elif "llama.cpp" in msg.lower() or "llamacpp" in msg.lower():
+            severity = "LLAMA.CPP"
         elif "Manager" in msg or "Action" in msg or "Manager" in source:
             severity = "MANAGER"
         elif "warning" in msg.lower() or "⚠️" in msg:
@@ -1146,6 +1148,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             "BLOCKED": "#ffcc00",
             "ERROR": "#ff4444",
             "OLLAMA": "#00b0ff",
+            "LLAMA.CPP": "#42a5f5",
             "MANAGER": "#00ccff",
             "INFO": "#aaaaaa",
             "WARNING": "#ff9800",
