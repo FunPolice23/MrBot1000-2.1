@@ -23,6 +23,7 @@ from agents.program_knowledge import (
     get_database, get_personality_engine, get_knowledge_context,
     ProgramKnowledge
 )
+from agents.prompt_assembly import assemble_role_prompt
 from agents.task_router import classify_task, get_tools_for_task, get_specialization_prompt
 from agents.safety_gate import SafetyGate, SafetyDecision
 
@@ -36,7 +37,8 @@ class BigBrainAdapter:
         # still wins, but there is one source of truth.
         from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
         _cfg = DualBrainRuntime.from_env().config(BrainRole.BIG)
-        self.base_url = base_url or os.getenv("BIG_BRAIN_URL") or _cfg.endpoint
+        legacy_url = os.getenv("BIG_BRAIN_URL") if _cfg.provider == "llamacpp" else ""
+        self.base_url = base_url or legacy_url or _cfg.endpoint
         self.device = _cfg.device
         self.context_length = _cfg.context
         
@@ -103,28 +105,19 @@ class BigBrainAdapter:
     
     def _build_system_prompt(self, query: str = "", task_type: str = "general") -> str:
         """Build system prompt with knowledge, personality, and specialization."""
-        prompt = self.base_system_prompt
-        
-        # Add program knowledge
-        prompt += f"\n\n# ABOUT {ProgramKnowledge.PROGRAM_NAME}"
-        prompt += ProgramKnowledge.CORE_IDENTITY
-        prompt += ProgramKnowledge.CORE_CAPABILITIES
-        prompt += ProgramKnowledge.SAFETY_RULES
+        extra = f"\n\n# ABOUT {ProgramKnowledge.PROGRAM_NAME}"
+        extra += ProgramKnowledge.CORE_IDENTITY
+        extra += ProgramKnowledge.CORE_CAPABILITIES
+        extra += ProgramKnowledge.SAFETY_RULES
         
         # Add task-specific specialization
         specialization = get_specialization_prompt(task_type)
         if specialization:
-            prompt += f"\n{specialization}"
-        
-        # Add personality
-        prompt += self.personality.get_system_prompt_addon("big_brain")
-        
-        # Add relevant memories and context
-        context = self.knowledge.build_context("big_brain", query)
-        if context:
-            prompt += f"\n\n# CURRENT CONTEXT\n{context}"
-        
-        return prompt
+            extra += f"\n{specialization}"
+
+        return assemble_role_prompt(
+            self.base_system_prompt, "big_brain", query,
+            self.personality, self.knowledge, extra)
     
     def _execute_tool_calls(self, tool_calls: list) -> list:
         """Execute tool calls from the model, with safety gate."""
@@ -299,7 +292,8 @@ class BigBrainAdapter:
         )
     
     def chat(self, user_message: str, history: list = None,
-             system_prompt: str = None, max_tokens: int = None) -> str:
+             system_prompt: str = None, max_tokens: int = None,
+             dialogue_mode: bool = False) -> str:
         """Handle direct chat with tool calling support."""
         # GUI is the source of truth for model selection
         if self.model == "unknown" or not self.model:
@@ -314,6 +308,13 @@ class BigBrainAdapter:
         # Add anti-hallucination rules
         from agents.tool_calling import add_anti_hallucination_rules
         full_system = add_anti_hallucination_rules(full_system)
+        if dialogue_mode:
+            full_system += (
+                "\n\nDIALOGUE-ONLY MODE: Reply as Marcus Rivera in natural language. "
+                "Do not call tools, write SQL, emit function names, or describe a "
+                "tool call. Use the evidence already present in the conversation. "
+                "If evidence is missing, say BLOCKED in one or two sentences."
+            )
         
         # v2.1: Use the context length from Providers_GPU settings
         # Reserve ~20% for input, rest for output
@@ -359,7 +360,7 @@ class BigBrainAdapter:
                 temperature=0.5,
                 # One tool round lets Dialogue execute bounded read-only
                 # research instead of endlessly announcing that it will search.
-                max_iterations=2,
+                max_iterations=1 if dialogue_mode else 2,
                 use_function_calling=protocol["use_function_calling"],
                 flatten_system_prompt=protocol["flatten_system_prompt"],
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},

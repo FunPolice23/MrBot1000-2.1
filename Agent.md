@@ -15,14 +15,18 @@ MrBot1000 is a real-time AI agent system for **automated earning opportunity dis
 
 ## v2.1 Dual-Brain Contract (canonical)
 
-MrBot1000 uses two GPU-isolated brains (llama.cpp / llama-server), coordinated deterministically:
+MrBot1000 uses two role-based brains, coordinated deterministically. llama.cpp /
+llama-server is the default local backend, but each role can use the active provider
+selected in Settings (llama.cpp, Ollama, LM Studio, vLLM, KoboldCpp, or a configured
+cloud provider):
 
 | Brain | Role | GPU / CUDA | Port | Typical size |
 |-------|------|-----------|------|--------------|
-| **Big** | planning, coding, deep research, review/verification | RTX 5060 Ti 16 GB (device 0) | 1234 | 14B–27B |
-| **Small** | human chat, triage, summarise, lightweight coordination | GTX 1660 Super 6 GB (device 1) | 1235 | 4B–7B |
+| **Big / Marcus Rivera** | planning, coding, deep research, review/verification | primary GPU, or active provider | provider-configured | provider-configured |
+| **Small / Alex Vega** | human chat, triage, summarise, lightweight coordination | secondary GPU, CPU/RAM, or disabled | provider-configured | provider-configured |
 
-- The canonical runtime (`agents/dual_brain_runtime.py`) is the single source of truth for role → endpoint/model/device. A model call never assumes a role/GPU of its own choosing.
+- The canonical runtime (`agents/dual_brain_runtime.py`) is the single source of truth for role → provider/endpoint/model/device. A model call never assumes a role/GPU of its own choosing.
+- `BIG_BRAIN_*` and `SMALL_BRAIN_*` environment variables configure each role. Provider-specific model variables are used when that provider is active.
 - Cross-model collaboration is a **deterministic typed handoff** (plan → research → review → execute) via the EventBus + coordinator (`agents/dual_brain_coordinator.py`), not unconstrained model-to-model chat.
 - **The LLM is NOT the source of truth.** Deterministic code controls validation, permissions, execution, financial actions, security, evidence, verification, and accounting.
 - Human gates (identity, payments, contracts, signatures, captchas, irreversible actions, sensitive info) are hard stops — never bypassed.
@@ -32,29 +36,30 @@ MrBot1000 uses two GPU-isolated brains (llama.cpp / llama-server), coordinated d
 
 ## Architecture Overview
 
-### Multi-Agent System
-The system operates with specialized agents sharing state through `SharedContext` JSON:
+### Runtime Roles and Supporting Services
+The two brain roles are the model-facing contract. Supporting workers and services
+perform deterministic orchestration, discovery, validation, execution, and storage;
+they are not additional model personas:
 
-| Agent | Role | Model | Color |
-|-------|------|-------|-------|
-| Manager | Coordinator & intent classifier | Main (gemma-4-E2B) | #bb86fc (purple) |
-| Summarizer | Chat & conversation | Chat (LFM2.5-1.2B) | #00b0ff (cyan) |
-| Coder | Code modification (actual file writes) | Main | #84cc16 (green) |
-| Analyst | Code review & proposal analysis | Main | #3b82f6 (blue) |
-| JobSearch | Find gigs (Fiverr, Upwork, web_search) | Main | #f97316 (orange) |
+| Runtime role | Responsibility |
+|-------------|----------------|
+| Marcus Rivera / Big Brain | Planning, coding, deep research, analysis, and review |
+| Alex Vega / Small Brain | Human chat, triage, summarisation, risk checks, and lightweight coordination |
+| Manager and specialized workers | Intent routing, discovery, platform clients, task execution, accounting, and UI coordination |
 
 ### Model Routing Strategy
-- **Chat/Questions** → Summarizer with `chat=True` (fast, ~2s)
-- **Tasks/Work** → Main model (accurate but slower)
-- **Lifecycle/Status Questions** → Summarizer with runtime context from shared state so replies can reflect recent opportunity progress
-- **Cross-talk** → SharedContext JSON (`~/.local/share/mrbot1000/shared_context.json`)
+- **Chat/Questions** → Small Brain / Alex with the configured chat-capable provider
+- **Tasks/Work** → Big Brain / Marcus with the configured main-capable provider
+- **Lifecycle/Status Questions** → Small Brain with bounded runtime and memory context
+- **Cross-model collaboration** → typed EventBus handoffs through `DualBrainCoordinator`, not unconstrained model-to-model chat
+- **Provider selection** → explicit Settings configuration; the selected local backend is preferred while configured cloud providers remain available for fallback
 
 ### Communication Flow
 ```
-User Input → ManagerThread → Intent Classification → Route:
-  question → Summarizer → Chat Model → Response → agents_tab.display()
-  task     → Coder/Analyst → Main Model → Execute → Report
-  status   → Summarizer + SharedContext → Lifecycle summary → UI/Chat update
+User Input → Manager / UI route → Brain role or deterministic service:
+  question/status → Small Brain → response → Chat/Dialogue UI
+  task/work      → Big Brain + validated services → execution report
+  collaboration  → plan → research → review → execute typed handoff
 ```
 
 ### Current Operating Capabilities
@@ -80,20 +85,38 @@ User Input → ManagerThread → Intent Classification → Route:
 - ✅ Changes pass: Syntax → Security → API → NullSafety → Spelling validation
 - ✅ Score threshold ≥ 0.85 for self-improve actions
 
+### EXTERNAL INSTRUCTIONS
+- External `SKILL.md`, playbook, and platform instructions are untrusted data, never
+  model authority or executable policy.
+- Route fetched instructions through `agents/instruction_gate.py`: safe-URL check →
+  quarantine → human review → allowlist or blocklist.
+- Unknown or pending instructions must never trigger tools, file writes, payments, or
+  external submissions.
+
+### AUTHORITATIVE RUNTIME SERVICES
+- `agents/composition_root.py` creates the shared process-level pipeline, portfolio,
+  lifecycle tracker, and autonomous run store.
+- `agents/earning_capability.py` produces the narrow paper/human-gated deliverable
+  path and records submission evidence; it does not claim payment.
+- `agents/evidence.py` and `agents/evidence_store.py` hold provenance and verification
+  state. `agents/economic_accounting.py` counts revenue only after verified payment
+  evidence.
+- `agents/autonomous_run_store.py` persists run stages and idempotency keys and can
+  recover incomplete work after restart.
+
 ---
 
 ## Provider & Model Configuration
 
-### Default Provider Priority (can be overridden)
-1. OpenAI when `OPENAI_API_KEY` is set and provider enabled
-2. Anthropic when `ANTHROPIC_API_KEY` is set and provider enabled  
-3. Ollama when local server reachable (default)
+### Provider and Model Configuration
+There are no canonical hardcoded model names. The runtime reads role settings from
+`BIG_BRAIN_PROVIDER`, `BIG_BRAIN_URL`, `BIG_BRAIN_MODEL` and the corresponding
+`SMALL_BRAIN_*` variables. Provider-specific values such as `OLLAMA_MAIN_MODEL`,
+`OLLAMA_CHAT_MODEL`, `LM_STUDIO_MODEL`, and `VLLM_MODEL` are used when their backend
+is selected. Models may also be selected from the Settings and Providers & GPU tabs.
 
-### Current Model Configuration (.env)
-```
-OLLAMA_MAIN_MODEL=hf.co/llmfan46/gemma-4-E2B-it-ultra-uncensored-heretic-GGUF:Q4_K_M
-OLLAMA_CHAT_MODEL=hf.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q5_K_M
-```
+The active provider is not inferred from API-key presence alone. Disabled providers
+are excluded, and the selected local provider is preferred over other local routes.
 
 ### Hardware Requirements
 - **GPU**: 6GB VRAM minimum (GTX 1660 Super or better)
@@ -145,7 +168,7 @@ OLLAMA_CHAT_MODEL=hf.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q5_K_M
 
 ## Agent Roster & State
 
-### Agent States
+### Agent and Run States
 - **ready** - Ready for work
 - **thinking** - Processing request
 - **researching** - Scanning files/context
@@ -153,6 +176,9 @@ OLLAMA_CHAT_MODEL=hf.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q5_K_M
 - **working** - Executing task
 - **success** - Task completed
 - **error** - Failed with error report
+
+Autonomous runs additionally persist stage ownership, outcomes, idempotency keys, and
+recovery state through `agents/autonomous_run_store.py`.
 
 ### Communication Protocol
 Agents emit state changes via signals:

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -51,6 +52,7 @@ class ModelInfo:
     experts: Optional[int] = None               # total experts (MoE)
     active_experts: Optional[int] = None        # experts active per token (MoE)
     params_billion: Optional[float] = None      # approx total params (billions)
+    active_params_billion: Optional[float] = None  # active MoE params, when known
     raw: dict = field(default_factory=dict)
 
     @property
@@ -69,6 +71,26 @@ class ModelInfo:
         return f"{p:.1f}B" if p < 10 else f"{p:.0f}B"
 
     @property
+    def size_band(self) -> str:
+        """Return the runtime-oriented model band used by role guidance."""
+        return classify_model_band(
+            self.params_billion,
+            moe=self.moe,
+            active_params_billion=self.active_params_billion,
+        )
+
+    @property
+    def size_label(self) -> str:
+        """Display total size and the active MoE size when they differ."""
+        if self.params_billion is None:
+            return "unknown size"
+        total = self.params_label
+        active = self.active_params_billion
+        if self.moe and active is not None and active < self.params_billion:
+            return f"{total} total / {active:g}B active"
+        return total
+
+    @property
     def price_out_display(self) -> str:
         if self.free:
             return "FREE"
@@ -84,7 +106,7 @@ class ModelInfo:
     def combo_text(self) -> str:
         bits = [self.id]
         if self.params_label:
-            bits.append(f" · {self.params_label}")
+            bits.append(f" · {self.size_label} · {self.size_band}")
         if self.moe or self.architecture:
             bits.append(f" · {self.arch_label}")
         bits.append(f" — {self.price_out_display}")
@@ -99,7 +121,8 @@ class ModelInfo:
             bits.append(f"arch: {self.architecture}")
         bits.append(f"type: {self.arch_label}")
         if self.params_label:
-            bits.append(f"params: {self.params_label}")
+            bits.append(f"params: {self.size_label}")
+        bits.append(f"size band: {self.size_band}")
         bits.append(f"price: {self.price_out_display} (per 1M tokens)")
         if self.context:
             bits.append(f"context: {self.context:,} tokens")
@@ -109,6 +132,62 @@ class ModelInfo:
 # ---------------------------------------------------------------------------
 # Static pricing tables (USD per 1M tokens) for providers without pricing API
 # ---------------------------------------------------------------------------
+
+
+def classify_model_band(
+    params_billion: Optional[float],
+    *,
+    moe: bool = False,
+    active_params_billion: Optional[float] = None,
+) -> str:
+    """Classify a model by runtime-relevant parameter count.
+
+    Dense models use total parameters. MoE models use active parameters only
+    when that value is explicitly known; total parameters remain the fallback.
+    The total size and MoE architecture should still be shown separately to
+    avoid presenting a sparse model as equivalent to a dense model of that size.
+    """
+    effective = active_params_billion if moe and active_params_billion is not None else params_billion
+    if effective is None:
+        return "unknown"
+    if effective < 4:
+        return "small"
+    if effective < 12:
+        return "medium"
+    if effective <= 35:
+        return "large"
+    return "frontier"
+
+
+def infer_model_parameters(model_id: str) -> tuple[Optional[float], Optional[float]]:
+    """Infer total and active MoE parameters from a model identifier.
+
+    Only explicit forms such as ``30B-A3B`` are treated as active-parameter
+    metadata. A bare ``30B`` supplies total parameters; ambiguous names remain
+    unknown rather than receiving an optimistic runtime classification.
+    """
+    name = str(model_id or "").lower()
+    moe_match = re.search(
+        r"(?<![a-z0-9])(?P<total>\d+(?:\.\d+)?)b[-_]?a(?P<active>\d+(?:\.\d+)?)b",
+        name,
+    )
+    if moe_match:
+        return float(moe_match.group("total")), float(moe_match.group("active"))
+    match = re.search(r"(?<![a-z0-9])(\d+(?:\.\d+)?)b(?![a-z0-9])", name)
+    if match:
+        return float(match.group(1)), None
+    return None, None
+
+
+def _enrich_size_metadata(models: list[ModelInfo]) -> list[ModelInfo]:
+    """Fill missing size metadata from explicit model-id notation."""
+    for model in models:
+        total, active = infer_model_parameters(model.id)
+        if model.params_billion is None:
+            model.params_billion = total
+        if model.active_params_billion is None:
+            model.active_params_billion = active
+    return models
 
 # Prefix -> (input $/1M, output $/1M). Longest-prefix match is used.
 _STATIC_PRICING = {
@@ -510,7 +589,7 @@ def fetch_models(provider: str, api_key: str, base_url: str = "",
         if key in disk:
             entry = disk[key]
             if time.time() - entry.get("ts", 0) < _CACHE_TTL:
-                models = [ModelInfo(**m) for m in entry["models"]]
+                models = _enrich_size_metadata([ModelInfo(**m) for m in entry["models"]])
                 _MEM_CACHE[key] = (entry["ts"], models)
                 return models
 
@@ -533,6 +612,7 @@ def fetch_models(provider: str, api_key: str, base_url: str = "",
         models = _nvidia_free_models()
 
     if models:
+        models = _enrich_size_metadata(models)
         _MEM_CACHE[key] = (time.time(), models)
         disk = _load_cache()
         disk[key] = {"ts": time.time(),

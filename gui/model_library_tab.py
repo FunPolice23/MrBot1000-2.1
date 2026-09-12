@@ -326,7 +326,7 @@ class ModelLibraryTab(QWidget):
                 visible.append(model)
         self.result_list.clear()
         for model in visible:
-            item = QListWidgetItem(f"{model.title} · {model.params_label} · {model.type_label} · {model.category} · {model.downloads:,} downloads")
+            item = QListWidgetItem(f"{model.title} · {model.size_label} · {model.size_band} · {model.type_label} · {model.category} · {model.downloads:,} downloads")
             item.setData(Qt.UserRole, model)
             self.result_list.addItem(item)
         if visible:
@@ -366,7 +366,7 @@ class ModelLibraryTab(QWidget):
             f"<h3>{model.title}</h3><p><b>Repository:</b> <a href='{model.site_url}'>{model.repo_id}</a><br>"
             f"<b>Architecture:</b> {model.architecture} · <b>Type:</b> {model.type_label}<br>"
             f"<b>Category:</b> {model.category} · <b>Task:</b> {model.task}<br>"
-            f"<b>Parameters:</b> {model.params_label} · <b>License:</b> {model.license}<br>"
+            f"<b>Parameters:</b> {model.size_label} · <b>Band:</b> {model.size_band} · <b>License:</b> {model.license}<br>"
             f"<b>Downloads:</b> {model.downloads:,} · <b>Context:</b> {model.context or 'unknown'}<br>"
             f"<b>Capabilities:</b> {', '.join(model.capabilities) or 'unknown'}<br>"
             f"<b>Metadata:</b> {model.metadata_source}</p>"

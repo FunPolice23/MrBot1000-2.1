@@ -1,3 +1,12 @@
+---
+name: Opportunity Evaluation
+category: ANALYSIS
+maturity: stable
+tool: opportunity_intelligence
+automatable: true
+human_capable: true
+---
+
 # Skill: Opportunity Evaluation
 
 Trigger: earnings pipeline needs scoring for discovered opportunities, or user asks for ranking/recommendation.

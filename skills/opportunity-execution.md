@@ -1,3 +1,12 @@
+---
+name: Opportunity Execution
+category: AUTOMATION
+maturity: beta
+tool: earning_capability
+automatable: true
+human_capable: true
+---
+
 # Skill: Opportunity Execution
 
 Trigger: earnings pipeline enters execute phase, or user manually selects an opportunity to pursue.

@@ -1,3 +1,12 @@
+---
+name: Opportunity Filtering
+category: ANALYSIS
+maturity: stable
+tool: opportunity_portfolio
+automatable: true
+human_capable: true
+---
+
 # Skill: Opportunity Filtering
 
 Trigger: earnings pipeline enters filter phase, or user applies risk/value/skill constraints.

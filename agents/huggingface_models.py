@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import requests
+from provider_models import classify_model_band, infer_model_parameters
 
 HF_API = "https://huggingface.co/api"
 HF_SITE = "https://huggingface.co"
@@ -77,6 +78,7 @@ class HuggingFaceGGUFModel:
     license: str = "unknown"
     architecture: str = "unknown"
     params_billion: Optional[float] = None
+    active_params_billion: Optional[float] = None
     moe: Optional[bool] = None
     context: Optional[int] = None
     capabilities: list[str] = field(default_factory=list)
@@ -99,6 +101,22 @@ class HuggingFaceGGUFModel:
     @property
     def params_label(self) -> str:
         return f"{self.params_billion:g}B" if self.params_billion is not None else "unknown params"
+
+    @property
+    def size_band(self) -> str:
+        return classify_model_band(
+            self.params_billion,
+            moe=self.moe is True,
+            active_params_billion=self.active_params_billion,
+        )
+
+    @property
+    def size_label(self) -> str:
+        if self.params_billion is None:
+            return "unknown size"
+        if self.moe and self.active_params_billion is not None and self.active_params_billion < self.params_billion:
+            return f"{self.params_label} total / {self.active_params_billion:g}B active"
+        return self.params_label
 
     @property
     def site_url(self) -> str:
@@ -228,6 +246,7 @@ class HuggingFaceModelService:
         capabilities = self._capabilities(item, tags, "")
         category = self._category(task, tags, capabilities)
         text = " ".join((repo_id, task, " ".join(tags)))
+        params, active_params = infer_model_parameters(repo_id)
         return HuggingFaceGGUFModel(
             repo_id=repo_id,
             title=repo_id.rsplit("/", 1)[-1],
@@ -235,7 +254,8 @@ class HuggingFaceModelService:
             likes=int(item.get("likes") or 0),
             last_modified=str(item.get("lastModified") or ""),
             architecture=_architecture(text),
-            params_billion=_parse_params(text),
+            params_billion=_parse_params(text) or params,
+            active_params_billion=active_params,
             moe=_is_moe(text),
             capabilities=capabilities,
             task=task,
@@ -280,6 +300,8 @@ class HuggingFaceModelService:
         card_text = base_readme or readme
         text = " ".join((repo_id, str(data.get("pipeline_tag") or ""), " ".join(tags), str(card), str(config), card_text, *(a.name for a in artifacts)))
         params = _parse_params(text)
+        inferred_params, active_params = infer_model_parameters(repo_id)
+        params = params or inferred_params
         architecture = self._config_architecture(config) or _architecture(text)
         moe = self._config_moe(config)
         if moe is None:
@@ -300,6 +322,7 @@ class HuggingFaceModelService:
             license=license_name,
             architecture=architecture,
             params_billion=params,
+            active_params_billion=active_params,
             moe=moe,
             context=context if isinstance(context, int) else None,
             capabilities=capabilities,

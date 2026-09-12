@@ -2,7 +2,7 @@
 Small Brain — Provider adapter for the fast chat model.
 Uses llama-server (llama.cpp) via the OpenAI SDK.
 Auto-detects downloaded models — no hardcoded model names.
-GPU: 1660 Super (device 1) with RAM overflow.
+ GPU: optional secondary device, or CPU/system RAM when no secondary GPU exists.
 Port: 1235.
 Includes program knowledge, memory, and personality.
 """
@@ -16,16 +16,18 @@ from agents.program_knowledge import (
     get_database, get_personality_engine, get_knowledge_context,
     ProgramKnowledge
 )
+from agents.prompt_assembly import assemble_role_prompt
 
 
 class SmallBrainAdapter:
-    """Interface to the fast chat model via llama-server on 1660 Super."""
+    """Interface to the fast chat model through the active provider."""
     
     def __init__(self, model=None, base_url=None):
         # Canonical runtime owns the role→endpoint/model/device contract.
         from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
         _cfg = DualBrainRuntime.from_env().config(BrainRole.SMALL)
-        self.base_url = base_url or os.getenv("SMALL_BRAIN_URL") or _cfg.endpoint
+        legacy_url = os.getenv("SMALL_BRAIN_URL") if _cfg.provider == "llamacpp" else ""
+        self.base_url = base_url or legacy_url or _cfg.endpoint
         self.device = _cfg.device
         self.context_length = _cfg.context
         
@@ -88,27 +90,49 @@ class SmallBrainAdapter:
         self.model = model_name
     
     def _build_system_prompt(self, query: str = "") -> str:
-        """Build system prompt with knowledge and personality."""
-        prompt = self.base_system_prompt
-        
-        # Add program knowledge
-        prompt += f"\n\n# ABOUT {ProgramKnowledge.PROGRAM_NAME}"
-        prompt += ProgramKnowledge.CORE_IDENTITY
-        prompt += ProgramKnowledge.CORE_CAPABILITIES
-        prompt += ProgramKnowledge.SAFETY_RULES
-        
-        # Add personality
-        prompt += self.personality.get_system_prompt_addon("small_brain")
-        
-        # Add relevant memories and context
-        context = self.knowledge.build_context("small_brain", query)
-        if context:
-            prompt += f"\n\n# CURRENT CONTEXT\n{context}"
-        
-        return prompt
+        """Build a tiered system prompt for the configured chat model.
+
+        Compact is the default because small models lose instruction adherence
+        when identity, capability documentation, memory, and tool rules compete
+        in one oversized prompt. Set SMALL_BRAIN_PROMPT_TIER=full for a larger
+        model, or =tiny for the smallest available model.
+        """
+        tier = os.getenv("SMALL_BRAIN_PROMPT_TIER", "compact").strip().lower()
+        if tier not in {"tiny", "compact", "full"}:
+            tier = "compact"
+
+        if tier == "tiny":
+            return self.base_system_prompt + (
+                "\n\n# OPERATING CONTRACT\n"
+                "You are Alex Vega, the concise chat and triage assistant for MrBot1000.\n"
+                "Answer the user's current question directly in 1-3 short paragraphs.\n"
+                "Do not invent facts. Say UNKNOWN when evidence is missing.\n"
+                "Never spend, submit, sign, share secrets, or claim payment without human approval.\n"
+            )
+
+        # Compact retains the parts that shape behavior, not the full program manual.
+        extra = (
+            "\n\n# ABOUT MRBOT1000\n"
+            "MrBot1000 is a local-first earning assistant. Alex handles chat, triage,\n"
+            "status, and lightweight risk checks; Marcus handles complex planning and review.\n"
+            "The human operator approves spending, contracts, credentials, submissions,\n"
+            "and irreversible actions. Never invent results or payment.\n"
+        )
+        # Full mode is opt-in for models with enough context to benefit from it.
+        if tier == "full":
+            extra += f"\n\n# ABOUT {ProgramKnowledge.PROGRAM_NAME}"
+            extra += ProgramKnowledge.CORE_IDENTITY
+            extra += ProgramKnowledge.CORE_CAPABILITIES
+            extra += ProgramKnowledge.SAFETY_RULES
+
+        limit = 1200 if tier == "compact" else 4000
+        return assemble_role_prompt(
+            self.base_system_prompt, "small_brain", query,
+            self.personality, self.knowledge, extra, limit)
     
     def chat(self, user_message: str, history: list = None,
-             system_prompt: str = None, max_tokens: int = None) -> str:
+             system_prompt: str = None, max_tokens: int = None,
+             dialogue_mode: bool = False) -> str:
         """Handle conversation with tool calling support."""
         # GUI is the source of truth for model selection
         if self.model == "unknown" or not self.model:
@@ -123,6 +147,13 @@ class SmallBrainAdapter:
         # Add anti-hallucination rules
         from agents.tool_calling import add_anti_hallucination_rules
         full_system = add_anti_hallucination_rules(full_system)
+        if dialogue_mode:
+            full_system += (
+                "\n\nDIALOGUE-ONLY MODE: Reply as Alex Vega in natural language. "
+                "Do not call tools, write SQL, emit function names, or describe a "
+                "tool call. Use the evidence already present in the conversation. "
+                "If evidence is missing, say BLOCKED in one or two sentences."
+            )
         
         # v2.1: Use the context length from Providers_GPU settings
         # Reserve ~20% for input, rest for output
@@ -155,8 +186,8 @@ class SmallBrainAdapter:
         try:
             client = self._get_client()
             
-            # v2.1: Small Brain (1660S) uses text-based tool parsing
-            # to avoid 400 errors from llama.cpp template parser
+            # Small Brain uses text-based tool parsing to remain compatible
+            # with compact local models and provider templates.
             from agents.tool_calling import chat_with_tools
             protocol = self._dialogue_protocol()
             answer = chat_with_tools(
@@ -169,7 +200,7 @@ class SmallBrainAdapter:
                 temperature=0.5,
                 # Text-form tool calls need a second round to execute and
                 # return evidence to the persona.
-                max_iterations=2,
+                max_iterations=1 if dialogue_mode else 2,
                 use_function_calling=False,
                 flatten_system_prompt=protocol["flatten_system_prompt"],
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},

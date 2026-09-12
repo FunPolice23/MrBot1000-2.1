@@ -3,8 +3,8 @@ agents/dual_brain_runtime.py — Canonical dual-brain runtime & configuration (v
 
 Single source of truth for the MrBot1000 dual-brain GPU/model contract:
 
-    Big Brain   → CUDA device 0 (RTX 5060 Ti 16 GB) → llama-server :1234
-    Small Brain → CUDA device 1 (GTX 1660 Super 6 GB) → llama-server :1235
+    Big Brain   → available primary GPU or configured provider
+    Small Brain → secondary GPU, CPU/system RAM, or configured provider
 
 Every component (adapters, GUI, legacy workers) reads its endpoint/model/device
 from this runtime so the application never operates with contradictory role→GPU
@@ -17,20 +17,22 @@ Design invariants
   WHERE to call a model, never WHAT the model may do.
 - Role→GPU isolation is explicit and verifiable (``validate_isolation``).
 - Health probes are bounded and NEVER raise; they degrade to "offline" instead.
-- The canonical provider is llama.cpp (llama-server, OpenAI-compatible /v1).
-  Ollama/LM Studio are explicit opt-in provider kinds, never silent defaults.
+- Provider selection follows enabled configuration; no local provider is
+    assumed when all local routes are disabled.
 
 Environment contract (all optional; defaults match the llama-server scripts)
 -----------------------------------------------------------------------------
   BIG_BRAIN_PROVIDER   (default "llamacpp")  llamacpp | ollama | lmstudio
   BIG_BRAIN_URL        (default http://127.0.0.1:1234/v1)
   BIG_BRAIN_MODEL      (default "")          auto-detected from the server
-  BIG_BRAIN_DEVICE     (default "0")         CUDA device index
+    BIG_BRAIN_DEVICE     (default "0")         CUDA device index
   BIG_BRAIN_PORT       (default "1234")
   BIG_BRAIN_CONTEXT    (default "32768")     context length in tokens
   BIG_BRAIN_GPU_LAYERS (default "")          ""/auto → server decides
   BIG_BRAIN_ENABLED    (default "true")
-  SMALL_* ... same keys, device "1", port "1235".
+    SMALL_* ... same keys, device "1", port "1235". When
+        SMALL_BRAIN_GPU_LAYERS=0 and context/batch are not explicitly set, the
+        CPU-safe defaults are 4096 context tokens and batch 256.
 """
 
 from __future__ import annotations
@@ -50,14 +52,16 @@ class BrainRole(str, Enum):
     SMALL = "small"
 
 
-# Provider kinds the runtime understands. `llamacpp` is the canonical default
-# (llama-server exposes an OpenAI-compatible /v1/models endpoint).
+# Provider kinds the runtime understands. Each role's enabled provider selects
+# its endpoint and controls.
 PROVIDER_LLAMACPP = "llamacpp"
 PROVIDER_OLLAMA = "ollama"
 PROVIDER_LMSTUDIO = "lmstudio"
 PROVIDER_VLLM = "vllm"
+PROVIDER_KOBOLDCPP = "koboldcpp"
 SUPPORTED_PROVIDERS = {
     PROVIDER_LLAMACPP, PROVIDER_OLLAMA, PROVIDER_LMSTUDIO, PROVIDER_VLLM,
+    PROVIDER_KOBOLDCPP,
 }
 
 # llama-server binary (v2.1 fix). The WindowsApps `llama.exe` (MSVC 0.3.0 build)
@@ -103,7 +107,7 @@ ROLE_DEFAULTS: Dict[BrainRole, Dict[str, Any]] = {
         "context": 32768,
         "gpu_layers": None,
         "display_name": "Alex Vega",
-        "gpu_label": "GTX 1660 Super 6 GB",
+        "gpu_label": "CPU / System RAM",
         "kv_cache": "f16",
         "split_mode": "none",
         "threads": 4,
@@ -159,6 +163,8 @@ class BrainConfig:
         if self.provider == PROVIDER_OLLAMA:
             base = self.endpoint.removesuffix("/v1")
             return f"{base}/api/tags"
+        if self.provider == PROVIDER_KOBOLDCPP:
+            return f"{self.endpoint.rstrip('/')}/api/v1/model"
         # OpenAI-compatible (llama-server, LM Studio) expose /v1/models.
         return f"{self.endpoint}/models"
 
@@ -182,11 +188,9 @@ class BrainConfig:
         """
         model = model_path or self.model
         bin_path = _server_bin(self._env_prefix)
-        device_name = f"CUDA{self.device}"
         cmd = [bin_path,
                "--host", "127.0.0.1",
                "--port", str(self.port),
-               "--device", device_name,
                "--ctx-size", str(self.context),
                "--threads", str(self.threads),
                "--batch-size", str(self.batch),
@@ -194,7 +198,14 @@ class BrainConfig:
                "--cache-type-k", self.kv_cache if self.kv_cache != "auto" else "f16",
                "--cache-type-v", self.kv_cache if self.kv_cache != "auto" else "f16",
                "--model", model]
-        if self.gpu_layers is not None:
+        if self.gpu_layers == 0:
+            # CPU-only mode must not reference a missing CUDA device. llama.cpp
+            # uses the absence of --device plus zero GPU layers for system RAM.
+            cmd += ["--n-gpu-layers", "0"]
+        else:
+            cmd[cmd.index("--model"):cmd.index("--model")] = [
+                "--device", f"CUDA{self.device}"]
+        if self.gpu_layers is not None and self.gpu_layers != 0:
             cmd += ["--n-gpu-layers", str(self.gpu_layers)]
         
         # Check if model template uses raise_exception and provide fallback
@@ -338,12 +349,25 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
     if provider not in SUPPORTED_PROVIDERS:
         provider = PROVIDER_LLAMACPP
     endpoint_default = defaults["endpoint"]
+    provider_endpoint = ""
     if provider == PROVIDER_OLLAMA:
-        endpoint_default = "http://127.0.0.1:11434/v1"
+        provider_endpoint = e.get("OLLAMA_BASE_URL", "").strip().rstrip("/")
+        endpoint_default = provider_endpoint or "http://127.0.0.1:11434/v1"
+        if provider_endpoint and not endpoint_default.endswith("/v1"):
+            endpoint_default += "/v1"
     elif provider == PROVIDER_LMSTUDIO:
-        endpoint_default = "http://127.0.0.1:1234/v1"
+        provider_endpoint = e.get("LM_STUDIO_BASE_URL", "").strip().rstrip("/")
+        endpoint_default = provider_endpoint or "http://127.0.0.1:1234/v1"
+        if provider_endpoint and not endpoint_default.endswith("/v1"):
+            endpoint_default += "/v1"
     elif provider == PROVIDER_VLLM:
-        endpoint_default = "http://127.0.0.1:8000/v1"
+        provider_endpoint = e.get("VLLM_BASE_URL", "").strip().rstrip("/")
+        endpoint_default = provider_endpoint or "http://127.0.0.1:8000/v1"
+        if provider_endpoint and not endpoint_default.endswith("/v1"):
+            endpoint_default += "/v1"
+    elif provider == PROVIDER_KOBOLDCPP:
+        provider_endpoint = e.get("KOBOLDCPP_BASE_URL", "").strip().rstrip("/")
+        endpoint_default = provider_endpoint or "http://127.0.0.1:5001/v1"
     gpu_raw = _g("GPU_LAYERS", "")
     gpu_layers: Optional[int] = None
     if gpu_raw:
@@ -351,17 +375,19 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
             gpu_layers = int(gpu_raw)
         except (TypeError, ValueError):
             gpu_layers = None
+    cpu_only = role is BrainRole.SMALL and gpu_layers == 0
     threads = _i("THREADS", defaults.get("threads", 8))
-    batch = _i("BATCH", defaults.get("batch", 2048))
+    batch = _i("BATCH", 256 if cpu_only else defaults.get("batch", 2048))
+    context_default = 4096 if cpu_only else defaults["context"]
 
     return BrainConfig(
         role=role,
         provider=provider,
-        endpoint=_g("URL", endpoint_default),
+        endpoint=(endpoint_default if provider_endpoint else _g("URL", endpoint_default)),
         model=_g("MODEL", ""),
         device=_i("DEVICE", defaults["device"]),
         port=_i("PORT", defaults["port"]),
-        context=_i("CONTEXT", defaults["context"]),
+        context=_i("CONTEXT", context_default),
         gpu_layers=gpu_layers,
         enabled=_b("ENABLED", True),
         kv_cache=_g("KV_CACHE", defaults.get("kv_cache", "f16")),
@@ -426,7 +452,7 @@ class DualBrainRuntime:
         big = self._configs[BrainRole.BIG]
         small = self._configs[BrainRole.SMALL]
         big_device_ok = big.device == 0
-        small_device_ok = small.device == 1
+        small_device_ok = small.gpu_layers == 0 or small.device == 1
         distinct_ports = big.port != small.port
         ok = big_device_ok and small_device_ok and distinct_ports
         return {
@@ -435,6 +461,7 @@ class DualBrainRuntime:
             "small_device": small.device,
             "big_device_ok": big_device_ok,
             "small_device_ok": small_device_ok,
+            "small_cpu_only": small.gpu_layers == 0,
             "big_port": big.port,
             "small_port": small.port,
             "distinct_ports": distinct_ports,
@@ -467,6 +494,9 @@ class DualBrainRuntime:
                 data = json.loads(payload)
                 if cfg.provider == PROVIDER_OLLAMA:
                     models = [m.get("name", "") for m in data.get("models", [])]
+                elif cfg.provider == PROVIDER_KOBOLDCPP:
+                    model = data.get("result", "")
+                    models = [model] if model else []
                 else:
                     models = [m.get("id", "") for m in data.get("data", [])]
                 models = [m for m in models if m]

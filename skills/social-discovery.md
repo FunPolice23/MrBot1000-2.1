@@ -1,3 +1,12 @@
+---
+name: Social Discovery
+category: WEB_RESEARCH
+maturity: stable
+tool: discovery_scheduler
+automatable: true
+human_capable: true
+---
+
 # Skill: Social Discovery
 
 Trigger: user requests opportunity discovery, or earnings pipeline enters discover phase, or refresh is requested for social/fiverr/upwork sources.

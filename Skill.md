@@ -15,7 +15,20 @@ This template defines the standard format for documenting skills in MrBot1000.
 
 ## Skill Specification Format
 
+Every operational skill starts with machine-readable frontmatter. The values are
+documentation metadata; deterministic execution still depends on the capability
+registry, validators, human gates, and provider implementations.
+
 ```markdown
+---
+name: Social Discovery
+category: WEB_RESEARCH
+maturity: stable
+tool: discovery_scheduler
+automatable: true
+human_capable: true
+---
+
 # Skill: <Name in Title Case>
 
 ## Trigger
@@ -40,6 +53,17 @@ Requirements for skill to be invoked
 - <Output 1>: <description>
 - <Output 2>: <description>
 ```
+
+Required frontmatter fields:
+- `name`: canonical display name
+- `category`: a `CapabilityCategory` value, or an explicitly registered extension
+- `maturity`: `stable`, `beta`, `experimental`, or `planned`
+- `tool`: concrete service, validator, or adapter that backs the skill
+- `automatable`: whether the system can perform the skill without a human step
+- `human_capable`: whether the operator can complete the skill when the system cannot
+
+`job-execution-plan.md` is retained as a historical design note and is marked
+`maturity: planned`; it is not an executable skill registration.
 
 ---
 

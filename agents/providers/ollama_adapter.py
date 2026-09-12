@@ -80,9 +80,11 @@ class OllamaAdapter:
     def context_for(self, model: str) -> int:
         # Resolve live via `ollama show`; fallback to the static floor.
         try:
-            out = subprocess.run(["ollama", "show", model], capture_output=True,
-                                 text=True, timeout=8,
-                                 creationflags=subprocess.CREATE_NO_WINDOW).stdout
+            out = subprocess.run(
+                ["ollama", "show", model], capture_output=True,
+                text=True, timeout=8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).stdout
             import re
             m = re.search(r"context length\s+(\d+)", out)
             if m:

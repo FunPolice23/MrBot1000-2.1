@@ -18,6 +18,8 @@ from agents.dual_brain_runtime import (
     default_contract,
     PROVIDER_LLAMACPP,
     PROVIDER_OLLAMA,
+    PROVIDER_KOBOLDCPP,
+    PROVIDER_VLLM,
 )
 
 
@@ -59,6 +61,15 @@ class TestRoleDefaults(unittest.TestCase):
         self.assertEqual(cfg.device, 1)
         self.assertEqual(cfg.port, 1235)
 
+    def test_small_brain_cpu_only_command_avoids_missing_cuda_device(self):
+        cfg = build_config(BrainRole.SMALL, {
+            "SMALL_BRAIN_GPU_LAYERS": "0",
+        })
+        command = cfg.build_llama_command(model_path="small.gguf")
+        self.assertNotIn("--device", command)
+        self.assertIn("--n-gpu-layers", command)
+        self.assertEqual(command[command.index("--n-gpu-layers") + 1], "0")
+
     def test_default_contract_has_both_roles(self):
         contract = default_contract()
         self.assertIn("big", contract)
@@ -83,6 +94,13 @@ class TestIsolation(unittest.TestCase):
         report = rt.validate_isolation()
         self.assertFalse(report["isolated"])
         self.assertFalse(report["small_device_ok"])
+
+    def test_cpu_only_small_brain_is_valid_without_gpu1(self):
+        big = build_config(BrainRole.BIG, {})
+        small = build_config(BrainRole.SMALL, {"SMALL_BRAIN_GPU_LAYERS": "0"})
+        report = DualBrainRuntime(big=big, small=small).validate_isolation()
+        self.assertTrue(report["small_cpu_only"])
+        self.assertTrue(report["small_device_ok"])
 
     def test_shared_port_breaks_isolation(self):
         big = build_config(BrainRole.BIG, {"BIG_BRAIN_PORT": "1234"})
@@ -114,6 +132,24 @@ class TestConfigFromEnv(unittest.TestCase):
         })
         self.assertEqual(cfg.provider, PROVIDER_OLLAMA)
         self.assertEqual(cfg.models_path, "http://127.0.0.1:11434/api/tags")
+
+    def test_vllm_provider_normalizes_shared_base_url(self):
+        cfg = build_config(BrainRole.BIG, {
+            "BIG_BRAIN_PROVIDER": "vllm",
+            "VLLM_BASE_URL": "http://127.0.0.1:8000/v1",
+        })
+        self.assertEqual(cfg.provider, PROVIDER_VLLM)
+        self.assertEqual(cfg.endpoint, "http://127.0.0.1:8000/v1")
+        self.assertEqual(cfg.models_path, "http://127.0.0.1:8000/v1/models")
+
+    def test_koboldcpp_provider_uses_native_model_path(self):
+        cfg = build_config(BrainRole.BIG, {
+            "BIG_BRAIN_PROVIDER": "koboldcpp",
+            "KOBOLDCPP_BASE_URL": "http://127.0.0.1:5001",
+        })
+        self.assertEqual(cfg.provider, PROVIDER_KOBOLDCPP)
+        self.assertEqual(cfg.endpoint, "http://127.0.0.1:5001")
+        self.assertEqual(cfg.models_path, "http://127.0.0.1:5001/api/v1/model")
 
 
 class TestOfflineHealth(unittest.TestCase):

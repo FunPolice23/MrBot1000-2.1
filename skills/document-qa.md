@@ -1,3 +1,12 @@
+---
+name: Document QA
+category: QA
+maturity: stable
+tool: document_scanner
+automatable: true
+human_capable: true
+---
+
 # Skill: Document QA
 
 Trigger: user submits text for review, earnings pipeline needs pre-submit validation, or document scanning is requested.

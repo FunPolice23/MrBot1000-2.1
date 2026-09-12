@@ -1,3 +1,12 @@
+---
+name: Opportunity Lifecycle
+category: ADMINISTRATIVE
+maturity: stable
+tool: opportunity_lifecycle
+automatable: true
+human_capable: true
+---
+
 # Skill: Opportunity Lifecycle
 
 Trigger: user asks about opportunity progress, earnings pipeline advances an opportunity to a new stage, or the system needs to report lifecycle status.

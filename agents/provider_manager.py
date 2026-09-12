@@ -163,6 +163,48 @@ class ProviderManager:
         self._detect_koboldcpp()
         # Detect llama.cpp
         self._detect_llamacpp()
+
+    def refresh_provider_models(self, provider_name: str) -> List[str]:
+        """Refresh models for one local provider without rebuilding all state."""
+        provider = self.get_provider(provider_name)
+        if not provider or not provider.is_local:
+            return []
+
+        env_prefix = {
+            ProviderType.OLLAMA.value: "OLLAMA",
+            ProviderType.VLLM.value: "VLLM",
+            ProviderType.LM_STUDIO.value: "LM_STUDIO",
+            ProviderType.KOBOLDCPP.value: "KOBOLDCPP",
+        }.get(provider.provider_type, "")
+        base_url = (
+            os.getenv(f"{env_prefix}_BASE_URL", "").strip()
+            if env_prefix else ""
+        ) or provider.base_url
+        provider.base_url = base_url
+        base_url = base_url.rstrip("/")
+        try:
+            if provider.provider_type == ProviderType.OLLAMA.value:
+                url = f"{base_url}/api/tags"
+                with urllib.request.urlopen(urllib.request.Request(url), timeout=5) as resp:
+                    models = [item.get("name", "") for item in json.loads(resp.read().decode()).get("models", [])]
+            elif provider.provider_type in (ProviderType.LM_STUDIO.value, ProviderType.VLLM.value):
+                url = f"{base_url}/models" if base_url.endswith("/v1") else f"{base_url}/v1/models"
+                with urllib.request.urlopen(urllib.request.Request(url), timeout=5) as resp:
+                    models = [item.get("id", "") for item in json.loads(resp.read().decode()).get("data", [])]
+            elif provider.provider_type == ProviderType.KOBOLDCPP.value:
+                with urllib.request.urlopen(urllib.request.Request(f"{base_url}/api/v1/model"), timeout=5) as resp:
+                    model = json.loads(resp.read().decode()).get("result", "")
+                    models = [model] if model else []
+            else:
+                return list(provider.models)
+        except Exception as exc:
+            provider.last_error = str(exc)
+            return []
+
+        provider.models = list(dict.fromkeys(model for model in models if model))
+        provider.status = ProviderStatus.RUNNING if provider.models else provider.status
+        provider.last_error = ""
+        return list(provider.models)
     
     def _detect_ollama(self):
         """Detect Ollama."""
@@ -194,11 +236,13 @@ class ProviderManager:
     
     def _detect_vllm(self):
         """Detect vLLM."""
-        base_url = os.getenv("VLLM_BASE_URL", "")
+        base_url = os.getenv("VLLM_BASE_URL", "").rstrip("/")
         if not base_url:
             return
         try:
-            req = urllib.request.Request(f"{base_url}/v1/models")
+            models_url = (f"{base_url}/models" if base_url.endswith("/v1")
+                          else f"{base_url}/v1/models")
+            req = urllib.request.Request(models_url)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
                 models = [m.get("id", "") for m in data.get("data", [])]
@@ -224,11 +268,15 @@ class ProviderManager:
     
     def _detect_lm_studio(self):
         """Detect LM Studio."""
-        base_url = os.getenv("LM_STUDIO_BASE_URL", "")
-        if not base_url:
-            return
+        base_url = os.getenv(
+            "LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
         try:
-            req = urllib.request.Request(f"{base_url}/v1/models")
+            models_url = (
+                f"{base_url.rstrip('/')}/models"
+                if base_url.rstrip('/').endswith('/v1')
+                else f"{base_url.rstrip('/')}/v1/models"
+            )
+            req = urllib.request.Request(models_url)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
                 models = [m.get("id", "") for m in data.get("data", [])]
@@ -375,6 +423,36 @@ class ProviderManager:
     def get_running_providers(self) -> Dict[str, ProviderInfo]:
         """Get only running providers."""
         return {k: v for k, v in self.get_providers().items() if v.status == ProviderStatus.RUNNING}
+
+    @staticmethod
+    def normalize_provider_name(name: str) -> str:
+        """Return the runtime/provider-config spelling for a provider name."""
+        return {
+            "lm_studio": "lmstudio",
+            "lm studio": "lmstudio",
+            "llama.cpp": "llamacpp",
+            "koboldcpp": "koboldcpp",
+        }.get((name or "").strip().lower(), (name or "").strip().lower())
+
+    def resolve_enabled_provider(self, local: bool = True) -> Optional[str]:
+        """Resolve the explicitly enabled provider, or ``None``.
+
+        Environment role settings are authoritative because they are shared by
+        the GUI, adapters, and workers. Provider detection alone is not enough:
+        a stopped or merely installed backend must not become the active route.
+        """
+        role_keys = ("BIG_BRAIN_PROVIDER", "SMALL_BRAIN_PROVIDER")
+        candidates = []
+        for key in role_keys:
+            provider = self.normalize_provider_name(os.getenv(key, ""))
+            enabled = os.getenv(key.replace("_PROVIDER", "_ENABLED"), "true")
+            if provider and enabled.strip().lower() not in ("0", "false", "no", "off"):
+                candidates.append(provider)
+        if candidates and all(provider == candidates[0] for provider in candidates):
+            return candidates[0]
+        if candidates:
+            return candidates[0]
+        return None
     
     def get_local_providers(self) -> Dict[str, ProviderInfo]:
         """Get local providers."""

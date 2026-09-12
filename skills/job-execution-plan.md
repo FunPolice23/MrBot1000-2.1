@@ -1,3 +1,12 @@
+---
+name: Job Execution Plan
+category: PLANNING
+maturity: planned
+tool: job_search_worker
+automatable: false
+human_capable: true
+---
+
 # MrBot1000 v2.0 - Job Platform Discovery & Execution Fix
 
 ## Issue: Subagents operate without real execution

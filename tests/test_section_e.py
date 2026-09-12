@@ -277,11 +277,11 @@ class TestGuiTabs(unittest.TestCase):
     def test_new_tabs_present(self):
         labels = [self.mw.tabs.tabText(i) for i in range(self.mw.tabs.count())]
         self.assertIn("Providers & GPU", labels)
-        self.assertIn("Memory & Stream", labels)
-        self.assertIn("Collaboration", labels)
-        # The current GUI includes the dual-brain and safety surfaces in addition
-        # to the original ten tabs.
-        self.assertEqual(self.mw.tabs.count(), 21)
+        self.assertIn("Live Logs", labels)
+        self.assertIn("DB Stats", labels)
+        # The current GUI includes the model library, safety, provider, and
+        # observability surfaces in addition to the core workflow tabs.
+        self.assertEqual(self.mw.tabs.count(), 19)
         self.assertIn("Model Library", labels)
 
     def test_lazy_then_scroll_on_open(self):

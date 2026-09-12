@@ -6,6 +6,7 @@ Allows switching cloud/local providers at runtime without restart.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Optional
 
 from PySide6.QtCore import Signal, QThread, Qt, QTimer
@@ -60,7 +61,7 @@ class ProviderConfigWidget(QWidget):
         cloud_scroll = QScrollArea()
         cloud_scroll.setWidgetResizable(True)
         cloud_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.cloud_widget = QWidget()
+        self.cloud_widget = QWidget(cloud_scroll)
         self.cloud_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.cloud_layout = QVBoxLayout(self.cloud_widget)
         self.cloud_layout.setSpacing(10)
@@ -73,7 +74,7 @@ class ProviderConfigWidget(QWidget):
         local_scroll = QScrollArea()
         local_scroll.setWidgetResizable(True)
         local_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.local_widget = QWidget()
+        self.local_widget = QWidget(local_scroll)
         self.local_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.local_layout = QVBoxLayout(self.local_widget)
         self.local_layout.setSpacing(10)
@@ -164,8 +165,11 @@ class ProviderConfigWidget(QWidget):
                 for name, prefix in (("ollama", "OLLAMA"), ("vllm", "VLLM"),
                                      ("lmstudio", "LM_STUDIO"), ("koboldcpp", "KOBOLDCPP")):
                     values[f"DISABLE_{prefix}"] = str(selected != name).lower()
-                values["BIG_BRAIN_ENABLED"] = str(selected == "llamacpp").lower()
-                values["SMALL_BRAIN_ENABLED"] = str(selected == "llamacpp").lower()
+                # Selecting a local provider enables that provider's route.
+                # The llama.cpp control panel separately skips llama-server
+                # startup when the selected provider is external.
+                values["BIG_BRAIN_ENABLED"] = "true"
+                values["SMALL_BRAIN_ENABLED"] = "true"
         os.environ.update(values)
         try:
             from main import set_env_values
@@ -240,6 +244,7 @@ class ProviderConfigWidget(QWidget):
             # Model dropdown - wider with placeholder when empty
             model_combo = QComboBox()
             model_combo.setMinimumWidth(120)
+            model_combo.setEditable(True)
             model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             model_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             model_combo.setMinimumContentsLength(12)
@@ -263,17 +268,30 @@ class ProviderConfigWidget(QWidget):
                 if provider.selected_model:
                     model_combo.setCurrentText(provider.selected_model)
             else:
-                # Show placeholder / hint when no models available
-                model_combo.addItem("(no models detected)")
-                model_combo.setEnabled(False)
-                model_combo.setStyleSheet("""
-                    QComboBox {
-                        background: #2a2a2a;
-                        color: #666;
-                    }
-                """)
+                # Keep the field editable when the provider is stopped or its
+                # model endpoint is unavailable. The selected name can still
+                # be persisted and used when the provider starts.
+                prefix = self._provider_prefix(name)
+                configured = (
+                    provider.selected_model
+                    or (os.getenv(f"{prefix}_MODEL", "") if prefix else "")
+                    or ""
+                ).strip()
+                if configured:
+                    model_combo.addItem(configured, configured)
+                    model_combo.setCurrentText(configured)
+                else:
+                    model_combo.setPlaceholderText("Enter model name")
+                model_combo.setEnabled(True)
             model_combo.currentTextChanged.connect(lambda text, n=name, combo=model_combo: self._on_model_changed(n, combo.currentData() or text))
             row.addWidget(model_combo)
+
+            refresh_btn = QPushButton("Refresh")
+            refresh_btn.setMinimumHeight(35)
+            refresh_btn.setToolTip("Fetch models currently available from this provider")
+            refresh_btn.clicked.connect(
+                lambda checked=False, n=name, combo=model_combo: self._refresh_provider_models(n, combo))
+            row.addWidget(refresh_btn)
             
             # GPU (for local)
             if provider.is_local:
@@ -355,6 +373,24 @@ class ProviderConfigWidget(QWidget):
                 role_combo.currentTextChanged.connect(lambda value, p=prefix: self._persist_provider_role(p, value))
                 details_row.addWidget(role_combo)
                 layout.addWidget(details)
+                if provider.is_local and name != "llamacpp":
+                    role_models = QHBoxLayout()
+                    role_models.setContentsMargins(110, 0, 8, 6)
+                    role_models.addWidget(QLabel("Main model:"))
+                    main_combo = self._role_model_combo(
+                        provider, "BIG_BRAIN_MODEL", provider.models)
+                    main_combo.currentTextChanged.connect(
+                        lambda value, n=name: self._on_role_model_changed(
+                            n, "BIG_BRAIN_MODEL", value))
+                    role_models.addWidget(main_combo, 1)
+                    role_models.addWidget(QLabel("Chat model:"))
+                    chat_combo = self._role_model_combo(
+                        provider, "SMALL_BRAIN_MODEL", provider.models)
+                    chat_combo.currentTextChanged.connect(
+                        lambda value, n=name: self._on_role_model_changed(
+                            n, "SMALL_BRAIN_MODEL", value))
+                    role_models.addWidget(chat_combo, 1)
+                    layout.addLayout(role_models)
     
     def _on_model_changed(self, provider_name: str, model: str):
         """Handle model change."""
@@ -363,20 +399,106 @@ class ProviderConfigWidget(QWidget):
         provider = pm.get_provider(provider_name)
         if provider and model != "(no models detected)":
             provider.selected_model = model
-            if provider_name == "llamacpp":
-                values = {"BIG_BRAIN_MODEL": model, "SMALL_BRAIN_MODEL": model}
-                os.environ.update(values)
-                try:
-                    from main import set_env_values
-                    set_env_values(values)
-                except Exception:
-                    pass
             prefix = self._provider_prefix(provider_name)
+            role = self._role_from_env(prefix) if prefix else "Both"
+            values = {}
+            if role in ("Both", "Main only"):
+                values["BIG_BRAIN_MODEL"] = model
+            if role in ("Both", "Chat only"):
+                values["SMALL_BRAIN_MODEL"] = model
             if prefix:
-                self._persist_provider_field(prefix, "MODEL", model)
+                values[f"{prefix}_MODEL"] = model
+                # Ollama has separate role keys in the legacy worker path.
+                # Keep both roles aligned when the shared provider-list model
+                # selector is used.
+                if prefix == "OLLAMA":
+                    values["OLLAMA_MAIN_MODEL"] = model
+                    values["OLLAMA_CHAT_MODEL"] = model
+            os.environ.update(values)
+            try:
+                from main import set_env_values
+                set_env_values(values)
+            except Exception:
+                pass
+            try:
+                from agents.base_worker import _active_worker
+                if _active_worker is not None:
+                    _active_worker.invalidate_provider_registry()
+            except Exception:
+                pass
             self.status_label.setText(f"Updated {provider_name} model to {model}")
             self.status_label.setStyleSheet("color: #4caf50;")
+            if provider.is_local:
+                self._load_selected_local_model(provider_name, provider, model, role)
             self.provider_changed.emit(provider_name, f"model:{model}")
+
+    @staticmethod
+    def _role_model_combo(provider, env_key: str, models):
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setMinimumWidth(160)
+        values = list(dict.fromkeys(str(item) for item in (models or []) if item))
+        configured = os.getenv(env_key, "").strip() or provider.selected_model
+        if configured and configured not in values:
+            values.insert(0, configured)
+        combo.addItems(values)
+        if configured:
+            combo.setCurrentText(configured)
+        return combo
+
+    def _on_role_model_changed(self, provider_name: str, env_key: str, model: str):
+        """Persist and load one brain role without changing the other role."""
+        model = (model or "").strip()
+        if not model or model == "(no models detected)":
+            return
+        from agents.provider_manager import ProviderManager
+        provider = ProviderManager.instance().get_provider(provider_name)
+        if not provider:
+            return
+        values = {env_key: model}
+        os.environ.update(values)
+        try:
+            from main import set_env_values
+            set_env_values(values)
+        except Exception:
+            pass
+        try:
+            from agents.base_worker import _active_worker
+            if _active_worker is not None:
+                _active_worker.invalidate_provider_registry()
+        except Exception:
+            pass
+        role = env_key == "SMALL_BRAIN_MODEL"
+        if provider.is_local:
+            self._load_selected_local_model(
+                provider_name, provider, model,
+                "Chat only" if role else "Main only")
+        self.status_label.setText(
+            f"Updated {'Chat' if role else 'Main'} model for {provider_name} to {model}")
+        self.status_label.setStyleSheet("color: #4caf50;")
+        self.provider_changed.emit(provider_name, f"model:{model}")
+
+    @staticmethod
+    def _load_selected_local_model(provider_name, provider, model, role):
+        """Load a selected model through providers that expose lifecycle APIs."""
+        from agents.provider_manager import ProviderManager
+        runtime_name = ProviderManager.normalize_provider_name(provider_name)
+        if runtime_name not in ("lmstudio", "ollama") or role == "Disabled":
+            return
+        try:
+            from gui.dual_brain_control import ProviderStatusChecker
+            endpoint = provider.base_url
+            threading.Thread(
+                target=ProviderConfigWidget._load_local_model_worker,
+                args=(ProviderStatusChecker, runtime_name, endpoint, model),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _load_local_model_worker(checker, provider, endpoint, model):
+        checker.load_provider_model(provider, endpoint, model)
     
     def _on_gpu_changed(self, provider_name: str, gpu_index: int):
         """Handle GPU change."""
@@ -390,7 +512,7 @@ class ProviderConfigWidget(QWidget):
     @staticmethod
     def _provider_prefix(provider_name: str) -> str:
         return {
-            "openai": "OPENAI", "anthropic": "ANTHROPIC", "openrouter": "OPENROUTER",
+            "ollama": "OLLAMA", "openai": "OPENAI", "anthropic": "ANTHROPIC", "openrouter": "OPENROUTER",
             "groq": "GROQ", "deepseek": "DEEPSEEK", "mistral": "MISTRAL",
             "together": "TOGETHER", "vllm": "VLLM", "lm_studio": "LM_STUDIO",
             "koboldcpp": "KOBOLDCPP", "llamacpp": "LLAMACPP",
@@ -421,6 +543,14 @@ class ProviderConfigWidget(QWidget):
             f"{prefix}_MAIN_ENABLED": str(role in ("Both", "Main only")).lower(),
             f"{prefix}_CHAT_ENABLED": str(role in ("Both", "Chat only")).lower(),
         }
+        local_role_providers = {
+            "OLLAMA", "VLLM", "LM_STUDIO", "KOBOLDCPP", "LLAMACPP",
+        }
+        if prefix in local_role_providers:
+            values.update({
+                "BIG_BRAIN_ENABLED": str(role in ("Both", "Main only")).lower(),
+                "SMALL_BRAIN_ENABLED": str(role in ("Both", "Chat only")).lower(),
+            })
         os.environ.update(values)
         try:
             from main import set_env_values
@@ -446,17 +576,25 @@ class ProviderConfigWidget(QWidget):
             self.status_label.setText(f"Enabled {provider_name}")
 
         prefix = self._provider_prefix(provider_name)
+        runtime_name = ProviderManager.normalize_provider_name(provider_name)
         if prefix:
             self._persist_provider_role(
                 prefix,
                 "Both" if provider.status == ProviderStatus.RUNNING.value else "Disabled",
             )
-        if provider_name == "llamacpp" and provider.status == ProviderStatus.RUNNING.value:
+        if provider.is_local and provider.status == ProviderStatus.RUNNING.value:
+            local_provider_names = {
+                "llamacpp": "llama.cpp",
+                "ollama": "Ollama",
+                "vllm": "vLLM",
+                "lmstudio": "LM Studio",
+                "koboldcpp": "KoboldCpp",
+            }
+            selected = runtime_name
             values = {
-                "BIG_BRAIN_PROVIDER": "llamacpp",
-                "SMALL_BRAIN_PROVIDER": "llamacpp",
-                "BIG_BRAIN_URL": os.getenv("BIG_BRAIN_URL", "http://127.0.0.1:1234/v1"),
-                "SMALL_BRAIN_URL": os.getenv("SMALL_BRAIN_URL", "http://127.0.0.1:1235/v1"),
+                "ACTIVE_LOCAL_PROVIDER": local_provider_names.get(selected, selected),
+                "BIG_BRAIN_PROVIDER": selected,
+                "SMALL_BRAIN_PROVIDER": selected,
                 "BIG_BRAIN_ENABLED": "true",
                 "SMALL_BRAIN_ENABLED": "true",
             }
@@ -466,13 +604,76 @@ class ProviderConfigWidget(QWidget):
                 set_env_values(values)
             except Exception:
                 pass
+            self.active_local.setCurrentText(local_provider_names.get(selected, selected))
+        elif provider.is_local and provider.status != ProviderStatus.RUNNING.value:
+            values = {}
+            for role in ("BIG_BRAIN", "SMALL_BRAIN"):
+                current = ProviderManager.normalize_provider_name(
+                    os.getenv(f"{role}_PROVIDER", ""))
+                if current == runtime_name:
+                    values[f"{role}_ENABLED"] = "false"
+            if values:
+                values["ACTIVE_LOCAL_PROVIDER"] = "Auto"
+                os.environ.update(values)
+                try:
+                    from main import set_env_values
+                    set_env_values(values)
+                except Exception:
+                    pass
         
         self.status_label.setStyleSheet("color: #4caf50;")
         self.provider_changed.emit(provider_name, "toggle")
         self._build_provider_list("cloud" if self.type_tabs.currentIndex() == 0 else "local")
+        if provider.is_local and provider.status == ProviderStatus.RUNNING.value:
+            self._refresh_local_provider_card(provider_name)
+
+    def _refresh_local_provider_card(self, provider_name: str):
+        """Refresh a local card after rebuilding the provider list."""
+        from agents.provider_manager import ProviderManager
+
+        for combo in self.findChildren(QComboBox):
+            if combo.toolTip() == "Select the active model":
+                provider = ProviderManager.instance().get_provider(provider_name)
+                if provider and provider.name == provider_name:
+                    self._refresh_provider_models(provider_name, combo)
+                    return
+
+    def _refresh_provider_models(self, provider_name: str, combo: QComboBox):
+        """Fetch current local models and update the provider card in place."""
+        from agents.provider_manager import ProviderManager
+
+        provider = ProviderManager.instance().get_provider(provider_name)
+        if not provider or not provider.is_local:
+            return
+        selected = combo.currentData() or combo.currentText()
+        models = ProviderManager.instance().refresh_provider_models(provider_name)
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems(models)
+            if selected and selected in models:
+                combo.setCurrentText(selected)
+            elif provider.selected_model and provider.selected_model in models:
+                combo.setCurrentText(provider.selected_model)
+        finally:
+            combo.blockSignals(False)
+        if models:
+            self.status_label.setText(f"Found {len(models)} {provider.name} model(s)")
+            self.status_label.setStyleSheet("color: #4caf50;")
+        else:
+            self.status_label.setText(f"No models found for {provider.name}; enter a model name manually")
+            self.status_label.setStyleSheet("color: #ff9800;")
     
     def refresh(self):
         """Refresh the provider list."""
+        # Rebuilding the cards destroys an open model popup. Let the user finish
+        # choosing when a provider exposes a long model list.
+        if any(
+            combo.toolTip() == "Select the active model"
+            and combo.view().isVisible()
+            for combo in self.findChildren(QComboBox)
+        ):
+            return
         # Rebuild the current tab
         current_tab = self.type_tabs.currentIndex()
         if current_tab == 0:
@@ -534,7 +735,7 @@ class CloudProviderPanel(QWidget):
         layout.addWidget(self.providers_table)
         
         layout.addStretch()
-    
+
     def _on_connect(self):
         """Handle connect button click."""
         provider = self.provider_combo.currentText()

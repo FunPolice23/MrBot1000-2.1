@@ -4,7 +4,7 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 
 ## v2.1.1 Highlights (2026-09-11)
 
-- **Canonical dual-brain runtime** (`agents/dual_brain_runtime.py`): one source of truth for role→endpoint/model/device. Big Brain → RTX 5060 Ti (CUDA 0, port 1234); Small Brain → GTX 1660 Super (CUDA 1, port 1235). llama.cpp/llama-server default; Ollama/LM Studio are explicit opt-ins.
+- **Canonical dual-brain runtime** (`agents/dual_brain_runtime.py`): one source of truth for role→endpoint/model/device. Big Brain uses the available primary GPU when a local provider is enabled; Small Brain can use a second GPU, CPU/system RAM, or be disabled. The active local or cloud provider is selected from Settings.
 - **Canonical cross-model collaboration** (`agents/dual_brain_coordinator.py`): deterministic plan→research→review→execute handoff on the EventBus with a durable MessageLog ledger; model_fn injected (mock-first, cycle-safe).
 - **Durable autonomous runs** (`agents/autonomous_run_store.py`): SQLite run/stage/idempotency ledger with restart recovery; autonomous-loop results now survive restarts.
 - **Unified composition root** (`agents/composition_root.py`): one shared pipeline/portfolio/run_store/lifecycle per process.
@@ -57,7 +57,7 @@ Safe mode can also be toggled from the Management tab at runtime.
 - Shares research snapshots across the manager and chat-side runtime context so both models can benefit from the same knowledge base
 - Tracks earnings and payouts locally in SQLite with **Unified Economic Accounting** (verified vs unverified revenue, LLM cost, gas, net profit, ROI, net hourly rate)
 - Runs a self-audit engine that identifies improvement opportunities across 14 categories without mutating safety constraints
-- Supports the local llama.cpp dual-brain runtime by default, with optional Ollama, OpenAI, Anthropic, OpenRouter, Gemini, Groq, DeepSeek, Mistral, Together, NVIDIA NIM, vLLM, LM Studio, and KoboldCpp providers through the Settings and Providers & GPU surfaces
+- Supports llama.cpp, Ollama, LM Studio, vLLM, KoboldCpp, and supported cloud providers through the Settings and Providers & GPU surfaces. The interface adapts to whichever enabled provider is active; if none is enabled, it reports that no provider is in use.
 - Maintains per-role memory (chat + CEO) that survives restarts
 - Dynamically schedules discovery sources based on historical performance (exploration/exploitation balance)
 
@@ -134,9 +134,9 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 
 ## Architecture
 
-- **Big Brain / Marcus Rivera**: llama-server on port 1234, normally GPU device 0 — planning, coding, deep research, and review
-- **Small Brain / Alex Vega**: llama-server on port 1235, normally GPU device 1 — human chat, triage, and lightweight coordination
-- **Optional providers**: Ollama, LM Studio, vLLM, and supported cloud providers can be selected explicitly; they are not silent defaults
+- **Big Brain / Marcus Rivera**: uses the active provider and available primary GPU — planning, coding, deep research, and review
+- **Small Brain / Alex Vega**: uses the active provider, a second GPU, CPU/system RAM, or can be disabled — human chat, triage, and lightweight coordination
+- **Provider selection**: llama.cpp, Ollama, LM Studio, vLLM, KoboldCpp, and cloud providers are selected explicitly from Settings; provider-specific controls appear only for the active backend
 - **Two-persona model runtime**: Marcus Rivera (Driver/Big Brain) plans and pushes work forward; Alex Vega (Navigator/Small Brain) handles chat, triage, risk checks, and verification
 - **Application services**: Management coordinates earning workflows, approvals, payouts, memory, and operational controls; specialized workers handle discovery, analysis, coding, and platform tasks
 - **Message routing**: Chat and Dialogue use the configured brain adapters; task and command intents are routed through the Manager and deterministic service boundaries
@@ -186,7 +186,7 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 | `database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
 | `theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
 | `version.py` | Public application version source (`2.1.1`) |
-| `Agent.md` / `ARCHITECTURE.md` / `CHANGELOG.md` | Runtime contract, system design, and release history |
+| `Agent.md` / `ARCHITECTURE_CURRENT.md` / `CHANGELOG.md` | Runtime contract, current system design, and release history |
 | `tests/` | Focused regression and subsystem tests |
 
 ## Configuration
@@ -201,6 +201,7 @@ Key settings:
 - `BIG_BRAIN_PROVIDER`, `BIG_BRAIN_URL`, `BIG_BRAIN_PORT` — Big Brain provider and endpoint (default llama-server on 1234)
 - `SMALL_BRAIN_PROVIDER`, `SMALL_BRAIN_URL`, `SMALL_BRAIN_PORT` — Small Brain provider and endpoint (default llama-server on 1235)
 - `BIG_BRAIN_DEVICE` / `SMALL_BRAIN_DEVICE` — GPU device assignment for the two local brains
+- `SMALL_BRAIN_GPU_LAYERS=0` — optional CPU/system-RAM mode for Alex when a second GPU is unavailable
 - `BIG_BRAIN_CONTEXT` / `SMALL_BRAIN_CONTEXT` — per-role context limits
 - `OLLAMA_MAIN_MODEL` / `OLLAMA_CHAT_MODEL` — optional Ollama fallback model names
 - `OPENAI_STREAM_TIMEOUT_SECONDS` — bounded streaming timeout for OpenAI-compatible providers
@@ -216,7 +217,7 @@ Key settings:
 ## UI Tabs
 
 1. **Management** — Agent controls, pause/resume, pipeline controls, gig proposals, payout verification
-2. **Providers & GPU** — Dual-brain orchestration, llama-server controls, GPU isolation, model selection, context, threads, and GPU layers
+2. **Providers & GPU** — Active-provider routing, dual-brain orchestration, detected hardware, and provider-specific controls
 3. **Model Library** — Local model discovery and download management
 4. **Safety & Tools** — Tool registry, safety rules, and approval queue
 5. **Chat** — Human conversation with the configured Small Brain
@@ -263,7 +264,8 @@ it is not a separate visible tab.
 ## Documentation
 
 - **Agent.md** — Runtime contract for any model interacting with the system
-- **ARCHITECTURE.md** — Full system design and component reference
+- **ARCHITECTURE_CURRENT.md** — Current v2.1 system design and component reference
+- **ARCHITECTURE.md** — Historical full program-review export; retained for reference
 - **CHANGELOG.md** — Full change history through v2.0.36m
 
 ## Requirements
@@ -281,4 +283,4 @@ it is not a separate visible tab.
 - **Hardware: runs on ANY setup** — from low-VRAM machines (e.g. 6GB VRAM + Zen3 + DDR4) up to modern RTX with more RAM. Model size is operator-chosen; the app works with whatever Ollama serves. A GPU helps speed but is not required.
 - RAM: 16GB minimum, 32GB recommended
 - Storage: 5GB+ for models and databases
-- Default local llama-server endpoints at `127.0.0.1:1234/v1` and `127.0.0.1:1235/v1`; Ollama is optional and uses its own configured endpoint when selected
+- Local endpoints and controls come from the enabled provider in Settings; llama.cpp uses the role ports by default, while Ollama, LM Studio, vLLM, and KoboldCpp use their configured endpoints

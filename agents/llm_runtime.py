@@ -39,7 +39,7 @@ def detect_vram_gb() -> int:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW)
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if out.returncode == 0:
             vals = [int(x.strip()) for x in out.stdout.splitlines() if x.strip().isdigit()]
             if vals:

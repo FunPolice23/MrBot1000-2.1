@@ -4,7 +4,8 @@ import unittest
 import os
 from unittest.mock import Mock, patch
 
-from gui.dialogue_tab import DialogueTab, DialogueWorker
+from gui.dialogue_tab import DialogueTab, DialogueWorker, LIFECYCLE
+from agents.personas import persona_for_key
 from agents.tool_calling import (
     chat_with_tools,
     _remove_reasoning_channels,
@@ -29,6 +30,78 @@ class TestDialogueResponseCorruption(unittest.TestCase):
             "I recommend one concrete next step and one risk check."
         ))
 
+    def test_training_continuations_and_code_are_rejected(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "```python\nimport torch\nimport torch.nn as nn\ndef create_model():\n"
+            "    return nn.Sequential(nn.Linear(4, 2), nn.ReLU())\n```"
+        ))
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "Gemma I'm learning about different cultures. " * 5
+        ))
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "Prompt: Describe a scene from your life. Response: Okay, here's a scene."
+        ))
+
+    def test_account_creation_cannot_be_declared_approved_by_research(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "The registration fields are only name and email, so I will create "
+            "the account. No further approvals are needed."
+        ))
+        self.assertFalse(worker._is_bad_dialogue_response(
+            "The registration fields are only name and email. Account creation "
+            "is blocked pending explicit human approval."
+        ))
+
+    def test_tiny_model_identity_and_failed_research_fallbacks_are_rejected(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "The model is Gemma. I am an open-weights model with no internet access."
+        ))
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "I got a 403 Forbidden error, so I will rely on my existing knowledge "
+            "and provide a generic guide based on typical freelance practices."
+        ))
+
+    def test_tiny_model_gets_safe_progress_response_after_failed_retries(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        worker.max_tokens = 128
+        fallback = worker._safe_fallback_response()
+        self.assertTrue(fallback.startswith("BLOCKED:"))
+        self.assertIn("No registration", fallback)
+        self.assertNotIn("malformed or non-conversational", fallback)
+
+    def test_tiny_fallback_responds_to_current_phase(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        worker.max_tokens = 128
+        worker.context = "CURRENT PHASE: discover\nPHASE INSTRUCTION: approve or block."
+        fallback = worker._safe_fallback_response()
+        self.assertIn("identity-document list is too broad", fallback)
+        self.assertIn("jurisdiction", fallback)
+        self.assertIn("BLOCKED:", fallback)
+
+    def test_non_progress_and_unrequested_image_continuations_are_rejected(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
+        worker.context = "CURRENT PHASE: discover\nPHASE INSTRUCTION: approve or block."
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "I'm ready to help Alex and the human user move forward with the current phase. "
+            "I'll rely on the read-only tools that are available."
+        ))
+        self.assertTrue(worker._is_bad_dialogue_response(
+            "The image you sent is a depiction of a detailed surreal portrait."
+        ))
+
+    def test_registration_research_never_grants_account_approval(self):
+        self.assertIn(
+            "Registration is always an external commitment",
+            LIFECYCLE[1][2],
+        )
+        self.assertIn(
+            "creating or using an account always requires explicit human approval",
+            LIFECYCLE[3][2],
+        )
+
     def test_gemma_model_size_and_prompt_tier(self):
         tab = DialogueTab.__new__(DialogueTab)
 
@@ -38,7 +111,44 @@ class TestDialogueResponseCorruption(unittest.TestCase):
             "gemma 4 e4b q4"), 4)
 
         prompt = tab._model_output_contract("gemma 4 12b it qat q4")
-        self.assertIn("Capability tier: compact", prompt)
+        self.assertIn("Capability tier: full", prompt)
+        self.assertIn(
+            "COMPACT MODEL RESPONSE CONTRACT",
+            tab._model_output_contract("granite-8b-instruct"),
+        )
+
+    def test_persona_prompts_have_distinct_parameter_tiers(self):
+        persona = persona_for_key("Alex Vega")
+        tiny = persona.build_system_prompt(goal="Choose one action", tier="tiny")
+        compact = persona.build_system_prompt(goal="Choose one action", tier="compact")
+        full = persona.build_system_prompt(goal="Choose one action", tier="full")
+        self.assertIn("Answer only the current phase in 1-3 short sentences", tiny)
+        self.assertIn("Follow the current phase instruction", compact)
+        self.assertIn("# RESPONSE PROCESS", full)
+        self.assertNotIn("# MEMORY", tiny)
+
+    def test_dialogue_capability_gate_rejects_tiny_and_base_models(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        blocked, reason = tab._dialogue_model_blocked("granite-1b-tiny")
+        self.assertTrue(blocked)
+        self.assertIn("below 4B", reason)
+        blocked, reason = tab._dialogue_model_blocked("llama-3.1-8b-base")
+        self.assertTrue(blocked)
+        self.assertIn("not dialogue-tuned", reason)
+        blocked, reason = tab._dialogue_model_blocked("qwen2.5-7b-instruct")
+        self.assertFalse(blocked)
+        self.assertEqual(reason, "")
+
+    def test_model_contracts_scale_output_without_inviting_topic_drift(self):
+        tab = DialogueTab.__new__(DialogueTab)
+        tiny = tab._model_output_contract("gemma-1b-it")
+        compact = tab._model_output_contract("gemma-5b-it")
+        full = tab._model_output_contract("qwen-32b-instruct")
+        self.assertIn("TINY MODEL RESPONSE CONTRACT", tiny)
+        self.assertIn("COMPACT MODEL RESPONSE CONTRACT", compact)
+        self.assertIn("FULL MODEL RESPONSE CONTRACT", full)
+        self.assertIn("Never invent websites", tiny)
+        self.assertIn("Do not drift", full)
 
     def test_gemma_request_does_not_use_system_role_or_tools(self):
         message = Mock(content="A valid answer", tool_calls=None)
@@ -96,8 +206,20 @@ class TestDialogueResponseCorruption(unittest.TestCase):
 
     def test_dialogue_worker_uses_bounded_turn_budget(self):
         worker = DialogueWorker.__new__(DialogueWorker)
+        worker.brain = Mock(model="granite-1b-tiny")
+        with patch.dict(os.environ, {"DIALOGUE_TURN_MAX_TOKENS": "512"}):
+            DialogueWorker.__init__(
+                worker, worker.brain, "context", [], "Alex Vega")
+        self.assertEqual(worker.max_tokens, 128)
+
+    def test_dialogue_worker_keeps_normal_budget_for_larger_models(self):
+        worker = DialogueWorker.__new__(DialogueWorker)
         worker.max_tokens = 512
-        self.assertLessEqual(worker.max_tokens, 768)
+        worker.brain = Mock(model="granite-8b-instruct")
+        with patch.dict(os.environ, {"DIALOGUE_TURN_MAX_TOKENS": "512"}):
+            DialogueWorker.__init__(
+                worker, worker.brain, "context", [], "Alex Vega")
+        self.assertEqual(worker.max_tokens, 512)
 
     def test_local_client_timeout_is_bounded(self):
         from agents.big_brain import BigBrainAdapter
@@ -196,9 +318,8 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         context = tab.get_dialogue_context()
         self.assertIn("CALL A READ-ONLY TOOL NOW", context)
         self.assertIn("do not say you will search later", context)
-        self.assertIn("public/no-account listings", context)
-        self.assertIn("agent-compatible task platforms", context)
-        self.assertIn("only two candidates", context)
+        self.assertIn("use one read-only tool and rely only on its returned evidence", context)
+        self.assertIn("Do not invent sources or results", context)
         self.assertIn("stop for human approval before", context)
 
     def test_reasoning_mode_router_matches_task_shape(self):

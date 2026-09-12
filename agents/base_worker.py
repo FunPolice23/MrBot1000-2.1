@@ -682,8 +682,39 @@ class WorkerAgent:
         """
         regs = self._build_provider_registry()
         out = []
+        # The Settings provider selector is an explicit local-backend choice.
+        # Keep cloud providers available for fallback, but do not let an
+        # unrelated local adapter (especially Ollama) win by registry order.
+        selected_local = os.getenv("ACTIVE_LOCAL_PROVIDER", "").strip().lower()
+        selected_local = {
+            "auto": "",
+            "llama.cpp": "llamacpp",
+            "llama-cpp": "llamacpp",
+            "lm studio": "lmstudio",
+            "lm_studio": "lmstudio",
+            "kobold cpp": "koboldcpp",
+        }.get(selected_local, selected_local)
+        local_adapter_names = {
+            "ollama", "vllm", "lm-studio", "koboldcpp",
+            "big-brain", "small-brain",
+        }
+        selected_adapter_names = {
+            "ollama": {"ollama"},
+            "vllm": {"vllm"},
+            "lmstudio": {"lm-studio"},
+            "koboldcpp": {"koboldcpp"},
+            "llamacpp": {"big-brain", "small-brain"},
+        }.get(selected_local)
+        if selected_adapter_names and not any(
+                ad.name in selected_adapter_names for ad in regs):
+            # Keep injected/offline registries usable when the selected backend
+            # is not registered; the normal registry will contain it when live.
+            selected_adapter_names = None
         for ad in sorted(regs, key=lambda a: a.order):
             if not ad.available():
+                continue
+            if selected_adapter_names and ad.name in local_adapter_names \
+                    and ad.name not in selected_adapter_names:
                 continue
             if not self._role_allows(ad, chat):
                 continue

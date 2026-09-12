@@ -9,6 +9,7 @@ import os
 import time
 import re
 import json
+import xml.etree.ElementTree as ET
 from typing import List, Optional
 from dataclasses import dataclass, field
 
@@ -79,7 +80,8 @@ class EarningDiscoverer:
         # 2. Twitter crypto earning posts
         opps = self._discover_twitter_crypto()
         all_opps.extend(opps)
-        print(f"[Discover] Found {len(opps)} from Twitter")
+        twitter_state = "bearer token not configured" if not os.getenv("TWITTER_BEARER_TOKEN", "").strip() else "API search not implemented"
+        print(f"[Discover] Found {len(opps)} from Twitter ({twitter_state})")
 
         # 3. GitHub bounty programs
         opps = self._discover_github_bounties()
@@ -89,17 +91,20 @@ class EarningDiscoverer:
         # 4. Discord bot commands (simulated - check for bot commands)
         opps = self._discover_discord_bots()
         all_opps.extend(opps)
-        print(f"[Discover] Found {len(opps)} from Discord bots")
+        discord_state = "bot token not configured" if not os.getenv("DISCORD_BOT_TOKEN", "").strip() else "guild search not implemented"
+        print(f"[Discover] Found {len(opps)} from Discord bots ({discord_state})")
 
         # 5. Search for referral programs (opt-in only — disabled by default)
         opps = self._discover_referral_programs()
         all_opps.extend(opps)
-        print(f"[Discover] Found {len(opps)} from referral programs")
+        referral_state = "opt-in disabled" if os.getenv("ALLOW_REFERRAL_DISCOVERY", "0").strip().lower() not in ("1", "true", "yes") else "live pages verified"
+        print(f"[Discover] Found {len(opps)} from referral programs ({referral_state})")
 
         # 6. Faucets and micro-payments (opt-in only — disabled by default)
         opps = self._discover_faucets()
         all_opps.extend(opps)
-        print(f"[Discover] Found {len(opps)} from faucets")
+        faucet_state = "opt-in disabled" if os.getenv("ALLOW_FAUCET_DISCOVERY", "0").strip().lower() not in ("1", "true", "yes") else "live pages verified"
+        print(f"[Discover] Found {len(opps)} from faucets ({faucet_state})")
 
         return self._deduplicate(all_opps)
 
@@ -110,6 +115,8 @@ class EarningDiscoverer:
             # Check r/WorkOnline subreddit
             url = "https://www.reddit.com/r/WorkOnline/new/.json?limit=50"
             data = self._reddit_json(url)
+            if data is None:
+                data = self._reddit_rss("https://www.reddit.com/r/WorkOnline/.rss")
             if data is not None:
                 for post in data.get("data", {}).get("children", []):
                     post_data = post.get("data", {})
@@ -131,6 +138,8 @@ class EarningDiscoverer:
             # Check r/CryptoCurrency for airdrops/rewards
             url = "https://www.reddit.com/r/CryptoCurrency/new/.json?limit=100"
             data = self._reddit_json(url)
+            if data is None:
+                data = self._reddit_rss("https://www.reddit.com/r/CryptoCurrency/.rss")
             if data is not None:
                 for post in data.get("data", {}).get("children", []):
                     post_data = post.get("data", {})
@@ -168,9 +177,32 @@ class EarningDiscoverer:
         try:
             resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
             if resp.status_code != 200 or not resp.text.strip():
+                print(f"  Reddit JSON unavailable ({resp.status_code}); trying RSS")
                 return None
             return resp.json()
-        except Exception:
+        except Exception as exc:
+            print(f"  Reddit JSON error ({exc}); trying RSS")
+            return None
+
+    @staticmethod
+    def _reddit_rss(url: str):
+        """Return Reddit RSS items in the JSON-shaped structure used above."""
+        try:
+            resp = requests.get(url, headers={"User-Agent": "MrBot1000-discovery/2.1"}, timeout=10)
+            if resp.status_code != 200 or not resp.text.strip():
+                print(f"  Reddit RSS unavailable ({resp.status_code})")
+                return None
+            root = ET.fromstring(resp.text)
+            children = []
+            for entry in root.findall("{http://www.w3.org/2005/Atom}entry"):
+                title = entry.findtext("{http://www.w3.org/2005/Atom}title", "")
+                link = entry.find("{http://www.w3.org/2005/Atom}link")
+                link_url = link.get("href", "") if link is not None else ""
+                entry_id = entry.findtext("{http://www.w3.org/2005/Atom}id", link_url)
+                children.append({"data": {"id": entry_id, "title": title, "selftext": "", "url": link_url}})
+            return {"data": {"children": children}}
+        except Exception as exc:
+            print(f"  Reddit RSS error ({exc})")
             return None
 
     def _discover_twitter_crypto(self) -> List[EarningOpportunity]:
@@ -198,51 +230,46 @@ class EarningDiscoverer:
         """Discover GitHub bug bounties and feature requests."""
         opps = []
         try:
-            # Check GitHub for bounty labels
-            repos = [
-                ("Mastodon", "Mastodon"),
-                ("MatrixOrg", "matrix-synapse"),
-            ]
+            # Search broadly because bounty labels vary by repository and old
+            # hardcoded repositories can disappear or rename their labels.
+            url = "https://api.github.com/search/issues"
+            resp = requests.get(
+                url,
+                params={"q": "(bounty OR reward OR paid) is:issue is:open", "per_page": 30},
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "MrBot1000-discovery/2.1"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                print(f"  GitHub search unavailable ({resp.status_code})")
+                return []
+            issues = resp.json().get("items", [])
 
-            for org, repo in repos:
-                url = f"https://api.github.com/repos/{org}/{repo}/issues"
-                resp = requests.get(url, params={"labels": "bounty", "state": "open", "per_page": 10})
-                issues = resp.json()
+            if not isinstance(issues, list):
+                return []
 
-                if not isinstance(issues, list):
+            for issue in issues:
+                if not isinstance(issue, dict) or "pull_request" in issue:
                     continue
 
-                for issue in issues:
-                    if not isinstance(issue, dict):
-                        continue
+                labels = issue.get("labels", [])
+                label_names = [str(l if isinstance(l, str) else l.get("name", "")) for l in labels] if isinstance(labels, list) else []
+                searchable = f"{issue.get('title', '')} {issue.get('body', '')} {' '.join(label_names)}".lower()
+                if not any(term in searchable for term in ("bounty", "reward", "paid")):
+                    continue
 
-                    labels = issue.get("labels", [])
-                    label_names = []
-                    if isinstance(labels, list):
-                        label_names = [l if isinstance(l, str) else l.get("name", "") for l in labels]
+                title = issue.get("title", "")
+                body = (issue.get("body", "") or "")[:300]
 
-                    if "bounty" not in label_names:
-                        continue
+                match = re.search(r'\$(\d+(?:\.\d+)?)', body + title)
+                bounty = float(match.group(1)) if match else 10.0
 
-                    title = issue.get("title", "")
-                    body = issue.get("body", "")[:300]
-
-                    # Estimate bounty value from issue
-                    match = re.search(r'\$(\d+(?:\.\d+)?)', body + title)
-                    bounty = float(match.group(1)) if match else 10.0
-
-                    opp = EarningOpportunity(
-                        id=f"github_{org}_{issue.get('number', 'unknown')}",
-                        title=title,
-                        description=body,
-                        platform=f"GitHub/{org}/{repo}",
-                        url=issue.get("html_url", ""),
-                        estimated_usd_value=bounty,
-                        min_amount=bounty,
-                        payment_type="usd",
-                        required_action="submit_pr",
-                    )
-                    opps.append(opp)
+                repo = issue.get("repository_url", "").rstrip("/").split("/")[-2:]
+                repo_name = "/".join(repo) if len(repo) == 2 else "search"
+                opps.append(EarningOpportunity(
+                    id=f"github_{issue.get('id', issue.get('number', 'unknown'))}",
+                    title=title, description=body, platform=f"GitHub/{repo_name}",
+                    url=issue.get("html_url", ""), estimated_usd_value=bounty,
+                    min_amount=bounty, payment_type="usd", required_action="submit_pr"))
 
         except Exception as e:
             print(f"  GitHub error: {e}")

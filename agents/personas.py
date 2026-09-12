@@ -55,7 +55,10 @@ class Persona:
         except Exception:
             return ""
 
-    def build_system_prompt(self, goal: str = "", query: str = "", compact: bool = False) -> str:
+    def build_system_prompt(
+        self, goal: str = "", query: str = "", compact: bool = False,
+        tiny: bool = False, tier: str = "",
+    ) -> str:
         """Return a minimal system prompt focused on tool usage.
         
         v2.1: The model was ignoring tool instructions when they were buried
@@ -72,7 +75,19 @@ class Persona:
         mem_block = f"\n# MEMORY\n{mem}" if mem else ""
         personality_block = f"\n{personality}" if personality else ""
 
-        if compact:
+        prompt_tier = tier or ("tiny" if tiny else "compact" if compact else "full")
+
+        if prompt_tier == "tiny":
+            return (
+                f"# IDENTITY\nYou are {self.name}. Speak only as {self.name} in first person.\n"
+                f"ACTIVE GOAL: {goal}\n"
+                "Answer only the current phase in 1-3 short sentences. Do not mention "
+                "models, Gemma, training, tools, or internet access. Do not invent facts. "
+                "If evidence is unavailable, say BLOCKED or UNKNOWN. Never create an account, "
+                "submit, pay, enter credentials, or claim approval without explicit human approval.\n"
+            )
+
+        if prompt_tier == "compact":
             return (
                 f"# IDENTITY\nYou are {self.name}, {self.tagline}\n"
                 f"{self.identity}\nPersonality: {self.personality_type}\n"

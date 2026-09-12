@@ -135,12 +135,15 @@ class CapabilityRegistry:
 
             # ── Research / web ──
             CapabilitySpec("RESEARCH", CapabilityCategory.RESEARCH, automatable=True,
-                           human_capable=True, tool="web_search", maturity="stable"),
+                           human_capable=True, tool="web_search", skill_file="skills/social-discovery.md",
+                           maturity="stable"),
             CapabilitySpec("WEB_RESEARCH", CapabilityCategory.WEB_RESEARCH, automatable=True,
-                           human_capable=True, tool="web_search", maturity="stable",
+                           human_capable=True, tool="web_search", skill_file="skills/social-discovery.md",
+                           maturity="stable",
                            note="Search the web / extract pages."),
             CapabilitySpec("ANALYSIS", CapabilityCategory.ANALYSIS, automatable=True,
-                           human_capable=True, tool="pandas/llm", maturity="stable",
+                           human_capable=True, tool="pandas/llm", skill_file="skills/opportunity-evaluation.md",
+                           maturity="stable",
                            note="Analyze data / draw conclusions."),
             CapabilitySpec("DATA", CapabilityCategory.DATA, automatable=True,
                            human_capable=True, tool="pandas", maturity="stable",
@@ -157,7 +160,8 @@ class CapabilityRegistry:
                            human_capable=True, tool="terminal/pytest", maturity="stable",
                            note="Run automated tests."),
             CapabilitySpec("QA", CapabilityCategory.QA, automatable=True,
-                           human_capable=True, tool="llm+tests", maturity="beta",
+                           human_capable=True, tool="llm+tests", skill_file="skills/document-qa.md",
+                           maturity="beta",
                            note="Quality checks / acceptance verification."),
 
             # ── Documents / content ──
@@ -170,12 +174,14 @@ class CapabilityRegistry:
 
             # ── Automation ──
             CapabilitySpec("AUTOMATION", CapabilityCategory.AUTOMATION, automatable=True,
-                           human_capable=True, tool="terminal/script", maturity="stable",
+                           human_capable=True, tool="terminal/script", skill_file="skills/opportunity-execution.md",
+                           maturity="stable",
                            note="Scripted/repetitive actions."),
 
             # ── Administrative (partially automatable) ──
             CapabilitySpec("ADMINISTRATIVE", CapabilityCategory.ADMINISTRATIVE, automatable=True,
-                           human_capable=True, tool="terminal/llm", maturity="beta",
+                           human_capable=True, tool="terminal/llm", skill_file="skills/opportunity-lifecycle.md",
+                           maturity="beta",
                            note="Scheduling/data-entry; some steps need a human."),
 
             # ── Crypto (partially automatable; fund-moving is approval-gated) ──

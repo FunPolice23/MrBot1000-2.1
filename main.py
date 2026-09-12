@@ -150,6 +150,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -2229,19 +2230,21 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 f"{provider}: {len(models)} models. Showing id — price (per 1M tokens).")
         self.log_signal.emit(f"[Models] {provider}: loaded {len(models)} models")
 
-    def _refresh_model_info(self):
+    def _refresh_model_info(self, live=False):
         """v2.0.34ab (F6): populate the Model Info panel for the selected main + chat models.
 
         Uses `ollama show <model>` (live=True) so params/context are populated from
-        the real model metadata when Ollama is running (H65 fix). Falls back to
-        static hints if Ollama is offline. Never raises.
+        the real model metadata when Ollama is running (H65 fix). The automatic
+        Settings-tab refresh passes live=False so opening Settings never spawns
+        an Ollama CLI probe; the explicit Refresh button still uses live metadata.
+        Falls back to static hints if Ollama is offline. Never raises.
         """
         try:
             from provider_models import _price_for, get_arch_info
             def fmt(label, model):
                 if not model:
                     return f"{label}: <i>(none selected)</i>"
-                ai = get_arch_info(model, live=True)
+                ai = get_arch_info(model, live=live)
                 inn, out = _price_for(model)
                 price = ("FREE" if (inn is None and out is None)
                          else f"${inn or 0:.2f} in / ${out or 0:.2f} out per 1M")

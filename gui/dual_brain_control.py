@@ -198,6 +198,89 @@ class ProviderStatusChecker:
         return result
 
     @staticmethod
+    def check_endpoint(url, timeout=10):
+        """Check an OpenAI-compatible provider endpoint and return its models."""
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+            return True, ProviderStatusChecker.extract_model_ids(data)
+        except Exception:
+            return False, []
+
+    @staticmethod
+    def _provider_root(endpoint):
+        return str(endpoint or "").rstrip("/").removesuffix("/v1")
+
+    @classmethod
+    def check_loaded_provider(cls, provider, endpoint, timeout=5):
+        """Return (server_available, loaded_models) for controllable providers."""
+        root = cls._provider_root(endpoint)
+        try:
+            if provider == "lmstudio":
+                url = f"{root}/api/v1/models"
+                with urllib.request.urlopen(urllib.request.Request(url), timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode())
+                loaded = []
+                for model in data.get("models", []):
+                    key = model.get("key", "")
+                    if key and model.get("loaded_instances"):
+                        loaded.append(key)
+                return True, loaded
+            if provider == "ollama":
+                url = f"{root}/api/ps"
+                with urllib.request.urlopen(urllib.request.Request(url), timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode())
+                return True, [m.get("name") or m.get("model", "") for m in data.get("models", [])]
+        except Exception:
+            return False, []
+        return False, []
+
+    @classmethod
+    def load_provider_model(cls, provider, endpoint, model, timeout=30):
+        root = cls._provider_root(endpoint)
+        if provider == "lmstudio":
+            url, body = f"{root}/api/v1/models/load", {"model": model}
+        elif provider == "ollama":
+            url, body = f"{root}/api/generate", {"model": model, "stream": False}
+        else:
+            return False, f"{provider} does not expose a model-load API"
+        return cls._post_json(url, body, timeout)
+
+    @classmethod
+    def unload_provider_model(cls, provider, endpoint, model="", timeout=30):
+        root = cls._provider_root(endpoint)
+        if provider == "lmstudio":
+            loaded_ok, loaded = cls.check_loaded_provider(provider, endpoint, timeout=5)
+            if not loaded_ok:
+                return False, "LM Studio loaded-model list is unavailable"
+            for instance_id in loaded:
+                if not model or instance_id == model:
+                    ok, message = cls._post_json(
+                        f"{root}/api/v1/models/unload", {"instance_id": instance_id}, timeout)
+                    if not ok:
+                        return False, message
+            return True, "unloaded"
+        if provider == "ollama":
+            if not model:
+                return False, "Ollama requires a model name to unload"
+            return cls._post_json(
+                f"{root}/api/generate", {"model": model, "keep_alive": 0}, timeout)
+        return False, f"{provider} does not expose a model-unload API"
+
+    @staticmethod
+    def _post_json(url, body, timeout):
+        try:
+            payload = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=payload, method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return True, resp.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            return False, str(exc)
+
+    @staticmethod
     def clear_cache(port=None):
         """Invalidate one port or all cached provider probes."""
         with ProviderStatusChecker._cache_lock:
@@ -209,6 +292,8 @@ class ProviderStatusChecker:
     @staticmethod
     def extract_model_ids(data):
         """Normalize llama.cpp model-list variants to displayable IDs."""
+        if isinstance(data.get("result"), str) and data["result"]:
+            return [data["result"]]
         raw_models = data.get("data") or data.get("models") or []
         result = []
         for item in raw_models:
@@ -432,6 +517,16 @@ class DualBrainControl(QWidget):
         provider = self.provider_manager.get_provider(provider_name)
         if provider:
             provider.selected_model = model_name
+            values = {
+                "BIG_BRAIN_MODEL": model_name,
+                "SMALL_BRAIN_MODEL": model_name,
+            }
+            os.environ.update(values)
+            try:
+                from main import set_env_values
+                set_env_values(values)
+            except Exception:
+                pass
             self._log(f"Selected model {model_name} for {provider_name}")
     
     def _on_context_changed(self, provider_name, context_size):
@@ -558,13 +653,32 @@ class DualBrainControl(QWidget):
         try:
             small = self.runtime.config(BrainRole.SMALL)
             big = self.runtime.config(BrainRole.BIG)
+            active_local = self.provider_manager.resolve_enabled_provider(local=True)
+            local_settings = getattr(self, "local_settings_group", None)
+            if local_settings is not None:
+                is_llamacpp = active_local == "llamacpp"
+                local_settings.setVisible(is_llamacpp and any(
+                    cfg.enabled and cfg.provider == "llamacpp" for cfg in (small, big)))
+                local_settings.setTitle(
+                    "⚙️ llama.cpp Settings (per brain)" if is_llamacpp
+                    else f"⚙️ {active_local or 'No local provider'} Settings")
             detected_gpus = {
                 gpu.index: gpu.name for gpu in self.provider_manager.get_gpus()
             }
             if small.device in detected_gpus:
                 small.gpu_label = detected_gpus[small.device]
+            elif small.provider == "llamacpp" and small.gpu_layers is None:
+                # A stale dual-GPU default must not make a single-GPU machine
+                # try CUDA1. Auto-fall back to CPU/system RAM until the user
+                # explicitly selects a GPU-layer count.
+                small.gpu_layers = 0
             if big.device in detected_gpus:
                 big.gpu_label = detected_gpus[big.device]
+            if small.gpu_layers == 0:
+                small.gpu_label = "CPU / System RAM"
+            elif active_local and active_local != "llamacpp":
+                small.gpu_label = "External provider"
+                big.gpu_label = big.gpu_label or "External provider"
             sb_spin = getattr(self, "sb_ctx_spin", None)
             bb_spin = getattr(self, "bb_ctx_spin", None)
             if sb_spin is not None:
@@ -596,29 +710,46 @@ class DualBrainControl(QWidget):
             except Exception:
                 pass
             # Refresh the port labels to match the canonical contract.
+            provider_names = {
+                "llamacpp": "llama.cpp",
+                "lmstudio": "LM Studio",
+                "ollama": "Ollama",
+                "vllm": "vLLM",
+            }
+            small_provider_name = provider_names.get(small.provider, small.provider)
+            big_provider_name = provider_names.get(big.provider, big.provider)
             sb_label = getattr(self, "sb_settings_label", None)
             bb_label = getattr(self, "bb_settings_label", None)
             if sb_label is not None:
                 sb_label.setText(
-                    f"🤖 Small Brain · {small.provider.upper()} · "
+                    f"🤖 Small Brain · {small_provider_name} · "
                     f"{small.gpu_label} · port {small.port}")
             if bb_label is not None:
                 bb_label.setText(
-                    f"🧠 Big Brain · {big.provider.upper()} · "
+                    f"🧠 Big Brain · {big_provider_name} · "
                     f"{big.gpu_label} · port {big.port}")
             # Route + GPU-contention guidance (v2.1): state which provider serves
             # which role and flag broken isolation so the operator can disable a
             # provider or split main/chat across GPUs.
             try:
-                route = (
-                    f"Route: Marcus → {big.provider.upper()} / "
-                    f"{big.model or 'auto model'} / {big.gpu_label} · "
-                    f"Alex → {small.provider.upper()} / "
-                    f"{small.model or 'auto model'} / {small.gpu_label}"
-                )
+                active_cloud = os.getenv("ACTIVE_CLOUD_PROVIDER", "").strip()
+                if active_local:
+                    route_provider_name = provider_names.get(active_local, active_local)
+                    route = (
+                        f"Route: Marcus → {route_provider_name} / "
+                        f"{big.model or 'auto model'} / {big.gpu_label} · "
+                        f"Alex → {route_provider_name} / "
+                        f"{small.model or 'auto model'} / {small.gpu_label}"
+                    )
+                elif active_cloud and active_cloud.lower() != "auto":
+                    route = f"Route: {active_cloud} cloud provider · no local provider enabled"
+                else:
+                    route = "Route: no local or cloud provider enabled"
                 if hasattr(self.runtime, "validate_isolation"):
                     iso = self.runtime.validate_isolation()
-                    if iso.get("isolated"):
+                    if not active_local:
+                        route += " · local hardware idle"
+                    elif iso.get("isolated"):
                         route += " · GPUs isolated ✓"
                     else:
                         route += " · ⚠ GPU isolation broken — give each brain its own GPU or disable one provider"
@@ -859,7 +990,8 @@ class DualBrainControl(QWidget):
         layout.addWidget(provider_group)
         
         # ── llama.cpp Settings Panel ─────────────────────────────────────
-        settings_group = QGroupBox("⚙️ llama.cpp Settings (per brain)")
+        settings_group = QGroupBox("⚙️ Local Provider Settings (per brain)")
+        self.local_settings_group = settings_group
         settings_group.setStyleSheet("""
             QGroupBox {
                 color: #9c27b0;
@@ -878,7 +1010,7 @@ class DualBrainControl(QWidget):
         settings_layout = QGridLayout(settings_group)
 
         # ── Small Brain Settings ──
-        self.sb_settings_label = QLabel("🤖 Small Brain (1660 Super, port 1235)")
+        self.sb_settings_label = QLabel("🤖 Small Brain (CPU / System RAM, port 1235)")
         self.sb_settings_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
         self.sb_settings_label.setStyleSheet("color: #03dac6;")
         settings_layout.addWidget(self.sb_settings_label, 0, 0, 1, 4)
@@ -1265,8 +1397,8 @@ class DualBrainControl(QWidget):
         
         # ── Configuration Info ──────────────────────────────────────────
         config_label = QLabel(
-            "Config: Small Brain = llama-server :1235 (1660S+RAM) | "
-            "Big Brain = llama-server :1234 (5060Ti+RAM)"
+            "Config: Small Brain = active provider / CPU or available GPU | "
+            "Big Brain = active provider / available primary GPU"
         )
         config_label.setAlignment(Qt.AlignCenter)
         config_label.setStyleSheet("color: #666; font-size: 10px; padding: 5px;")
@@ -1772,7 +1904,7 @@ class DualBrainControl(QWidget):
             return str(data)
         return combo.currentText()
 
-    def _repopulate_model_combo(self, small: bool, loaded_path: str = ""):
+    def _repopulate_model_combo(self, small: bool, loaded_path: str = "", models=None):
         """Fill a brain's dropdown with ALL local .gguf (display name, full path
         in item data).
 
@@ -1784,10 +1916,16 @@ class DualBrainControl(QWidget):
         combo = self._model_combo(small)
         prev = self._current_model_path(small)  # what the user has selected (may be "")
         prev_norm = self._norm_path(prev)
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+        runtime = self.runtime or DualBrainRuntime.from_env()
+        cfg = runtime.config(BrainRole.SMALL if small else BrainRole.BIG)
+        external = cfg.provider != "llamacpp"
         combo.blockSignals(True)
         try:
             combo.clear()
-            paths = self._discover_gguf_models()
+            paths = list(models or []) if external else self._discover_gguf_models()
+            if external and cfg.model and cfg.model not in paths:
+                paths.insert(0, cfg.model)
             if loaded_path and self._norm_path(loaded_path) not in {self._norm_path(p) for p in paths}:
                 paths.insert(0, loaded_path)  # running model not under scanned dirs
             # Decide the target selection:
@@ -1801,7 +1939,7 @@ class DualBrainControl(QWidget):
                 target_norm = self._norm_path(loaded_path)
             select = 0
             for i, p in enumerate(paths):
-                combo.addItem(os.path.basename(p), p)
+                combo.addItem(p if external else os.path.basename(p), p)
                 if self._norm_path(p) == target_norm:
                     select = i
             if paths:
@@ -2323,7 +2461,10 @@ class BrainLaunchWorker(QThread):
     
     def _show_vram_warning(self, small: bool, model_path: str, need: float, free: float, result: dict):
         """Show VRAM warning dialog on GUI thread."""
-        role = "Small Brain (1660 Super, 6 GB)" if small else "Big Brain (5060 Ti, ~14.5 GB free)"
+        if small:
+            role = "Small Brain target GPU"
+        else:
+            role = "Big Brain target GPU"
         mb = QMessageBox(self)
         mb.setWindowTitle("Model larger than GPU VRAM")
         mb.setIcon(QMessageBox.Icon.Warning)
@@ -2353,6 +2494,18 @@ class BrainLaunchWorker(QThread):
 
     def _begin_stop_brain(self, small: bool):
         label = "Small Brain" if small else "Big Brain"
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+        runtime = self.runtime or DualBrainRuntime.from_env()
+        cfg = runtime.config(BrainRole.SMALL if small else BrainRole.BIG)
+        if cfg.provider != "llamacpp":
+            model = cfg.model
+            self._log(f"Stopping {label} model {model or '(selected provider model)'}...")
+            threading.Thread(
+                target=self._unload_external_model,
+                args=(small, cfg.provider, cfg.endpoint, model, label),
+                daemon=True,
+            ).start()
+            return
         self._log(f"Stopping {label}...")
         worker = ProviderStopWorker(self, small)
         setattr(self, "_small_stop_worker" if small else "_big_stop_worker", worker)
@@ -2374,9 +2527,17 @@ class BrainLaunchWorker(QThread):
     def _probe_before_start(self, small: bool):
         label = "Small Brain" if small else "Big Brain"
         try:
-            port = self._brain_port(small)
+            from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+            runtime = DualBrainRuntime.from_env()
+            cfg = runtime.config(BrainRole.SMALL if small else BrainRole.BIG)
             self._log(f"Checking {label}...")
-            worker = ProviderProbeWorker(self.provider_checker, port)
+            worker = ProviderProbeWorker(
+                self.provider_checker,
+                self._brain_port(small) if cfg.provider == "llamacpp" else cfg.models_path,
+                endpoint=cfg.provider != "llamacpp",
+                provider=cfg.provider,
+                model=cfg.model,
+            )
             setattr(self, "_small_probe_worker" if small else "_big_probe_worker", worker)
             worker.probe_finished.connect(
                 lambda running, models: self._on_provider_probe_done(small, running, models)
@@ -2390,7 +2551,7 @@ class BrainLaunchWorker(QThread):
     def _on_provider_probe_done(self, small: bool, running: bool, models):
         try:
             if running:
-                self._log(f"{'Small' if small else 'Big'} Brain already running")
+                self._log(f"{'Small' if small else 'Big'} Brain provider is reachable")
                 self._refresh_provider_status()
                 return
             if small:
@@ -2402,20 +2563,35 @@ class BrainLaunchWorker(QThread):
             self._set_loading(small, False, "")
 
     def _start_small_brain_after_probe(self):
-        """Start Small Brain (llama-server on 1660 Super, port 1235)."""
+        """Start Small Brain on its configured local hardware/provider."""
         try:
             from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
-            rt = self.runtime or DualBrainRuntime.from_env()
+            rt = DualBrainRuntime.from_env()
             cfg = rt.config(BrainRole.SMALL)
             if not cfg.enabled:
                 self._log("ℹ️ Small Brain is disabled in Settings; no local server started.")
                 self._set_loading(True, False, "")
                 return
-            if cfg.provider != "llamacpp":
-                self._log(f"ℹ️ Small Brain uses {cfg.provider}; configure that provider instead of starting llama-server.")
+            active_local = self.provider_manager.resolve_enabled_provider(local=True)
+            if active_local != cfg.provider:
+                self._log(f"ℹ️ Small Brain has no active {cfg.provider} route; select or enable a provider in Settings.")
                 self._set_loading(True, False, "")
                 return
-            self._log("Starting Small Brain (llama-server on 1660 Super)...")
+            if cfg.provider != "llamacpp":
+                self._start_external_brain(True, cfg)
+                return
+            detected_gpu_indexes = {gpu.index for gpu in self.provider_manager.get_gpus()}
+            if cfg.gpu_layers is None and cfg.device not in detected_gpu_indexes:
+                # The persisted dual-GPU default cannot be used on a
+                # single-GPU machine. Apply the fallback at the final command
+                # construction point so the GUI cannot overwrite it with Auto.
+                cfg.gpu_layers = 0
+                if getattr(self, "sb_gpu_layers_spin", None) is not None:
+                    self.sb_gpu_layers_spin.setValue(0)
+                cfg.gpu_label = "CPU / System RAM"
+                self._log("Small Brain: secondary GPU unavailable; using CPU/system RAM.")
+            else:
+                self._log("Starting Small Brain (llama-server)...")
 
             model = self._resolve_model_path(True, self._current_model_path(True))
             if not model:
@@ -2427,7 +2603,7 @@ class BrainLaunchWorker(QThread):
             self._set_loading(True, True, model)
             # VRAM-affinity guard (warn-but-allow) before launching.
             if not self._check_vram_affinity(True, model):
-                self._log("⛔ Small Brain start cancelled — model exceeds the 1660 Super's VRAM (would spill to RAM).")
+                self._log("⛔ Small Brain start cancelled — model exceeds the target GPU VRAM (would spill to RAM).")
                 self._set_loading(True, False, "")
                 return
             
@@ -2440,6 +2616,8 @@ class BrainLaunchWorker(QThread):
             self._persist_settings()
             gpu_l = self.sb_gpu_layers_spin.value()
             cfg.gpu_layers = None if gpu_l < 0 else int(gpu_l)
+            if not detected_gpu_indexes or cfg.device not in detected_gpu_indexes:
+                cfg.gpu_layers = 0
             cfg.model = model
             cmd = cfg.build_llama_command(model_path=model)
             
@@ -2477,15 +2655,19 @@ class BrainLaunchWorker(QThread):
         """Start Big Brain (llama-server on 5060 Ti, port 1234)."""
         try:
             from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
-            rt = self.runtime or DualBrainRuntime.from_env()
+            rt = DualBrainRuntime.from_env()
             cfg = rt.config(BrainRole.BIG)
             if not cfg.enabled:
                 self._log("ℹ️ Big Brain is disabled in Settings; no local server started.")
                 self._set_loading(False, False, "")
                 return
-            if cfg.provider != "llamacpp":
-                self._log(f"ℹ️ Big Brain uses {cfg.provider}; configure that provider instead of starting llama-server.")
+            active_local = self.provider_manager.resolve_enabled_provider(local=True)
+            if active_local != cfg.provider:
+                self._log(f"ℹ️ Big Brain has no active {cfg.provider} route; select or enable a provider in Settings.")
                 self._set_loading(False, False, "")
+                return
+            if cfg.provider != "llamacpp":
+                self._start_external_brain(False, cfg)
                 return
             self._log("Starting Big Brain (llama-server on 5060 Ti)...")
 
@@ -2527,6 +2709,22 @@ class BrainLaunchWorker(QThread):
             self._record_start_failure("big launch setup", e)
             self._set_loading(False, False, "")
 
+    def _start_external_brain(self, small: bool, cfg):
+        """Load the configured role model for a shared external provider."""
+        label = "Small Brain" if small else "Big Brain"
+        model = (cfg.model or "").strip()
+        if not model:
+            self._log(f"❌ {label}: no {cfg.provider} model is configured.")
+            self._set_loading(small, False, "")
+            return
+        self._set_loading(small, True, model)
+        self._log(f"Loading {label} model {model} through {cfg.provider}...")
+        threading.Thread(
+            target=self._load_external_model,
+            args=(small, cfg.provider, cfg.endpoint, model, label),
+            daemon=True,
+        ).start()
+
     def _on_big_brain_launched(self, success: bool, message: str, proc):
         """Handle big brain launch completion."""
         try:
@@ -2561,6 +2759,25 @@ class BrainLaunchWorker(QThread):
         self._log("Stopping all providers...")
         self._on_stop_small_brain()
         self._on_stop_big_brain()
+
+    def _unload_external_model(self, small, provider, endpoint, model, label):
+        ok, message = self.provider_checker.unload_provider_model(
+            provider, endpoint, model)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self._finish_external_lifecycle(
+            small, ok, f"{label} {message}"))
+
+    def _load_external_model(self, small, provider, endpoint, model, label):
+        ok, message = self.provider_checker.load_provider_model(
+            provider, endpoint, model)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, lambda: self._finish_external_lifecycle(
+            small, ok, f"{label} {message}"))
+
+    def _finish_external_lifecycle(self, small, ok, message):
+        prefix = "✅" if ok else "❌"
+        self._log(f"{prefix} {message}")
+        self._refresh_provider_status()
 
     # ═══════════════════════════════════════════════════════════════════
     # MODEL SWITCH HANDLERS
@@ -2600,6 +2817,12 @@ class BrainLaunchWorker(QThread):
         # Guard against placeholder/error items (v2.1).
         if not model_name or model_name.startswith(self._PLACEHOLDER_MARKERS):
             return
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+        runtime = DualBrainRuntime.from_env()
+        cfg = runtime.config(BrainRole.SMALL)
+        if cfg.provider != "llamacpp":
+            self._select_external_model(True, model_name, runtime, cfg)
+            return
         path = self._current_model_path(True)
         if not path:
             return
@@ -2632,6 +2855,12 @@ class BrainLaunchWorker(QThread):
         model when it is running, else just record the selection for next Start."""
         if not model_name or model_name.startswith(self._PLACEHOLDER_MARKERS):
             return
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+        runtime = DualBrainRuntime.from_env()
+        cfg = runtime.config(BrainRole.BIG)
+        if cfg.provider != "llamacpp":
+            self._select_external_model(False, model_name, runtime, cfg)
+            return
         path = self._current_model_path(False)
         if not path:
             return
@@ -2655,6 +2884,36 @@ class BrainLaunchWorker(QThread):
         else:
             self._last_big_model = path
 
+    def _select_external_model(self, small: bool, model_name: str, runtime, cfg):
+        """Persist an external model ID without treating it as a GGUF path."""
+        role_key = "SMALL_BRAIN_MODEL" if small else "BIG_BRAIN_MODEL"
+        cfg.model = model_name
+        runtime.set_model(cfg.role, model_name)
+        os.environ[role_key] = model_name
+        try:
+            from main import set_env_values
+            set_env_values({role_key: model_name})
+        except Exception:
+            pass
+        try:
+            from agents.base_worker import _active_worker
+            if _active_worker is not None:
+                _active_worker.invalidate_provider_registry()
+        except Exception:
+            pass
+        label = self.sb_model_label if small else self.bb_model_label
+        label.setText(f"Model: {model_name}")
+        self._log(
+            f"✅ {'Small' if small else 'Big'} Brain model selected: "
+            f"{model_name} ({cfg.provider}); provider will serve it on the next request."
+        )
+        threading.Thread(
+            target=self._load_external_model,
+            args=(small, cfg.provider, cfg.endpoint, model_name,
+                  "Small Brain" if small else "Big Brain"),
+            daemon=True,
+        ).start()
+
     def _on_start_all(self):
         """Start both brains concurrently through their non-blocking probes."""
         self._log("Starting all providers...")
@@ -2677,22 +2936,47 @@ class BrainLaunchWorker(QThread):
     def _probe_providers(self):
         if self._closing:
             return
-        sb_port = self._brain_port(True)
-        bb_port = self._brain_port(False)
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+        # Settings can change provider/model values while this widget remains
+        # open. Re-resolve from the current environment so probes never use a
+        # startup-only runtime snapshot.
+        runtime = DualBrainRuntime.from_env()
+        self.runtime = runtime
+
+        def _probe(small):
+            role = BrainRole.SMALL if small else BrainRole.BIG
+            cfg = runtime.config(role)
+            if not cfg.enabled:
+                return False, [], cfg.provider != "llamacpp", cfg.model
+            if cfg.provider == "llamacpp":
+                running, models = self.provider_checker.check_llama_server(self._brain_port(small))
+                return running, models, False, cfg.model
+            server_running, models = self.provider_checker.check_endpoint(cfg.models_path)
+            if cfg.provider in ("lmstudio", "ollama"):
+                loaded_server, loaded_models = self.provider_checker.check_loaded_provider(
+                    cfg.provider, cfg.endpoint)
+                selected = (cfg.model or "").strip().lower()
+                loaded = {str(item).strip().lower() for item in loaded_models}
+                role_loaded = bool(selected and selected in loaded)
+                return server_running and loaded_server and role_loaded, models, True, cfg.model
+            return server_running, models, True, cfg.model
+
         try:
-            sb_running, sb_models = self.provider_checker.check_llama_server(sb_port)
+            sb_running, sb_models, sb_external, sb_selected = _probe(True)
         except Exception:
-            sb_running, sb_models = False, []
+            sb_running, sb_models, sb_external, sb_selected = False, [], False, ""
         try:
-            bb_running, bb_models = self.provider_checker.check_llama_server(bb_port)
+            bb_running, bb_models, bb_external, bb_selected = _probe(False)
         except Exception:
-            bb_running, bb_models = False, []
+            bb_running, bb_models, bb_external, bb_selected = False, [], False, ""
         if self._closing:
             return
         try:
             self.provider_probed.emit({
                 "sb_running": sb_running, "sb_models": sb_models,
                 "bb_running": bb_running, "bb_models": bb_models,
+                "sb_external": sb_external, "bb_external": bb_external,
+                "sb_selected": sb_selected, "bb_selected": bb_selected,
             })
         except RuntimeError:
             pass
@@ -2700,39 +2984,43 @@ class BrainLaunchWorker(QThread):
     def _apply_provider_status(self, data):
         """Apply probe results on the GUI thread."""
         sb_running = data["sb_running"]; sb_models = data["sb_models"]
+        sb_external = data.get("sb_external", False)
+        sb_selected = data.get("sb_selected", "")
         if sb_running:
             self.sb_status.setText("● Running")
             self.sb_status.setStyleSheet("color: #4caf50; font-weight: bold;")
-            model_name = sb_models[0] if sb_models else ""
+            model_name = sb_selected if sb_selected in sb_models else (sb_models[0] if sb_models else "")
             if model_name:
                 self.sb_model_label.setText(f"Model: {os.path.basename(model_name)}")
-            self._repopulate_model_combo(True, model_name)
-            self.sb_start_btn.setEnabled(False)
-            self.sb_stop_btn.setEnabled(True)
+            self._repopulate_model_combo(True, model_name, sb_models)
+            self.sb_start_btn.setEnabled(not sb_external)
+            self.sb_stop_btn.setEnabled(not sb_external)
         else:
             self.sb_status.setText("● Stopped")
             self.sb_status.setStyleSheet("color: #ff5252; font-weight: bold;")
             self.sb_model_label.setText("Model: —")
             self._repopulate_model_combo(True, "")
-            self.sb_start_btn.setEnabled(True)
+            self.sb_start_btn.setEnabled(not sb_external)
             self.sb_stop_btn.setEnabled(False)
 
         bb_running = data["bb_running"]; bb_models = data["bb_models"]
+        bb_external = data.get("bb_external", False)
+        bb_selected = data.get("bb_selected", "")
         if bb_running:
             self.bb_status.setText("● Running")
             self.bb_status.setStyleSheet("color: #4caf50; font-weight: bold;")
-            model_name = bb_models[0] if bb_models else ""
+            model_name = bb_selected if bb_selected in bb_models else (bb_models[0] if bb_models else "")
             if model_name:
                 self.bb_model_label.setText(f"Model: {os.path.basename(model_name)}")
-            self._repopulate_model_combo(False, model_name)
-            self.bb_start_btn.setEnabled(False)
-            self.bb_stop_btn.setEnabled(True)
+            self._repopulate_model_combo(False, model_name, bb_models)
+            self.bb_start_btn.setEnabled(not bb_external)
+            self.bb_stop_btn.setEnabled(not bb_external)
         else:
             self.bb_status.setText("● Stopped")
             self.bb_status.setStyleSheet("color: #ff5252; font-weight: bold;")
             self.bb_model_label.setText("Model: —")
             self._repopulate_model_combo(False, "")
-            self.bb_start_btn.setEnabled(True)
+            self.bb_start_btn.setEnabled(not bb_external)
             self.bb_stop_btn.setEnabled(False)
 
         # Update Start All button state
@@ -2793,14 +3081,27 @@ class ProviderProbeWorker(QThread):
 
     probe_finished = Signal(bool, object)
 
-    def __init__(self, checker, port: int):
+    def __init__(self, checker, target, endpoint=False, provider="", model=""):
         super().__init__()
         self.checker = checker
-        self.port = port
+        self.target = target
+        self.endpoint = endpoint
+        self.provider = provider
+        self.model = model
 
     def run(self):
         try:
-            running, models = self.checker.check_llama_server(self.port, timeout=2)
+            if self.endpoint:
+                if self.provider in ("lmstudio", "ollama"):
+                    available, models = self.checker.check_loaded_provider(
+                        self.provider, self.target, timeout=2)
+                    wanted = (self.model or "").strip().lower()
+                    loaded = {str(item).strip().lower() for item in models}
+                    running = available and bool(wanted and wanted in loaded)
+                else:
+                    running, models = self.checker.check_endpoint(self.target, timeout=2)
+            else:
+                running, models = self.checker.check_llama_server(self.target, timeout=2)
         except Exception:
             running, models = False, []
         self.probe_finished.emit(running, models)
@@ -2849,10 +3150,11 @@ for _handler_name in (
     "_refresh_small_brain_models", "_refresh_big_brain_models", "_get_llama_model",
     "_on_stop_small_brain", "_begin_stop_brain", "_on_brain_stopped",
     "_on_start_small_brain", "_probe_before_start", "_on_provider_probe_done",
-    "_start_small_brain_after_probe", "_on_small_brain_launched",
+    "_start_small_brain_after_probe", "_start_external_brain", "_on_small_brain_launched",
     "_on_start_big_brain", "_start_big_brain_after_probe", "_on_big_brain_launched",
     "_on_stop_big_brain", "_on_stop_all", "_on_small_brain_model_changed",
     "_on_big_brain_model_changed", "_sync_adapter_model", "_on_start_all",
+    "_unload_external_model", "_load_external_model", "_finish_external_lifecycle",
     "_gpu_free_vram_gb", "_model_vram_need_gb", "_check_vram_affinity",
     "_show_vram_warning", "_refresh_provider_status", "_probe_providers",
     "_apply_provider_status", "_safe_apply_provider_status",

@@ -1301,12 +1301,11 @@ class TabBuildersMixin:
         ollama_vbox.addWidget(ollama_body)
 
         def _ollama_refresh():
-            auto = (self.ollama_hide.isChecked()
-                    and self.ollama_role.currentText() == "Disabled")
-            expanded = (not auto) and ollama_coll.isChecked()
-            ollama_body.setVisible(expanded)
-            ollama_coll.setText("\u25be" if expanded else "\u25b8")
-            ollama_box.setVisible(True)
+            # This legacy control block is retained only for save/load
+            # compatibility. ProviderConfigWidget is the visible Settings
+            # surface; showing this unattached box creates a second top-level
+            # window titled "python".
+            ollama_box.hide()
         self.ollama_hide.toggled.connect(lambda *_: _ollama_refresh())
         self.ollama_role.currentTextChanged.connect(lambda *_: _ollama_refresh())
         ollama_coll.toggled.connect(lambda *_: _ollama_refresh())
@@ -1459,7 +1458,8 @@ class TabBuildersMixin:
         self.model_info_browser.setReadOnly(True)
         infol.addRow(self.model_info_browser)
         self.refresh_model_info_btn = QPushButton("Refresh Model Info")
-        self.refresh_model_info_btn.clicked.connect(self._refresh_model_info)
+        self.refresh_model_info_btn.clicked.connect(
+            lambda: self._refresh_model_info(live=True))
         infol.addRow(self.refresh_model_info_btn)
         info_note = QLabel(
             "Shows the type of each selected model: dense vs Mixture-of-Experts (MoE), "
@@ -1470,7 +1470,7 @@ class TabBuildersMixin:
         infol.addRow(info_note)
         lay.addWidget(infog)
         # PERF: defer model info refresh to avoid blocking tab paint
-        QTimer.singleShot(100, self._refresh_model_info)
+        QTimer.singleShot(100, lambda: self._refresh_model_info(live=False))
 
         # Security Settings with explanations
         secg = QGroupBox("Security")
@@ -2144,6 +2144,27 @@ class TabBuildersMixin:
         """Handle provider configuration changes from the widget."""
         from agents.provider_manager import ProviderManager
         pm = ProviderManager.instance()
+        normalized_provider = ProviderManager.normalize_provider_name(provider_name)
+        is_local_route_change = (
+            provider_name == "local"
+            or normalized_provider in {"llamacpp", "ollama", "lmstudio", "vllm", "koboldcpp"}
+        )
+        if is_local_route_change:
+            # The Settings tab changes the process environment immediately,
+            # so rebuild the shared runtime before Providers & GPU renders its
+            # route labels or handles a launch request.
+            try:
+                from agents.dual_brain_runtime import DualBrainRuntime
+                self.dual_brain_runtime = DualBrainRuntime.from_env()
+                panel = getattr(self, "providers_gpu_tab", None)
+                if panel is not None:
+                    panel.runtime = self.dual_brain_runtime
+                    panel._apply_runtime()
+                    panel._repopulate_model_combo(True)
+                    panel._repopulate_model_combo(False)
+                    panel._refresh_provider_status()
+            except Exception:
+                pass
         
         if action.startswith("model:"):
             model = action[6:]
