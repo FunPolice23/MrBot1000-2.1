@@ -285,4 +285,3 @@ it is not a separate visible tab.
 - Storage: 5GB+ for models and databases
 - Local endpoints and controls come from the enabled provider in Settings; llama.cpp uses the role ports by default, while Ollama, LM Studio, vLLM, and KoboldCpp use their configured endpoints
 - 
-Contact | X - @NoCaresMinddGuy
