@@ -20,9 +20,7 @@ DEST = Path(os.environ.get("GITHUB_UPLOAD_DIR", r"D:\github_upload"))
 INCLUDE = [
     # Docs
     "README.md",
-    "ARCHITECTURE.md",
     "CHANGELOG.md",
-    "IDEA.md",
     "Skill.md",
     "Agent.md",
     # Config

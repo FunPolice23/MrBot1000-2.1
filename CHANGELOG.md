@@ -130,6 +130,9 @@
   imports allow local operation without either SDK installed.
 
 ### Fixed
+- Fixed Providers & GPU tab layout: Small Brain KV Cache and Batch Size controls were
+  displayed under Big Brain's section instead of grouped with Small Brain's controls.
+  Each brain's settings now appear directly under its own section with its assigned GPU.
 - Fixed Coinbase adapter startup when sandbox mode is enabled even though the
   selected ccxt Coinbase client has no sandbox URL. Coinbase now documents a
   live API read configuration, exchange sandbox mode now defaults off unless
