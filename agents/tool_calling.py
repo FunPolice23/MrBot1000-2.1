@@ -39,6 +39,7 @@ _MUTATING_TOOLS = {
     "run_command",
     "file_write",
     "workshop_write",
+    "workshop_mkdir",
     "workshop_proposal",
     "workshop_account",
     "workshop_payment",
@@ -116,6 +117,56 @@ def get_all_tools() -> List[Dict[str, Any]]:
                     },
                     "required": ["url"]
                 }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_list",
+                "description": "List files in an organized workshop folder.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subdir": {"type": "string", "description": "Relative folder, such as proposals or research"}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_write",
+                "description": "Write a text document inside the shared workshop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filepath": {"type": "string", "description": "Relative path inside ai_workshop"},
+                        "content": {"type": "string", "description": "Text content"}
+                    },
+                    "required": ["filepath", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_mkdir",
+                "description": "Create an organized folder inside the shared workshop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "Relative folder path inside ai_workshop"}
+                    },
+                    "required": ["folder"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_storage",
+                "description": "Show workshop quota usage and available disk space.",
+                "parameters": {"type": "object", "properties": {}}
             }
         },
         {
@@ -263,6 +314,10 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             return _tool_workshop_read(arguments)
         elif name == "workshop_write":
             return _tool_workshop_write(arguments)
+        elif name == "workshop_mkdir":
+            return _tool_workshop_mkdir(arguments)
+        elif name == "workshop_storage":
+            return _tool_workshop_storage(arguments)
         elif name == "workshop_search":
             return _tool_workshop_search(arguments)
         elif name == "workshop_proposal":
@@ -433,6 +488,27 @@ def _tool_workshop_write(args: Dict[str, Any]) -> str:
         return f"[Written to {args['filepath']}]" if success else "[Write failed]"
     except Exception as e:
         return f"[Write error: {e}]"
+
+
+def _tool_workshop_mkdir(args: Dict[str, Any]) -> str:
+    """Create a workshop folder."""
+    try:
+        from agents.workshop import get_workshop
+        if get_workshop().create_folder(args["folder"]):
+            return f"[Workshop folder created: {args['folder']}]"
+        return "[Workshop folder creation failed]"
+    except Exception as e:
+        return f"[Workshop folder error: {e}]"
+
+
+def _tool_workshop_storage(args: Dict[str, Any]) -> str:
+    """Report workshop quota and disk usage."""
+    try:
+        from agents.workshop import get_workshop
+        stats = get_workshop().storage_stats()
+        return json.dumps(stats, sort_keys=True)
+    except Exception as e:
+        return f"[Workshop storage error: {e}]"
 
 
 def _tool_workshop_search(args: Dict[str, Any]) -> str:
@@ -742,6 +818,7 @@ def _remove_tool_syntax(text: str) -> str:
     return re.sub(
         r"\b(?:web_search|web_read|web_check|workshop_search|workshop_read|"
         r"workshop_list|workshop_proposal|workshop_account|workshop_payment|"
+        r"workshop_write|workshop_mkdir|workshop_storage|"
         r"file_read|file_write|file_list|run_command|query_db)\s*\([^\n]*\)",
         "", text, flags=re.IGNORECASE,
     ).replace("[web_search ]", "").replace("[web_read ]", "") \
@@ -817,6 +894,9 @@ def _parse_tool_call_from_text(text: str) -> Optional[tuple]:
         (r'workshop_search\s*\(\s*["\'](.+?)["\']\s*\)', 'workshop_search', {'query': 1}),
         (r'workshop_read\s*\(\s*["\'](.+?)["\']\s*\)', 'workshop_read', {'filepath': 1}),
         (r'workshop_list\s*\(\s*\)', 'workshop_list', {}),
+        (r'workshop_write\s*\(\s*["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*\)', 'workshop_write', {'filepath': 1, 'content': 2}),
+        (r'workshop_mkdir\s*\(\s*["\'](.+?)["\']\s*\)', 'workshop_mkdir', {'folder': 1}),
+        (r'workshop_storage\s*\(\s*\)', 'workshop_storage', {}),
         (r'workshop_proposal\s*\(\s*["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*\)', 'workshop_proposal', {'title': 1, 'client': 2, 'description': 3}),
         (r'workshop_account\s*\(\s*["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*\)', 'workshop_account', {'platform': 1, 'username': 2, 'email': 3}),
         (r'workshop_payment\s*\(\s*["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*\)', 'workshop_payment', {'method': 1, 'identifier': 2}),

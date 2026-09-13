@@ -54,7 +54,7 @@ class DiscoveryEngine:
     def sources(self) -> List[OpportunitySource]:
         return list(self._registry)
 
-    def discover_all(self) -> Tuple[List[Opportunity], Dict[str, str], DiscoveryStats]:
+    def discover_all(self, page: int = 1) -> Tuple[List[Opportunity], Dict[str, str], DiscoveryStats]:
         stats = DiscoveryStats(sources=len(self._registry))
         start = time.time()
         results: List[Opportunity] = []
@@ -66,7 +66,12 @@ class DiscoveryEngine:
             try:
                 if self._throttle:
                     self._acquire(src.name)
-                found = src.discover()
+                try:
+                    found = src.discover(page=max(1, int(page)))
+                except TypeError as exc:
+                    if "page" not in str(exc):
+                        raise
+                    found = src.discover()
             except Exception as e:  # noqa: BLE001 - isolate one bad source
                 errors[src.name] = str(e)
                 stats.errors += 1

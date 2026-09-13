@@ -26,6 +26,7 @@ from agents.opportunity_models import (
 from agents.discovery_sources import (
     UpworkSource, FiverrSource, SocialSource, AirdropSource, DefiSource,
     MicrotaskSource, UgigSource, ContentSource, DynamicSource, all_builtin_sources,
+    MoltbookSource,
 )
 from agents.discovery_engine import DiscoveryEngine, DiscoveryStats
 from agents.web_discovery import WebDiscoverySource
@@ -200,9 +201,42 @@ class TestExistingIntegrationsAsSources(unittest.TestCase):
 
     def test_all_builtin_sources_are_registry_compatible(self):
         srcs = all_builtin_sources()
-        self.assertEqual(len(srcs), 9)
+        self.assertEqual(len(srcs), 10)
         for s in srcs:
             self.assertIsInstance(s, BaseOpportunitySource)
+
+    def test_moltbook_source_requires_explicit_api_key(self):
+        os.environ.pop("MOLTBOOK_API_KEY", None)
+        self.assertEqual(MoltbookSource().discover(), [])
+
+    def test_moltbook_source_filters_posts_and_preserves_provenance(self):
+        os.environ["MOLTBOOK_API_KEY"] = "test-key"
+        payload = {
+            "results": [
+                {
+                    "type": "post", "id": "paid-1", "title": "Paid agent task",
+                    "content": "Client offers a bounty for an evaluation harness.",
+                    "submolt": {"name": "agentfinance", "display_name": "Agent Finance"},
+                },
+                {"type": "post", "id": "chat-1", "title": "Interesting AI discussion",
+                 "content": "A general conversation about memory."},
+                {"type": "comment", "id": "comment-1", "title": "Paid task",
+                 "content": "Comments are not standalone opportunities."},
+            ]
+        }
+        response = mock.Mock()
+        response.json.return_value = payload
+        response.raise_for_status.return_value = None
+        with mock.patch("requests.get", return_value=response) as get:
+            opps = MoltbookSource().discover()
+        os.environ.pop("MOLTBOOK_API_KEY", None)
+        self.assertEqual(len(opps), 1)
+        self.assertTrue(opps[0].human_required)
+        self.assertEqual(opps[0].external_url,
+                         "https://www.moltbook.com/post/paid-1")
+        self.assertEqual(opps[0].provenance,
+                         "moltbook::https://www.moltbook.com/post/paid-1")
+        get.assert_called_once()
 
     def test_source_failure_isolated_by_registry(self):
         reg = OpportunityRegistry()

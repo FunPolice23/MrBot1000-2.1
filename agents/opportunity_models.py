@@ -217,17 +217,27 @@ class BaseOpportunitySource(OpportunitySource):
 
     v2.0.36p: `discover()` accepts an optional `query` (and `categories`) so the
     Dynamic Discovery Scheduler can drive a SPECIFIC search term per task instead
-    of every source always re-running its hardcoded default query. Sources that
-    cannot scope by query simply ignore it. Default None keeps the engine/tests
-    (which call `discover()` with no args) unaffected.
+    of every source always re-running its hardcoded default query. `page` lets
+    network-backed sources rotate through paginated results. Sources that cannot
+    scope by query or page simply ignore them. Defaults keep existing callers
+    and tests unaffected.
     """
 
     name = "base"
 
     def discover(self, query: Optional[str] = None,
-                 categories: Optional[List[str]] = None) -> List[Opportunity]:
+                 categories: Optional[List[str]] = None,
+                 page: int = 1) -> List[Opportunity]:
         out: List[Opportunity] = []
-        for o in self._discover(query=query, categories=categories):
+        try:
+            found = self._discover(query=query, categories=categories, page=max(1, int(page)))
+        except TypeError as exc:
+            # Backward compatibility for third-party/test sources that still
+            # implement the pre-pagination two-argument hook.
+            if "page" not in str(exc):
+                raise
+            found = self._discover(query=query, categories=categories)
+        for o in found:
             if not o.provenance:
                 o.provenance = f"{self.name}::{o.external_url or o.title}"
             out.append(o)

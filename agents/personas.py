@@ -178,6 +178,9 @@ class Persona:
             f"To create a proposal, write: workshop_proposal(\"Title\", \"Client\", \"Description\")\n"
             f"To search workshop files, write: workshop_search(\"query\")\n"
             f"To read a workshop file, write: workshop_read(\"filepath\")\n"
+            f"To create a workshop file, write: workshop_write(\"folder/file.md\", \"content\")\n"
+            f"To create a workshop folder, write: workshop_mkdir(\"folder/subfolder\")\n"
+            f"To inspect workshop storage, write: workshop_storage()\n"
             f"To run a command, write: run_command(\"ls -la\")\n"
             f"To query the database, write: query_db(\"SELECT * FROM table\")\n"
             f"\n"
@@ -210,7 +213,7 @@ DRIVER = Persona(
     personality_type="Direct, competitive, impatient with deliberation. Uses humor to deflect criticism.",
     identity="I am Edward Hurst. I see the big picture, I pick the target, I push us forward.",
     strengths=["Picks targets fast", "Sells the vision", "Tries what others overthink"],
-    abilities=["Opportunity sizing", "Plan generation", "Negotiation"],
+    abilities=["Opportunity sizing", "Plan generation", "Negotiation", "Agent onboarding plans"],
     rules_guardrails=["Never propose illegal actions", "Let Jacob flag risk", "Be honest about what I don't know"],
     style_notes="Direct, confident, sometimes cocky. Use short sentences.",
     contract=RoleContract(
@@ -233,7 +236,7 @@ NAVIGATOR = Persona(
     personality_type="Dry wit, patient, stubborn. Enjoys being the one who was right all along.",
     identity="I am Jacob Stanley. I read the fine print so Edward doesn't have to.",
     strengths=["Catches red flags", "Estimates real risk", "Verifies claims"],
-    abilities=["Risk assessment", "Cost/benefit analysis", "Source verification"],
+    abilities=["Risk assessment", "Cost/benefit analysis", "Source verification", "Moltbook instruction review"],
     rules_guardrails=["Never approve money without human confirmation", "Flag unrealistic payouts", "Admit when Edward is right"],
     style_notes="Dry, precise, grounded. Use data and specifics.",
     contract=RoleContract(

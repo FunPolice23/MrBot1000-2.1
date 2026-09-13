@@ -183,6 +183,11 @@ class CapabilityRegistry:
                            human_capable=True, tool="terminal/llm", skill_file="skills/opportunity-lifecycle.md",
                            maturity="beta",
                            note="Scheduling/data-entry; some steps need a human."),
+            CapabilitySpec("MOLTBOOK_AGENT_ONBOARDING", CapabilityCategory.ADMINISTRATIVE,
+                           automatable=True, human_capable=True,
+                           tool="moltbook_agent", skill_file="skills/moltbook-agent.md",
+                           maturity="experimental",
+                           note="Read Moltbook instructions and register an agent; human claims and verifies it."),
 
             # ── Crypto (partially automatable; fund-moving is approval-gated) ──
             CapabilitySpec("CRYPTO", CapabilityCategory.CRYPTO, automatable=True,

@@ -26,7 +26,11 @@ from pathlib import Path
 
 # ── Workspace Paths ───────────────────────────────────────────────────────
 
-WORKSHOP_ROOT = r"D:\ai_workshop"
+WORKSHOP_ROOT = os.getenv("MRBOT_WORKSHOP_ROOT") or os.getenv(
+    "AI_WORKSHOP_ROOT") or r"D:\ai_workshop"
+DEFAULT_WORKSHOP_MAX_BYTES = 10 * 1024 * 1024 * 1024
+WORKSHOP_MAX_BYTES = int(os.getenv(
+    "MRBOT_WORKSHOP_MAX_BYTES", str(DEFAULT_WORKSHOP_MAX_BYTES)))
 
 PATHS = {
     "root": WORKSHOP_ROOT,
@@ -48,27 +52,91 @@ PATHS = {
 class Workshop:
     """Workspace manager for persona agents."""
     
-    def __init__(self, root: str = WORKSHOP_ROOT):
-        self.root = root
+    def __init__(self, root: str = None, max_bytes: int = None):
+        configured_root = root or WORKSHOP_ROOT
+        self.root = str(Path(configured_root).expanduser().resolve())
+        self.max_bytes = max(0, int(WORKSHOP_MAX_BYTES if max_bytes is None else max_bytes))
+        self.paths = {
+            name: os.path.join(self.root, name)
+            for name in PATHS
+            if name != "root"
+        }
+        self.paths["root"] = self.root
         self._ensure_dirs()
-        self._accounts_file = os.path.join(root, "accounts", "accounts.json")
-        self._payments_file = os.path.join(root, "payments.json")
-        self._tasks_file = os.path.join(root, "tasks.json")
+        self._accounts_file = os.path.join(self.paths["accounts"], "accounts.json")
+        self._payments_file = os.path.join(self.root, "payments.json")
+        self._tasks_file = os.path.join(self.root, "tasks.json")
     
     def _ensure_dirs(self):
         """Create all workshop directories if they don't exist."""
-        for path in PATHS.values():
+        for path in self.paths.values():
             os.makedirs(path, exist_ok=True)
+
+    def _safe_path(self, filepath: str) -> Optional[str]:
+        """Resolve a path strictly inside this workshop root."""
+        if not isinstance(filepath, str) or not filepath.strip():
+            return None
+        candidate = Path(filepath).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(self.root) / candidate
+        candidate = candidate.resolve()
+        try:
+            candidate.relative_to(Path(self.root))
+        except ValueError:
+            return None
+        return str(candidate)
+
+    def _usage_bytes(self) -> int:
+        total = 0
+        for path in Path(self.root).rglob("*"):
+            if path.is_file():
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    pass
+        return total
+
+    def storage_stats(self) -> Dict[str, int]:
+        """Return quota and physical free-space information for the workshop."""
+        usage = self._usage_bytes()
+        free = shutil.disk_usage(self.root).free
+        return {
+            "used_bytes": usage,
+            "max_bytes": self.max_bytes,
+            "remaining_bytes": max(0, self.max_bytes - usage),
+            "free_disk_bytes": free,
+        }
+
+    def _can_write(self, path: str, content_size: int) -> bool:
+        current_size = 0
+        if os.path.isfile(path):
+            try:
+                current_size = os.path.getsize(path)
+            except OSError:
+                return False
+        delta = max(0, content_size - current_size)
+        stats = self.storage_stats()
+        return delta <= stats["remaining_bytes"] and delta <= stats["free_disk_bytes"]
+
+    def create_folder(self, folder: str) -> bool:
+        """Create an organized folder inside the workshop root."""
+        path = self._safe_path(folder)
+        if not path:
+            return False
+        try:
+            os.makedirs(path, exist_ok=True)
+            return True
+        except OSError:
+            return False
     
     # ── File Operations ────────────────────────────────────────────────────
     
     def read_file(self, filepath: str) -> str:
         """Read a file from the workshop."""
         try:
-            # Handle relative paths
-            if not os.path.isabs(filepath):
-                filepath = os.path.join(self.root, filepath)
-            
+            filepath = self._safe_path(filepath)
+            if not filepath:
+                return "Error reading file: path is outside workshop"
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
         except Exception as e:
@@ -77,9 +145,11 @@ class Workshop:
     def write_file(self, filepath: str, content: str) -> bool:
         """Write a file to the workshop."""
         try:
-            if not os.path.isabs(filepath):
-                filepath = os.path.join(self.root, filepath)
-            
+            filepath = self._safe_path(filepath)
+            if not filepath or not isinstance(content, str):
+                return False
+            if not self._can_write(filepath, len(content.encode("utf-8"))):
+                return False
             # Create parent dirs if needed
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             
@@ -92,9 +162,12 @@ class Workshop:
     def append_file(self, filepath: str, content: str) -> bool:
         """Append to a file in the workshop."""
         try:
-            if not os.path.isabs(filepath):
-                filepath = os.path.join(self.root, filepath)
-            
+            filepath = self._safe_path(filepath)
+            if not filepath or not isinstance(content, str):
+                return False
+            if not self._can_write(filepath, os.path.getsize(filepath) + len(content.encode("utf-8"))
+                                   if os.path.exists(filepath) else len(content.encode("utf-8"))):
+                return False
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             
             with open(filepath, "a", encoding="utf-8") as f:
@@ -106,7 +179,9 @@ class Workshop:
     def list_files(self, subdir: str = "") -> List[Dict[str, Any]]:
         """List files in a workshop subdirectory."""
         try:
-            dirpath = os.path.join(self.root, subdir) if subdir else self.root
+            dirpath = self._safe_path(subdir or ".")
+            if not dirpath or not os.path.isdir(dirpath):
+                return []
             results = []
             
             for item in os.listdir(dirpath):
@@ -127,23 +202,24 @@ class Workshop:
     def list_dirs(self, subdir: str = "") -> List[str]:
         """List subdirectories."""
         try:
-            dirpath = os.path.join(self.root, subdir) if subdir else self.root
+            dirpath = self._safe_path(subdir or ".")
+            if not dirpath or not os.path.isdir(dirpath):
+                return []
             return [d for d in os.listdir(dirpath) if os.path.isdir(os.path.join(dirpath, d))]
         except Exception:
             return []
     
     def file_exists(self, filepath: str) -> bool:
         """Check if a file exists."""
-        if not os.path.isabs(filepath):
-            filepath = os.path.join(self.root, filepath)
-        return os.path.exists(filepath)
+        filepath = self._safe_path(filepath)
+        return bool(filepath and os.path.exists(filepath))
     
     def get_file_info(self, filepath: str) -> Dict[str, Any]:
         """Get file info."""
         try:
-            if not os.path.isabs(filepath):
-                filepath = os.path.join(self.root, filepath)
-            
+            filepath = self._safe_path(filepath)
+            if not filepath:
+                return {}
             stat = os.stat(filepath)
             return {
                 "name": os.path.basename(filepath),
@@ -592,7 +668,9 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
     def search_files(self, query: str, subdir: str = "") -> List[Dict[str, str]]:
         """Search files by name or content."""
         results = []
-        dirpath = os.path.join(self.root, subdir) if subdir else self.root
+        dirpath = self._safe_path(subdir or ".")
+        if not dirpath or not os.path.isdir(dirpath):
+            return []
         
         for root_dir, dirs, files in os.walk(dirpath):
             for filename in files:
@@ -628,7 +706,7 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
     def get_stats(self) -> Dict[str, int]:
         """Get workspace statistics."""
         stats = {}
-        for key, path in PATHS.items():
+        for key, path in self.paths.items():
             if os.path.exists(path):
                 count = len([f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))])
                 stats[key] = count
@@ -690,6 +768,11 @@ def create_research_note(title: str, content: str, **kwargs) -> str:
 def get_template(name: str) -> str:
     """Get a template."""
     return get_workshop().get_template(name)
+
+
+def get_workshop_storage() -> Dict[str, int]:
+    """Return current workshop quota and free-space statistics."""
+    return get_workshop().storage_stats()
 
 
 if __name__ == "__main__":

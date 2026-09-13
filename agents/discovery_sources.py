@@ -203,10 +203,13 @@ class UgigSource(BaseOpportunitySource):
     endpoint = "https://ugig.net/api/gigs"
 
     def _discover(self, query: Optional[str] = None,
-                  categories: Optional[List[str]] = None) -> List[Opportunity]:
+                  categories: Optional[List[str]] = None,
+                  page: int = 1) -> List[Opportunity]:
         import requests
 
         params = {"listing_type": "hiring"}
+        if int(page) > 1:
+            params.update({"page": int(page), "per_page": 20})
         if query and query.strip():
             params["search"] = query.strip()
         response = requests.get(
@@ -254,6 +257,68 @@ class UgigSource(BaseOpportunitySource):
         return out
 
 
+class MoltbookSource(BaseOpportunitySource):
+    """Discover AI-agent work leads from Moltbook's semantic post search.
+
+    Read-only and opt-in: Moltbook requires an agent API key for the documented
+    search endpoint. Posts are leads for human review, not verified jobs.
+    """
+
+    name = "moltbook"
+    endpoint = "https://www.moltbook.com/api/v1/search"
+    _WORK_TERMS = (
+        "paid", "pay", "bounty", "contract", "freelance", "hire",
+        "job", "work", "task", "reward", "grant", "client", "service",
+    )
+
+    def _discover(self, query: Optional[str] = None,
+                  categories: Optional[List[str]] = None) -> List[Opportunity]:
+        import requests
+
+        api_key = os.getenv("MOLTBOOK_API_KEY", "").strip()
+        if not api_key:
+            return []
+        search = (query or
+                  "paid work, bounties, freelance tasks, and clients for AI agents").strip()
+        response = requests.get(
+            self.endpoint,
+            params={"q": search, "type": "posts", "limit": 50},
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        if not isinstance(results, list):
+            return []
+
+        out = []
+        for post in results:
+            if not isinstance(post, dict) or post.get("type", "post") != "post":
+                continue
+            title = str(post.get("title", "")).strip()
+            content = str(post.get("content", "")).strip()
+            text = f"{title} {content}".lower()
+            if not title or not any(term in text for term in self._WORK_TERMS):
+                continue
+            post_id = str(post.get("post_id") or post.get("id") or "").strip()
+            if not post_id:
+                continue
+            url = f"https://www.moltbook.com/post/{post_id}"
+            submolt = post.get("submolt") or {}
+            platform = str(submolt.get("display_name") or submolt.get("name") or "Moltbook")
+            out.append(Opportunity(
+                opportunity_id=f"moltbook_{post_id}", source=self.name,
+                platform=platform, title=title, description=content[:2000],
+                category=classify_category(text), payment_type="unknown",
+                currency="", advertised_amount=0.0, estimated_net_value=0.0,
+                risk_level="medium", source_reliability=0.3,
+                external_id=post_id, external_url=url,
+                provenance=f"{self.name}::{url}",
+            ))
+        return out
+
+
 class ContentSource(BaseOpportunitySource):
     """DEPRECATED / REMOVED from default discovery (v2.0.36p).
 
@@ -277,9 +342,10 @@ class DynamicSource(BaseOpportunitySource):
     name = "dynamic"
 
     def _discover(self, query: Optional[str] = None,
-                  categories: Optional[List[str]] = None) -> List[Opportunity]:
+                  categories: Optional[List[str]] = None,
+                  page: int = 1) -> List[Opportunity]:
         from agents.earning_discoverer import EarningDiscoverer
-        disc = EarningDiscoverer()
+        disc = EarningDiscoverer(page=max(1, int(page)))
         # v2.0.36p: if the scheduler supplied a focused term, bias discovery toward it.
         if query:
             try:
@@ -321,6 +387,6 @@ def all_builtin_sources() -> List[BaseOpportunitySource]:
     from agents.web_discovery import WebDiscoverySource
     return [
         UpworkSource(), FiverrSource(), SocialSource(), AirdropSource(),
-        DefiSource(), MicrotaskSource(), UgigSource(), DynamicSource(),
+        DefiSource(), MicrotaskSource(), UgigSource(), MoltbookSource(), DynamicSource(),
         WebDiscoverySource(),   # disabled unless ALLOW_WEB_DISCOVERY=true (human review)
     ]

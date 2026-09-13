@@ -40,6 +40,13 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 python main.py
 ```
 
+Edward and Jacob share a persistent `ai_workshop` for proposals, research,
+documents, scripts, applications, templates, notes, and deliverables. Set the
+human-approved location before starting the application with
+`MRBOT_WORKSHOP_ROOT` (or `AI_WORKSHOP_ROOT`). If the folder already exists it
+is reused; otherwise MrBot creates the organized structure. The default quota
+is 10 GiB and can be changed with `MRBOT_WORKSHOP_MAX_BYTES`.
+
 To exercise the workflow without making real changes, run in safe mode:
 
 ```bash

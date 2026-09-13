@@ -65,8 +65,9 @@ class EarningDiscoverer:
         "test", "bug bounty", "translate", "design", "coding",
     ]
 
-    def __init__(self, min_amount: float = 1.0):
+    def __init__(self, min_amount: float = 1.0, page: int = 1):
         self.min_amount = min_amount
+        self.page = max(1, int(page))
 
     def discover_all(self) -> List[EarningOpportunity]:
         """Discover all earning opportunities from all sources."""
@@ -112,56 +113,45 @@ class EarningDiscoverer:
         """Discover earning opportunities from Reddit."""
         opps = []
         try:
-            # Check r/WorkOnline subreddit
-            url = "https://www.reddit.com/r/WorkOnline/new/.json?limit=50"
-            data = self._reddit_json(url)
+            work_url = ("https://www.reddit.com/r/WorkOnline/new/.json"
+                        f"?limit=50&page={self.page}")
+            data = self._reddit_json(work_url)
             if data is None:
                 data = self._reddit_rss("https://www.reddit.com/r/WorkOnline/.rss")
             if data is not None:
                 for post in data.get("data", {}).get("children", []):
                     post_data = post.get("data", {})
                     title = post_data.get("title", "").lower()
-
                     if any(kw in title for kw in ["earn", "make money", "gig", "freelance", "cash"]):
-                        opp = EarningOpportunity(
+                        opps.append(EarningOpportunity(
                             id=f"reddit_{post_data.get('id')}",
                             title=post_data.get("title", "Work Opportunity"),
                             description=post_data.get("selftext", "")[:500],
                             platform="Reddit r/WorkOnline",
-                            url=post_data.get("url", ""),
-                            payment_type="usd",
-                            min_amount=1.0,
-                            required_action="apply",
-                        )
-                        opps.append(opp)
+                            url=post_data.get("url", ""), payment_type="usd",
+                            min_amount=1.0, required_action="apply",
+                        ))
 
-            # Check r/CryptoCurrency for airdrops/rewards
-            url = "https://www.reddit.com/r/CryptoCurrency/new/.json?limit=100"
-            data = self._reddit_json(url)
+            crypto_url = ("https://www.reddit.com/r/CryptoCurrency/new/.json"
+                          f"?limit=100&page={self.page}")
+            data = self._reddit_json(crypto_url)
             if data is None:
                 data = self._reddit_rss("https://www.reddit.com/r/CryptoCurrency/.rss")
             if data is not None:
                 for post in data.get("data", {}).get("children", []):
                     post_data = post.get("data", {})
                     title = post_data.get("title", "").lower()
-
                     if any(kw in title for kw in ["airdrop", "faucet", "reward", "earn", "free"]):
-                        opp = EarningOpportunity(
+                        opps.append(EarningOpportunity(
                             id=f"cryptoreddit_{post_data.get('id')}",
                             title=post_data.get("title", "Crypto Reward"),
                             description=post_data.get("selftext", "")[:500],
                             platform="Reddit r/CryptoCurrency",
-                            url=post_data.get("url", ""),
-                            payment_type="crypto",
-                            min_amount=1.0,
-                            required_action="claim",
-                            risk_level="medium",
-                        )
-                        opps.append(opp)
-
+                            url=post_data.get("url", ""), payment_type="crypto",
+                            min_amount=1.0, required_action="claim", risk_level="medium",
+                        ))
         except Exception as e:
             print(f"  Reddit error: {e}")
-
         return opps
 
     @staticmethod
@@ -235,7 +225,8 @@ class EarningDiscoverer:
             url = "https://api.github.com/search/issues"
             resp = requests.get(
                 url,
-                params={"q": "(bounty OR reward OR paid) is:issue is:open", "per_page": 30},
+                params={"q": "(bounty OR reward OR paid) is:issue is:open",
+                    "per_page": 30, "page": self.page},
                 headers={"Accept": "application/vnd.github+json", "User-Agent": "MrBot1000-discovery/2.1"},
                 timeout=15,
             )

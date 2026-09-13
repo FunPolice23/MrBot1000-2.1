@@ -1,6 +1,25 @@
 ## [Unreleased] - 2026-09-12
 
 ### Added
+- Added a configurable shared `ai_workshop` for Edward and Jacob. The human
+  selects its location with `MRBOT_WORKSHOP_ROOT` or `AI_WORKSHOP_ROOT`; an
+  existing folder is reused and a standard structure is created when needed.
+  Workshop reads and writes are constrained to that root, explicit folder
+  creation is available, and writes enforce a 10 GiB default quota plus free
+  disk checks. Added `workshop_storage` reporting and aligned the advertised
+  workshop tools with the dispatcher.
+- Added an experimental `MOLTBOOK_AGENT_ONBOARDING` capability for Edward and
+  Jacob. The agent can read and quarantine Moltbook's official `skill.md`,
+  prepare a registration plan, and submit its own registration only after
+  explicit capability approval. The human remains responsible for claiming and
+  verifying the agent; returned API keys are discarded and later posting stays
+  separately gated.
+- Added an opt-in Moltbook discovery source using the documented
+  `https://www.moltbook.com/api/v1/search` endpoint. It searches AI-agent
+  community posts for work, bounty, contract, and service signals, excludes
+  ordinary discussion and comments, preserves public post provenance, and
+  marks every result for human review. The source requires `MOLTBOOK_API_KEY`
+  and performs no writes.
 - Added persistent Opportunities duplicate suppression across scans using
   normalized listing URLs and platform/title identity, plus exclusion of
   seeker posts such as `[For Hire]`, `Looking to hire`, and `Need a developer`.

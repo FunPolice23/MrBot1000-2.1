@@ -236,7 +236,7 @@ class EarningPipeline:
     # ── Stage 1: DISCOVER ──────────────────────────────────
 
     def discover(self, sources: List[str] = None,
-                 on_found=None
+                 on_found=None, page: int = 1
                   ) -> List[Opportunity]:
         """Run discovery sources and return raw opportunities.
 
@@ -249,11 +249,11 @@ class EarningPipeline:
         """
         requested = sources or [
             "social", "upwork", "fiverr", "airdrop",
-            "defi", "microtask", "ugig", "web", "content", "dynamic",
+            "defi", "microtask", "ugig", "moltbook", "web", "content", "dynamic",
         ]
         valid_sources = {
             "social", "upwork", "fiverr", "airdrop",
-            "defi", "microtask", "ugig", "web", "content", "dynamic",
+            "defi", "microtask", "ugig", "moltbook", "web", "content", "dynamic",
         }
 
         from agents.discovery_sources import all_builtin_sources
@@ -267,7 +267,7 @@ class EarningPipeline:
             self._log(f"[Discover] Invalid source '{n}' blocked")
 
         engine = DiscoveryEngine(engine_sources, throttle=False)
-        found, errors, stats = engine.discover_all()
+        found, errors, stats = engine.discover_all(page=max(1, int(page)))
         for name, err in errors.items():
             self._log(f"[Discover] Error from {name}: {err}")
 

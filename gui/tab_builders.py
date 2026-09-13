@@ -1728,7 +1728,7 @@ class TabBuildersMixin:
         self.opp_source_combo = QComboBox()
         self.opp_source_combo.addItems([
             "all", "upwork", "fiverr", "social", "microtask", "ugig",
-            "airdrop", "defi", "web", "content", "dynamic",
+            "moltbook", "airdrop", "defi", "web", "content", "dynamic",
         ])
         self.opp_source_combo.currentTextChanged.connect(self._reset_opportunity_page)
         controls.addWidget(QLabel("Source:"))
@@ -1814,6 +1814,7 @@ class TabBuildersMixin:
         lay.addWidget(self.opp_status_label)
         self._opp_scan_queue = queue.Queue()
         self._opp_scan_active = False
+        self._opp_scan_page = 1
         self._opp_scan_found = 0
         self._opp_scan_last_refresh = 0.0
         self.opp_scan_drain_timer = QTimer(self)
@@ -2185,7 +2186,10 @@ class TabBuildersMixin:
             def run_scan():
                 try:
                     pipeline = EarningPipeline(portfolio=self.opportunity_portfolio)
-                    found = pipeline.discover(sources=sources, on_found=add_found_opportunity)
+                    found = pipeline.discover(
+                        sources=sources, on_found=add_found_opportunity,
+                        page=self._opp_scan_page,
+                    )
                     self._opp_scan_queue.put(("done", len(found), None))
                 except Exception as exc:
                     self._opp_scan_queue.put(("done", 0, str(exc)))
@@ -2210,7 +2214,11 @@ class TabBuildersMixin:
                     self.opp_status_label.setText(f"Scan failed: {event[2]}")
                 else:
                     self.opp_status_label.setText(
-                        f"Scan complete: {event[1]} opportunities found; {self._opp_scan_found} new saved")
+                        f"Scan page {self._opp_scan_page}: {event[1]} opportunities found; "
+                        f"{self._opp_scan_found} new saved")
+                    # Rotate upstream pages on the next scan. Sources without
+                    # pagination retain their normal behavior.
+                    self._opp_scan_page = min(self._opp_scan_page + 1, 1000)
                 self._refresh_opportunities()
                 continue
             opportunity = event[1]
