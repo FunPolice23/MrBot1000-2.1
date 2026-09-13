@@ -1356,7 +1356,7 @@ class DualBrainControl(QWidget):
         self.bb_settings_label = bb_settings_label
         bb_settings_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
         bb_settings_label.setStyleSheet("color: #bb86fc;")
-        settings_layout.addWidget(bb_settings_label, 5, 0, 1, 4)
+        settings_layout.addWidget(bb_settings_label, 6, 0, 1, 4)
 
         self.bb_model_combo = QComboBox()
         self.bb_model_combo.setMinimumWidth(250)
@@ -1378,7 +1378,7 @@ class DualBrainControl(QWidget):
             }
         """)
         self.bb_model_combo.setToolTip("Select model for Big Brain (auto-detected from llama-server)")
-        settings_layout.addWidget(self.bb_model_combo, 5, 0)
+        settings_layout.addWidget(self.bb_model_combo, 7, 0)
 
         self.bb_refresh_models_btn = QPushButton("🔄 Refresh")
         self.bb_refresh_models_btn.setFixedWidth(80)
@@ -1394,11 +1394,11 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #bb86fc88; }
         """)
-        settings_layout.addWidget(self.bb_refresh_models_btn, 5, 1)
+        settings_layout.addWidget(self.bb_refresh_models_btn, 7, 1)
 
         self.bb_ctx_label = QLabel("Ctx Size:")
         self.bb_ctx_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(self.bb_ctx_label, 5, 2)
+        settings_layout.addWidget(self.bb_ctx_label, 7, 2)
 
         self.bb_ctx_spin = QSpinBox()
         self.bb_ctx_spin.setRange(2048, 524288)
@@ -1416,11 +1416,11 @@ class DualBrainControl(QWidget):
             }
         """)
         self.bb_ctx_spin.valueChanged.connect(lambda: self._on_context_changed(True))
-        settings_layout.addWidget(self.bb_ctx_spin, 5, 3)
+        settings_layout.addWidget(self.bb_ctx_spin, 7, 3)
 
         bb_adv_label = QLabel("GPU Layers / Split / Threads / KV:")
         bb_adv_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(bb_adv_label, 6, 0)
+        settings_layout.addWidget(bb_adv_label, 8, 0)
 
         self.bb_gpu_layers_spin = QSpinBox()
         self.bb_gpu_layers_spin.setRange(-1, 999)
@@ -1429,7 +1429,7 @@ class DualBrainControl(QWidget):
         self.bb_gpu_layers_spin.setToolTip("GPU layers (-1=auto, 0=CPU only, N=offload N layers to GPU)")
         self.bb_gpu_layers_spin.setFixedWidth(80)
         self.bb_gpu_layers_spin.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_gpu_layers_spin, 6, 1)
+        settings_layout.addWidget(self.bb_gpu_layers_spin, 8, 1)
 
         self.bb_split_combo = QComboBox()
         self.bb_split_combo.addItems(["none", "layer", "row"])
@@ -1437,7 +1437,7 @@ class DualBrainControl(QWidget):
         self.bb_split_combo.setToolTip("Split mode: none=1 GPU, layer=per-layer across GPUs, row=row-wise")
         self.bb_split_combo.setFixedWidth(90)
         self.bb_split_combo.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_split_combo, 6, 2)
+        settings_layout.addWidget(self.bb_split_combo, 8, 2)
 
         self.bb_threads_spin = QSpinBox()
         self.bb_threads_spin.setRange(1, 32)
@@ -1445,35 +1445,35 @@ class DualBrainControl(QWidget):
         self.bb_threads_spin.setSuffix(" t")
         self.bb_threads_spin.setFixedWidth(70)
         self.bb_threads_spin.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_threads_spin, 6, 3)
+        settings_layout.addWidget(self.bb_threads_spin, 8, 3)
 
-        # ── Big Brain KV cache type + batch (row 7) ──────────────────────
+        # ── Big Brain KV cache type + batch (row 9) ──────────────────────
         self.bb_kv_label = QLabel("Big KV Cache:")
         bb_kv_label = self.bb_kv_label
         bb_kv_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(bb_kv_label, 7, 0)
+        settings_layout.addWidget(bb_kv_label, 9, 0)
         self.bb_kv_combo = QComboBox()
         self.bb_kv_combo.addItems(["f16", "f32", "q8_0", "q4_0", "auto"])
         self.bb_kv_combo.setCurrentText(os.getenv("BIG_BRAIN_KV_CACHE", "f16"))
         self.bb_kv_combo.setToolTip("KV cache quantization: f16=default, q8_0/q4_0=saves VRAM, f32=max accuracy")
         self.bb_kv_combo.setFixedWidth(90)
         self.bb_kv_combo.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_kv_combo, 7, 1)
+        settings_layout.addWidget(self.bb_kv_combo, 9, 1)
         bb_batch_label = QLabel("Big Batch Size:")
         bb_batch_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(bb_batch_label, 7, 2)
+        settings_layout.addWidget(bb_batch_label, 9, 2)
         self.bb_batch_spin = QSpinBox()
         self.bb_batch_spin.setRange(128, 8192)
         self.bb_batch_spin.setValue(int(os.getenv("BIG_BRAIN_BATCH", "2048") or 2048))
         self.bb_batch_spin.setToolTip("Prompt/eval batch size (tokens). Lower uses less VRAM.")
         self.bb_batch_spin.setFixedWidth(90)
         self.bb_batch_spin.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_batch_spin, 7, 3)
+        settings_layout.addWidget(self.bb_batch_spin, 9, 3)
 
-        # ── Big Brain temperature (row 8a) ────────────────────────────
+        # ── Big Brain temperature (row 10) ────────────────────────────
         bb_temp_label = QLabel("Temperature:")
         bb_temp_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(bb_temp_label, 8, 0)
+        settings_layout.addWidget(bb_temp_label, 10, 0)
         self.bb_temp_spin = QDoubleSpinBox()
         self.bb_temp_spin.setRange(0.0, 2.0)
         self.bb_temp_spin.setSingleStep(0.05)
@@ -1484,7 +1484,7 @@ class DualBrainControl(QWidget):
         self.bb_temp_spin.setToolTip(
             "Sampling temperature (0.0=precise, 2.0=creative). "
             "Lower for factual Q&A, higher for brainstorming.")
-        settings_layout.addWidget(self.bb_temp_spin, 8, 1)
+        settings_layout.addWidget(self.bb_temp_spin, 10, 1)
         bb_temp_presets = QComboBox()
         bb_temp_presets.addItems(["Custom", "0.0 (Precise)", "0.3 (Low)", "0.5 (Default)",
                                    "0.7 (Medium)", "1.0 (Creative)", "1.5 (Wild)"])
@@ -1492,7 +1492,7 @@ class DualBrainControl(QWidget):
         bb_temp_presets.setStyleSheet(BIG_SPIN_QSS)
         bb_temp_presets.currentTextChanged.connect(
             lambda t: self._on_temp_preset(t, self.bb_temp_spin, "BIG_BRAIN_TEMPERATURE"))
-        settings_layout.addWidget(bb_temp_presets, 8, 2, 1, 2)
+        settings_layout.addWidget(bb_temp_presets, 10, 2, 1, 2)
 
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Hardware preset:"))
@@ -1530,7 +1530,7 @@ class DualBrainControl(QWidget):
         self.tensor_profile_label.setWordWrap(True)
         self.tensor_profile_label.setStyleSheet("color: #888; font-size: 10px;")
         preset_row.addWidget(self.tensor_profile_label, 3)
-        settings_layout.addLayout(preset_row, 9, 0, 1, 4)
+        settings_layout.addLayout(preset_row, 11, 0, 1, 4)
 
         layout.addWidget(settings_group)
 
@@ -1805,6 +1805,35 @@ class DualBrainControl(QWidget):
         status_label.setStyleSheet("color: #4caf50; font-size: 10px; font-weight: bold; padding-top: 4px;")
         layout.addWidget(status_label)
 
+        # ── Live generation progress bar ───────────────────────────────
+        progress_label = QLabel("Generation:")
+        progress_label.setStyleSheet("color: #ccc; font-size: 10px; padding-top: 4px;")
+        layout.addWidget(progress_label)
+
+        progress_bar = QProgressBar()
+        progress_bar.setMaximum(100)
+        progress_bar.setValue(0)
+        progress_bar.setTextVisible(True)
+        progress_bar.setFormat("— tok/s")
+        progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #444;
+                border-radius: 4px;
+                text-align: center;
+                color: white;
+                min-height: 14px;
+            }
+            QProgressBar::chunk {
+                background: #00bcd4;
+                border-radius: 4px;
+            }
+        """)
+        layout.addWidget(progress_bar)
+
+        tok_speed_label = QLabel("— tok/s  |  — tok generated  |  — elapsed")
+        tok_speed_label.setStyleSheet("color: #888; font-size: 9px;")
+        layout.addWidget(tok_speed_label)
+
         # Store references
         if index == 0:
             self.gpu0_est_bar = est_bar
@@ -1817,6 +1846,12 @@ class DualBrainControl(QWidget):
             self.gpu0_act_detail = act_detail
             self.gpu0_kv_detail = kv_detail
             self.gpu0_status = status_label
+            self.gpu0_progress = progress_bar
+            self.gpu0_tok_speed = tok_speed_label
+            # Live generation progress (updated from dialogue).
+            self._gpu_gen_start = {}
+            self._gpu_tok_count = {}
+            self._gpu_tok_running = {}
         else:
             self.gpu1_est_bar = est_bar
             self.gpu1_act_bar = act_bar
@@ -1828,6 +1863,11 @@ class DualBrainControl(QWidget):
             self.gpu1_act_detail = act_detail
             self.gpu1_kv_detail = kv_detail
             self.gpu1_status = status_label
+            self.gpu1_progress = progress_bar
+            self.gpu1_tok_speed = tok_speed_label
+            self._gpu_gen_start = {}
+            self._gpu_tok_count = {}
+            self._gpu_tok_running = {}
 
         return frame
     
@@ -1966,6 +2006,31 @@ class DualBrainControl(QWidget):
             color = "#4caf50" if "✅" in text else "#ff9800" if "⚠️" in text else "#888"
             label.setStyleSheet(f"color: {color}; font-size: 10px; font-weight: bold; padding-top: 4px;")
             label.setText(text)
+
+    def clear_gpu_progress(self, speaker: str):
+        """Reset the generation progress bar after generation completes."""
+        idx = 0 if speaker == "Edward Hurst" else 1
+        bar = getattr(self, f"gpu{idx}_progress", None)
+        speed_label = getattr(self, f"gpu{idx}_tok_speed", None)
+        if bar is not None:
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFormat("— tok/s")
+        if speed_label is not None:
+            speed_label.setText("— tok/s  |  — tok generated  |  — elapsed")
+
+    def update_gpu_progress(self, speaker: str, tok_count: int, elapsed_s: float):
+        """Update the live generation progress bar from the dialogue."""
+        idx = 0 if speaker == "Edward Hurst" else 1
+        bar = getattr(self, f"gpu{idx}_progress", None)
+        speed_label = getattr(self, f"gpu{idx}_tok_speed", None)
+        if bar is None:
+            return
+        tps = tok_count / elapsed_s if elapsed_s > 0 else 0.0
+        bar.setRange(0, 0)
+        bar.setFormat(f"● {tps:.1f} tok/s")
+        if speed_label is not None:
+            speed_label.setText(f"{tps:.1f} tok/s  |  ~{tok_count} tok  |  {elapsed_s:.1f}s")
 
     def _get_context_for_gpu(self, idx):
         """Get the configured context size for a GPU."""

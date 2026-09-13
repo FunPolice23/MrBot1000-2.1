@@ -725,6 +725,10 @@ class DialogueTab(QWidget):
         self.current_speaker = _persona_name(self.current_speaker)
         self.append_system(f"Generating {self.current_speaker}'s response...")
 
+        # Generate unique ID for this response generation.
+        self._generation_id += 1
+        generation_id = self._generation_id
+
         # Watchdog: if the worker runs longer than DIALOGUE_WATCHDOG_SECONDS,
         # kill it and show an error instead of hanging on "Generating..." forever.
         # This happens when VRAM is full and the SDK timeout doesn't abort the
@@ -735,6 +739,30 @@ class DialogueTab(QWidget):
         self._watchdog_timer.setSingleShot(True)
         self._watchdog_timer.timeout.connect(self._on_watchdog_timeout)
         self._watchdog_timer.start(int(watchdog_sec * 1000))
+
+        # Build system prompt and context for the current turn.
+        from agents.personas import persona_for_key
+        persona = persona_for_key(self.current_speaker)
+        model_name = getattr(
+            self.big_brain if self.current_speaker == "Edward Hurst" else self.small_brain,
+            "model", "")
+        model_size = self._estimate_model_size(model_name)
+        prompt_tier = (
+            "tiny" if model_size < 4
+            else "compact" if model_size < 9
+            else "full"
+        )
+        system_prompt = (
+            persona.build_system_prompt(
+                goal=self.goal, tier=prompt_tier)
+            if persona else None
+        )
+
+        context = self.get_dialogue_context()
+        if system_prompt:
+            system_prompt += self._model_output_contract(getattr(
+                self.big_brain if self.current_speaker == "Edward Hurst" else self.small_brain,
+                "model", ""))
 
         # Probe the server for readiness before starting the worker.
         # This avoids the 503 "Loading model" race when llama-server accepts
@@ -766,6 +794,8 @@ class DialogueTab(QWidget):
             lambda response, speaker, generation=generation_id:
             self._on_response_ready(response, speaker, generation))
         self.worker.start()
+        # Track generation start time for elapsed calculation.
+        self._gen_start_time = time.time()
         # Reset probe retry counter on successful start.
         self._probe_retry_count = 0
 
@@ -816,6 +846,7 @@ class DialogueTab(QWidget):
                              system_prompt: str, context: str):
         """Check if server is ready. If yes, start worker. If not, retry."""
         import json
+        from urllib.parse import urlparse
         from urllib.request import urlopen, Request
 
         base = str(base_url or "").rstrip("/")
@@ -925,6 +956,16 @@ class DialogueTab(QWidget):
         # Estimate token count from chars.
         est_tokens = len(running) // 4 if running else 0
         self.progress_bar.setFormat(f"Generating — ~{est_tokens} tok streamed")
+        # Also update the Providers & GPU tab's live progress bar.
+        main_window = getattr(self, "_main_window", None)
+        if main_window is not None:
+            providers_tab = getattr(main_window, "providers_gpu_tab", None)
+            if providers_tab is not None and hasattr(providers_tab, "update_gpu_progress"):
+                elapsed = time.time() - getattr(self, "_gen_start_time", time.time())
+                try:
+                    providers_tab.update_gpu_progress(speaker, est_tokens, elapsed)
+                except Exception:
+                    pass
 
     def _on_stats(self, response: str, speaker: str, stats: dict):
         """Display turn stats (latency, tokens/sec, model) in the dialogue."""
