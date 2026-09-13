@@ -1159,9 +1159,61 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         tok_item.setForeground(QColor("#4caf50" if entry.get("tokens_sec") else "#666666"))
         self.log_table.setItem(row, 4, tok_item)
         
+        # Details (category + extra context)
+        details = entry.get("category", "") or ""
+        if entry.get("details"):
+            details = f"{details} | {entry['details']}" if details else entry["details"]
+        det_item = QTableWidgetItem(details[:80])
+        det_item.setForeground(QColor("#888888"))
+        self.log_table.setItem(row, 5, det_item)
+        
         # Limit rows
         if self.log_table.rowCount() > 5000:
             self.log_table.removeRow(0)
+        
+        # Auto-scroll if enabled
+        if getattr(self, "auto_scroll_logs", None) and self.auto_scroll_logs.isChecked():
+            self.log_table.scrollToBottom()
+
+    def _show_log_details(self):
+        """Show full details of the selected log entry in the details panel."""
+        if not hasattr(self, "log_details") or self.log_details is None:
+            return
+        selected = self.log_table.selectedItems()
+        if not selected:
+            self.log_details.clear()
+            return
+        row = selected[0].row()
+        # Reconstruct from buffer (find matching row)
+        if row < len(self._log_buffer):
+            entry = self._log_buffer[row]
+            lines = [
+                f"Time: {entry.get('ts', 'N/A')}",
+                f"Severity: {entry.get('severity', 'N/A')}",
+                f"Source: {entry.get('source', 'N/A')}",
+                f"Category: {entry.get('category', 'N/A')}",
+                f"Message: {entry.get('msg', 'N/A')}",
+            ]
+            if entry.get("tokens_sec"):
+                lines.append(f"Tokens/s: {entry['tokens_sec']}")
+            if entry.get("details"):
+                lines.append(f"Details: {entry['details']}")
+            self.log_details.setText("\n".join(lines))
+
+    def _export_logs(self):
+        """Export the current log buffer to a text file."""
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(
+            None, "Export Logs", "mrbot1000_logs.txt", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for e in self._log_buffer:
+                    f.write(f"[{e.get('ts','')}] {e.get('severity','INFO')} {e.get('source','')} | {e.get('msg','')}\n")
+            self.log_signal.emit(f"[System] Logs exported to {path}")
+        except Exception as ex:
+            self.log_signal.emit(f"[System] Export failed: {ex}")
 
     def _append_log(self, msg: str, source: str = "", category: str = "", details: str = ""):
         from datetime import datetime as _dt
@@ -1184,6 +1236,22 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         elif "success" in msg.lower() or "✅" in msg or "ready" in msg.lower():
             severity = "SUCCESS"
         
+        # Auto-detect category if not provided
+        if not category:
+            cat_lower = msg.lower()
+            if "[llm]" in cat_lower or "provider" in cat_lower or "ollama" in cat_lower or "llama" in cat_lower:
+                category = "LLM"
+            elif "[pipeline]" in cat_lower or "validation" in cat_lower or "validate" in cat_lower:
+                category = "Safety"
+            elif "[earning]" in cat_lower or "revenue" in cat_lower or "cost" in cat_lower:
+                category = "Earning"
+            elif "[gpu]" in cat_lower or "cuda" in cat_lower or "vram" in cat_lower:
+                category = "GPU"
+            elif "[manager]" in cat_lower or "[agent]" in cat_lower or "heartbeat" in cat_lower:
+                category = "System"
+            else:
+                category = "System"
+        
         color = {
             "BLOCKED": "#ffcc00",
             "ERROR": "#ff4444",
@@ -1202,12 +1270,18 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             match = re.search(r'([\d.]+)\s*(?:tokens|tok)/s', msg)
             if match:
                 tokens_sec = f"{match.group(1)} tok/s"
+        
+        # Extract latency info if present
+        if not details:
+            lat_match = re.search(r'(\d+)\s*ms', msg)
+            if lat_match:
+                details = f"latency={lat_match.group(1)}ms"
 
         entry = {
             "ts": ts,
             "msg": msg,
             "source": source or "system",
-            "category": category or "info",
+            "category": category,
             "details": details,
             "color": color,
             "severity": severity,
@@ -1822,6 +1896,32 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         if reply == QMessageBox.Yes:
             self.db.clear_file_cache()
             self.log_signal.emit("File cache cleared")
+            self._refresh_cache_stats()
+
+    def _refresh_cache_stats(self):
+        """Update the cache statistics label in the Settings tab."""
+        if not hasattr(self, "cache_stats_label") or self.cache_stats_label is None:
+            return
+        try:
+            db = getattr(self, "db", None)
+            if db is None or getattr(db, "_conn", None) is None:
+                return
+            # File cache entries
+            row = db._execute("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM file_cache").fetchone()
+            cache_count = row[0] if row else 0
+            cache_bytes = row[1] if row else 0
+            cache_mb = cache_bytes / (1024 * 1024)
+            
+            # Research cache entries
+            row2 = db._execute("SELECT COUNT(*) FROM research_cache").fetchone()
+            research_count = row2[0] if row2 else 0
+            
+            self.cache_stats_label.setText(
+                f"File cache: {cache_count:,} entries ({cache_mb:.1f} MB) | "
+                f"Research cache: {research_count:,} entries"
+            )
+        except Exception as e:
+            self.cache_stats_label.setText(f"Error: {e}")
 
     def refresh_db_stats(self):
         """Refresh DB Stats tab with data from database."""
@@ -1851,6 +1951,8 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.db_stat_tokens_sec.value_label.setText(f"{stats.get('avg_tokens_per_second', 0):.1f}")
             self.db_stat_uptime.value_label.setText(f"{stats.get('uptime_hours', 0)}h")
             self.db_stat_db_size.value_label.setText(f"{stats.get('db_size_mb', 0)} MB")
+            self.db_stat_prompt_tokens.value_label.setText(f"{int(stats.get('total_prompt_tokens', 0)):,}")
+            self.db_stat_completion_tokens.value_label.setText(f"{int(stats.get('total_completion_tokens', 0)):,}")
             
             # Update provider table
             self.provider_table.setRowCount(0)
@@ -2326,10 +2428,25 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                         f"&nbsp;&nbsp;price: {price}")
             main_model = self.ollama_model_combo.currentText().strip()
             chat_model = self.ollama_chat_model_combo.currentText().strip()
+            
+            # Also include currently-active provider/model from worker
+            active_provider = getattr(self.worker, "last_provider", "N/A") if hasattr(self, "worker") else "N/A"
+            
             lines = [fmt("Main", main_model), fmt("Chat", chat_model)]
+            lines.append(f"<br><b>Active Provider:</b> {active_provider}")
+            lines.append(f"<b>Daily Budget:</b> ${os.getenv('LLM_DAILY_BUDGET_USD', '0')} | <b>Max Tokens:</b> {os.getenv('MAX_TOKENS', '1024')} | <b>Temperature:</b> {os.getenv('LLM_TEMPERATURE', '0.7')}")
+            
             self.model_info_browser.setHtml("<br>".join(lines))
         except Exception as exc:  # never break the settings UI
             self.model_info_browser.setHtml(f"<i>Model info unavailable: {exc}</i>")
+
+    def _copy_model_info_to_clipboard(self):
+        """Copy the model info text to clipboard."""
+        text = self.model_info_browser.toPlainText()
+        if text.strip():
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(text)
+            self.log_signal.emit("[System] Model info copied to clipboard")
 
     def _fetch_ollama_models(self) -> list[str]:
         """Best-effort fetch of locally-installed Ollama models from the running
@@ -2703,9 +2820,18 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.manager._idle_heartbeat_cooldown = int(self.idle_cooldown_spin.value())
         except Exception:
             pass
-        # v2.0.21 P3#6: apply Max Tokens knob live (no restart).
+        # v2.0.36w: save LLM parameters
+        try:
+            values["MAX_TOKENS"] = str(self.max_tokens_spin.value())
+            values["LLM_TEMPERATURE"] = str(self.temperature_spin.value())
+            values["LLM_TOP_P"] = str(self.top_p_spin.value())
+        except Exception:
+            pass
+        # Apply LLM parameters live
         try:
             self.worker._max_tokens = int(self.max_tokens_spin.value())
+            self.worker._temperature = float(self.temperature_spin.value())
+            self.worker._top_p = float(self.top_p_spin.value())
         except Exception:
             pass
         if hasattr(self, "agents_tab"):

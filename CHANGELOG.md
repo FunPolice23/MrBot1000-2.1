@@ -1,3 +1,30 @@
+## [Unreleased] - 2026-09-13 - Comprehensive revamp: providers, performance, dialogue, UI
+
+### Added
+- **Nous Research provider** (`agents/provider_manager.py`, `agents/base_worker.py`, `.env.example`): Added as cloud provider with `NOUS_API_KEY`, `NOUS_MODEL=hermes-4.3-36b`, `NOUS_BASE_URL=https://inference-api.nousresearch.com/v1`. Supports Hermes-4.3-36B, Hermes-4-70B, Hermes-4-405B (128k context).
+- **Prompting engine** (`agents/prompting_engine.py`): Adaptive prompt construction. Selects best technique per task type: ToT (research/planning), CoT (dialogue), ReAct+CoT+tools (dynamic decisions), Skeleton of Thought (proposals), Agentic (complex goals), Prompt Chaining (pipelines), Meta Prompting (high-stakes), Few-Shot (structured). Remembers successful patterns in `prompt_memory` table.
+- **Model-agnostic brain recommendations** (`agents/prompting_engine.py`): Detects param size from model name/metadata, not brain slot. Heavy (14B+) → ToT/agentic/meta; Medium (7-14B) → balanced CoT/ReAct; Small (<7B) → fast CoT/few-shot/chaining.
+- **Opportunity dialogue bridge** (`agents/opportunity_dialogue_bridge.py`): Edward and Jacob see all opportunities in dialogue context. Can evaluate, compare, choose which to pursue, reject/scam-mark. Blacklist persists across restarts.
+- **Opportunity commands** (`agents/opportunity_commands.py`): Parse EVALUATE/APPROVE/REJECT commands from dialogue (e.g. "EVALUATE 3", "REJECT 2, 5, 8").
+- **Performance toolkit** (`gui/performance.py`): Deferred initialization queue, request coalescing, signal throttling, memory-bounded LRU cache, weak-ref worker pool.
+- **Per-brain temperature controls** (`gui/dual_brain_control.py`): QDoubleSpinBox + preset combo (0.0 Precise / 0.3 Low / 0.5 Default / 0.7 Medium / 1.0 Creative / 1.5 Wild) for both brains. Persists to `.env`.
+- **DB Stats revamp** (`gui/tab_builders.py`, `database.py`, `main.py`): Added Prompt Tokens and Completion Tokens stat cards. Fixed avg latency SQL to exclude error/null entries (was showing 10k+ ms).
+- **Live Logs revamp** (`gui/tab_builders.py`, `main.py`): Added 6th column 'Details' showing category + extracted latency. Export button to save logs. Entry Details panel for full row info. Auto-categorization (LLM, Safety, Earning, GPU, System).
+- **Settings tab revamp** (`gui/tab_builders.py`, `main.py`): Performance & Cache statistics display. LLM Parameters: Temperature (0.0-2.0) and Top-P (0.0-1.0) spin boxes, max_tokens range to 16384. Model Info: larger display, Copy to Clipboard button. Save persists MAX_TOKENS, LLM_TEMPERATURE, LLM_TOP_P to .env.
+- **LLM runtime parameters** (`agents/base_worker.py`, `agents/providers/ollama_adapter.py`, `agents/providers/anthropic_adapter.py`): WorkerAgent initializes _max_tokens, _temperature, _top_p from env vars. Call chain propagates through to adapters.
+- **Dialogue progress bar** (`gui/dialogue_tab.py`): QProgressBar below chat display shows "Generating {persona}'s response..." with color-coded bars.
+- **Prompt memory table** (`database.py`): New `prompt_memory` table for long-term prompt pattern memory.
+
+### Fixed
+- **Live mode**: No longer stops on errors. Transport errors recover silently, duplicates skip turn and force next speaker, blocked states are part of dialogue.
+- **Token limits**: Default 512 → 4096. Per-brain env vars: `BIG_BRAIN_MAX_TOKENS=8192`, `SMALL_BRAIN_MAX_TOKENS=4096`.
+- **Qwen model families**: 3.8 vs 3.6 vs 3 now distinct families (different thinking extraction: 3.8 uses `reasoning_content` field, 3.6/3 use inline `<think>` tags).
+- **Model detection**: Word-boundary regex prevents "26B" from matching "2B" in compact model check.
+- **Startup performance**: Lazy imports in `personas.py` — `build_system_prompt()` no longer eagerly imports `program_knowledge` at module load time.
+- **DB Stats latency**: Fixed avg latency calculation to exclude error/null entries and zero-latency rows.
+- **Semantic duplicate threshold**: 0.78 → 0.85 to avoid false positives on "no verified evidence" vs "no evidence".
+- **Retry limits**: Hard limit of 5 total retries across all types to prevent infinite loops.
+
 ## [2.1.0] - 2026-09-10 - Stability and Provider Routing Maintenance
 
 ### Development History for This Maintenance Cycle

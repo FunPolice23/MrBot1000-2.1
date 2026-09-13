@@ -593,10 +593,10 @@ class AgentDB:
                 COALESCE(COUNT(*), 0) AS total_calls,
                 COALESCE(SUM(CASE WHEN error IS NULL THEN 1 ELSE 0 END), 0) AS successes,
                 COALESCE(SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END), 0) AS errors,
-                COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
+                COALESCE(AVG(CASE WHEN error IS NULL AND latency_ms > 0 THEN latency_ms END), 0) AS avg_latency_ms,
                 COALESCE(SUM(prompt_chars + response_chars), 0) AS total_chars,
                 COALESCE(SUM(cost_usd), 0) AS total_cost,
-                COALESCE(AVG(tokens_per_second), 0) AS avg_tokens_per_second,
+                COALESCE(AVG(CASE WHEN error IS NULL AND tokens_per_second > 0 THEN tokens_per_second END), 0) AS avg_tokens_per_second,
                 COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
                 COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens
             FROM llm_calls
@@ -609,8 +609,8 @@ class AgentDB:
             SELECT provider,
                    COUNT(*) as calls,
                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) as errors,
-                   AVG(latency_ms) as avg_ms,
-                   AVG(tokens_per_second) as avg_tok_s
+                   AVG(CASE WHEN error IS NULL AND latency_ms > 0 THEN latency_ms END) as avg_ms,
+                   AVG(CASE WHEN error IS NULL AND tokens_per_second > 0 THEN tokens_per_second END) as avg_tok_s
             FROM llm_calls
             GROUP BY provider
         """).fetchall()
@@ -622,7 +622,7 @@ class AgentDB:
                    COUNT(*) as calls,
                    SUM(prompt_tokens) as tokens_in,
                    SUM(completion_tokens) as tokens_out,
-                   AVG(tokens_per_second) as avg_tok_s
+                   AVG(CASE WHEN error IS NULL AND tokens_per_second > 0 THEN tokens_per_second END) as avg_tok_s
             FROM llm_calls
             GROUP BY model
         """).fetchall()

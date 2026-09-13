@@ -409,6 +409,8 @@ class ProviderManager:
              ["mistral-large-latest", "mistral-medium-latest", "mistral-small-latest", "open-mixtral-8x22b"]),
             ("together", "Together", "TOGETHER_API_KEY", ProviderType.TOGETHER,
              ["meta-llama/Llama-3.3-70B-Instruct-Turbo", "deepseek-ai/DeepSeek-V3", "mistralai/Mistral-7B-Instruct-v0.3"]),
+            ("nous", "Nous Research", "NOUS_API_KEY", ProviderType.OPENAI,
+             ["hermes-4.3-36b", "hermes-4-70b", "hermes-4-405b"]),
         ]
         
         for name, display_name, key_env, ptype, default_models in cloud_providers:

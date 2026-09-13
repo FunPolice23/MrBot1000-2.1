@@ -36,12 +36,18 @@ class AnthropicAdapter:
         if not key:
             raise RuntimeError(f"anthropic: {self.api_key_env} not set")
         client = anthropic.Anthropic(api_key=key)
-        resp = client.messages.create(
+        params = dict(
             model=model or self.default_model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": user}],
             system=system,
         )
+        # Forward temperature and top_p if provided
+        if 'temperature' in kwargs:
+            params["temperature"] = kwargs["temperature"]
+        if 'top_p' in kwargs:
+            params["top_p"] = kwargs["top_p"]
+        resp = client.messages.create(**params)
         return resp.content[0].text
 
     def context_for(self, model: str) -> int:

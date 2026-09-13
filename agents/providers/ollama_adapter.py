@@ -53,6 +53,10 @@ class OllamaAdapter:
         if not ollama:
             raise RuntimeError("Ollama not available")
         options = {"num_predict": max_tokens}
+        if 'temperature' in kwargs:
+            options["temperature"] = kwargs["temperature"]
+        if 'top_p' in kwargs:
+            options["top_p"] = kwargs["top_p"]
         if chat:
             chat_gpu = os.getenv("OLLAMA_CHAT_GPU", "").strip()
             if chat_gpu.lstrip("-").isdigit():

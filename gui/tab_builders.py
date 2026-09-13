@@ -12,6 +12,7 @@ from PySide6.QtCore import QTimer, QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileSystemModel,
     QFormLayout,
     QFrame,
@@ -744,7 +745,7 @@ class TabBuildersMixin:
             return w
 
     def create_logs_tab(self):
-        """Live Logs tab with full information display including tokens/sec."""
+        """Live Logs tab with full information display including tokens/sec and trigger info."""
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(12, 12, 12, 12)
@@ -779,17 +780,24 @@ class TabBuildersMixin:
         cb = QPushButton("Clear")
         cb.clicked.connect(self._clear_log)
         frow.addWidget(cb)
+        
+        # Export logs button
+        export_btn = QPushButton("Export…")
+        export_btn.clicked.connect(self._export_logs)
+        frow.addWidget(export_btn)
+        
         lay.addLayout(frow)
 
         # Table widget for structured log display
         self.log_table = QTableWidget()
-        self.log_table.setColumnCount(5)
-        self.log_table.setHorizontalHeaderLabels(["Time", "Severity", "Source", "Message", "Tokens/s"])
+        self.log_table.setColumnCount(6)
+        self.log_table.setHorizontalHeaderLabels(["Time", "Severity", "Source", "Message", "Tokens/s", "Details"])
         self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.log_table.setAlternatingRowColors(True)
         self.log_table.setStyleSheet(
@@ -797,7 +805,21 @@ class TabBuildersMixin:
             "background:#0a0a0f;color:#d4d4d4;"
             "QHeaderView::section { background:#1a1a1f; color:#e0e0e0; }"
         )
+        self.log_table.itemSelectionChanged.connect(self._show_log_details)
         lay.addWidget(self.log_table)
+        
+        # Details panel for selected log entry
+        details_group = QGroupBox("Entry Details")
+        details_layout = QVBoxLayout(details_group)
+        self.log_details = QTextEdit()
+        self.log_details.setReadOnly(True)
+        self.log_details.setMaximumHeight(100)
+        self.log_details.setStyleSheet(
+            "font-family:Consolas,Monaco,monospace;font-size:10px;"
+            "background:#0a0a0f;color:#d4d4d4;"
+        )
+        details_layout.addWidget(self.log_details)
+        lay.addWidget(details_group)
         
         # Replay buffered logs
         self._replay_log_buffer()
@@ -828,6 +850,8 @@ class TabBuildersMixin:
         self.db_stat_tokens_sec = self._stat_cell("Avg Tokens/s", "0", "#00bcd4")
         self.db_stat_uptime = self._stat_cell("Uptime", "0h", "#607d8b")
         self.db_stat_db_size = self._stat_cell("DB Size", "0 MB", "#795548")
+        self.db_stat_prompt_tokens = self._stat_cell("Prompt Tokens", "0", "#e91e63")
+        self.db_stat_completion_tokens = self._stat_cell("Completion Tokens", "0", "#009688")
 
         stats_grid.addWidget(self.db_stat_calls, 0, 0)
         stats_grid.addWidget(self.db_stat_errors, 0, 1)
@@ -837,6 +861,8 @@ class TabBuildersMixin:
         stats_grid.addWidget(self.db_stat_tokens_sec, 1, 1)
         stats_grid.addWidget(self.db_stat_uptime, 1, 2)
         stats_grid.addWidget(self.db_stat_db_size, 1, 3)
+        stats_grid.addWidget(self.db_stat_prompt_tokens, 2, 0)
+        stats_grid.addWidget(self.db_stat_completion_tokens, 2, 1)
 
         stats_widget = QWidget()
         stats_widget.setLayout(stats_grid)
@@ -1443,6 +1469,17 @@ class TabBuildersMixin:
         self._themeable.append((auto_research_note, "caption", "font-size:10px;padding-top:3px;"))
         auto_research_note.setWordWrap(True)
         perfl.addRow(auto_research_note)
+        
+        # Cache statistics display
+        self.cache_stats_label = QLabel("Loading cache stats…")
+        self.cache_stats_label.setStyleSheet(f"color:{self._t('accent')};font-size:10px;padding:4px;")
+        self.cache_stats_label.setWordWrap(True)
+        perfl.addRow("Cache Stats:", self.cache_stats_label)
+        cache_refresh_btn = QPushButton("Refresh Stats")
+        cache_refresh_btn.clicked.connect(self._refresh_cache_stats)
+        perfl.addRow(cache_refresh_btn)
+        # Populate cache stats on first build
+        QTimer.singleShot(200, self._refresh_cache_stats)
         lay.addWidget(perfg)
 
         # ── LLM Parameters (relocated from the removed "Model & GPU" tab) ──
@@ -1454,7 +1491,7 @@ class TabBuildersMixin:
         llml.setContentsMargins(12, 12, 12, 12)
         llml.setVerticalSpacing(8)
         self.max_tokens_spin = QSpinBox()
-        self.max_tokens_spin.setRange(128, 8192)
+        self.max_tokens_spin.setRange(128, 16384)
         self.max_tokens_spin.setValue(int(os.getenv("MAX_TOKENS", 1024)))
         llml.addRow("Max Tokens:", self.max_tokens_spin)
         max_tokens_note = QLabel("Maximum length of generated responses. Higher = longer answers but slower.")
@@ -1462,6 +1499,31 @@ class TabBuildersMixin:
         self._themeable.append((max_tokens_note, "caption", "font-size:10px;padding-top:3px;"))
         max_tokens_note.setWordWrap(True)
         llml.addRow(max_tokens_note)
+        
+        # Temperature control
+        self.temperature_spin = QDoubleSpinBox()
+        self.temperature_spin.setRange(0.0, 2.0)
+        self.temperature_spin.setSingleStep(0.1)
+        self.temperature_spin.setValue(float(os.getenv("LLM_TEMPERATURE", 0.7)))
+        llml.addRow("Temperature:", self.temperature_spin)
+        temp_note = QLabel("Controls randomness. 0 = deterministic, 2 = very creative.")
+        temp_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
+        self._themeable.append((temp_note, "caption", "font-size:10px;padding-top:3px;"))
+        temp_note.setWordWrap(True)
+        llml.addRow(temp_note)
+        
+        # Top-P control
+        self.top_p_spin = QDoubleSpinBox()
+        self.top_p_spin.setRange(0.0, 1.0)
+        self.top_p_spin.setSingleStep(0.05)
+        self.top_p_spin.setValue(float(os.getenv("LLM_TOP_P", 0.9)))
+        llml.addRow("Top-P:", self.top_p_spin)
+        topp_note = QLabel("Nucleus sampling. 0.9 = consider top 90% of probability mass.")
+        topp_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
+        self._themeable.append((topp_note, "caption", "font-size:10px;padding-top:3px;"))
+        topp_note.setWordWrap(True)
+        llml.addRow(topp_note)
+        
         self.llm_budget_edit = QLineEdit()
         self.llm_budget_edit.setPlaceholderText("0 = off (no cap)")
         self.llm_budget_edit.setText(os.getenv("LLM_DAILY_BUDGET_USD", "0"))
@@ -1486,25 +1548,33 @@ class TabBuildersMixin:
 
         # ── Model Info (relocated from the removed "Model & GPU" tab) ──
         infog = QGroupBox("Model Info")
-        infol = QFormLayout(infog)
+        infol = QVBoxLayout(infog)
         infol.setContentsMargins(12, 12, 12, 12)
-        infol.setVerticalSpacing(6)
+        infol.setSpacing(6)
         self.model_info_browser = QTextEdit()
-        self.model_info_browser.setMinimumHeight(90)
-        self.model_info_browser.setMaximumHeight(130)
+        self.model_info_browser.setMinimumHeight(120)
+        self.model_info_browser.setMaximumHeight(180)
         self.model_info_browser.setReadOnly(True)
-        infol.addRow(self.model_info_browser)
+        infol.addWidget(self.model_info_browser)
+        
+        btn_row = QHBoxLayout()
         self.refresh_model_info_btn = QPushButton("Refresh Model Info")
         self.refresh_model_info_btn.clicked.connect(
             lambda: self._refresh_model_info(live=True))
-        infol.addRow(self.refresh_model_info_btn)
+        btn_row.addWidget(self.refresh_model_info_btn)
+        self.copy_model_info_btn = QPushButton("Copy to Clipboard")
+        self.copy_model_info_btn.clicked.connect(self._copy_model_info_to_clipboard)
+        btn_row.addWidget(self.copy_model_info_btn)
+        btn_row.addStretch()
+        infol.addLayout(btn_row)
+        
         info_note = QLabel(
             "Shows the type of each selected model: dense vs Mixture-of-Experts (MoE), "
             "approximate parameter count, context window, and price.")
         info_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
         self._themeable.append((info_note, "caption", "font-size:10px;padding-top:3px;"))
         info_note.setWordWrap(True)
-        infol.addRow(info_note)
+        infol.addWidget(info_note)
         lay.addWidget(infog)
         # PERF: defer model info refresh to avoid blocking tab paint
         QTimer.singleShot(100, lambda: self._refresh_model_info(live=False))

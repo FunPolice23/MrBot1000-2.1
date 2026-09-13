@@ -431,6 +431,9 @@ class WorkerAgent:
         self.last_response = {"thinking": "", "answer": "", "raw": "", "provider": None, "model": None, "mode": None}
         self._ollama_model_override = primary_ollama_model or ollama_model
         self._chat_ollama_model_override = chat_ollama_model
+        self._max_tokens = int(os.getenv("MAX_TOKENS", 1024))
+        self._temperature = float(os.getenv("LLM_TEMPERATURE", 0.7))
+        self._top_p = float(os.getenv("LLM_TOP_P", 0.9))
         # v2.0.24i: register the ACTUAL model names so context_tokens() can query
         # Ollama for each model's real context length. Main resolution mirrors
         # _llm_call; chat uses the effective chat model (raw name, no live
@@ -592,6 +595,13 @@ class WorkerAgent:
             base_url=os.getenv("TOGETHER_BASE_URL", "https://api.together.xyz/v1"),
             default_model=os.getenv("TOGETHER_MODEL", ""), disabled_env="DISABLE_TOGETHER", order=70,
             chat_model=os.getenv("TOGETHER_CHAT_MODEL", "")))
+        # Nous Research (OpenAI-compatible)
+        regs.append(OpenAICompatibleAdapter(
+            name="nous", api_key_env="NOUS_API_KEY",
+            base_url=os.getenv("NOUS_BASE_URL", "https://inference-api.nousresearch.com/v1"),
+            default_model=os.getenv("NOUS_MODEL", "hermes-4.3-36b"),
+            disabled_env="DISABLE_NOUS", order=65,
+            chat_model=os.getenv("NOUS_CHAT_MODEL", "")))
         # NVIDIA NIM (OpenAI-compatible hosted API) — v2.0.34ap (H70)
         regs.append(OpenAICompatibleAdapter(
             name="nvidia", api_key_env="NVIDIA_API_KEY",
@@ -864,7 +874,8 @@ class WorkerAgent:
                     # providers (NVIDIA Nemotron w/ enable_thinking) emit their
                     # thinking stream. Adapters that don't support it ignore it.
                     resp = func(model, system, user, max_tokens, chat=chat,
-                                think=think_on)
+                                think=think_on,
+                                temperature=self._temperature, top_p=self._top_p)
                     dt_ms = int((time.time() - t0) * 1000)
                     # v2.0.21 P1#2: an empty response (chars=0) is a failure, not
                     # a success. The logs showed the chat model returning empty
@@ -960,11 +971,12 @@ class WorkerAgent:
             system=system,
         ).content[0].text
 
-    def _call_ollama(self, model: str, system: str, user: str, max_tokens: int, chat: bool = False) -> str:
+    def _call_ollama(self, model: str, system: str, user: str, max_tokens: int, chat: bool = False,
+                     temperature: float = 0.7, top_p: float = 0.9, **kwargs) -> str:
         if not OLLAMA_AVAILABLE or not ollama:
             raise RuntimeError("Ollama not available or pydantic_core issue")
         try:
-            options = {"num_predict": max_tokens}
+            options = {"num_predict": max_tokens, "temperature": temperature, "top_p": top_p}
             # v2.0.34ab (Section E F5) + v2.0.36: resolve GPU layers per role.
             # `num_gpu_for` returns None for AUTO (env unset/"auto"/-1) so we OMIT
             # num_gpu and let Ollama's VRAM-aware scheduler offload what fits —

@@ -113,8 +113,16 @@ class Persona:
         in a long prompt. Now the prompt is short and repeats the tool format
         3 times to ensure compliance. Includes thinking/reasoning support.
         """
-        mem = self.memory_context(query or goal)
-        personality = self.personality_addon()
+        # Lazy imports to avoid startup slowdown
+        mem = ""
+        personality = ""
+        try:
+            from agents.program_knowledge import get_knowledge_context, get_personality_engine
+            mem = self.memory_context(query or goal) or ""
+            personality = self.personality_addon() or ""
+        except Exception:
+            pass
+        
         strengths = ", ".join(self.strengths)
         abilities = ", ".join(self.abilities)
         guardrails = "; ".join(self.rules_guardrails)

@@ -1684,7 +1684,7 @@ class DualBrainControl(QWidget):
         layout.setSpacing(4)
 
         # GPU name + assigned brain
-        brain_name = "Edward (Big Brain)" if index == 0 else "Jacob (Small Brain)"
+        brain_name = f"Edward (Big Brain)" if index == 0 else f"Jacob (Small Brain)"
         name_label = QLabel(f"GPU {index}: {name} — {brain_name}")
         name_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
         name_label.setStyleSheet(f"color: {color};")
