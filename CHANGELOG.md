@@ -1,6 +1,27 @@
 ## [Unreleased] - 2026-09-12
 
 ### Added
+- Added a Live Portfolio exchange selector for Coinbase, Kraken, Binance,
+  Gemini, Bitfinex, OKX, Bybit, KuCoin, Bitstamp, and Gate.io. Each selection
+  remains an independent exchange account using its own API credentials;
+  CCXT only provides the common integration interface.
+- Added real USD valuation for non-stable portfolio holdings using exchange
+  ticker prices. Portfolio synchronization now fails clearly when a positive
+  holding cannot be valued instead of presenting incomplete equity.
+- Added exchange-derived market snapshots from ticker and order-book data,
+  including validated last price, volatility, spread, and top-level USD
+  liquidity. Malformed, incomplete, or crossed books are rejected before risk
+  assessment.
+- Added a separate Live Portfolio service boundary with optional ccxt support
+  for Coinbase, Kraken, Binance, and other supported exchanges. It reads live
+  account state without inventing starting equity and keeps execution disabled
+  until explicitly enabled.
+- Added layered deterministic trading policy checks for order size, portfolio
+  allocation, daily loss, volatility, spread, liquidity, confidence, expected
+  return, and asset class. High-risk orders are blocked or sent to the existing
+  human approval queue; only low-risk orders may use explicit preapproval.
+- Added the Live Portfolio GUI surface and renamed the old Paper Trading tab to
+  Strategy Simulator so simulated capital cannot be mistaken for real funds.
 - Expanded the Earning Center's web-search discovery targets to include
   AI-agent marketplaces, crypto/Web3 work, open-source and security bounties,
   user testing, paid studies, Contra, Freelancer, Toptal, and PeoplePerHour,
@@ -34,6 +55,10 @@
   indicator initializes from existing queue state and clears after a decision.
 
 ### Changed
+- Live risk assessment now uses actual portfolio balances to hard-block buys
+  above available quote-asset funds and sells above held base-asset amounts.
+- The GUI tab regression contract now explicitly covers both Live Portfolio
+  and Strategy Simulator surfaces.
 - Added a two-tier GUI refresh policy across Collaboration, Earnings, Provider
   Configuration, Providers & GPU, Approvals, Notifications, Payments, and
   Safety. Active views retain their responsive polling cadence; hidden views
@@ -59,6 +84,17 @@
   imports allow local operation without either SDK installed.
 
 ### Fixed
+- Fixed Coinbase adapter startup when sandbox mode is enabled even though the
+  selected ccxt Coinbase client has no sandbox URL. Coinbase now documents a
+  live API read configuration, exchange sandbox mode now defaults off unless
+  explicitly requested, and unsupported sandbox requests fail with an
+  actionable message instead of appearing only as an unconfigured adapter.
+- Live status now remains disabled when the enable flag is set without an
+  exchange adapter. Exchange mismatches, stale market data, unsupported order
+  types, and missing order-book data fail closed before execution.
+- Live order execution now fails closed when live trading is disabled, no
+  exchange adapter is configured, risk limits are exceeded, or required human
+  approval is absent. An approval queue decision is verified before submission.
 - Fixed the Earning Center search handler consuming the freelance finder response
   as a list instead of reading its `results` payload. Search results now render
   with their budget, partial source failures remain visible, and proposal drafts

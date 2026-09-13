@@ -94,6 +94,37 @@ Safe mode can also be toggled from the Management tab at runtime.
 - Maintains per-role memory (chat + CEO) that survives restarts
 - Dynamically schedules discovery sources based on historical performance (exploration/exploitation balance)
 
+### Live Portfolio and Trading
+
+The **Live Portfolio** surface is separate from the **Strategy Simulator**. It
+does not create a fictional starting balance: equity, free cash, and balances
+come from the configured exchange. Live execution is disabled by default and
+requires an explicitly enabled account, exchange credentials, current market
+data, deterministic risk checks, and human approval for orders outside the
+configured low-risk preapproval band.
+
+Optional exchange support uses `ccxt`:
+
+```bash
+python -m pip install -r requirements-live.txt
+```
+
+The Live Portfolio exchange selector includes Coinbase, Kraken, Binance,
+Gemini, Bitfinex, OKX, Bybit, KuCoin, Bitstamp, and Gate.io. The selector and
+`TRADING_EXCHANGE` setting choose one exchange account at a time; CCXT is the
+common adapter library, not a shared exchange or custodial network. Each
+exchange uses its own API endpoint and credentials. Use withdrawal-disabled
+API keys and keep
+`MRBOT_LIVE_TRADING_ENABLED=false` until the account, limits, and approval flow
+have been reviewed. The policy evaluates notional size, portfolio allocation,
+daily loss, volatility, spread, liquidity, strategy confidence, expected
+return, and asset class. Meme, unknown, or otherwise elevated-risk assets are
+not eligible for silent execution.
+
+The Strategy Simulator remains available for agent dry-runs and previews. Its
+virtual capital is never portfolio equity, wallet balance, exchange balance, or
+verified financial evidence.
+
 ## Current Workflow
 
 ### Dialogue Control and Evidence

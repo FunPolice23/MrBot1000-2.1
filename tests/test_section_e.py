@@ -279,9 +279,11 @@ class TestGuiTabs(unittest.TestCase):
         self.assertIn("Providers & GPU", labels)
         self.assertIn("Live Logs", labels)
         self.assertIn("DB Stats", labels)
+        self.assertIn("Live Portfolio", labels)
+        self.assertIn("Strategy Simulator", labels)
         # The current GUI includes the model library, safety, provider, and
         # observability surfaces in addition to the core workflow tabs.
-        self.assertEqual(self.mw.tabs.count(), 19)
+        self.assertEqual(self.mw.tabs.count(), 20)
         self.assertIn("Model Library", labels)
 
     def test_lazy_then_scroll_on_open(self):

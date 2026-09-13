@@ -57,6 +57,28 @@ class DataExplorerWorker(QThread):
         self.finished.emit(result)
 
 
+class LivePortfolioWorker(QThread):
+    """Read a live exchange account without blocking the Qt GUI thread."""
+
+    finished = Signal(dict)
+
+    def __init__(self, service):
+        super().__init__()
+        self.service = service
+
+    def run(self):
+        try:
+            snapshot = self.service.sync_portfolio()
+            self.finished.emit({
+                "ok": True,
+                "equity": snapshot.total_equity_usd,
+                "cash": snapshot.free_cash_usd,
+                "balances": len(snapshot.balances),
+            })
+        except Exception as exc:
+            self.finished.emit({"ok": False, "error": str(exc)})
+
+
 class TabBuildersMixin:
     """Provides all create_*_tab methods + tab machinery for MainWindow."""
 
@@ -1774,8 +1796,130 @@ class TabBuildersMixin:
         
         return w
     
+    def create_live_portfolio_tab(self):
+        """Create the live portfolio status surface; no fake balance is shown."""
+        from agents.live_trading import LiveTradingService, TradingPolicy, adapter_from_env
+        from agents.workspace_context import register_component
+
+        exchange = os.getenv("TRADING_EXCHANGE", "coinbase").strip().lower()
+        self.live_exchange_ids = [
+            "coinbase", "kraken", "binance", "gemini", "bitfinex", "okx",
+            "bybit", "kucoin", "bitstamp", " Gate.io".strip(),
+        ]
+        if exchange not in self.live_exchange_ids:
+            self.live_exchange_ids.insert(0, exchange)
+        policy = TradingPolicy(
+            preapproval_enabled=os.getenv("TRADING_PREAPPROVAL_ENABLED", "false").lower() in {"1", "true", "yes"},
+            max_order_usd=float(os.getenv("TRADING_MAX_ORDER_USD", "100")),
+            max_position_pct=float(os.getenv("TRADING_MAX_POSITION_PCT", "0.05")),
+            max_daily_loss_pct=float(os.getenv("TRADING_MAX_DAILY_LOSS_PCT", "0.02")),
+            max_volatility_pct=float(os.getenv("TRADING_MAX_VOLATILITY_PCT", "12")),
+            max_spread_pct=float(os.getenv("TRADING_MAX_SPREAD_PCT", "1")),
+            min_liquidity_multiple=float(os.getenv("TRADING_MIN_LIQUIDITY_MULTIPLE", "20")),
+            min_confidence=float(os.getenv("TRADING_MIN_CONFIDENCE", "0.70")),
+            min_expected_profit_pct=float(os.getenv("TRADING_MIN_EXPECTED_PROFIT_PCT", "0.25")),
+        )
+        self.live_trading_policy = policy
+        self.live_adapter_from_env = adapter_from_env
+        self._configure_live_exchange(exchange)
+        register_component("live_trading", self.live_trading_service)
+        self.live_portfolio_worker = None
+
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        header = QLabel("Live Portfolio")
+        header.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        header.setAlignment(Qt.AlignCenter)
+        header.setStyleSheet("color: #4fc3f7; padding: 10px;")
+        lay.addWidget(header)
+        explanation = QLabel(
+            "Real exchange state only. No starting balance is invented. Live orders remain "
+            "disabled until explicitly enabled and pass the layered risk policy."
+        )
+        explanation.setWordWrap(True)
+        lay.addWidget(explanation)
+
+        status_group = QGroupBox("Connection and Risk Status")
+        status_lay = QFormLayout(status_group)
+        self.live_exchange_combo = QComboBox()
+        self.live_exchange_combo.addItems(self.live_exchange_ids)
+        self.live_exchange_combo.setCurrentText(exchange)
+        self.live_exchange_combo.currentTextChanged.connect(self._on_live_exchange_changed)
+        self.live_status_label = QLabel("Disabled")
+        self.live_equity_label = QLabel("Not synchronized")
+        self.live_cash_label = QLabel("Not synchronized")
+        self.live_error_label = QLabel(self.live_adapter_error or "")
+        self.live_error_label.setWordWrap(True)
+        status_lay.addRow("Exchange:", self.live_exchange_combo)
+        status_lay.addRow("Execution:", self.live_status_label)
+        status_lay.addRow("Total equity:", self.live_equity_label)
+        status_lay.addRow("Free cash:", self.live_cash_label)
+        status_lay.addRow("Configuration:", self.live_error_label)
+        lay.addWidget(status_group)
+
+        sync_btn = QPushButton("Refresh Live Portfolio")
+        sync_btn.clicked.connect(self._refresh_live_portfolio)
+        lay.addWidget(sync_btn)
+        self._refresh_live_portfolio()
+        return w
+
+    def _configure_live_exchange(self, exchange: str):
+        from agents.live_trading import LiveTradingService
+
+        adapter = None
+        adapter_error = ""
+        try:
+            adapter = self.live_adapter_from_env(exchange)
+        except Exception as exc:
+            adapter_error = str(exc)
+        self.live_trading_service = LiveTradingService(
+            adapter, policy=self.live_trading_policy,
+        )
+        self.live_adapter_error = adapter_error
+        self.live_selected_exchange = exchange
+
+    def _on_live_exchange_changed(self, exchange: str):
+        if not exchange:
+            return
+        worker = getattr(self, "live_portfolio_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        self._configure_live_exchange(exchange)
+        self.live_error_label.setText(
+            self.live_adapter_error or "Exchange adapter configured; refresh to synchronize"
+        )
+        self._refresh_live_portfolio()
+
+    def _refresh_live_portfolio(self):
+        service = getattr(self, "live_trading_service", None)
+        if service is None:
+            return
+        status = service.status()
+        self.live_status_label.setText(status["execution_mode"])
+        worker = getattr(self, "live_portfolio_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        self.live_equity_label.setText("Synchronizing...")
+        self.live_cash_label.setText("Synchronizing...")
+        worker = LivePortfolioWorker(service)
+        self.live_portfolio_worker = worker
+        worker.finished.connect(self._on_live_portfolio_result)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_live_portfolio_result(self, result: dict):
+        self.live_portfolio_worker = None
+        if not result.get("ok"):
+            self.live_equity_label.setText("Unavailable")
+            self.live_cash_label.setText("Unavailable")
+            self.live_error_label.setText(result.get("error", "Portfolio synchronization failed"))
+            return
+        self.live_equity_label.setText(f"${result['equity']:,.2f}")
+        self.live_cash_label.setText(f"${result['cash']:,.2f}")
+        self.live_error_label.setText(f"Synchronized {result['balances']} non-zero balances")
+
     def create_paper_trading_tab(self):
-        """Create the Paper Trading tab — virtual portfolio and strategy testing."""
+        """Create the Strategy Simulator tab — virtual portfolio testing only."""
         from PySide6.QtWidgets import (
             QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
             QDoubleSpinBox,
@@ -1791,14 +1935,14 @@ class TabBuildersMixin:
         lay = QVBoxLayout(w)
         
         # Header
-        header = QLabel("📈 Paper Trading")
+        header = QLabel("📈 Strategy Simulator")
         header.setFont(QFont("Segoe UI", 18, QFont.Bold))
         header.setAlignment(Qt.AlignCenter)
         header.setStyleSheet("color: #bb86fc; padding: 10px;")
         lay.addWidget(header)
         
         # Portfolio summary
-        summary_group = QGroupBox("Virtual Portfolio Summary")
+        summary_group = QGroupBox("Simulated Portfolio Summary")
         summary_lay = QFormLayout(summary_group)
         
         self.paper_equity_label = QLabel("$10,000.00")
@@ -1827,7 +1971,7 @@ class TabBuildersMixin:
         
         lay.addWidget(summary_group)
         lay.addWidget(QLabel(
-            "Simulation only: no bank, broker, wallet, exchange, or live order connection. "
+            "Strategy simulation only: no bank, broker, wallet, exchange, or live order connection. "
             "Prices are entered manually for paper testing."
         ))
         
