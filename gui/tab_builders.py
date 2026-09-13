@@ -3,7 +3,10 @@
 # ~2k lines of tab-construction UI live in their own module while still being
 # MainWindow instance methods (so `self.*` access is unchanged).
 import os
+import queue
 import re
+import threading
+import time
 
 from PySide6.QtCore import QTimer, QThread, Qt, Signal
 from PySide6.QtWidgets import (
@@ -1745,7 +1748,7 @@ class TabBuildersMixin:
         
         self.opp_min_score_spin = QSpinBox()
         self.opp_min_score_spin.setRange(0, 100)
-        self.opp_min_score_spin.setValue(50)
+        self.opp_min_score_spin.setValue(0)
         self.opp_min_score_spin.setSuffix("%")
         self.opp_min_score_spin.valueChanged.connect(self._reset_opportunity_page)
         controls.addWidget(QLabel("Min Score:"))
@@ -1809,6 +1812,13 @@ class TabBuildersMixin:
         # Status
         self.opp_status_label = QLabel("Ready")
         lay.addWidget(self.opp_status_label)
+        self._opp_scan_queue = queue.Queue()
+        self._opp_scan_active = False
+        self._opp_scan_found = 0
+        self._opp_scan_last_refresh = 0.0
+        self.opp_scan_drain_timer = QTimer(self)
+        self.opp_scan_drain_timer.timeout.connect(self._drain_opportunity_scan)
+        self.opp_scan_drain_timer.start(100)
 
         page_row = QHBoxLayout()
         self.opp_prev_btn = QPushButton("Previous")
@@ -2156,49 +2166,120 @@ class TabBuildersMixin:
 
     def _on_scan_opportunities(self):
         """Scan for opportunities now."""
+        if self._opp_scan_active:
+            self.opp_status_label.setText("Scan already running")
+            return
         self.opp_status_label.setText("Scanning...")
         try:
             from earning_pipeline import EarningPipeline
             from agents.opportunity_portfolio import PortfolioEntry, WorkStatus
             source = self.opp_source_combo.currentText()
             sources = None if source == "all" else [source]
-            pipeline = EarningPipeline(portfolio=self.opportunity_portfolio)
+            self._opp_scan_active = True
+            self._opp_scan_found = 0
 
             def add_found_opportunity(opportunity):
-                opportunity_id = getattr(opportunity, "id", "")
-                if not opportunity_id:
-                    return
-                ref = {
-                    "title": getattr(opportunity, "title", ""),
-                    "description": getattr(opportunity, "description", ""),
-                    "url": getattr(opportunity, "url", ""),
-                    "source": getattr(opportunity, "source", ""),
-                    "platform": getattr(opportunity, "platform", ""),
-                    "category": getattr(opportunity, "type", ""),
-                }
-                if self._is_hiring_request(ref):
-                    return
-                existing = self.opportunity_portfolio.get(opportunity_id)
-                if existing is not None:
-                    return
-                if self._portfolio_contains_duplicate(ref):
-                    return
-                self.opportunity_portfolio.add(PortfolioEntry(
-                    opportunity_id=opportunity_id,
-                    opportunity_ref={"id": opportunity_id, **ref},
-                    work_status=WorkStatus.EVALUATING,
-                    expected_value=float(getattr(opportunity, "estimated_usd_value", 0.0) or 0.0),
-                    platform=getattr(opportunity, "platform", "") or "",
-                    category=getattr(opportunity, "type", "") or "",
-                    next_action="Review evidence and score before approval",
-                ))
-                self._refresh_opportunities()
+                # Discovery runs off-thread; only pass data through the queue.
+                self._opp_scan_queue.put(("found", opportunity))
 
-            found = pipeline.discover(sources=sources, on_found=add_found_opportunity)
-            self._refresh_opportunities()
-            self.opp_status_label.setText(f"Scan complete: {len(found)} opportunities found")
+            def run_scan():
+                try:
+                    pipeline = EarningPipeline(portfolio=self.opportunity_portfolio)
+                    found = pipeline.discover(sources=sources, on_found=add_found_opportunity)
+                    self._opp_scan_queue.put(("done", len(found), None))
+                except Exception as exc:
+                    self._opp_scan_queue.put(("done", 0, str(exc)))
+
+            threading.Thread(target=run_scan, daemon=True, name="opportunity-discovery").start()
         except Exception as exc:
+            self._opp_scan_active = False
             self.opp_status_label.setText(f"Scan failed: {exc}")
+
+    def _drain_opportunity_scan(self):
+        """Persist a bounded batch of discoveries and refresh progressively."""
+        from agents.opportunity_portfolio import PortfolioEntry, WorkStatus
+        processed = 0
+        while processed < 50:
+            try:
+                event = self._opp_scan_queue.get_nowait()
+            except queue.Empty:
+                break
+            if event[0] == "done":
+                self._opp_scan_active = False
+                if event[2]:
+                    self.opp_status_label.setText(f"Scan failed: {event[2]}")
+                else:
+                    self.opp_status_label.setText(
+                        f"Scan complete: {event[1]} opportunities found; {self._opp_scan_found} new saved")
+                self._refresh_opportunities()
+                continue
+            opportunity = event[1]
+            opportunity_id = getattr(opportunity, "id", "")
+            if not opportunity_id:
+                continue
+            ref = {
+                "title": getattr(opportunity, "title", ""),
+                "description": getattr(opportunity, "description", ""),
+                "url": getattr(opportunity, "url", ""),
+                "source": getattr(opportunity, "source", ""),
+                "platform": getattr(opportunity, "platform", ""),
+                "category": getattr(opportunity, "type", ""),
+            }
+            if self._is_hiring_request(ref):
+                continue
+            if self.opportunity_portfolio.get(opportunity_id) is not None:
+                continue
+            entry = PortfolioEntry(
+                opportunity_id=opportunity_id,
+                opportunity_ref={"id": opportunity_id, **ref},
+                work_status=WorkStatus.EVALUATING,
+                expected_value=float(getattr(opportunity, "estimated_usd_value", 0.0) or 0.0),
+                platform=getattr(opportunity, "platform", "") or "",
+                category=getattr(opportunity, "type", "") or "",
+                next_action="Review evidence and score before approval",
+            )
+            self.opportunity_portfolio.add(entry)
+            self._opp_scan_found += 1
+            self._append_scanned_opportunity(entry)
+            processed += 1
+
+    def _append_scanned_opportunity(self, entry):
+        """Add one newly discovered row without rebuilding the whole table."""
+        if self._opp_page != 0:
+            return
+        ref = entry.opportunity_ref or {}
+        source = self.opp_source_combo.currentText()
+        entry_source = str(ref.get("source", "")).lower()
+        if (source != "all" and entry.platform.lower() != source.lower()
+                and entry_source != source.lower()):
+            return
+        query = self.opp_search_edit.text().strip().lower()
+        haystack = " ".join(str(ref.get(key, "")) for key in
+                            ("title", "description", "url")).lower()
+        if query and query not in haystack:
+            return
+        if self.opp_status_combo.currentText() != "all" and entry.work_status.value != self.opp_status_combo.currentText():
+            return
+        if entry.policy_score < self.opp_min_score_spin.value() / 100:
+            return
+        page_size = int(self.opp_page_size_combo.currentText())
+        if self.opp_table.rowCount() >= page_size:
+            return
+        from PySide6.QtCore import Qt
+        row = self.opp_table.rowCount()
+        self.opp_table.insertRow(row)
+        values = (
+            ref.get("title", entry.opportunity_id), entry.platform or ref.get("source", ""),
+            entry.category or ref.get("category", ""), f"${entry.expected_value:,.2f}",
+            f"{entry.policy_score * 100:.0f}%", entry.work_status.value,
+            ref.get("url", ref.get("source_url", "")),
+        )
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            if column == 0:
+                item.setData(Qt.UserRole, entry.opportunity_id)
+            self.opp_table.setItem(row, column, item)
+        self.opp_page_label.setText(f"Live scan: {self._opp_scan_found} new saved")
 
     def _configure_opportunity_auto_scan(self, enabled: bool):
         """Start or stop the user-configured opportunity scan timer."""

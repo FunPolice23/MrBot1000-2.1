@@ -19,6 +19,15 @@
 - Moved recurring GGUF VRAM estimation out of the GPU telemetry callback and
   cached estimates by model, context, and KV-cache settings, eliminating
   repeated large-file reads on the GUI thread during model loading.
+- Moved Opportunities discovery to a background worker with a bounded Qt queue;
+  found listings are persisted and appended to the visible page in real time,
+  while the GUI processes at most a small batch per timer tick instead of
+  rebuilding the entire table for every result or waiting for the full scan.
+- Set the Opportunities minimum-score filter default to 0% so newly discovered,
+  not-yet-evaluated listings appear immediately during and after a scan.
+- Refreshed Opportunities pagination metadata after the background scan drains
+  its final result event, enabling Next and Previous correctly for newly found
+  multi-page result sets.
 - Added a Live Portfolio exchange selector for Coinbase, Kraken, Binance,
   Gemini, Bitfinex, OKX, Bybit, KuCoin, Bitstamp, and Gate.io. Each selection
   remains an independent exchange account using its own API credentials;
