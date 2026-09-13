@@ -792,34 +792,48 @@ class TabBuildersMixin:
         self.log_table = QTableWidget()
         self.log_table.setColumnCount(6)
         self.log_table.setHorizontalHeaderLabels(["Time", "Severity", "Source", "Message", "Tokens/s", "Details"])
-        self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.log_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        # Column widths: Time/Severity/Source are compact, Message is wide, Tokens/s and Details are medium
+        self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Time
+        self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Severity
+        self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Source
+        self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)  # Message — wide
+        self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Tokens/s
+        self.log_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Interactive)  # Details — user-resizable
+        self.log_table.horizontalHeader().resizeSection(5, 120)  # default 120px
         self.log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.log_table.setAlternatingRowColors(True)
+        self.log_table.setWordWrap(True)  # wrap long messages to multiple lines
         self.log_table.setStyleSheet(
             "font-family:Consolas,Monaco,monospace;font-size:11px;"
             "background:#0a0a0f;color:#d4d4d4;"
             "QHeaderView::section { background:#1a1a1f; color:#e0e0e0; }"
         )
         self.log_table.itemSelectionChanged.connect(self._show_log_details)
-        lay.addWidget(self.log_table)
+        # lay.addWidget(self.log_table)  # removed — splitter below
         
         # Details panel for selected log entry
         details_group = QGroupBox("Entry Details")
         details_layout = QVBoxLayout(details_group)
         self.log_details = QTextEdit()
         self.log_details.setReadOnly(True)
-        self.log_details.setMaximumHeight(100)
+        self.log_details.setMinimumHeight(80)
+        self.log_details.setMaximumHeight(250)  # larger max so more content visible
         self.log_details.setStyleSheet(
             "font-family:Consolas,Monaco,monospace;font-size:10px;"
             "background:#0a0a0f;color:#d4d4d4;"
         )
         details_layout.addWidget(self.log_details)
-        lay.addWidget(details_group)
+        # lay.addWidget(details_group)  # removed — splitter below
+
+        # Resizable vertical splitter for table + details
+        from PySide6.QtWidgets import QSplitter
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self.log_table)
+        splitter.addWidget(details_group)
+        splitter.setStretchFactor(0, 3)  # table gets 3x more space
+        splitter.setStretchFactor(1, 1)  # details gets 1x
+        splitter.setSizes([400, 150])
+        lay.addWidget(splitter)
         
         # Replay buffered logs
         self._replay_log_buffer()
@@ -1010,19 +1024,15 @@ class TabBuildersMixin:
         provider_config.provider_changed.connect(self._on_provider_widget_changed)
         lay.addWidget(provider_config)
 
-        # Registration
+        # Registration (identity only — wallet/cashApp moved to Payout Destinations below)
         rg = QGroupBox("Agent Registration")
         rl = QFormLayout(rg)
         rl.setContentsMargins(12, 12, 12, 12)
         rl.setVerticalSpacing(8)
         self.name_edit   = QLineEdit(os.getenv("AGENT_NAME", "CodeSelfLearnBot"))
         self.user_edit   = QLineEdit(os.getenv("AGENT_USERNAME", "codeselflearn-2026"))
-        self.wallet_edit = QLineEdit(os.getenv("ATOMIC_SOLANA_ADDRESS", ""))
-        self.cashapp_edit = QLineEdit(os.getenv("CASHAPP_TAG", ""))
         rl.addRow("Agent Name:",    self.name_edit)
         rl.addRow("Username:",      self.user_edit)
-        rl.addRow("Wallet:",        self.wallet_edit)
-        rl.addRow("Cash App Tag:",  self.cashapp_edit)
         rb = QPushButton("Register")
         rb.clicked.connect(self.register_autonomous)
         rl.addRow(rb)
@@ -1657,10 +1667,9 @@ class TabBuildersMixin:
         payl = QFormLayout(payg)
         payl.setContentsMargins(12, 12, 12, 12)
         payl.setVerticalSpacing(8)
-        self.cashapp_edit = QLineEdit(os.getenv("CASHAPP_TAG", "$csmith7899"))
-        payl.addRow("Cash App tag:", self.cashapp_edit)
-        self.solana_payout_edit = QLineEdit(
-            os.getenv("ATOMIC_SOLANA_ADDRESS", ""))
+        self.cashapp_payout_edit = QLineEdit(os.getenv("CASHAPP_TAG", ""))
+        payl.addRow("Cash App tag:", self.cashapp_payout_edit)
+        self.solana_payout_edit = QLineEdit(os.getenv("ATOMIC_SOLANA_ADDRESS", ""))
         payl.addRow("Solana address:", self.solana_payout_edit)
         payout_note = QLabel("Auto-payout: agent earnings route to Cash App first, then Solana wallet for on-chain storage.")
         payout_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")

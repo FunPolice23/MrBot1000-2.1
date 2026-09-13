@@ -1159,13 +1159,16 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         tok_item.setForeground(QColor("#4caf50" if entry.get("tokens_sec") else "#666666"))
         self.log_table.setItem(row, 4, tok_item)
         
-        # Details (category + extra context)
+        # Details (category + extra context) — show full text, not truncated
         details = entry.get("category", "") or ""
         if entry.get("details"):
             details = f"{details} | {entry['details']}" if details else entry["details"]
-        det_item = QTableWidgetItem(details[:80])
+        det_item = QTableWidgetItem(details)
         det_item.setForeground(QColor("#888888"))
         self.log_table.setItem(row, 5, det_item)
+        
+        # Resize row height to fit wrapped content
+        self.log_table.resizeRowToContents(row)
         
         # Limit rows
         if self.log_table.rowCount() > 5000:
@@ -1265,8 +1268,8 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         
         # Extract tokens/sec if present in message
         tokens_sec = ""
+        import re
         if "tokens/s" in msg or "tok/s" in msg:
-            import re
             match = re.search(r'([\d.]+)\s*(?:tokens|tok)/s', msg)
             if match:
                 tokens_sec = f"{match.group(1)} tok/s"
@@ -1963,8 +1966,8 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 self.provider_table.setItem(row, 0, QTableWidgetItem(str(provider)))
                 self.provider_table.setItem(row, 1, QTableWidgetItem(str(pstats.get("calls", 0))))
                 self.provider_table.setItem(row, 2, QTableWidgetItem(str(pstats.get("errors", 0))))
-                self.provider_table.setItem(row, 3, QTableWidgetItem(f"{pstats.get('avg_ms', 0):.0f}"))
-                self.provider_table.setItem(row, 4, QTableWidgetItem(f"{pstats.get('avg_tok_s', 0):.1f}"))
+                self.provider_table.setItem(row, 3, QTableWidgetItem(f"{pstats.get('avg_ms', 0) or 0:.0f}"))
+                self.provider_table.setItem(row, 4, QTableWidgetItem(f"{pstats.get('avg_tok_s', 0) or 0:.1f}"))
             
             # Update model table
             self.model_table.setRowCount(0)
@@ -1976,7 +1979,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 self.model_table.setItem(row, 1, QTableWidgetItem(str(mstats.get("calls", 0))))
                 self.model_table.setItem(row, 2, QTableWidgetItem(str(mstats.get("tokens_in", 0))))
                 self.model_table.setItem(row, 3, QTableWidgetItem(str(mstats.get("tokens_out", 0))))
-                self.model_table.setItem(row, 4, QTableWidgetItem(f"{mstats.get('avg_tok_s', 0):.1f}"))
+                self.model_table.setItem(row, 4, QTableWidgetItem(f"{mstats.get('avg_tok_s', 0) or 0:.1f}"))
             
             # Update recent calls table
             self.db_calls_table.setRowCount(0)
@@ -2690,6 +2693,20 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         values["PIPELINE_ENABLED"] = str(self.pipeline_enabled_check.isChecked())
         values["PIPELINE_ALLOW_WRITE"] = str(self.pipeline_allow_write_check.isChecked())
         values["PIPELINE_ALLOW_SELF_IMPROVE"] = str(self.pipeline_allow_selfimprove_check.isChecked())
+
+        # Persist payout destinations (wallet/cashApp) from the (possibly lazily-built) Settings tab
+        try:
+            cashapp_widget = getattr(self, "cashapp_payout_edit", None)
+            if cashapp_widget is not None:
+                values["CASHAPP_TAG"] = cashapp_widget.text().strip()
+        except Exception:
+            pass
+        try:
+            solana_widget = getattr(self, "solana_payout_edit", None)
+            if solana_widget is not None:
+                values["ATOMIC_SOLANA_ADDRESS"] = solana_widget.text().strip()
+        except Exception:
+            pass
         values["MRBOT_THEME"] = getattr(self, "theme_combo", None).currentText() \
             if getattr(self, "theme_combo", None) is not None \
             else os.getenv("MRBOT_THEME", "Dark")

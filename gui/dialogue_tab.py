@@ -657,7 +657,7 @@ class DialogueTab(QWidget):
                 continue
             prior_text = " ".join(str(previous.get("content", "")).lower().split())
             if normalized and prior_text and difflib.SequenceMatcher(
-                    None, normalized, prior_text).ratio() >= 0.92:
+                    None, normalized, prior_text).ratio() >= 0.95:
                 duplicate_response = True
                 break
 
@@ -668,7 +668,7 @@ class DialogueTab(QWidget):
                 f"{speaker} repeated an earlier answer; the repeated text was not "
                 "added to the shared conversation."
             )
-            if self._duplicate_retry_count <= 1 and (self.live_running or self.is_running):
+            if self._duplicate_retry_count <= 3 and (self.live_running or self.is_running):
                 self.conversation_history.append({
                     "role": "system",
                     "speaker": "System",
@@ -695,6 +695,8 @@ class DialogueTab(QWidget):
             response_lower.startswith(("error:", "[error:", "connection error"))
             or " error: connection error" in response_lower
             or response_lower.startswith(("[marcus rivera error:", "[alex vega error:"))
+            or "no model selected" in response_lower
+            or "no model loaded" in response_lower
         )
         if is_transport_error:
             self.append_system(
