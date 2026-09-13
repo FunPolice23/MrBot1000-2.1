@@ -385,6 +385,7 @@ class DualBrainControl(QWidget):
         from agents.provider_manager import ProviderManager
         self.provider_manager = ProviderManager.instance()
         self.provider_manager.detect_providers()
+        self._hardware_tensor_types = {}
         
         # Track which providers we started (vs already running)
         self.we_started_small = False
@@ -410,6 +411,7 @@ class DualBrainControl(QWidget):
         # to _wire_all_signals via QTimer to avoid AttributeError on methods
         # defined later in the class body.
         self.setup_ui()
+        self._apply_hardware_tensor_options()
 
         # Defer all signal/slot connections to the next event-loop cycle so
         # every handler method (defined later in the class body) is guaranteed
@@ -579,9 +581,22 @@ class DualBrainControl(QWidget):
             self.bb_refresh_models_btn.clicked.connect(self._refresh_big_brain_models)
 
     def _apply_hardware_preset(self):
-        """Apply editable values for the selected hardware tier."""
+        """Apply the selected preset to the chosen hardware target."""
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+
         preset = HARDWARE_PRESETS[self.hardware_preset_combo.currentText()]
-        for prefix, values in (("sb", preset["small"]), ("bb", preset["big"])):
+        runtime = self.runtime or DualBrainRuntime.from_env()
+        gpus = {gpu.index: gpu for gpu in self.provider_manager.get_gpus()}
+        targets = {
+            "Small Brain / GPU 1": (("sb", BrainRole.SMALL),),
+            "Big Brain / GPU 0": (("bb", BrainRole.BIG),),
+            "Both brains": (("sb", BrainRole.SMALL), ("bb", BrainRole.BIG)),
+        }.get(self.hardware_preset_target_combo.currentText(), ())
+        for prefix, role in targets:
+            config = runtime.config(role)
+            values = self._adapt_preset_for_hardware(
+                preset["big"], gpus.get(config.device),
+                cpu_only=config.gpu_layers == 0 or config.device not in gpus)
             ctx, batch, threads, gpu_layers, kv = values
             getattr(self, f"{prefix}_ctx_spin").setValue(ctx)
             getattr(self, f"{prefix}_batch_spin").setValue(batch)
@@ -590,6 +605,157 @@ class DualBrainControl(QWidget):
             getattr(self, f"{prefix}_kv_combo").setCurrentText(kv)
         self.hardware_preset_help.setText(
             preset["help"] + " Click Save to write these values.")
+
+    @staticmethod
+    def _adapt_preset_for_hardware(values, gpu=None, cpu_only=False):
+        """Adapt a shared preset to device memory and supported KV types."""
+        context, batch, threads, gpu_layers, kv = values
+        if cpu_only:
+            return min(context, 8192), min(batch, 512), min(threads, 6), 0, "q8_0"
+
+        supported = set(gpu.tensor_types if gpu else ())
+        if gpu and gpu.memory_total_mb <= 8192:
+            context = min(context, 16384)
+            batch = min(batch, 1024)
+            threads = min(threads, 6)
+        if kv not in supported:
+            kv = "q8_0" if "q8_0" in supported else (next(iter(supported), "f16"))
+        return context, batch, threads, gpu_layers, kv
+
+    def _build_gpu_hardware_settings(self, parent_layout):
+        """Show hardware-specific options for every detected GPU.
+
+        GPU 0 and GPU 1 are controlled by the Big/Small Brain runtime rows.
+        Additional devices are displayed as available hardware until a runtime
+        role is assigned to them; this keeps the UI honest about what is live.
+        """
+        from agents.provider_manager import supported_tensor_types
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+
+        group = QGroupBox("🖥 Detected GPU Hardware Settings")
+        group.setStyleSheet("""
+            QGroupBox {
+                color: #03dac6;
+                font-weight: bold;
+                border: 2px solid #03dac6;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        grid = QGridLayout(group)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
+        grid.setColumnStretch(2, 2)
+        grid.setColumnStretch(3, 3)
+        self.gpu_hardware_controls = {}
+        runtime = self.runtime or DualBrainRuntime.from_env()
+        assigned_roles = {
+            runtime.config(BrainRole.BIG).device: "Big Brain",
+            runtime.config(BrainRole.SMALL).device: "Small Brain",
+        }
+
+        gpus = sorted(self.provider_manager.get_gpus(), key=lambda gpu: gpu.index)
+        if not gpus:
+            grid.addWidget(QLabel("No CUDA GPUs detected. CPU-safe settings are active."), 0, 0, 1, 4)
+        for row, gpu in enumerate(gpus):
+            runtime_role = assigned_roles.get(gpu.index)
+            role_text = runtime_role or "Available / unassigned"
+            capability = f"SM {gpu.compute_capability}" if gpu.compute_capability else "SM unknown"
+            header = QLabel(
+                f"GPU {gpu.index}: {gpu.name} · {capability} · "
+                f"{gpu.memory_total_mb / 1024:.1f} GB · {role_text}")
+            header.setStyleSheet("color: #bdbdbd; font-size: 11px;")
+            grid.addWidget(header, row, 0)
+
+            options = list(gpu.tensor_types or supported_tensor_types(gpu.compute_capability))
+            kv_combo = QComboBox()
+            kv_combo.addItems(options)
+            kv_combo.setToolTip(
+                f"KV/tensor types supported by {gpu.name} ({capability}): "
+                + ", ".join(options))
+            kv_combo.setEnabled(runtime_role is None)
+            if runtime_role == "Big Brain":
+                kv_combo.setCurrentText(self.bb_kv_combo.currentText())
+                kv_combo.setToolTip("Live setting is controlled by Big Brain KV above.")
+            elif runtime_role == "Small Brain":
+                kv_combo.setCurrentText(self.sb_kv_combo.currentText())
+                kv_combo.setToolTip("Live setting is controlled by Small Brain KV above.")
+            grid.addWidget(kv_combo, row, 1)
+
+            details = QLabel("KV types: " + ", ".join(options))
+            details.setStyleSheet("color: #888; font-size: 10px;")
+            grid.addWidget(details, row, 2, 1, 2)
+            self.gpu_hardware_controls[gpu.index] = {
+                "kv_combo": kv_combo,
+                "options": options,
+                "role": runtime_role,
+            }
+
+        parent_layout.addWidget(group)
+
+    def _apply_hardware_tensor_options(self):
+        """Limit KV choices to the assigned GPU's supported tensor profile."""
+        from agents.provider_manager import supported_tensor_types
+        from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
+
+        gpus = {gpu.index: gpu for gpu in self.provider_manager.get_gpus()}
+        for small, combo in ((True, self.sb_kv_combo), (False, self.bb_kv_combo)):
+            role = BrainRole.SMALL if small else BrainRole.BIG
+            runtime = self.runtime or DualBrainRuntime.from_env()
+            device = runtime.config(role).device
+            gpu = gpus.get(device)
+            options = gpu.tensor_types if gpu else supported_tensor_types(cpu=True)
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(options)
+            combo.setCurrentText(current if current in options else options[0])
+            combo.blockSignals(False)
+            hardware = gpu.name if gpu else "CPU / system RAM"
+            capability = f" SM {gpu.compute_capability}" if gpu and gpu.compute_capability else ""
+            combo.setToolTip(
+                f"Supported KV/tensor types for {hardware}{capability}: "
+                + ", ".join(options))
+            self._hardware_tensor_types[small] = options
+            label = self.sb_kv_label if small else self.bb_kv_label
+            label.setText("Small KV Cache:" if small else "Big KV Cache:")
+            label.setToolTip(
+                f"{hardware}{capability}. Available KV/tensor types: {', '.join(options)}")
+        profiles = []
+        runtime = self.runtime or DualBrainRuntime.from_env()
+        for small in (True, False):
+            role = BrainRole.SMALL if small else BrainRole.BIG
+            device = runtime.config(role).device
+            gpu = gpus.get(device)
+            options = self._hardware_tensor_types[small]
+            if gpu:
+                sm = f"SM {gpu.compute_capability}" if gpu.compute_capability else "SM unknown"
+                profiles.append(f"{'Small' if small else 'Big'}: {gpu.name} ({sm}) -> {', '.join(options)}")
+            else:
+                profiles.append(f"{'Small' if small else 'Big'}: CPU / system RAM -> {', '.join(options)}")
+        self.tensor_profile_label.setText("Hardware tensor/KV profiles: " + " | ".join(profiles))
+        self._sync_gpu_hardware_controls()
+
+    def _sync_gpu_hardware_controls(self):
+        """Mirror live brain KV values in the detected-GPU summary rows."""
+        for index, control in getattr(self, "gpu_hardware_controls", {}).items():
+            role = control.get("role")
+            if role == "Big Brain":
+                combo = control["kv_combo"]
+                combo.blockSignals(True)
+                combo.setCurrentText(self.bb_kv_combo.currentText())
+                combo.blockSignals(False)
+            elif role == "Small Brain":
+                combo = control["kv_combo"]
+                combo.blockSignals(True)
+                combo.setCurrentText(self.sb_kv_combo.currentText())
+                combo.blockSignals(False)
 
     def _wire_settings_signals(self):
         """Wire up settings spinbox/combo signals after class body is fully defined.
@@ -674,12 +840,15 @@ class DualBrainControl(QWidget):
             active_local = self.provider_manager.resolve_enabled_provider(local=True)
             local_settings = getattr(self, "local_settings_group", None)
             if local_settings is not None:
-                is_llamacpp = active_local == "llamacpp"
-                local_settings.setVisible(is_llamacpp and any(
-                    cfg.enabled and cfg.provider == "llamacpp" for cfg in (small, big)))
+                supported_local = {
+                    "llamacpp", "ollama", "lmstudio", "vllm", "koboldcpp"
+                }
+                has_local_brain = any(
+                    cfg.enabled and cfg.provider in supported_local
+                    for cfg in (small, big))
+                local_settings.setVisible(has_local_brain)
                 local_settings.setTitle(
-                    "⚙️ llama.cpp Settings (per brain)" if is_llamacpp
-                    else f"⚙️ {active_local or 'No local provider'} Settings")
+                    f"⚙️ {active_local or 'Local Provider'} Settings (per brain)")
             detected_gpus = {
                 gpu.index: gpu.name for gpu in self.provider_manager.get_gpus()
             }
@@ -1127,12 +1296,35 @@ class DualBrainControl(QWidget):
         self.sb_threads_spin.setStyleSheet(SMALL_SPIN_QSS)
         settings_layout.addWidget(self.sb_threads_spin, 2, 3)
 
+        # ── Small Brain KV cache type + batch (row 3) ────────────────────
+        self.sb_kv_label = QLabel("Small KV Cache:")
+        kv_label = self.sb_kv_label
+        kv_label.setStyleSheet("color: #888; font-size: 11px;")
+        settings_layout.addWidget(kv_label, 3, 0)
+        self.sb_kv_combo = QComboBox()
+        self.sb_kv_combo.addItems(["f16", "f32", "q8_0", "q4_0", "auto"])
+        self.sb_kv_combo.setCurrentText(os.getenv("SMALL_BRAIN_KV_CACHE", "f16"))
+        self.sb_kv_combo.setToolTip("KV cache quantization: f16=default, q8_0/q4_0=saves VRAM, f32=max accuracy")
+        self.sb_kv_combo.setFixedWidth(90)
+        self.sb_kv_combo.setStyleSheet(SMALL_SPIN_QSS)
+        settings_layout.addWidget(self.sb_kv_combo, 3, 1)
+        sb_batch_label = QLabel("Small Batch Size:")
+        sb_batch_label.setStyleSheet("color: #888; font-size: 11px;")
+        settings_layout.addWidget(sb_batch_label, 3, 2)
+        self.sb_batch_spin = QSpinBox()
+        self.sb_batch_spin.setRange(128, 8192)
+        self.sb_batch_spin.setValue(int(os.getenv("SMALL_BRAIN_BATCH", "2048") or 2048))
+        self.sb_batch_spin.setToolTip("Prompt/eval batch size (tokens). Lower uses less VRAM.")
+        self.sb_batch_spin.setFixedWidth(90)
+        self.sb_batch_spin.setStyleSheet(SMALL_SPIN_QSS)
+        settings_layout.addWidget(self.sb_batch_spin, 3, 3)
+
         # ── Big Brain Settings ──
         bb_settings_label = QLabel("🧠 Big Brain (5060 Ti, port 1234)")
         self.bb_settings_label = bb_settings_label
         bb_settings_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
         bb_settings_label.setStyleSheet("color: #bb86fc;")
-        settings_layout.addWidget(bb_settings_label, 3, 0, 1, 4)
+        settings_layout.addWidget(bb_settings_label, 4, 0, 1, 4)
 
         self.bb_model_combo = QComboBox()
         self.bb_model_combo.setMinimumWidth(250)
@@ -1154,7 +1346,7 @@ class DualBrainControl(QWidget):
             }
         """)
         self.bb_model_combo.setToolTip("Select model for Big Brain (auto-detected from llama-server)")
-        settings_layout.addWidget(self.bb_model_combo, 4, 0)
+        settings_layout.addWidget(self.bb_model_combo, 5, 0)
 
         self.bb_refresh_models_btn = QPushButton("🔄 Refresh")
         self.bb_refresh_models_btn.setFixedWidth(80)
@@ -1170,11 +1362,11 @@ class DualBrainControl(QWidget):
             }
             QPushButton:hover { background: #bb86fc88; }
         """)
-        settings_layout.addWidget(self.bb_refresh_models_btn, 4, 1)
+        settings_layout.addWidget(self.bb_refresh_models_btn, 5, 1)
 
         self.bb_ctx_label = QLabel("Ctx Size:")
         self.bb_ctx_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(self.bb_ctx_label, 4, 2)
+        settings_layout.addWidget(self.bb_ctx_label, 5, 2)
 
         self.bb_ctx_spin = QSpinBox()
         self.bb_ctx_spin.setRange(2048, 524288)
@@ -1192,11 +1384,11 @@ class DualBrainControl(QWidget):
             }
         """)
         self.bb_ctx_spin.valueChanged.connect(lambda: self._on_context_changed(True))
-        settings_layout.addWidget(self.bb_ctx_spin, 4, 3)
+        settings_layout.addWidget(self.bb_ctx_spin, 5, 3)
 
         bb_adv_label = QLabel("GPU Layers / Split / Threads / KV:")
         bb_adv_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(bb_adv_label, 5, 0)
+        settings_layout.addWidget(bb_adv_label, 6, 0)
 
         self.bb_gpu_layers_spin = QSpinBox()
         self.bb_gpu_layers_spin.setRange(-1, 999)
@@ -1205,7 +1397,7 @@ class DualBrainControl(QWidget):
         self.bb_gpu_layers_spin.setToolTip("GPU layers (-1=auto, 0=CPU only, N=offload N layers to GPU)")
         self.bb_gpu_layers_spin.setFixedWidth(80)
         self.bb_gpu_layers_spin.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_gpu_layers_spin, 5, 1)
+        settings_layout.addWidget(self.bb_gpu_layers_spin, 6, 1)
 
         self.bb_split_combo = QComboBox()
         self.bb_split_combo.addItems(["none", "layer", "row"])
@@ -1213,7 +1405,7 @@ class DualBrainControl(QWidget):
         self.bb_split_combo.setToolTip("Split mode: none=1 GPU, layer=per-layer across GPUs, row=row-wise")
         self.bb_split_combo.setFixedWidth(90)
         self.bb_split_combo.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_split_combo, 5, 2)
+        settings_layout.addWidget(self.bb_split_combo, 6, 2)
 
         self.bb_threads_spin = QSpinBox()
         self.bb_threads_spin.setRange(1, 32)
@@ -1221,41 +1413,20 @@ class DualBrainControl(QWidget):
         self.bb_threads_spin.setSuffix(" t")
         self.bb_threads_spin.setFixedWidth(70)
         self.bb_threads_spin.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_threads_spin, 5, 3)
+        settings_layout.addWidget(self.bb_threads_spin, 6, 3)
 
-        # ── KV cache type + batch (shared row across both brains) ──────────
-        kv_label = QLabel("KV Cache:")
-        kv_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(kv_label, 6, 0)
-        self.sb_kv_combo = QComboBox()
-        self.sb_kv_combo.addItems(["f16", "f32", "q8_0", "q4_0", "auto"])
-        self.sb_kv_combo.setCurrentText(os.getenv("SMALL_BRAIN_KV_CACHE", "f16"))
-        self.sb_kv_combo.setToolTip("KV cache quantization: f16=default, q8_0/q4_0=saves VRAM, f32=max accuracy")
-        self.sb_kv_combo.setFixedWidth(90)
-        self.sb_kv_combo.setStyleSheet(SMALL_SPIN_QSS)
-        settings_layout.addWidget(self.sb_kv_combo, 6, 1)
-        bb_kv_label = QLabel("Big KV Cache:")
+        # ── Big Brain KV cache type + batch (row 7) ──────────────────────
+        self.bb_kv_label = QLabel("Big KV Cache:")
+        bb_kv_label = self.bb_kv_label
         bb_kv_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(bb_kv_label, 6, 2)
+        settings_layout.addWidget(bb_kv_label, 7, 0)
         self.bb_kv_combo = QComboBox()
         self.bb_kv_combo.addItems(["f16", "f32", "q8_0", "q4_0", "auto"])
         self.bb_kv_combo.setCurrentText(os.getenv("BIG_BRAIN_KV_CACHE", "f16"))
         self.bb_kv_combo.setToolTip("KV cache quantization: f16=default, q8_0/q4_0=saves VRAM, f32=max accuracy")
         self.bb_kv_combo.setFixedWidth(90)
         self.bb_kv_combo.setStyleSheet(BIG_SPIN_QSS)
-        settings_layout.addWidget(self.bb_kv_combo, 6, 3)
-
-        # ── Batch size (row 7) ─────────────────────────────────────────────
-        batch_label = QLabel("Batch Size:")
-        batch_label.setStyleSheet("color: #888; font-size: 11px;")
-        settings_layout.addWidget(batch_label, 7, 0)
-        self.sb_batch_spin = QSpinBox()
-        self.sb_batch_spin.setRange(128, 8192)
-        self.sb_batch_spin.setValue(int(os.getenv("SMALL_BRAIN_BATCH", "2048") or 2048))
-        self.sb_batch_spin.setToolTip("Prompt/eval batch size (tokens). Lower uses less VRAM.")
-        self.sb_batch_spin.setFixedWidth(90)
-        self.sb_batch_spin.setStyleSheet(SMALL_SPIN_QSS)
-        settings_layout.addWidget(self.sb_batch_spin, 7, 1)
+        settings_layout.addWidget(self.bb_kv_combo, 7, 1)
         bb_batch_label = QLabel("Big Batch Size:")
         bb_batch_label.setStyleSheet("color: #888; font-size: 11px;")
         settings_layout.addWidget(bb_batch_label, 7, 2)
@@ -1276,9 +1447,20 @@ class DualBrainControl(QWidget):
             "Choose a starting point for VRAM, context, batch size, and CPU/GPU use. "
             "Save and restart both servers after applying a preset.")
         preset_row.addWidget(self.hardware_preset_combo)
+        preset_row.addWidget(QLabel("Target:"))
+        self.hardware_preset_target_combo = QComboBox()
+        self.hardware_preset_target_combo.addItems([
+            "Big Brain / GPU 0",
+            "Small Brain / GPU 1",
+            "Both brains",
+        ])
+        self.hardware_preset_target_combo.setCurrentText("Big Brain / GPU 0")
+        self.hardware_preset_target_combo.setToolTip(
+            "Choose which runtime GPU/brain receives the preset values.")
+        preset_row.addWidget(self.hardware_preset_target_combo)
         self.apply_hardware_preset_btn = QPushButton("Apply")
         self.apply_hardware_preset_btn.setToolTip(
-            "Fill the llama.cpp controls with the selected hardware preset.")
+            "Fill the selected brain's local-provider controls with the hardware preset.")
         self.apply_hardware_preset_btn.clicked.connect(self._apply_hardware_preset)
         preset_row.addWidget(self.apply_hardware_preset_btn)
         preset_row.addStretch(1)
@@ -1288,6 +1470,10 @@ class DualBrainControl(QWidget):
         self.hardware_preset_combo.currentTextChanged.connect(
             lambda name: self.hardware_preset_help.setText(HARDWARE_PRESETS[name]["help"]))
         preset_row.addWidget(self.hardware_preset_help, 2)
+        self.tensor_profile_label = QLabel()
+        self.tensor_profile_label.setWordWrap(True)
+        self.tensor_profile_label.setStyleSheet("color: #888; font-size: 10px;")
+        preset_row.addWidget(self.tensor_profile_label, 3)
         settings_layout.addLayout(preset_row, 8, 0, 1, 4)
 
         layout.addWidget(settings_group)
@@ -1365,7 +1551,7 @@ class DualBrainControl(QWidget):
         quick_layout.addWidget(self.refresh_btn)
 
         # Save llama.cpp customization to .env (v2.1)
-        self.save_settings_btn = QPushButton("💾 Save llama.cpp Settings")
+        self.save_settings_btn = QPushButton("💾 Save Local Provider Settings")
         self.save_settings_btn.setStyleSheet("""
             QPushButton {
                 background: #ff9800;
@@ -2291,7 +2477,10 @@ class BrainLaunchWorker(QThread):
                             tail = f.read()[-1200:].strip()
                     except OSError:
                         tail = ""
-                    self.launch_finished.emit(False, f"Process exited with code {self._proc.returncode}\n{tail}", None)
+                    detail = f"Process exited with code {self._proc.returncode}"
+                    if "tensor '" in tail and "not found" in tail:
+                        detail += " — the selected GGUF is incomplete or incompatible with this llama.cpp build; re-download it or choose a matching model."
+                    self.launch_finished.emit(False, f"{self.role_name}: {detail}\n{tail}", None)
                     return
                 if self.check_fn(self.port):
                     log_file.close()
@@ -2492,6 +2681,23 @@ class BrainLaunchWorker(QThread):
         if result["warning"]:
             self._log(f"⚠️ {('Small' if small else 'Big')} Brain: {result['warning']}")
         return result["value"]
+
+    def _validate_model_before_launch(self, small: bool, model_path: str) -> bool:
+        """Reject malformed GGUFs before spawning llama-server."""
+        try:
+            from agents.gguf_meta import validate_model
+            errors = validate_model(model_path)
+        except Exception as exc:
+            self._log(f"⚠️ Model preflight skipped: {exc}")
+            return True
+        if not errors:
+            return True
+        label = "Small" if small else "Big"
+        self._log(
+            f"❌ {label} Brain model preflight failed: {errors[0]}. "
+            "Download a complete GGUF matching the model architecture and llama.cpp build.")
+        self._set_loading(small, False, "")
+        return False
     
     def _show_vram_warning(self, small: bool, model_path: str, need: float, free: float, result: dict):
         """Show VRAM warning dialog on GUI thread."""
@@ -2635,6 +2841,8 @@ class BrainLaunchWorker(QThread):
             # Show feedback before metadata/VRAM checks so the GUI never looks
             # idle while launch preparation is in progress.
             self._set_loading(True, True, model)
+            if not self._validate_model_before_launch(True, model):
+                return
             # VRAM-affinity guard (warn-but-allow) before launching.
             if not self._check_vram_affinity(True, model):
                 self._log("⛔ Small Brain start cancelled — model exceeds the target GPU VRAM (would spill to RAM).")
@@ -2713,6 +2921,8 @@ class BrainLaunchWorker(QThread):
             # Show feedback before metadata/VRAM checks so the GUI never looks
             # idle while launch preparation is in progress.
             self._set_loading(False, True, model)
+            if not self._validate_model_before_launch(False, model):
+                return
             # VRAM-affinity guard (warn-but-allow) before launching.
             if not self._check_vram_affinity(False, model):
                 self._log("⛔ Big Brain start cancelled — model exceeds the 5060 Ti's free VRAM (would spill to RAM).")
@@ -3220,6 +3430,7 @@ for _handler_name in (
     "_persist_role_model", "_select_external_model", "_unload_external_model",
     "_load_external_model", "_finish_external_lifecycle",
     "_gpu_free_vram_gb", "_model_vram_need_gb", "_check_vram_affinity",
+    "_validate_model_before_launch",
     "_show_vram_warning", "_refresh_provider_status", "_probe_providers",
     "_apply_provider_status", "_safe_apply_provider_status",
 ):

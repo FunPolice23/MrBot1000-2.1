@@ -193,6 +193,7 @@ class SmallBrainAdapter:
             from agents.tool_calling import chat_with_tools
             protocol = self._dialogue_protocol()
             self.last_tool_trace = []
+            thinking_model = "thinking" in str(self.model).lower()
             answer = chat_with_tools(
                 client=client,
                 model=self.model,
@@ -206,7 +207,8 @@ class SmallBrainAdapter:
                 max_iterations=1 if dialogue_mode else 2,
                 use_function_calling=False,
                 flatten_system_prompt=protocol["flatten_system_prompt"],
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                extra_body={"chat_template_kwargs": {
+                    "enable_thinking": thinking_model}},
                 tool_trace=self.last_tool_trace,
             )
             if not str(answer or "").strip():

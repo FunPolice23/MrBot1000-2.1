@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 import os
+import html
+import re
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, Signal
@@ -361,18 +363,26 @@ class ModelLibraryTab(QWidget):
 
     def _render_model(self, model):
         self.artifact_combo.clear()
-        description = model.description.replace("<", "&lt;").replace(">", "&gt;")
+        description = html.escape(model.description or "No model description was supplied.")
+        description = re.sub(r"^###?\s+(.+)$", r"<h4>\1</h4>", description, flags=re.MULTILINE)
+        description = re.sub(r"^##\s+(.+)$", r"<h3>\1</h3>", description, flags=re.MULTILINE)
+        description = re.sub(r"^#\s+(.+)$", r"<h2>\1</h2>", description, flags=re.MULTILINE)
+        description = re.sub(r"^[-*]\s+(.+)$", r"<li>\1</li>", description, flags=re.MULTILINE)
+        description = re.sub(r"(?:<li>.*?</li>\n?)+", lambda match: f"<ul>{match.group(0)}</ul>", description, flags=re.S)
+        description = description.replace("\n\n", "</p><p>").replace("\n", "<br>")
         self.details.setHtml(
-            f"<h3>{model.title}</h3><p><b>Repository:</b> <a href='{model.site_url}'>{model.repo_id}</a><br>"
-            f"<b>Architecture:</b> {model.architecture} · <b>Type:</b> {model.type_label}<br>"
-            f"<b>Category:</b> {model.category} · <b>Task:</b> {model.task}<br>"
-            f"<b>Parameters:</b> {model.size_label} · <b>Band:</b> {model.size_band} · <b>License:</b> {model.license}<br>"
-            f"<b>Downloads:</b> {model.downloads:,} · <b>Context:</b> {model.context or 'unknown'}<br>"
-            f"<b>Capabilities:</b> {', '.join(model.capabilities) or 'unknown'}<br>"
-            f"<b>Metadata:</b> {model.metadata_source}</p>"
-            f"<p><b>Backend:</b> GGUF is directly compatible with llama.cpp, LM Studio, and KoboldCpp. "
+            f"<h3>{html.escape(model.title)}</h3>"
+            f"<p><b>Repository:</b> <a href='{html.escape(model.site_url)}'>{html.escape(model.repo_id)}</a></p>"
+            f"<table cellpadding='3'><tr><td><b>Architecture</b></td><td>{html.escape(model.architecture)}</td></tr>"
+            f"<tr><td><b>Type</b></td><td>{html.escape(model.type_label)}</td></tr>"
+            f"<tr><td><b>Category / task</b></td><td>{html.escape(model.category)} / {html.escape(model.task)}</td></tr>"
+            f"<tr><td><b>Parameters</b></td><td>{html.escape(model.size_label)} ({html.escape(model.size_band)})</td></tr>"
+            f"<tr><td><b>License</b></td><td>{html.escape(model.license)}</td></tr>"
+            f"<tr><td><b>Downloads / context</b></td><td>{model.downloads:,} / {model.context or 'unknown'}</td></tr>"
+            f"<tr><td><b>Capabilities</b></td><td>{html.escape(', '.join(model.capabilities) or 'unknown')}</td></tr></table>"
+            f"<h4>Backend notes</h4><p>GGUF is directly compatible with llama.cpp, LM Studio, and KoboldCpp. "
             f"Ollama requires an import/Modelfile step; vLLM compatibility depends on its configured backend.</p>"
-            f"<p>{description or 'No model description was supplied.'}</p>"
+            f"<h4>Model card</h4><p>{description}</p>"
         )
         for artifact in model.artifacts:
             self.artifact_combo.addItem(f"{artifact.name} · {artifact.quantization} · {artifact.size_label}", artifact)
@@ -421,6 +431,9 @@ class ModelLibraryTab(QWidget):
         self.pause_event.clear()
         self.cancel_event.clear()
         self.progress.setValue(0)
+        partial = destination / (Path(artifact.name).name + ".part")
+        if partial.exists():
+            self._set_status(f"Resuming retained partial download: {partial.stat().st_size:,} bytes.")
         self.pause_button.setEnabled(True)
         self.cancel_button.setEnabled(True)
         self.download_button.setEnabled(False)

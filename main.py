@@ -1354,14 +1354,30 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         QTimer.singleShot(0, lambda: self._set_window_mode(self._window_mode, persist=False))
 
     def _size_for_screen(self):
-        """Choose a usable initial size on the current display."""
-        screen = QApplication.primaryScreen()
+        """Choose a usable initial size on the current display.
+
+        Use the available work area rather than physical monitor size: a
+        15-inch laptop and a large monitor can have the same logical desktop,
+        while Windows display scaling changes the usable pixel dimensions.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
         if screen is None:
             self.resize(1280, 800)
             return
         available = screen.availableGeometry()
-        width = min(1450, max(960, int(available.width() * 0.92)))
-        height = min(950, max(640, int(available.height() * 0.90)))
+        dpi_scale = max(screen.logicalDotsPerInch(), 96.0) / 96.0
+        compact = available.width() < 1200 or available.height() < 720
+        width_ratio = 0.98 if compact else 0.92
+        height_ratio = 0.96 if compact else 0.90
+        preferred_width = int(2200 * min(dpi_scale, 1.25))
+        preferred_height = int(1300 * min(dpi_scale, 1.15))
+        width = min(preferred_width, int(available.width() * width_ratio))
+        height = min(preferred_height, int(available.height() * height_ratio))
+        minimum_width = min(960, max(720, available.width() - 24))
+        minimum_height = min(640, max(480, available.height() - 48))
+        width = max(minimum_width, width)
+        height = max(minimum_height, height)
+        self.setProperty("compactLayout", compact)
         self.resize(min(width, available.width()), min(height, available.height()))
         self.move(
             available.left() + max(0, (available.width() - self.width()) // 2),

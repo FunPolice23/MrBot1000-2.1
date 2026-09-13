@@ -29,6 +29,18 @@ def test_list_name_classification_handles_dense_and_moe_variants():
     assert moe.type_label == "MoE"
 
 
+def test_embedding_gguf_is_discoverable():
+    service = HuggingFaceModelService(Mock())
+    model = service._summary_model({
+        "id": "sentence-transformers/embedding-qwen-0.6b-GGUF",
+        "pipeline_tag": "feature-extraction",
+        "tags": ["gguf", "text-embeddings"],
+        "siblings": [{"rfilename": "embedding-qwen-0.6b-Q8_0.gguf", "size": 1}],
+    })
+    assert model.category == "embedding"
+    assert [item.name for item in model.artifacts] == ["embedding-qwen-0.6b-Q8_0.gguf"]
+
+
 def test_inspect_keeps_chat_gguf_and_excludes_mmproj():
     response = Mock()
     response.url = "https://huggingface.co/api/models/acme/demo"

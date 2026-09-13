@@ -102,6 +102,44 @@ def read_metadata(path: str) -> Dict[str, Any]:
     return out
 
 
+def read_tensor_names(path: str) -> set[str]:
+    """Read GGUF tensor names without touching tensor data."""
+    names: set[str] = set()
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return names
+            f.read(4)
+            (tensor_count,) = struct.unpack("<Q", f.read(8))
+            (n_kv,) = struct.unpack("<Q", f.read(8))
+            for _ in range(n_kv):
+                (key_length,) = struct.unpack("<Q", f.read(8))
+                f.seek(key_length, 1)
+                (value_type,) = struct.unpack("<I", f.read(4))
+                _skip_val(f, value_type)
+            for _ in range(tensor_count):
+                (name_length,) = struct.unpack("<Q", f.read(8))
+                names.add(f.read(name_length).decode("utf-8", "replace"))
+                (dimensions,) = struct.unpack("<I", f.read(4))
+                f.seek(8 * dimensions + 4 + 8, 1)
+    except (OSError, struct.error, UnicodeError, ValueError):
+        return set()
+    return names
+
+
+def validate_model(path: str) -> list[str]:
+    """Return deterministic GGUF compatibility errors before server startup."""
+    metadata = read_metadata(path)
+    if not metadata:
+        return ["file is not a readable GGUF"]
+    if metadata.get("general.architecture") == "qwen35":
+        tensor_names = read_tensor_names(path)
+        required = "blk.16.attn_norm.weight"
+        if tensor_names and required not in tensor_names:
+            return [f"qwen35 GGUF is missing required tensor {required!r}"]
+    return []
+
+
 def estimate_vram_gb(path: str, context: int = 8192,
                      kv_type_bytes: int = 2) -> Dict[str, Any]:
     """Estimate a model's VRAM footprint.

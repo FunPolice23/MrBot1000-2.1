@@ -50,8 +50,34 @@ class GPUInfo:
     memory_free_mb: int
     temperature: float = 0.0
     utilization: float = 0.0
+    compute_capability: str = ""
     assigned_provider: str = ""
     assigned_brain: str = ""
+
+    @property
+    def tensor_types(self) -> List[str]:
+        """Tensor/KV precisions appropriate for this CUDA capability."""
+        return supported_tensor_types(self.compute_capability)
+
+
+def supported_tensor_types(compute_capability: str = "", cpu: bool = False) -> List[str]:
+    """Return conservative llama.cpp KV types for detected hardware.
+
+    F16 arithmetic is available on CUDA GPUs without tensor cores. BF16 is
+    exposed only for Ampere-class (SM 8.0+) hardware; quantized KV types are
+    useful on both old and new GPUs and do not require tensor cores.
+    """
+    if cpu:
+        return ["f32", "f16", "q8_0", "q4_0"]
+    try:
+        major, minor = (int(part) for part in str(compute_capability).split(".", 1))
+        capability = major + minor / 10
+    except (TypeError, ValueError):
+        capability = 0.0
+    types = ["f16", "f32", "q8_0", "q4_0"]
+    if capability >= 8.0:
+        types.insert(1, "bf16")
+    return types
 
 
 @dataclass
@@ -130,7 +156,7 @@ class ProviderManager:
         self._gpus = []
         try:
             result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,memory.free,temperature.gpu,utilization.gpu",
+                ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,memory.free,temperature.gpu,utilization.gpu,compute_cap",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -147,6 +173,7 @@ class ProviderManager:
                             memory_free_mb=int(float(parts[4])),
                             temperature=float(parts[5]) if parts[5] != "N/A" else 0.0,
                             utilization=float(parts[6]) if parts[6] != "N/A" else 0.0,
+                            compute_capability=parts[7] if len(parts) >= 8 and parts[7] != "N/A" else "",
                         ))
         except Exception:
             pass

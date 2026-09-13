@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -173,7 +174,7 @@ def _architecture(text: str) -> str:
 
 def _is_moe(text: str) -> Optional[bool]:
     lowered = text.lower()
-    if re.search(r"\b(?:mixture[- ]of[- ]experts|moe|mixtral|experts?)\b", lowered) or re.search(r"(?:\d+x\d+b|\d+b[-_]?a\d+b|a\d+b|a3b|a4b)", lowered):
+    if re.search(r"\b(?:mixture[- ]of[- ]experts|moe|mixtral|experts?)\b", lowered) or re.search(r"(?:\d+x\d+b|\d+b[-_]?a\d+b|a\d+b)", lowered):
         return True
     if re.search(r"\b(?:dense|causal language model|decoder[- ]only)\b", lowered):
         return False
@@ -187,7 +188,7 @@ def _is_moe(text: str) -> Optional[bool]:
 def _artifact_from_sibling(repo_id: str, sibling: dict[str, Any]) -> Optional[GGUFArtifact]:
     name = str(sibling.get("rfilename") or sibling.get("path") or "")
     lowered = name.lower()
-    excluded = ("mmproj", "imatrix", "embedding", "adapter", "projector", "tokenizer", "clip")
+    excluded = ("mmproj", "imatrix", "adapter", "projector", "tokenizer", "clip")
     if not lowered.endswith(".gguf") or any(token in lowered for token in excluded):
         return None
     if "/mtp/" in f"/{lowered}" or lowered.startswith("mtp/"):
@@ -459,7 +460,20 @@ def download_artifact(
     destination.mkdir(parents=True, exist_ok=True)
     target = destination / Path(artifact.name).name
     partial = target.with_name(target.name + ".part")
+    state_file = partial.with_suffix(partial.suffix + ".json")
     existing = partial.stat().st_size if partial.exists() else 0
+    expected_state = {"url": artifact.download_url, "size": int(artifact.size or 0), "sha256": artifact.sha256.lower()}
+    if existing:
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            state = None
+        if state != expected_state:
+            partial.unlink(missing_ok=True)
+            state_file.unlink(missing_ok=True)
+            existing = 0
+    if existing or artifact.size or artifact.sha256:
+        state_file.write_text(json.dumps(expected_state, sort_keys=True), encoding="utf-8")
     if artifact.size and free_space(destination) < max(artifact.size - existing, 0):
         raise OSError("Not enough free storage for this model")
     headers = {"Range": f"bytes={existing}-"} if existing else {}
@@ -469,10 +483,12 @@ def download_artifact(
         if existing and not resumed:
             existing = 0
             partial.unlink(missing_ok=True)
+            state_file.unlink(missing_ok=True)
         response.raise_for_status()
         total = _response_total_bytes(response, existing, artifact.size, resumed)
         if artifact.size and total > artifact.size:
             partial.unlink(missing_ok=True)
+            state_file.unlink(missing_ok=True)
             raise ValueError("Model response exceeds the declared artifact size")
         mode = "ab" if existing else "wb"
         completed = existing
@@ -494,6 +510,7 @@ def download_artifact(
                     if artifact.size and completed > artifact.size:
                         handle.close()
                         partial.unlink(missing_ok=True)
+                        state_file.unlink(missing_ok=True)
                         raise ValueError("Model download exceeded the declared artifact size")
                     completed = max(completed, 0)
                     if completed - checked_space_at >= 16 * 1024 * 1024:
@@ -521,8 +538,10 @@ def download_artifact(
                 digest.update(chunk)
         if digest.hexdigest().lower() != artifact.sha256.lower():
             partial.unlink(missing_ok=True)
+            state_file.unlink(missing_ok=True)
             raise ValueError("SHA-256 checksum verification failed")
     os.replace(partial, target)
+    state_file.unlink(missing_ok=True)
     return target
 
 

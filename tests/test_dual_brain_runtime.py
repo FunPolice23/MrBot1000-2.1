@@ -21,6 +21,7 @@ from agents.dual_brain_runtime import (
     PROVIDER_KOBOLDCPP,
     PROVIDER_VLLM,
 )
+from agents.provider_manager import supported_tensor_types
 
 
 class _FakeModelsHandler(http.server.BaseHTTPRequestHandler):
@@ -50,6 +51,16 @@ class _Server:
 
 
 class TestRoleDefaults(unittest.TestCase):
+    def test_tensor_types_are_conservative_for_old_cuda(self):
+        self.assertNotIn("bf16", supported_tensor_types("7.5"))
+        self.assertIn("q4_0", supported_tensor_types("7.5"))
+
+    def test_tensor_types_include_bf16_for_ampere_and_newer(self):
+        self.assertIn("bf16", supported_tensor_types("8.6"))
+
+    def test_cpu_tensor_types_do_not_require_cuda(self):
+        self.assertEqual(supported_tensor_types(cpu=True), ["f32", "f16", "q8_0", "q4_0"])
+
     def test_custom_display_names_are_role_specific(self):
         big = build_config(BrainRole.BIG, {"BIG_BRAIN_NAME": "Orion"})
         small = build_config(BrainRole.SMALL, {"SMALL_BRAIN_NAME": "Lumen"})
@@ -117,6 +128,18 @@ class TestIsolation(unittest.TestCase):
 
 
 class TestConfigFromEnv(unittest.TestCase):
+    def test_kv_cache_and_batch_are_independent_per_brain(self):
+        rt = DualBrainRuntime.from_env({
+            "BIG_BRAIN_KV_CACHE": "q4_0",
+            "BIG_BRAIN_BATCH": "4096",
+            "SMALL_BRAIN_KV_CACHE": "f16",
+            "SMALL_BRAIN_BATCH": "512",
+        })
+        self.assertEqual(rt.config(BrainRole.BIG).kv_cache, "q4_0")
+        self.assertEqual(rt.config(BrainRole.BIG).batch, 4096)
+        self.assertEqual(rt.config(BrainRole.SMALL).kv_cache, "f16")
+        self.assertEqual(rt.config(BrainRole.SMALL).batch, 512)
+
     def test_env_overrides_endpoint_and_model(self):
         env = {
             "BIG_BRAIN_URL": "http://127.0.0.1:9000/v1",
