@@ -1,7 +1,26 @@
 ## [Unreleased] - 2026-09-12
 
 ### Added
-- Added a configurable shared `ai_workshop` for Edward and Jacob. The human
+- Added per-brain temperature control to Providers & GPU: QDoubleSpinBox + preset combo (0.0 Precise / 0.3 Low / 0.5 Default / 0.7 Medium / 1.0 Creative / 1.5 Wild) for both Small Brain and Big Brain. Values persist to `.env` as `SMALL_BRAIN_TEMPERATURE` / `BIG_BRAIN_TEMPERATURE` and are picked up by both adapters on next restart.
+- Added model-family auto-detection (`agents/model_profile.py`): detects the
+  correct chat template, tool-calling format, and thinking mode from GGUF
+  metadata, filename patterns, and the server ``/props`` endpoint. Supports
+  Qwen 3.8/3.6/3/2.5, Gemma 4/3/2, DeepSeek V3/V2/Coder, NVIDIA
+  Nemotron/Nano, Llama 3/4, Mistral, Phi 3/4, Falcon, and StarCoder.
+- Added live generation progress bar to the Dialogue tab: a QProgressBar below
+  the chat display shows "Generating {persona}'s response..." with
+  color-coded bars (blue=Edward/Jacob) and live token count updates as tokens
+  stream in. Progress bar appears immediately when generation starts and hides
+  on completion. Stats line now includes actual streamed token count instead
+  of just character-based estimates.
+- Added live turn stats to the Dialogue tab: after Edward or Jacob responds, a
+  stats line shows model name, provider, latency, estimated tokens, and
+  tokens/sec (e.g. `📊 Edward Hurst responded model=Qwen3.8-27B via big-brain
+  in 3.2s ~412 tok at 128.5 tok/s (max 768)`).
+- Added a watchdog timer for dialogue inference: if a response takes longer
+  than `DIALOGUE_WATCHDOG_SECONDS` (default 900), the worker is cancelled and
+  an error is shown instead of hanging on "Generating..." forever. This
+  happens when VRAM is full and the SDK timeout doesn't abort.
   selects its location with `MRBOT_WORKSHOP_ROOT` or `AI_WORKSHOP_ROOT`; an
   existing folder is reused and a standard structure is created when needed.
   Workshop reads and writes are constrained to that root, explicit folder
@@ -133,6 +152,12 @@
 - Fixed Providers & GPU tab layout: Small Brain KV Cache and Batch Size controls were
   displayed under Big Brain's section instead of grouped with Small Brain's controls.
   Each brain's settings now appear directly under its own section with its assigned GPU.
+- Fixed Small Brain failure with Qwen3-4B_Thinking model: when the thinking model
+  returned empty content (thinking tokens in `reasoning_content` instead of `content`),
+  the response parsed as empty and triggered retries that eventually failed with
+  "Connection error." Two fixes: (1) `_visible_response_content()` in `tool_calling.py`
+  now falls back to `reasoning_content` when `content` is empty, and (2) `chat_with_tools()`
+  retries without `enable_thinking` if the first response is empty.
 - Fixed Coinbase adapter startup when sandbox mode is enabled even though the
   selected ccxt Coinbase client has no sandbox URL. Coinbase now documents a
   live API read configuration, exchange sandbox mode now defaults off unless

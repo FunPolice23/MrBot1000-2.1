@@ -13,9 +13,10 @@ Features:
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
-import json
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -56,6 +57,7 @@ class BigBrainAdapter:
         # We intentionally avoid a blocking HTTP call in __init__ so tab
         # construction stays fast even when llama-server is not yet running.
         self.model = model or os.getenv("BIG_BRAIN_MODEL", "").strip() or ""
+        self.temperature = float(os.getenv("BIG_BRAIN_TEMPERATURE", "0.5") or 0.5)
         self.last_tool_trace = []
         
         # Load system prompt
@@ -69,7 +71,11 @@ class BigBrainAdapter:
     def _get_client(self):
         """Get OpenAI client for llama-server."""
         import openai
-        timeout = float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "60"))
+        # Use a longer default timeout for local inference — when VRAM is
+        # contended, a 60s default fires before the model can even finish a
+        # single generation, leaving the Dialogue tab stuck on "Generating..."
+        # with no error shown to the operator.
+        timeout = float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "600"))
         return openai.OpenAI(api_key="local", base_url=self.base_url,
                              timeout=max(5.0, timeout))
 
@@ -301,11 +307,19 @@ class BigBrainAdapter:
     
     def chat(self, user_message: str, history: list = None,
              system_prompt: str = None, max_tokens: int = None,
-             dialogue_mode: bool = False) -> str:
-        """Handle direct chat with tool calling support."""
+             dialogue_mode: bool = False, stream_progress=None) -> str:
+        """Handle direct chat with tool calling support.
+        
+        stream_progress: optional callback(str_chunk) invoked for each streamed
+        token so the caller can show live generation progress.
+        """
         # GUI is the source of truth for model selection
         if self.model == "unknown" or not self.model:
             return f"[{DRIVER.current_name}: No model selected. Please choose a model in the Providers & GPU tab.]"
+        
+        # Detect model family for proper template/tool/thinking handling.
+        from agents.model_profile import get_model_profile, build_extra_body, needs_flat_system
+        profile = get_model_profile(model_path=self.model, base_url=self.base_url)
 
         # Build system prompt
         if system_prompt:
@@ -359,7 +373,18 @@ class BigBrainAdapter:
             from agents.tool_calling import chat_with_tools
             protocol = self._dialogue_protocol()
             self.last_tool_trace = []
+            
+            # Use detected profile for thinking/extra_body configuration.
             thinking_model = "thinking" in str(self.model).lower()
+            extra_body = build_extra_body(profile, enable_thinking=thinking_model)
+            # Only send extra_body if non-empty (avoids issues with servers that
+            # reject unknown fields).
+            final_extra_body = extra_body if extra_body else None
+            
+            # Track timing for stats.
+            import time as _time
+            _t0 = _time.time()
+            
             answer = chat_with_tools(
                 client=client,
                 model=self.model,
@@ -367,16 +392,40 @@ class BigBrainAdapter:
                 user_message=user_message,
                 history=history,
                 max_tokens=request_max_tokens,
-                temperature=0.5,
+                temperature=self.temperature,
                 # One tool round lets Dialogue execute bounded read-only
                 # research instead of endlessly announcing that it will search.
                 max_iterations=1 if dialogue_mode else 2,
                 use_function_calling=protocol["use_function_calling"],
                 flatten_system_prompt=protocol["flatten_system_prompt"],
-                extra_body={"chat_template_kwargs": {
-                    "enable_thinking": thinking_model}},
+                extra_body=final_extra_body,
                 tool_trace=self.last_tool_trace,
+                stream_progress=stream_progress,
             )
+            elapsed = _time.time() - _t0
+            
+            # Log to DB with real tokens/tps.
+            try:
+                prompt_chars = len(full_system) + len(user_message)
+                resp_chars = len(answer or "")
+                prompt_tokens = max(1, prompt_chars // 4)
+                completion_tokens = max(1, resp_chars // 4)
+                tps = (prompt_tokens + completion_tokens) / elapsed if elapsed > 0 else 0.0
+                self.db.log_llm_call(
+                    model=self.model,
+                    provider=getattr(self, "last_provider", "big-brain"),
+                    trigger="dialogue" if dialogue_mode else "chat",
+                    prompt_chars=prompt_chars,
+                    response_chars=resp_chars,
+                    latency_ms=int(elapsed * 1000),
+                    error=None,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    tokens_per_second=tps,
+                    cost_usd=0.0,
+                )
+            except Exception:
+                pass  # Stats logging must never break the response
             if not str(answer or "").strip():
                 return (
                     f"[{DRIVER.current_name} Error: model returned an empty response "

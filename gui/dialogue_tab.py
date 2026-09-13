@@ -28,11 +28,12 @@ Inference runs on a background QThread so the GUI never blocks.
 
 from PySide6.QtCore import Qt, Signal, QThread, QTimer
 from PySide6.QtWidgets import (
-    QWidget, QTextEdit, QVBoxLayout, QHBoxLayout,
+    QWidget, QTextEdit, QVBoxLayout, QHBoxLayout, QProgressBar,
     QPushButton, QLineEdit, QLabel, QComboBox, QListWidget, QGroupBox,
 )
 import os
 import re
+import time
 
 from agents.personas import DRIVER, NAVIGATOR
 
@@ -498,7 +499,34 @@ class DialogueTab(QWidget):
                 font-size: 13px; padding: 10px;
             }
         """)
-        main_layout.addWidget(self.chat_display, stretch=4)
+        
+        # Live progress bar (below chat) showing generation progress + stats.
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)  # 0/0 = busy/indeterminate
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("Ready")
+        self.progress_bar.setFixedHeight(20)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background: #1a1a1a;
+                border: 1px solid #333;
+                border-radius: 4px;
+                text-align: center;
+                color: #aaa;
+                font-size: 11px;
+            }
+            QProgressBar::chunk {
+                background: #4fc3f7;
+                border-radius: 4px;
+            }
+        """)
+        self.progress_bar.hide()
+        
+        chat_with_progress = QVBoxLayout()
+        chat_with_progress.addWidget(self.chat_display)
+        chat_with_progress.addWidget(self.progress_bar)
+        chat_with_progress.setSpacing(4)
+        main_layout.addLayout(chat_with_progress, stretch=4)
 
         # Sidebar (stretch=1) - collapsible panels
         sidebar_layout = QVBoxLayout()
@@ -697,35 +725,33 @@ class DialogueTab(QWidget):
         self.current_speaker = _persona_name(self.current_speaker)
         self.append_system(f"Generating {self.current_speaker}'s response...")
 
-        from agents.personas import persona_for_key
-        persona = persona_for_key(self.current_speaker)
-        model_name = getattr(
-            self.big_brain if self.current_speaker == "Edward Hurst" else self.small_brain,
-            "model", "")
-        # Gemma 4 is sensitive to long generic tool/example prompts. Keep the
-        # dialogue contract compact for this family even when the active model
-        # is the larger Driver model.
-        model_size = self._estimate_model_size(model_name)
-        prompt_tier = (
-            "tiny" if model_size < 4
-            else "compact" if model_size < 9
-            else "full"
-        )
-        system_prompt = (
-            persona.build_system_prompt(
-                goal=self.goal, tier=prompt_tier)
-            if persona else None
-        )
+        # Watchdog: if the worker runs longer than DIALOGUE_WATCHDOG_SECONDS,
+        # kill it and show an error instead of hanging on "Generating..." forever.
+        # This happens when VRAM is full and the SDK timeout doesn't abort the
+        # underlying connection.
+        watchdog_sec = float(os.getenv("DIALOGUE_WATCHDOG_SECONDS", "900"))
+        self._watchdog_start = time.time()
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.setSingleShot(True)
+        self._watchdog_timer.timeout.connect(self._on_watchdog_timeout)
+        self._watchdog_timer.start(int(watchdog_sec * 1000))
 
-        context = self.get_dialogue_context()
+        # Probe the server for readiness before starting the worker.
+        # This avoids the 503 "Loading model" race when llama-server accepts
+        # the connection before the model is fully mapped into VRAM.
         brain = self.big_brain if self.current_speaker == "Edward Hurst" else self.small_brain
-        if system_prompt:
-            system_prompt += self._model_output_contract(getattr(brain, "model", ""))
-        # ``context`` already contains the summarized and recent transcript.
-        # Passing the same history again makes models see every turn twice and
-        # repeatedly issue the same search/read request.
-        self._generation_id += 1
-        generation_id = self._generation_id
+        base_url = getattr(brain, "base_url", "")
+        if base_url:
+            self._probe_server_ready(base_url, self.current_speaker, generation_id,
+                                     system_prompt, context)
+            return  # Worker started by probe callback
+
+        # Server not local or no URL — start immediately.
+        self._start_worker(brain, context, system_prompt, generation_id)
+
+    def _start_worker(self, brain, context: str, system_prompt: str, generation_id: int):
+        """Create and start the DialogueWorker. Called directly or from probe."""
+        self._show_progress_for(self.current_speaker, generation_id)
         self.worker = DialogueWorker(brain, context, [],
                                      self.current_speaker, system_prompt,
                                      generation_id=generation_id)
@@ -734,10 +760,14 @@ class DialogueTab(QWidget):
                 else "_navigator_dialogue_blocked", False))
         self.worker.done.connect(self._on_worker_done)
         self.worker.tool_activity.connect(self._on_tool_activity)
+        self.worker.stats.connect(self._on_stats)
+        self.worker.progress.connect(self._on_dialogue_progress)
         self.worker.finished.connect(
             lambda response, speaker, generation=generation_id:
             self._on_response_ready(response, speaker, generation))
         self.worker.start()
+        # Reset probe retry counter on successful start.
+        self._probe_retry_count = 0
 
     def _on_tool_activity(self, speaker: str, event: object):
         """Display and retain dispatcher-confirmed tool execution separately."""
@@ -782,8 +812,78 @@ class DialogueTab(QWidget):
                 "queue. Review or deny the request before continuing."
             )
 
+    def _probe_server_ready(self, base_url: str, speaker: str, generation_id: int,
+                             system_prompt: str, context: str):
+        """Check if server is ready. If yes, start worker. If not, retry."""
+        import json
+        from urllib.request import urlopen, Request
+
+        base = str(base_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        if not base:
+            return
+        host = (urlparse(base).hostname or "").lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            return
+
+        def _check_ready():
+            try:
+                req = Request(f"{base}/health", headers={"Accept": "application/json"})
+                with urlopen(req, timeout=2) as r:
+                    return r.status == 200
+            except Exception:
+                pass
+            try:
+                req = Request(f"{base}/v1/models", headers={"Accept": "application/json"})
+                with urlopen(req, timeout=2) as r:
+                    if r.status == 200:
+                        body = json.loads(r.read().decode("utf-8"))
+                        return bool(body.get("data"))
+            except Exception:
+                pass
+            return False
+
+        if _check_ready():
+            self._start_worker(
+                self.big_brain if speaker == "Edward Hurst" else self.small_brain,
+                context, system_prompt, generation_id)
+            return
+
+        # Not ready yet — retry with exponential backoff.
+        probe_retries = getattr(self, "_probe_retry_count", 0)
+        self._probe_retry_count = probe_retries + 1
+        wait = min(10, 1 * (2 ** probe_retries))
+        self.append_system(
+            f"⏳ {speaker}'s model still loading; checking again in {wait}s.")
+        QTimer.singleShot(wait * 1000,
+                          lambda: self._probe_server_ready(base_url, speaker, generation_id,
+                                                            system_prompt, context))
+
+    def _on_watchdog_timeout(self):
+        """Worker ran too long — likely VRAM contention. Kill it and show error."""
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self._retired_workers.append(self.worker)
+            self.worker = None
+            self.append_system(
+                f"⚠️ {self.current_speaker}'s response timed out — "
+                "likely VRAM contention. Try reducing context size or "
+                "restarting the brain server."
+            )
+            if self.live_running or self.is_running:
+                self.stop_live()
+
     def _on_worker_done(self, worker):
         """Release completed workers and resume a deferred live generation."""
+        # Stop the watchdog timer — the worker finished normally.
+        watchdog = getattr(self, "_watchdog_timer", None)
+        if watchdog is not None:
+            watchdog.stop()
+            self._watchdog_timer = None
+        # Hide progress bar on completion.
+        self.progress_bar.hide()
+        self.progress_bar.setFormat("Ready")
         was_retired = worker in self._retired_workers
         if was_retired:
             self._retired_workers.remove(worker)
@@ -793,6 +893,59 @@ class DialogueTab(QWidget):
         if was_retired:
             if self.live_running or self.is_running:
                 self.respond()
+
+    def _show_progress_for(self, speaker: str, generation_id: int):
+        """Show the indeterminate progress bar for a new response generation."""
+        self._progress_generation_id = generation_id
+        self.progress_bar.show()
+        self.progress_bar.setRange(0, 0)  # indeterminate
+        name = _persona_name(speaker)
+        color = "#4fc3f7" if "Edward" in name else "#03dac6"
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: #1a1a1a;
+                border: 1px solid #333;
+                border-radius: 4px;
+                text-align: center;
+                color: #aaa;
+                font-size: 11px;
+            }}
+            QProgressBar::chunk {{
+                background: {color};
+                border-radius: 4px;
+            }}
+        """)
+        self.progress_bar.setFormat(f"Generating {name}'s response...")
+
+    def _on_dialogue_progress(self, speaker: str, chunk: str, running: str):
+        """Update the progress bar as tokens stream in."""
+        if getattr(self, "_progress_generation_id", None) != self._generation_id:
+            return
+        self.progress_bar.setRange(0, 0)  # stay indeterminate during streaming
+        # Estimate token count from chars.
+        est_tokens = len(running) // 4 if running else 0
+        self.progress_bar.setFormat(f"Generating — ~{est_tokens} tok streamed")
+
+    def _on_stats(self, response: str, speaker: str, stats: dict):
+        """Display turn stats (latency, tokens/sec, model) in the dialogue."""
+        tps = stats.get("tokens_per_second", 0)
+        elapsed = stats.get("elapsed_s", 0)
+        total = stats.get("total_tokens", 0)
+        model = stats.get("model", "")
+        provider = stats.get("provider", "")
+        max_tok = stats.get("max_tokens", "")
+        parts = [f"{speaker} responded"]
+        if model:
+            parts.append(f"model={model}")
+        if provider:
+            parts.append(f"via {provider}")
+        parts.append(f"in {elapsed:.1f}s")
+        parts.append(f"~{total} tok")
+        if tps > 0:
+            parts.append(f"at {tps:.1f} tok/s")
+        if max_tok:
+            parts.append(f"(max {max_tok})")
+        self.append_system(" 📊 " + " │ ".join(parts))
 
     def _on_response_ready(self, response: str, speaker: str, generation: int = None):
         if generation is not None and generation != self._generation_id:
@@ -894,14 +1047,21 @@ class DialogueTab(QWidget):
         is_transport_error = (
             response_lower.startswith(("error:", "[error:", "connection error"))
             or " error: connection error" in response_lower
+            or "loading model" in response_lower
+            or "503" in response_lower
             or response_lower.startswith(("[edward hurst error:", "[jacob stanley error:"))
         )
         if is_transport_error:
+            # Exponential backoff: 3s, 6s, 12s — wait for model to load into VRAM.
+            transport_retries = getattr(self, "_transport_retry_count", 0)
+            self._transport_retry_count = transport_retries + 1
+            wait = min(30, 3 * (2 ** transport_retries))
             self.append_system(
-                f"{speaker} could not reach its model; retrying in 3 seconds.")
+                f"{speaker} could not reach its model (attempt "
+                f"{self._transport_retry_count}); retrying in {wait}s.")
             self.worker = None
             if self.live_running or self.is_running:
-                QTimer.singleShot(3000, self.respond)
+                QTimer.singleShot(wait * 1000, self.respond)
             return
         
         # Empty output is a failed generation, not a persona turn. Keep the
@@ -933,6 +1093,7 @@ class DialogueTab(QWidget):
         self._empty_response_retries = 0
         self._duplicate_retry_count = 0
         self._semantic_retry_count = 0
+        self._transport_retry_count = 0
         self.worker = None
 
         pending_tool_blocked = getattr(self, "_pending_tool_blocked", False)
@@ -1508,7 +1669,7 @@ class DialogueTab(QWidget):
     # ── display ─────────────────────────────────────────────────────────
     def append_system(self, text: str):
         self.chat_display.append(
-            f'<i style="color:{SYS_COLOR};">{text}</i>')
+            f'<div style="margin:8px 0;"><i style="color:{SYS_COLOR};">{text}</i></div>')
         self.chat_display.verticalScrollBar().setValue(
             self.chat_display.verticalScrollBar().maximum())
 
@@ -1534,7 +1695,7 @@ class DialogueTab(QWidget):
         
         self.chat_display.append(
             f'<b style="color:{_color(sender)};">{_emoji(sender)} {name}:</b>')
-        self.chat_display.append(f'<p style="margin:4px 0 12px 0;">{html_msg}</p>')
+        self.chat_display.append(f'<p style="margin:4px 0 20px 0;">{html_msg}</p>')
         self.chat_display.verticalScrollBar().setValue(
             self.chat_display.verticalScrollBar().maximum())
 
@@ -1567,6 +1728,8 @@ class DialogueWorker(QThread):
 
     finished = Signal(str, str)  # response, speaker
     tool_activity = Signal(str, object)  # speaker, dispatcher-confirmed event
+    stats = Signal(str, str, dict)  # response, speaker, stats_dict
+    progress = Signal(str, str, str)  # speaker, token_chunk, running_text
     done = Signal(object)
 
     def __init__(self, brain, context, history, speaker, system_prompt=None,
@@ -1604,13 +1767,27 @@ class DialogueWorker(QThread):
             if self.model_blocked:
                 self.finished.emit(self._safe_fallback_response(), self.speaker)
                 return
+            import time as _time
+            _t0 = _time.time()
+            _running = [""]  # accumulate streamed text for progress signal
+            _token_count = [0]
+            def _on_stream(chunk: str):
+                """Forward streamed chunks to the UI progress bar."""
+                _running[0] += chunk
+                _token_count[0] += 1
+                try:
+                    self.progress.emit(self.speaker, chunk, _running[0])
+                except Exception:
+                    pass
             kwargs = {}
             if self.system_prompt:
                 kwargs["system_prompt"] = self.system_prompt
             
             kwargs["max_tokens"] = self.max_tokens
             kwargs["dialogue_mode"] = True
+            kwargs["stream_progress"] = _on_stream
             response = self.brain.chat(self.context, self.history, **kwargs)
+            _elapsed = _time.time() - _t0
             for event in getattr(self.brain, "last_tool_trace", []) or []:
                 self.tool_activity.emit(self.speaker, event)
             if self._cancelled:
@@ -1632,22 +1809,48 @@ class DialogueWorker(QThread):
                         "say BLOCKED and stop; do not answer from general knowledge. Do not "
                         "describe an image unless the current phase explicitly asks for image analysis.]" )
                     response = self.brain.chat(retry_context, self.history, **kwargs)
+                    _elapsed = _time.time() - _t0
                     if self._cancelled:
                         return
                     if not self._is_bad_dialogue_response(response):
                         break
 
             # Never place malformed provider output into the shared transcript.
-            # A failed retry is safer than feeding a token/template corruption
-            # loop back to the other brain.
             if self._is_bad_dialogue_response(response):
                 response = self._safe_fallback_response()
             
+            # Emit stats alongside the finished signal so the dialogue tab can
+            # show tokens/sec, latency, model name for the turn just completed.
+            _stats = self._compute_stats(response, _elapsed, _token_count[0])
+            self.stats.emit(response or "(empty)", self.speaker, _stats)
             self.finished.emit(response or "(empty)", self.speaker)
         except Exception as e:
             self.finished.emit(f"Error: {str(e)}", self.speaker)
         finally:
             self.done.emit(self)
+
+    def _compute_stats(self, response: str, elapsed: float, streamed_tokens: int = 0) -> dict:
+        """Estimate turn stats from response length and elapsed wall time."""
+        model = str(getattr(self.brain, "model", "") or "")
+        # Estimate tokens from character count (rough but useful for live display).
+        est_tokens = max(1, len(response or "") // 4)
+        # Prefer the actual streamed chunk count when available.
+        completion_tokens = max(est_tokens, streamed_tokens)
+        prompt_chars = len(str(getattr(self, "context", "") or ""))
+        prompt_tokens = max(1, prompt_chars // 4)
+        elapsed_s = max(0.01, float(elapsed or 0.01))
+        tps = (prompt_tokens + completion_tokens) / elapsed_s if elapsed_s > 0 else 0.0
+        return {
+            "model": model,
+            "provider": getattr(self.brain, "last_provider", ""),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "elapsed_s": elapsed_s,
+            "tokens_per_second": tps,
+            "max_tokens": int(self.max_tokens),
+            "retries": 0,
+        }
 
     def _safe_fallback_response(self) -> str:
         """Return a useful, transcript-safe response after failed retries."""

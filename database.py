@@ -259,24 +259,33 @@ class AgentDB:
     # ------------------------------------------------------------------
     def log_llm_call(self, model: str, provider: str, trigger: str,
                      prompt_chars: int, response_chars: int,
-                     latency_ms: int, error: str = None):
+                     latency_ms: int, error: str = None,
+                     prompt_tokens: int = 0, completion_tokens: int = 0,
+                     tokens_per_second: float = 0.0, cost_usd: float = 0.0):
         self._execute(
             """INSERT INTO llm_calls
-               (ts, model, provider, trigger, prompt_chars, response_chars, latency_ms, error)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (ts, model, provider, trigger, prompt_chars, response_chars, latency_ms, error,
+                prompt_tokens, completion_tokens, tokens_per_second, cost_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (time.time(), model, provider, trigger,
-             prompt_chars, response_chars, latency_ms, error),
+             prompt_chars, response_chars, latency_ms, error,
+             prompt_tokens, completion_tokens, tokens_per_second, cost_usd),
             commit=True
         )
 
-    def get_llm_stats(self) -> dict:
+    def _get_llm_stats_basic(self) -> dict:
+        """Basic LLM stats (internal use)."""
         row = self._execute("""
             SELECT
                 COALESCE(COUNT(*), 0) AS total_calls,
                 COALESCE(SUM(CASE WHEN error IS NULL THEN 1 ELSE 0 END), 0) AS successes,
                 COALESCE(SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END), 0) AS errors,
                 COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
-                COALESCE(SUM(prompt_chars + response_chars), 0) AS total_chars
+                COALESCE(SUM(prompt_chars + response_chars), 0) AS total_chars,
+                COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens,
+                COALESCE(AVG(tokens_per_second), 0) AS avg_tokens_per_second,
+                COALESCE(SUM(cost_usd), 0) AS total_cost
             FROM llm_calls
         """).fetchone()
         return dict(row) if row else {}
@@ -284,7 +293,8 @@ class AgentDB:
     def get_recent_llm_calls(self, limit: int = 50) -> list[dict]:
         rows = self._execute(
             """SELECT ts, model, provider, trigger, prompt_chars,
-                      response_chars, latency_ms, error
+                      response_chars, latency_ms, error,
+                      prompt_tokens, completion_tokens, tokens_per_second, cost_usd
                FROM llm_calls ORDER BY ts DESC LIMIT ?""",
             (limit,),
         ).fetchall()

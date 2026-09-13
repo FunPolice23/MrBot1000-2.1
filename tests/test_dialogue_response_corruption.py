@@ -445,7 +445,9 @@ class TestDialogueResponseCorruption(unittest.TestCase):
 
     def test_reasoning_only_message_returns_empty_visible_content(self):
         message = Mock(content="", reasoning_content="private notes")
-        self.assertEqual(_visible_response_content(message), "")
+        # When content is empty but reasoning_content has text, we fall back to
+        # reasoning_content so the operator still receives the response.
+        self.assertEqual(_visible_response_content(message), "private notes")
 
     def test_empty_provider_response_becomes_model_diagnostic(self):
         from agents.big_brain import BigBrainAdapter

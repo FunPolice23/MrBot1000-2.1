@@ -647,6 +647,7 @@ def chat_with_tools(
     flatten_system_prompt: bool = False,
     extra_body: dict | None = None,
     tool_trace: list | None = None,
+    stream_progress: callable = None,
 ) -> str:
     """
     Chat with tool calling support.
@@ -654,6 +655,9 @@ def chat_with_tools(
     v2.1 fix: Added use_function_calling parameter. When False, tools are not
     passed to the API (avoids 400 errors on llama.cpp). Instead, tool calls
     are parsed from text format in the response.
+    
+    stream_progress: optional callback(str_chunk) invoked for each streamed
+    token so the caller can show live generation progress.
     """
     tools = get_all_tools() if use_function_calling else None
     
@@ -691,14 +695,60 @@ def chat_with_tools(
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
         
-        response = client.chat.completions.create(**kwargs)
-        msg = response.choices[0].message
+        # Stream tokens so the caller can show live progress in the UI.
+        kwargs["stream"] = True
+        answer_parts: list[str] = []
+        try:
+            stream = client.chat.completions.create(**kwargs)
+            msg = None
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+                if content is not None:
+                    answer_parts.append(content)
+                    if stream_progress is not None:
+                        try:
+                            stream_progress(content)
+                        except Exception:
+                            pass
+            answer = "".join(answer_parts)
+            if not answer.strip():
+                raise RuntimeError("empty stream response")
+        except TypeError:
+            # Some SDK/server combos reject extra_body/stream at call time;
+            # fall back to a plain non-streaming call (no progress streaming).
+            kwargs.pop("stream", None)
+            kwargs.pop("extra_body", None)
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            msg = response.choices[0].message
+            answer = msg.content or ""
+        
+        if not answer.strip():
+            thinking_key = kwargs.get("extra_body", {}).get("chat_template_kwargs", {}).get("enable_thinking")
+            if thinking_key:
+                kwargs.pop("extra_body", None)
+                response = client.chat.completions.create(**kwargs)
+                msg = response.choices[0].message
+                answer = getattr(msg, "content", None) or ""
         
         # If no tool calls via API, try to parse tool calls from text
         # This handles models that don't support function calling
-        visible_content = _visible_response_content(msg)
+        # Wrap answer in a simple object so _visible_response_content works.
+        _msg_proxy = msg or type('MsgProxy', (), {
+            'content': answer,
+            'reasoning_content': None,
+            'tool_calls': None,
+        })()
+        visible_content = _visible_response_content(_msg_proxy)
 
-        if not msg.tool_calls:
+        if not _msg_proxy.tool_calls:
             # Parse tool calls from text (works for all models)
             text_tool_call = _parse_tool_call_from_text(visible_content)
             if text_tool_call:
@@ -855,16 +905,40 @@ def _remove_think_blocks(text: str) -> str:
     return text.strip()
 
 
-def _visible_response_content(message: Any) -> str:
-    """Extract only user-visible answer text from an OpenAI message."""
+def _visible_response_content(message: Any, profile: dict[str, Any] = None) -> str:
+    """Extract only user-visible answer text from an OpenAI message.
+
+    For thinking/reasoning models (Qwen3-Think, DeepSeek, NVIDIA Nemotron),
+    the provider may place private thought in ``reasoning_content`` and the
+    final answer in ``content``. When ``content`` is empty but
+    ``reasoning_content`` carries the only visible output, fall back to it so
+    the operator still receives a response instead of an opaque empty error.
+
+    If a ``profile`` is provided, use the family-specific thinking extractor
+    to strip inline ``<think>`` or ``<|channel>thought`` blocks from the
+    visible output.
+    """
     content = getattr(message, "content", None) or ""
     reasoning = getattr(message, "reasoning_content", None)
-    # A separate reasoning_content field is intentionally discarded. When the
-    # provider puts thought in content, the format-specific cleaners below do
-    # the same without requiring a model-family name.
+    # When the provider puts thought in content, the format-specific cleaners
+    # do the same without requiring a model-family name.
     if not isinstance(content, str):
         return ""
-    return _remove_think_blocks(_remove_reasoning_channels(content))
+    cleaned = _remove_think_blocks(_remove_reasoning_channels(content))
+    if not cleaned and reasoning and isinstance(reasoning, str):
+        cleaned = _remove_think_blocks(_remove_reasoning_channels(reasoning))
+    # Apply family-specific thinking extraction if profile provided.
+    if profile and cleaned:
+        import re
+        thinking_kind = profile.get("thinking", "none")
+        if thinking_kind == "channel_thought":
+            # Gemma 4: strip inline <|channel>thought ... <channel|>
+            cleaned = re.sub(r"<\|\s*channel\s*>thought\s*.*?\s*<\s*channel\s*\|>", "", cleaned, flags=re.DOTALL).strip()
+        elif thinking_kind == "enable_thinking_param":
+            # Qwen/DeepSeek: reasoning_content already handled above, but also
+            # strip any leftover <think> blocks in content just in case.
+            cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL).strip()
+    return cleaned
 
 
 def _parse_tool_call_from_text(text: str) -> Optional[tuple]:

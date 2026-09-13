@@ -34,6 +34,7 @@ from PySide6.QtCore import Qt, QThread, QTimer, Signal, QObject
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -782,6 +783,11 @@ class DualBrainControl(QWidget):
                 self.refresh_btn.clicked.connect(self._refresh_provider_status)
             if hasattr(self, "save_settings_btn"):
                 self.save_settings_btn.clicked.connect(self._persist_settings)
+            # Temperature spinbox signals.
+            if hasattr(self, "sb_temp_spin"):
+                self.sb_temp_spin.valueChanged.connect(self._persist_settings)
+            if hasattr(self, "bb_temp_spin"):
+                self.bb_temp_spin.valueChanged.connect(self._persist_settings)
         except RuntimeError:
             # The widget may be in teardown while the delayed singleShot callback
             # is still running; do not crash the parent app during rebuilds.
@@ -975,6 +981,8 @@ class DualBrainControl(QWidget):
                 "BIG_BRAIN_BATCH": str(self.bb_batch_spin.value()),
                 "SMALL_BRAIN_KV_CACHE": self.sb_kv_combo.currentText() or "f16",
                 "BIG_BRAIN_KV_CACHE": self.bb_kv_combo.currentText() or "f16",
+                "SMALL_BRAIN_TEMPERATURE": str(self.sb_temp_spin.value()),
+                "BIG_BRAIN_TEMPERATURE": str(self.bb_temp_spin.value()),
             }
             try:
                 from main import set_env_values
@@ -1319,12 +1327,36 @@ class DualBrainControl(QWidget):
         self.sb_batch_spin.setStyleSheet(SMALL_SPIN_QSS)
         settings_layout.addWidget(self.sb_batch_spin, 3, 3)
 
+        # ── Small Brain temperature (row 4) ────────────────────────────
+        sb_temp_label = QLabel("Temperature:")
+        sb_temp_label.setStyleSheet("color: #888; font-size: 11px;")
+        settings_layout.addWidget(sb_temp_label, 4, 0)
+        self.sb_temp_spin = QDoubleSpinBox()
+        self.sb_temp_spin.setRange(0.0, 2.0)
+        self.sb_temp_spin.setSingleStep(0.05)
+        self.sb_temp_spin.setValue(float(os.getenv("SMALL_BRAIN_TEMPERATURE", "0.5")))
+        self.sb_temp_spin.setDecimals(2)
+        self.sb_temp_spin.setFixedWidth(80)
+        self.sb_temp_spin.setStyleSheet(SMALL_SPIN_QSS)
+        self.sb_temp_spin.setToolTip(
+            "Sampling temperature (0.0=precise, 2.0=creative). "
+            "Lower for factual Q&A, higher for brainstorming.")
+        settings_layout.addWidget(self.sb_temp_spin, 4, 1)
+        sb_temp_presets = QComboBox()
+        sb_temp_presets.addItems(["Custom", "0.0 (Precise)", "0.3 (Low)", "0.5 (Default)",
+                                   "0.7 (Medium)", "1.0 (Creative)", "1.5 (Wild)"])
+        sb_temp_presets.setFixedWidth(120)
+        sb_temp_presets.setStyleSheet(SMALL_SPIN_QSS)
+        sb_temp_presets.currentTextChanged.connect(
+            lambda t: self._on_temp_preset(t, self.sb_temp_spin, "SMALL_BRAIN_TEMPERATURE"))
+        settings_layout.addWidget(sb_temp_presets, 4, 2, 1, 2)
+
         # ── Big Brain Settings ──
         bb_settings_label = QLabel("🧠 Big Brain (5060 Ti, port 1234)")
         self.bb_settings_label = bb_settings_label
         bb_settings_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
         bb_settings_label.setStyleSheet("color: #bb86fc;")
-        settings_layout.addWidget(bb_settings_label, 4, 0, 1, 4)
+        settings_layout.addWidget(bb_settings_label, 5, 0, 1, 4)
 
         self.bb_model_combo = QComboBox()
         self.bb_model_combo.setMinimumWidth(250)
@@ -1438,6 +1470,30 @@ class DualBrainControl(QWidget):
         self.bb_batch_spin.setStyleSheet(BIG_SPIN_QSS)
         settings_layout.addWidget(self.bb_batch_spin, 7, 3)
 
+        # ── Big Brain temperature (row 8a) ────────────────────────────
+        bb_temp_label = QLabel("Temperature:")
+        bb_temp_label.setStyleSheet("color: #888; font-size: 11px;")
+        settings_layout.addWidget(bb_temp_label, 8, 0)
+        self.bb_temp_spin = QDoubleSpinBox()
+        self.bb_temp_spin.setRange(0.0, 2.0)
+        self.bb_temp_spin.setSingleStep(0.05)
+        self.bb_temp_spin.setValue(float(os.getenv("BIG_BRAIN_TEMPERATURE", "0.5")))
+        self.bb_temp_spin.setDecimals(2)
+        self.bb_temp_spin.setFixedWidth(80)
+        self.bb_temp_spin.setStyleSheet(BIG_SPIN_QSS)
+        self.bb_temp_spin.setToolTip(
+            "Sampling temperature (0.0=precise, 2.0=creative). "
+            "Lower for factual Q&A, higher for brainstorming.")
+        settings_layout.addWidget(self.bb_temp_spin, 8, 1)
+        bb_temp_presets = QComboBox()
+        bb_temp_presets.addItems(["Custom", "0.0 (Precise)", "0.3 (Low)", "0.5 (Default)",
+                                   "0.7 (Medium)", "1.0 (Creative)", "1.5 (Wild)"])
+        bb_temp_presets.setFixedWidth(120)
+        bb_temp_presets.setStyleSheet(BIG_SPIN_QSS)
+        bb_temp_presets.currentTextChanged.connect(
+            lambda t: self._on_temp_preset(t, self.bb_temp_spin, "BIG_BRAIN_TEMPERATURE"))
+        settings_layout.addWidget(bb_temp_presets, 8, 2, 1, 2)
+
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Hardware preset:"))
         self.hardware_preset_combo = QComboBox()
@@ -1474,7 +1530,7 @@ class DualBrainControl(QWidget):
         self.tensor_profile_label.setWordWrap(True)
         self.tensor_profile_label.setStyleSheet("color: #888; font-size: 10px;")
         preset_row.addWidget(self.tensor_profile_label, 3)
-        settings_layout.addLayout(preset_row, 8, 0, 1, 4)
+        settings_layout.addLayout(preset_row, 9, 0, 1, 4)
 
         layout.addWidget(settings_group)
 
@@ -3003,6 +3059,14 @@ class BrainLaunchWorker(QThread):
         self._log("Stopping all providers...")
         self._on_stop_small_brain()
         self._on_stop_big_brain()
+
+    def _on_temp_preset(self, text: str, spin: QDoubleSpinBox, env_key: str):
+        """Apply a temperature preset to the spinbox and persist."""
+        presets = {"0.0 (Precise)": 0.0, "0.3 (Low)": 0.3, "0.5 (Default)": 0.5,
+                   "0.7 (Medium)": 0.7, "1.0 (Creative)": 1.0, "1.5 (Wild)": 1.5}
+        if text in presets:
+            spin.setValue(presets[text])
+            self._persist_settings()
 
     def _unload_external_model(self, small, provider, endpoint, model, label):
         ok, message = self.provider_checker.unload_provider_model(

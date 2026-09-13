@@ -237,7 +237,10 @@ def os_getenv(key: str, default: str = "") -> str:
 def _stream_timeout_seconds() -> float:
     """Return a bounded provider timeout from the environment."""
     try:
-        return max(1.0, min(float(os_getenv("OPENAI_STREAM_TIMEOUT_SECONDS", "120")),
+        # Use a longer default timeout for local inference — when VRAM is
+        # contended, a 120s default fires before the model can finish a
+        # single generation.
+        return max(1.0, min(float(os_getenv("OPENAI_STREAM_TIMEOUT_SECONDS", "600")),
                             3600.0))
     except (TypeError, ValueError):
         return 120.0
