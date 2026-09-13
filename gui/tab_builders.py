@@ -3,6 +3,7 @@
 # ~2k lines of tab-construction UI live in their own module while still being
 # MainWindow instance methods (so `self.*` access is unchanged).
 import os
+import re
 
 from PySide6.QtCore import QTimer, QThread, Qt, Signal
 from PySide6.QtWidgets import (
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QPlainTextEdit,
     QPushButton,
+    QMessageBox,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -1721,14 +1723,31 @@ class TabBuildersMixin:
         controls.addWidget(self.opp_scan_interval_spin)
         
         self.opp_source_combo = QComboBox()
-        self.opp_source_combo.addItems(["all", "upwork", "fiverr", "github", "prolific"])
+        self.opp_source_combo.addItems([
+            "all", "upwork", "fiverr", "social", "microtask", "ugig",
+            "airdrop", "defi", "web", "content", "dynamic",
+        ])
+        self.opp_source_combo.currentTextChanged.connect(self._reset_opportunity_page)
         controls.addWidget(QLabel("Source:"))
         controls.addWidget(self.opp_source_combo)
+
+        self.opp_search_edit = QLineEdit()
+        self.opp_search_edit.setPlaceholderText("Search title, description, or URL")
+        self.opp_search_edit.textChanged.connect(self._reset_opportunity_page)
+        controls.addWidget(self.opp_search_edit)
+
+        self.opp_status_combo = QComboBox()
+        self.opp_status_combo.addItems(["all", "NEW", "EVALUATING", "QUALIFIED",
+                                        "AWAITING_APPROVAL", "REJECTED", "ABANDONED"])
+        self.opp_status_combo.currentTextChanged.connect(self._reset_opportunity_page)
+        controls.addWidget(QLabel("Status:"))
+        controls.addWidget(self.opp_status_combo)
         
         self.opp_min_score_spin = QSpinBox()
         self.opp_min_score_spin.setRange(0, 100)
         self.opp_min_score_spin.setValue(50)
         self.opp_min_score_spin.setSuffix("%")
+        self.opp_min_score_spin.valueChanged.connect(self._reset_opportunity_page)
         controls.addWidget(QLabel("Min Score:"))
         controls.addWidget(self.opp_min_score_spin)
         
@@ -1745,6 +1764,7 @@ class TabBuildersMixin:
         self.opp_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.opp_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.opp_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.opp_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.opp_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.opp_table.setStyleSheet("""
             QTableWidget {
@@ -1778,6 +1798,10 @@ class TabBuildersMixin:
         self.opp_reject_btn = QPushButton("❌ Reject")
         self.opp_reject_btn.clicked.connect(self._on_reject_opportunity)
         action_row.addWidget(self.opp_reject_btn)
+
+        self.opp_clear_btn = QPushButton("Clear All")
+        self.opp_clear_btn.clicked.connect(self._clear_opportunities)
+        action_row.addWidget(self.opp_clear_btn)
         
         action_row.addStretch()
         lay.addLayout(action_row)
@@ -1785,6 +1809,25 @@ class TabBuildersMixin:
         # Status
         self.opp_status_label = QLabel("Ready")
         lay.addWidget(self.opp_status_label)
+
+        page_row = QHBoxLayout()
+        self.opp_prev_btn = QPushButton("Previous")
+        self.opp_prev_btn.clicked.connect(self._previous_opportunity_page)
+        page_row.addWidget(self.opp_prev_btn)
+        self.opp_page_label = QLabel("Page 1")
+        page_row.addWidget(self.opp_page_label)
+        self.opp_next_btn = QPushButton("Next")
+        self.opp_next_btn.clicked.connect(self._next_opportunity_page)
+        page_row.addWidget(self.opp_next_btn)
+        page_row.addWidget(QLabel("Results per page:"))
+        self.opp_page_size_combo = QComboBox()
+        self.opp_page_size_combo.addItems(["10", "20", "50", "100"])
+        self.opp_page_size_combo.setCurrentText("20")
+        self.opp_page_size_combo.currentTextChanged.connect(self._reset_opportunity_page)
+        page_row.addWidget(self.opp_page_size_combo)
+        page_row.addStretch()
+        lay.addLayout(page_row)
+        self._opp_page = 0
         
         # Refresh timer
         self.opp_refresh_timer = QTimer()
@@ -2125,20 +2168,24 @@ class TabBuildersMixin:
                 opportunity_id = getattr(opportunity, "id", "")
                 if not opportunity_id:
                     return
+                ref = {
+                    "title": getattr(opportunity, "title", ""),
+                    "description": getattr(opportunity, "description", ""),
+                    "url": getattr(opportunity, "url", ""),
+                    "source": getattr(opportunity, "source", ""),
+                    "platform": getattr(opportunity, "platform", ""),
+                    "category": getattr(opportunity, "type", ""),
+                }
+                if self._is_hiring_request(ref):
+                    return
                 existing = self.opportunity_portfolio.get(opportunity_id)
                 if existing is not None:
                     return
+                if self._portfolio_contains_duplicate(ref):
+                    return
                 self.opportunity_portfolio.add(PortfolioEntry(
                     opportunity_id=opportunity_id,
-                    opportunity_ref={
-                        "id": opportunity_id,
-                        "title": getattr(opportunity, "title", ""),
-                        "description": getattr(opportunity, "description", ""),
-                        "url": getattr(opportunity, "url", ""),
-                        "source": getattr(opportunity, "source", ""),
-                        "platform": getattr(opportunity, "platform", ""),
-                        "category": getattr(opportunity, "type", ""),
-                    },
+                    opportunity_ref={"id": opportunity_id, **ref},
                     work_status=WorkStatus.EVALUATING,
                     expected_value=float(getattr(opportunity, "estimated_usd_value", 0.0) or 0.0),
                     platform=getattr(opportunity, "platform", "") or "",
@@ -2172,12 +2219,30 @@ class TabBuildersMixin:
         entries = self.opportunity_portfolio.list_all()
         minimum = self.opp_min_score_spin.value() / 100
         source = self.opp_source_combo.currentText()
-        self.opp_table.setRowCount(0)
+        query = self.opp_search_edit.text().strip().lower()
+        status = self.opp_status_combo.currentText()
+        filtered = []
         for entry in entries:
-            if source != "all" and entry.platform.lower() != source.lower():
+            ref = entry.opportunity_ref or {}
+            haystack = " ".join(str(ref.get(key, "")) for key in
+                                ("title", "description", "url")).lower()
+            entry_source = str(ref.get("source", "")).lower()
+            if (source != "all" and entry.platform.lower() != source.lower()
+                    and entry_source != source.lower()):
                 continue
-            if entry.policy_score and entry.policy_score < minimum:
+            if status != "all" and entry.work_status.value != status:
                 continue
+            if query and query not in haystack:
+                continue
+            if entry.policy_score < minimum:
+                continue
+            filtered.append(entry)
+        page_size = int(self.opp_page_size_combo.currentText())
+        page_count = max(1, (len(filtered) + page_size - 1) // page_size)
+        self._opp_page = min(self._opp_page, page_count - 1)
+        page_entries = filtered[self._opp_page * page_size:(self._opp_page + 1) * page_size]
+        self.opp_table.setRowCount(0)
+        for entry in page_entries:
             ref = entry.opportunity_ref or {}
             row = self.opp_table.rowCount()
             self.opp_table.insertRow(row)
@@ -2192,74 +2257,151 @@ class TabBuildersMixin:
                 if column == 0:
                     item.setData(Qt.UserRole, entry.opportunity_id)
                 self.opp_table.setItem(row, column, item)
+        self.opp_page_label.setText(
+            f"Page {self._opp_page + 1} of {page_count} ({len(filtered)} results)")
+        self.opp_prev_btn.setEnabled(self._opp_page > 0)
+        self.opp_next_btn.setEnabled(self._opp_page < page_count - 1)
+
+    @staticmethod
+    def _is_hiring_request(ref):
+        """Exclude posts where someone is seeking a worker rather than work."""
+        text = " ".join(str(ref.get(key, "")) for key in ("title", "description")).lower()
+        return any(re.search(pattern, text) for pattern in (
+            r"\[?for hire\]?", r"looking to hire", r"we are hiring",
+            r"hiring a developer", r"need (a|an) (developer|freelancer|worker)",
+            r"seeking (a|an) (developer|freelancer|worker)",
+        ))
+
+    def _portfolio_contains_duplicate(self, ref):
+        """Catch the same listing when a source changes its external ID."""
+        url = str(ref.get("url", "")).split("?", 1)[0].rstrip("/").lower()
+        title = " ".join(str(ref.get("title", "")).lower().split())
+        platform = str(ref.get("platform", "")).lower()
+        if not url and not title:
+            return False
+        for entry in self.opportunity_portfolio.list_all():
+            old = entry.opportunity_ref or {}
+            old_url = str(old.get("url", "")).split("?", 1)[0].rstrip("/").lower()
+            old_title = " ".join(str(old.get("title", "")).lower().split())
+            if url and old_url and url == old_url:
+                return True
+            if title and title == old_title and platform == entry.platform.lower():
+                return True
+        return False
+
+    def _reset_opportunity_page(self, *_args):
+        self._opp_page = 0
+        self._refresh_opportunities()
+
+    def _previous_opportunity_page(self):
+        self._opp_page = max(0, self._opp_page - 1)
+        self._refresh_opportunities()
+
+    def _next_opportunity_page(self):
+        self._opp_page += 1
+        self._refresh_opportunities()
+
+    def _clear_opportunities(self):
+        entries = self.opportunity_portfolio.list_all()
+        if not entries:
+            return
+        answer = QMessageBox.question(
+            self, "Clear opportunities", "Remove all saved opportunities?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        for entry in entries:
+            self.opportunity_portfolio.remove(entry.opportunity_id)
+        self._reset_opportunity_page()
+        self.opp_status_label.setText("Opportunities cleared")
 
     def _on_research_opportunity(self):
         """Research selected opportunity."""
-        entry = self._selected_opportunity_entry()
-        if entry is None:
+        entries = self._selected_opportunity_entries()
+        if not entries:
             self.opp_status_label.setText("Select an opportunity first")
             return
         from agents.opportunity_portfolio import WorkStatus
         try:
-            self.opportunity_portfolio.transition_work_status(
-                entry.opportunity_id, WorkStatus.EVALUATING)
+            for entry in entries:
+                self.opportunity_portfolio.transition_work_status(
+                    entry.opportunity_id, WorkStatus.EVALUATING)
             self._refresh_opportunities()
-            self.opp_status_label.setText("Opportunity marked for evaluation")
+            self.opp_status_label.setText(f"{len(entries)} opportunities marked for evaluation")
         except Exception as exc:
             self.opp_status_label.setText(f"Research unavailable: {exc}")
 
     def _on_apply_opportunity(self):
         """Apply to selected opportunity."""
-        entry = self._selected_opportunity_entry()
-        if entry is None:
+        entries = self._selected_opportunity_entries()
+        if not entries:
             self.opp_status_label.setText("Select an opportunity first")
             return
         from agents.opportunity_portfolio import WorkStatus
         try:
-            if entry.work_status == WorkStatus.NEW:
+            for entry in entries:
+                if entry.work_status == WorkStatus.NEW:
+                    self.opportunity_portfolio.transition_work_status(
+                        entry.opportunity_id, WorkStatus.EVALUATING)
+                    entry = self.opportunity_portfolio.get(entry.opportunity_id)
+                if entry.work_status == WorkStatus.EVALUATING:
+                    self.opportunity_portfolio.transition_work_status(
+                        entry.opportunity_id, WorkStatus.QUALIFIED)
+                    entry = self.opportunity_portfolio.get(entry.opportunity_id)
                 self.opportunity_portfolio.transition_work_status(
-                    entry.opportunity_id, WorkStatus.EVALUATING)
-                entry = self.opportunity_portfolio.get(entry.opportunity_id)
-            if entry.work_status == WorkStatus.EVALUATING:
-                self.opportunity_portfolio.transition_work_status(
-                    entry.opportunity_id, WorkStatus.QUALIFIED)
-                entry = self.opportunity_portfolio.get(entry.opportunity_id)
-            self.opportunity_portfolio.transition_work_status(
-                entry.opportunity_id, WorkStatus.AWAITING_APPROVAL)
+                    entry.opportunity_id, WorkStatus.AWAITING_APPROVAL)
             self._refresh_opportunities()
             self.opp_status_label.setText(
-                "Application queued for human approval; nothing was submitted")
+                f"{len(entries)} applications queued for human approval; nothing was submitted")
         except Exception as exc:
             self.opp_status_label.setText(f"Apply unavailable: {exc}")
 
     def _on_reject_opportunity(self):
         """Reject selected opportunity."""
-        entry = self._selected_opportunity_entry()
-        if entry is None:
+        entries = self._selected_opportunity_entries()
+        if not entries:
             self.opp_status_label.setText("Select an opportunity first")
             return
         from agents.opportunity_portfolio import WorkStatus
         try:
-            if entry.work_status == WorkStatus.NEW:
-                self.opportunity_portfolio.transition_work_status(
-                    entry.opportunity_id, WorkStatus.ABANDONED)
-            else:
-                self.opportunity_portfolio.transition_work_status(
-                    entry.opportunity_id, WorkStatus.REJECTED)
+            for entry in entries:
+                if entry.work_status == WorkStatus.NEW:
+                    self.opportunity_portfolio.transition_work_status(
+                        entry.opportunity_id, WorkStatus.ABANDONED)
+                else:
+                    self.opportunity_portfolio.transition_work_status(
+                        entry.opportunity_id, WorkStatus.REJECTED)
             self._refresh_opportunities()
-            self.opp_status_label.setText("Opportunity rejected")
+            self.opp_status_label.setText(f"{len(entries)} opportunities rejected")
         except Exception as exc:
             self.opp_status_label.setText(f"Reject unavailable: {exc}")
 
     def _selected_opportunity_entry(self):
         """Return the portfolio entry represented by the selected table row."""
+        entries = self._selected_opportunity_entries()
+        return entries[0] if entries else None
+
+    def _selected_opportunity_entries(self):
+        """Return portfolio entries represented by all selected table rows."""
+        rows = sorted({index.row() for index in self.opp_table.selectedIndexes()})
+        entries = []
+        for row in rows:
+            item = self.opp_table.item(row, 0)
+            if item is None:
+                continue
+            entry = self.opportunity_portfolio.get(item.data(Qt.UserRole))
+            if entry is not None:
+                entries.append(entry)
+        if entries:
+            return entries
         row = self.opp_table.currentRow()
         if row < 0:
-            return None
+            return []
         item = self.opp_table.item(row, 0)
         if item is None:
-            return None
-        return self.opportunity_portfolio.get(item.data(Qt.UserRole))
+            return []
+        entry = self.opportunity_portfolio.get(item.data(Qt.UserRole))
+        return [entry] if entry is not None else []
 
     # ── Paper Trading Tab Callbacks ─────────────────────────────────────────
 

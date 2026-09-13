@@ -355,6 +355,7 @@ class DualBrainControl(QWidget):
 
     _restart_ready = Signal(bool)
     _external_lifecycle_finished = Signal(bool, bool, str)
+    _vram_estimate_ready = Signal(int, str, object)
     
     # Signals emitted when model changes
     small_brain_model_changed = Signal(str)  # model_name
@@ -390,6 +391,9 @@ class DualBrainControl(QWidget):
         self.we_started_big = False
         self._closing = False
         self._provider_probe_thread = None
+        self._vram_estimates = {}
+        self._vram_estimate_inflight = set()
+        self._vram_estimate_ready.connect(self._on_vram_estimate_ready)
 
         # Guard against auto-restart loops from probe-triggered combo changes
         self._suppress_model_change_restart = False
@@ -1753,31 +1757,44 @@ class DualBrainControl(QWidget):
     def _get_model_vram_for_gpu(self, gpu_index: int) -> dict:
         """Get VRAM estimate for the model assigned to a GPU."""
         try:
-            from agents.dual_brain_runtime import BrainRole
-            from agents.gguf_meta import estimate_vram_gb
-            
-            # Determine which brain maps to this GPU
-            if gpu_index == 0:
-                role = BrainRole.BIG
-                ctx = self.bb_ctx_spin.value()
-            else:
-                role = BrainRole.SMALL
-                ctx = self.sb_ctx_spin.value()
-            
-            # Get the model path from the combo
-            small = (role == BrainRole.SMALL)
+            small = gpu_index != 0
+            ctx = self.sb_ctx_spin.value() if small else self.bb_ctx_spin.value()
             model_path = self._current_model_path(small)
             if not model_path:
                 return {}
-            
             kv_name = (self.sb_kv_combo.currentText() if small else self.bb_kv_combo.currentText()) or "f16"
-            kv_type_bytes = {"f32": 4, "f16": 2, "q8_0": 1, "q4_0": 0.5, "auto": 2}.get(kv_name, 2)
-            # Estimate VRAM using the selected cache precision.
-            est = estimate_vram_gb(model_path, context=ctx, kv_type_bytes=kv_type_bytes)
-            est["kv_type"] = kv_name
-            return est
+            key = f"{model_path}|{ctx}|{kv_name}"
+            cached = self._vram_estimates.get(key)
+            if cached is not None:
+                return cached
+            if key not in self._vram_estimate_inflight:
+                self._vram_estimate_inflight.add(key)
+                threading.Thread(
+                    target=self._estimate_vram_background,
+                    args=(gpu_index, key, model_path, ctx, kv_name),
+                    daemon=True,
+                ).start()
+            return {}
         except Exception:
             return {}
+
+    def _estimate_vram_background(self, gpu_index, key, model_path, context, kv_name):
+        """Estimate GGUF memory without reading model metadata on the GUI thread."""
+        try:
+            from agents.gguf_meta import estimate_vram_gb
+            kv_type_bytes = {"f32": 4, "f16": 2, "q8_0": 1,
+                             "q4_0": 0.5, "auto": 2}.get(kv_name, 2)
+            estimate = estimate_vram_gb(
+                model_path, context=context, kv_type_bytes=kv_type_bytes)
+            estimate["kv_type"] = kv_name
+        except Exception:
+            estimate = {}
+        self._vram_estimate_ready.emit(gpu_index, key, estimate)
+
+    def _on_vram_estimate_ready(self, gpu_index, key, estimate):
+        self._vram_estimate_inflight.discard(key)
+        if estimate:
+            self._vram_estimates[key] = estimate
 
     def _on_context_changed(self, is_big: bool):
         """Live preview: update the estimated VRAM bar when context spinbox changes."""
@@ -2037,19 +2054,12 @@ class DualBrainControl(QWidget):
                 self.bb_start_btn.setEnabled(False)
                 self.bb_stop_btn.setEnabled(False)
             
-            # Update GPU bars to show loading state
-            model_info = self._get_model_vram_for_gpu(idx)
-            model_vram_gb = model_info.get("total_gb", 0)
-            if model_vram_gb > 0:
-                # Show estimated bar at 100% (model is being loaded)
-                self._set_gpu_bar(idx, "est", 100, "#ffb300")
-                self._set_gpu_detail(idx, "est", f"Loading {os.path.basename(model_path)}...")
-                # Show actual bar at 0% (will be updated by nvidia-smi polling)
-                self._set_gpu_bar(idx, "act", 0, "#4caf50")
-                self._set_gpu_detail(idx, "act", "Loading...")
-                # Show KV bar at 0%
-                self._set_gpu_bar(idx, "kv", 0, "#ff9800")
-                self._set_gpu_detail(idx, "kv", "Loading...")
+            # Do not parse GGUF metadata here. Large model files can make that
+            # operation expensive, and this method runs on the Qt thread.
+            # GPUStatusWorker will update actual usage while the server loads.
+            self._set_gpu_detail(idx, "est", f"Loading {os.path.basename(model_path)}...")
+            self._set_gpu_detail(idx, "act", "Loading...")
+            self._set_gpu_detail(idx, "kv", "Loading...")
         else:
             if small:
                 self.sb_status.setText("● Checking...")
@@ -2397,14 +2407,18 @@ class BrainLaunchWorker(QThread):
             return None
         return None
 
-    def _model_vram_need_gb(self, small: bool, model_path: str) -> Dict[str, Any]:
+    def _model_vram_need_gb(self, small: bool, model_path: str,
+                            context: Optional[int] = None,
+                            kv_name: Optional[str] = None) -> Dict[str, Any]:
         """Estimate a model's total VRAM need (weights + KV @ configured ctx).
 
         Returns {estimate_gb, complete, kv_gb, weights_gb}. Bounded; never raises.
         Falls back to weights+margin when metadata is unreadable.
         """
-        ctx = self.sb_ctx_spin.value() if small else self.bb_ctx_spin.value()
-        kv_name = (self.sb_kv_combo.currentText() if small else self.bb_kv_combo.currentText()) or "f16"
+        ctx = context if context is not None else (
+            self.sb_ctx_spin.value() if small else self.bb_ctx_spin.value())
+        kv_name = kv_name or (
+            self.sb_kv_combo.currentText() if small else self.bb_kv_combo.currentText()) or "f16"
         kv_type_bytes = {
             "f32": 4,
             "f16": 2,
@@ -2440,11 +2454,14 @@ class BrainLaunchWorker(QThread):
         """
         import threading
         
-        result = {"value": True, "done": False}
+        result = {"value": True, "done": False, "warning": ""}
+        context = self.sb_ctx_spin.value() if small else self.bb_ctx_spin.value()
+        kv_name = (self.sb_kv_combo.currentText() if small else self.bb_kv_combo.currentText()) or "f16"
         
         def _check():
             try:
-                est = self._model_vram_need_gb(small, model_path)
+                est = self._model_vram_need_gb(
+                    small, model_path, context=context, kv_name=kv_name)
                 need = est.get("total_gb") or est.get("estimate_gb") or 0.0
                 free = self._gpu_free_vram_gb(1 if small else 0)
                 if free is None or need <= 0:
@@ -2452,11 +2469,12 @@ class BrainLaunchWorker(QThread):
                 elif need <= free:
                     result["value"] = True
                 else:
-                    # Need exceeds free VRAM -> ask user on GUI thread
-                    # Emit from the worker thread; Qt delivers this QWidget
-                    # slot on the GUI thread through the queued connection.
-                    self.vram_warning_requested.emit(small, model_path, need, free, result)
-                    return
+                    # Never block the GUI with a modal confirmation while a
+                    # model is loading. llama.cpp can spill to system RAM;
+                    # report the risk and let the background launch continue.
+                    result["warning"] = (
+                        f"{os.path.basename(model_path)} needs ~{need:.1f} GB, "
+                        f"but only ~{free:.1f} GB VRAM is free; system-RAM spill is expected.")
             except Exception:
                 result["value"] = True
             result["done"] = True
@@ -2471,7 +2489,8 @@ class BrainLaunchWorker(QThread):
         t.join(timeout=0.25)
         if not result["done"]:
             return True  # timeout -> proceed
-        
+        if result["warning"]:
+            self._log(f"⚠️ {('Small' if small else 'Big')} Brain: {result['warning']}")
         return result["value"]
     
     def _show_vram_warning(self, small: bool, model_path: str, need: float, free: float, result: dict):

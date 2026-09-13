@@ -70,6 +70,7 @@ class FiverrClient:
     def __init__(self):
         self.session = requests.Session()
         self._ua_idx = 0  # C3: stable per-instance rotation counter
+        self._last_error = None
         self.session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -99,6 +100,7 @@ class FiverrClient:
         except Exception as e:
             self._last_error = str(e)
             return []
+        self._last_error = None
         # C3: if the page is actually a captcha/interstitial, don't parse it as
         # gig data — bail gracefully so discovery can fall back to other sources.
         if detect_captcha(resp.text):

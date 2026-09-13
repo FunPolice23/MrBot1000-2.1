@@ -1,6 +1,24 @@
 ## [Unreleased] - 2026-09-12
 
 ### Added
+- Added persistent Opportunities duplicate suppression across scans using
+  normalized listing URLs and platform/title identity, plus exclusion of
+  seeker posts such as `[For Hire]`, `Looking to hire`, and `Need a developer`.
+- Added Opportunities source selection for all currently registered discovery
+  sources, title/description/URL search, work-status filtering, 10/20/50/100
+  result page sizes, pagination, multi-row selection, batch Research/Apply/
+  Reject actions, and a confirmed Clear All action.
+- Added explicit asynchronous model-loading status for local llama.cpp starts
+  and model switches. Server startup and readiness checks run in background
+  workers so the GUI remains responsive and other tabs remain usable while a
+  model loads into VRAM or system RAM.
+- Removed large-GGUF metadata parsing from the GUI loading transition and made
+  the VRAM overflow notice non-modal. Large model starts now continue without
+  waiting on a GUI dialog or synchronously inspecting the model file; warnings
+  are logged while llama.cpp loads in the background.
+- Moved recurring GGUF VRAM estimation out of the GPU telemetry callback and
+  cached estimates by model, context, and KV-cache settings, eliminating
+  repeated large-file reads on the GUI thread during model loading.
 - Added a Live Portfolio exchange selector for Coinbase, Kraken, Binance,
   Gemini, Bitfinex, OKX, Bybit, KuCoin, Bitstamp, and Gate.io. Each selection
   remains an independent exchange account using its own API credentials;

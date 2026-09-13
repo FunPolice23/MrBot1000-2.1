@@ -2592,16 +2592,29 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # Settings owns llama.cpp role enablement only while llama.cpp is the
         # selected backend. Do not let Save All Settings silently overwrite an
         # Ollama/vLLM/LM Studio route selected in Provider Configuration.
+        def _live_checkbox_value(name):
+            """Read a lazily-built Qt checkbox without touching deleted C++ objects."""
+            checkbox = getattr(self, name, None)
+            if checkbox is None:
+                return None
+            try:
+                import shiboken6
+                if not shiboken6.isValid(checkbox):
+                    return None
+                return checkbox.isChecked()
+            except (ImportError, RuntimeError):
+                return None
+
         if os.getenv("BIG_BRAIN_PROVIDER", "llamacpp").lower() == "llamacpp":
             values["BIG_BRAIN_PROVIDER"] = "llamacpp"
-            values["BIG_BRAIN_ENABLED"] = str(
-                getattr(self, "llamacpp_big_enabled", None) is not None
-                and self.llamacpp_big_enabled.isChecked())
+            big_enabled = _live_checkbox_value("llamacpp_big_enabled")
+            if big_enabled is not None:
+                values["BIG_BRAIN_ENABLED"] = str(big_enabled)
         if os.getenv("SMALL_BRAIN_PROVIDER", "llamacpp").lower() == "llamacpp":
             values["SMALL_BRAIN_PROVIDER"] = "llamacpp"
-            values["SMALL_BRAIN_ENABLED"] = str(
-                getattr(self, "llamacpp_small_enabled", None) is not None
-                and self.llamacpp_small_enabled.isChecked())
+            small_enabled = _live_checkbox_value("llamacpp_small_enabled")
+            if small_enabled is not None:
+                values["SMALL_BRAIN_ENABLED"] = str(small_enabled)
 
         # v2.0.34aj: single lock-resilient atomic write (replaces ~40 set_key calls
         # that each spawned a .tmp_* temp vulnerable to WinError 32/5 lock races).

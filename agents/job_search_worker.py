@@ -325,6 +325,10 @@ class JobSearchWorker(WorkerAgent):
                     query=skill_str.split(",")[0] or "python",
                     limit=10
                 )
+                if not gigs:
+                    fetch_error = getattr(self._fiverr_client, "_last_error", None)
+                    if fetch_error:
+                        self._logger.warn(f"Fiverr fetch returned no gigs: {fetch_error}")
                 for g in gigs:
                     jr = JobRecord(
                         job_id=fingerprint(f"fiverr_{g.id}"),
