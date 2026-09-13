@@ -3207,6 +3207,9 @@ class BrainLaunchWorker(QThread):
         # Guard against placeholder/error items (v2.1).
         if not model_name or model_name.startswith(self._PLACEHOLDER_MARKERS):
             return
+        # Guard: skip if the model hasn't actually changed (combo refresh).
+        if getattr(self, "_last_small_model_emitted", None) == model_name:
+            return
         from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
         runtime = DualBrainRuntime.from_env()
         cfg = runtime.config(BrainRole.SMALL)
@@ -3221,6 +3224,7 @@ class BrainLaunchWorker(QThread):
 
         # Sync model to adapter
         self._sync_adapter_model(True)
+        self._last_small_model_emitted = model_name
         self.small_brain_model_changed.emit(model_name)
 
         # Guard: skip auto-restart if we're currently suppressing model-change restarts
@@ -3246,6 +3250,9 @@ class BrainLaunchWorker(QThread):
         model when it is running, else just record the selection for next Start."""
         if not model_name or model_name.startswith(self._PLACEHOLDER_MARKERS):
             return
+        # Guard: skip if the model hasn't actually changed (combo refresh).
+        if getattr(self, "_last_big_model_emitted", None) == model_name:
+            return
         from agents.dual_brain_runtime import BrainRole, DualBrainRuntime
         runtime = DualBrainRuntime.from_env()
         cfg = runtime.config(BrainRole.BIG)
@@ -3260,6 +3267,7 @@ class BrainLaunchWorker(QThread):
 
         # Sync model to adapter
         self._sync_adapter_model(False)
+        self._last_big_model_emitted = model_name
         self.big_brain_model_changed.emit(model_name)
 
         # Guard: skip auto-restart if we're currently suppressing model-change restarts

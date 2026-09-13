@@ -49,6 +49,13 @@ class BigBrainAdapter:
         self.personality = get_personality_engine()
         self.knowledge = get_knowledge_context()
         
+        # Prompting engine — remembers what works per task type
+        from agents.prompting_engine import record_successful_pattern, get_brain_recommendation
+        self._prompting_engine = {
+            "record": record_successful_pattern,
+            "recommend": get_brain_recommendation,
+        }
+        
         # Safety gate
         self.safety_gate = safety_gate or SafetyGate()
         
@@ -112,7 +119,11 @@ class BigBrainAdapter:
         self.model = model_name
     
     def _build_system_prompt(self, query: str = "", task_type: str = "general") -> str:
-        """Build system prompt with knowledge, personality, and specialization."""
+        """Build system prompt with knowledge, personality, and specialization.
+        
+        Uses the prompting engine to select the best technique for the task type
+        and injects memory of what worked before.
+        """
         extra = f"\n\n# ABOUT {ProgramKnowledge.PROGRAM_NAME}"
         extra += ProgramKnowledge.CORE_IDENTITY
         extra += ProgramKnowledge.CORE_CAPABILITIES
@@ -122,10 +133,15 @@ class BigBrainAdapter:
         specialization = get_specialization_prompt(task_type)
         if specialization:
             extra += f"\n{specialization}"
-
-        return assemble_role_prompt(
+        
+        base = assemble_role_prompt(
             self.base_system_prompt, "big_brain", query,
             self.personality, self.knowledge, extra)
+        
+        # Apply prompting engine: select technique + inject memory
+        from agents.prompting_engine import adaptive_prompt
+        recommendation = self._prompting_engine["recommend"]("big_brain", task_type, model_path=self.model, model_name=os.path.basename(self.model))
+        return adaptive_prompt(task_type, base, recommendation)
     
     def _execute_tool_calls(self, tool_calls: list) -> list:
         """Execute tool calls from the model, with safety gate."""

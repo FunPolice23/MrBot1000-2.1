@@ -50,6 +50,15 @@ class AgentDB:
                 latency_ms   INTEGER,
                 error        TEXT
             )""",
+            """CREATE TABLE IF NOT EXISTS prompt_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_type TEXT NOT NULL,
+                technique TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                success_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
             """CREATE TABLE IF NOT EXISTS events (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts          REAL    NOT NULL,

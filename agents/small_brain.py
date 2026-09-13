@@ -134,9 +134,21 @@ class SmallBrainAdapter:
             extra += ProgramKnowledge.SAFETY_RULES
 
         limit = 1200 if tier == "compact" else 4000
-        return assemble_role_prompt(
+        base = assemble_role_prompt(
             self.base_system_prompt, "small_brain", query,
             self.personality, self.knowledge, extra, limit)
+        
+        # Apply prompting engine: select technique + inject memory
+        from agents.prompting_engine import adaptive_prompt, select_technique
+        # Pass actual model to recommendation engine (not just role)
+        recommendation = {
+            "recommended_technique": select_technique("dialogue", {"complexity": "low", "urgency": "urgent"}),
+            "complexity": "low",
+        }
+        # Override if model is actually large (e.g. 27B in Small Brain slot)
+        from agents.prompting_engine import get_brain_recommendation
+        recommendation = get_brain_recommendation("small_brain", "dialogue", model_path=self.model, model_name=os.path.basename(self.model))
+        return adaptive_prompt("dialogue", base, recommendation)
     
     def chat(self, user_message: str, history: list = None,
              system_prompt: str = None, max_tokens: int = None,

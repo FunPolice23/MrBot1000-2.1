@@ -25,18 +25,44 @@ from urllib.request import urlopen
 # tools, and thinking/reasoning instructions.
 
 FAMILY_PROFILES: dict[str, dict[str, Any]] = {
-    # Qwen 3.8 / 3.6 / 3 / 2.5 — same lineage
-    "qwen3": {
-        "id": "qwen3",
-        "system_format": "im_start",          # <|im_start|>system\n...\n<|im_end|>
-        "tool_format": "tool_call_xml",       # <tool_call><function=name><parameter=k>v</parameter></function></tool_call>
-        "thinking": "enable_thinking_param",  # extra_body.chat_template_kwargs.enable_thinking
+    # Qwen 3.8 — thinking delivered in separate reasoning_content field
+    "qwen3_8": {
+        "id": "qwen3_8",
+        "system_format": "im_start",
+        "tool_format": "tool_call_xml",
+        "thinking": "enable_thinking_param",
         "thinking_tag": "<think>",
         "reasoning_field": "reasoning_content",
         "supports_function_calling": True,
         "supports_system_role": True,
         "streaming": True,
-        "notes": "Qwen3.8/3.6/3 — uses reasoning_content field in streaming.",
+        "notes": "Qwen3.8 — reasoning_content field in API, not inline.",
+    },
+    # Qwen 3.6 / 3 — thinking inline in content as <think>...</think>
+    "qwen3": {
+        "id": "qwen3",
+        "system_format": "im_start",
+        "tool_format": "tool_call_xml",
+        "thinking": "enable_thinking_param",
+        "thinking_tag": "<think>",
+        "reasoning_field": None,
+        "supports_function_calling": True,
+        "supports_system_role": True,
+        "streaming": True,
+        "notes": "Qwen3.6/3 — enable_thinking, thinking inline in content.",
+    },
+    # Qwen 3.6 — same inline-thinking behavior as qwen3
+    "qwen3_6": {
+        "id": "qwen3_6",
+        "system_format": "im_start",
+        "tool_format": "tool_call_xml",
+        "thinking": "enable_thinking_param",
+        "thinking_tag": "<think>",
+        "reasoning_field": None,
+        "supports_function_calling": True,
+        "supports_system_role": True,
+        "streaming": True,
+        "notes": "Qwen3.6 — enable_thinking, thinking inline in content.",
     },
     "qwen2": {
         "id": "qwen2",
@@ -190,6 +216,8 @@ ARCH_TO_FAMILY: dict[str, str] = {
     "llama": "llama",
     "qwen2": "qwen2",
     "qwen3": "qwen3",
+    "qwen3_8": "qwen3_8",
+    "qwen3_6": "qwen3_6",
     "gemma": "gemma",
     "gemma2": "gemma",
     "gemma3": "gemma",
@@ -210,8 +238,8 @@ ARCH_TO_FAMILY: dict[str, str] = {
 
 # Filename patterns → family (fallback when metadata is missing)
 FILENAME_PATTERNS: list[tuple[str, str]] = [
-    ("qwen3.8", "qwen3"),
-    ("qwen3.6", "qwen3"),
+    ("qwen3.8", "qwen3_8"),
+    ("qwen3.6", "qwen3_6"),
     ("qwen3", "qwen3"),
     ("qwen2.5", "qwen2"),
     ("qwen2", "qwen2"),
@@ -267,6 +295,11 @@ def detect_family_from_metadata(model_path: str) -> Optional[str]:
     template = meta.get("tokenizer.chat_template", "")
     template_lower = template.lower()
     if "qwen3" in template_lower or "qwen 3" in template_lower:
+        # Qwen3.8 uses a distinct template with reasoning_content field
+        if "3.8" in template_lower or "3_8" in template_lower:
+            return "qwen3_8"
+        if "3.6" in template_lower or "3_6" in template_lower:
+            return "qwen3_6"
         return "qwen3"
     if "qwen2" in template_lower or "qwen 2" in template_lower:
         return "qwen2"
@@ -307,7 +340,12 @@ def detect_family_from_server_props(base_url: str) -> Optional[str]:
         if not model_name:
             # Try to infer from chat_template string
             tpl = props.get("chat_template", "") or ""
-            if "qwen3" in tpl.lower():
+            tpl_lower = tpl.lower()
+            if "qwen3" in tpl_lower:
+                if "3.8" in tpl_lower or "3_8" in tpl_lower:
+                    return "qwen3_8"
+                if "3.6" in tpl_lower or "3_6" in tpl_lower:
+                    return "qwen3_6"
                 return "qwen3"
             if "gemma" in tpl.lower():
                 return "gemma4" if "4" in tpl else "gemma"

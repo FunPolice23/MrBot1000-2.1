@@ -403,8 +403,16 @@ class TestDialogueResponseCorruption(unittest.TestCase):
     def test_dialogue_disables_reasoning_only_for_dialogue_request(self):
         message = Mock(content="Short answer", tool_calls=None)
         client = Mock()
-        client.chat.completions.create.return_value = Mock(
-            choices=[Mock(message=message)])
+        # Stream-compatible mock: create() returns an iterable of chunks.
+        # Each chunk has choices[0].delta.content.
+        chunk = Mock()
+        chunk.choices = [Mock()]
+        chunk.choices[0].delta = Mock(content="Short answer")
+        # Final chunk with empty content to signal end
+        end_chunk = Mock()
+        end_chunk.choices = [Mock()]
+        end_chunk.choices[0].delta = Mock(content=None)
+        client.chat.completions.create.return_value = iter([chunk, end_chunk])
         chat_with_tools(
             client=client,
             model="qwen3-8b",
@@ -415,8 +423,9 @@ class TestDialogueResponseCorruption(unittest.TestCase):
             use_function_calling=False,
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
+        # The streaming call should include extra_body.
         self.assertEqual(
-            client.chat.completions.create.call_args.kwargs["extra_body"],
+            client.chat.completions.create.call_args_list[0].kwargs["extra_body"],
             {"chat_template_kwargs": {"enable_thinking": False}})
 
     def test_channel_reasoning_is_removed_from_visible_answer(self):

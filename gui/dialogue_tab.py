@@ -1786,16 +1786,36 @@ class DialogueWorker(QThread):
         self.generation_id = generation_id
         self._cancelled = False
         self.model_blocked = False
-        configured_max_tokens = int(os.getenv("DIALOGUE_TURN_MAX_TOKENS", "512"))
+        # Per-brain token limits (override DIALOGUE_TURN_MAX_TOKENS per brain)
+        is_big_brain = getattr(brain, "role", "") == "big_brain" or "big" in str(getattr(brain, "base_url", "")).lower()
+        if is_big_brain:
+            default_max = "8192"
+            env_key = "BIG_BRAIN_MAX_TOKENS"
+        else:
+            default_max = "4096"
+            env_key = "SMALL_BRAIN_MAX_TOKENS"
+        
+        configured_max_tokens = int(os.getenv(env_key, os.getenv("DIALOGUE_TURN_MAX_TOKENS", default_max)))
         model_name = str(getattr(brain, "model", "") or "").lower()
+        # Use word-boundary matching to avoid "26b" matching "2b"
+        import re
         compact_model = (
             "tiny" in model_name
             or "small" in model_name
-            or any(token in model_name for token in ("0.5b", "0.6b", "1b", "2b"))
+            or bool(re.search(r'\b[0-2]b\b', model_name))  # 0b, 1b, 2b but not 26b, 70b
         )
-        tiny_model = any(token in model_name for token in ("0.5b", "0.6b", "1b"))
-        self.max_tokens = max(
-            128, min(configured_max_tokens, 128 if tiny_model else 256 if compact_model else 768))
+        tiny_model = bool(re.search(r'\b[01]b\b', model_name))
+        is_thinking = "thinking" in model_name or "think" in model_name
+        if is_thinking:
+            # Thinking models need room for both thinking tokens and answer.
+            self.max_tokens = max(3048, configured_max_tokens)
+        elif tiny_model:
+            self.max_tokens = min(configured_max_tokens, 512)
+        elif compact_model:
+            self.max_tokens = min(configured_max_tokens, 1024)
+        else:
+            # Large models get full configured budget
+            self.max_tokens = configured_max_tokens
 
     def cancel(self):
         """Request cancellation; the provider call remains non-blocking to Qt."""
