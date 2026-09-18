@@ -67,7 +67,31 @@ class TestNumericEvidence(unittest.TestCase):
 
     def test_extract_deduplicates_and_keeps_order(self):
         values = extract_monetary_values("$5 then $10 then $5")
-        self.assertEqual([str(v) for v in values], ["5", "1E+1"])
+        self.assertEqual([str(v) for v in values], ["5", "10"])
+
+    def test_values_beyond_context_precision_do_not_collapse(self):
+        """Regression: normalize() rounded to 28 sig digits and merged distinct values.
+
+        10**81 and 10**81 + 1 are different numbers; the old code normalised both
+        to 1E+81 so the second was reported as supported. This is the magnitude
+        class of the incident value, so it must not regress.
+        """
+        a = "1" + "0" * 81
+        b = "1" + "0" * 80 + "1"
+        self.assertNotEqual(a, b)
+        self.assertEqual(unsupported_values(f"worth ${b}", f"ev=${a}"), [f"${b}"])
+
+    def test_scientific_values_beyond_precision_stay_distinct(self):
+        a = "1.00000000000000000000000000001e+82"
+        b = "1.00000000000000000000000000002e+82"
+        self.assertEqual(
+            unsupported_values(f"worth ${b}", f"ev=${a}"), [f"${b}"])
+
+    def test_equal_values_in_different_forms_still_match(self):
+        """Exact comparison must still treat 1.0 and 1.00 as the same value."""
+        self.assertEqual(unsupported_values("pays $1.00", "pays $1.0"), [])
+        self.assertEqual(
+            unsupported_values("pays $1e+81", "pays $" + "1" + "0" * 81), [])
 
     def test_unparseable_tokens_are_ignored(self):
         self.assertEqual(unsupported_values("$ not a number $x", _BOARD), [])

@@ -23,7 +23,16 @@ _MONEY = re.compile(
 
 
 def _to_decimal(raw: str) -> Decimal | None:
-    """Parse a matched number to a normalised Decimal, or None if unusable."""
+    """Parse a matched number to an exact Decimal, or None if unusable.
+
+    The value is deliberately NOT normalised. ``Decimal.normalize()`` applies the
+    active decimal context precision (28 significant digits by default), so it
+    rounds longer values before any comparison: 10**81 and 10**81 + 1 both became
+    ``1E+81`` and compared equal. That is exactly the magnitude class this check
+    exists to police, so normalising silently disabled it for the incident value.
+    Decimal equality and hashing are already numeric, so ``Decimal("1.0")`` still
+    matches ``Decimal("1.00")`` and set lookups stay valid without it.
+    """
     cleaned = (raw or "").replace(",", "").strip()
     if not cleaned:
         return None
@@ -33,15 +42,11 @@ def _to_decimal(raw: str) -> Decimal | None:
         return None
     if not value.is_finite():
         return None
-    normalised = value.normalize()
-    # normalize() renders 1E+82; keep a plain form for equality work.
-    if normalised == 0:
-        return Decimal(0)
-    return normalised
+    return value
 
 
 def extract_monetary_values(text: str) -> List[Decimal]:
-    """Every monetary value in the text, normalised, deduplicated, order kept."""
+    """Every monetary value in the text, exact, deduplicated, order kept."""
     out: List[Decimal] = []
     seen: set[Decimal] = set()
     for match in _MONEY.finditer(text or ""):

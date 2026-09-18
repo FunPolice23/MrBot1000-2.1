@@ -1158,6 +1158,7 @@ class DialogueTab(QWidget):
                 # 14B on a 6GB card that actually ran "compact", misleading
                 # any diagnosis that reads this log.
                 "tier": self._tier_for_brain(speaker != _BIG, model),
+                "context_values": getattr(self, "_last_context_values", []),
                 "phase": (getattr(self, "_phase_index", 0) or 0),
                 "goal": (self.goal or "")[:300],
                 "mode": ("live" if getattr(self, "live_running", False)
@@ -2155,6 +2156,15 @@ class DialogueTab(QWidget):
         )
         # Keep prompt processing predictable for long-running Live sessions.
         # The durable conversation log retains the complete transcript.
+        # Cache the monetary values present in the context actually sent, so
+        # the per-turn log can record them and the numeric-evidence check can
+        # be measured retrospectively (the log has no full prompt field).
+        try:
+            from agents.numeric_evidence import extract_monetary_values
+            _vals = extract_monetary_values(context[:self._context_char_limit])
+            self._last_context_values = [str(v) for v in _vals[:50]]
+        except Exception:
+            self._last_context_values = []
         return context[:self._context_char_limit]
 
     # ── display ─────────────────────────────────────────────────────────

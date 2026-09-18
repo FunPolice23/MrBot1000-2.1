@@ -218,15 +218,58 @@ def _read_env_lines(path: Path):
         return []
 
 
-def set_env_values(values: dict):
+class EnvWriteRefused(RuntimeError):
+    """Raised when a `.env` write is refused (test isolation / protected key)."""
+
+
+# Brain model keys must never be blanked by a settings write: an unresolved
+# model dropdown resolves to "" and would erase the operator's saved selection.
+_PROTECTED_NONEMPTY_KEYS = {"BIG_BRAIN_MODEL", "SMALL_BRAIN_MODEL"}
+
+
+def env_file_path() -> Path:
+    """Path of the live `.env` used by set_env_values.
+
+    Tests redirect this to a temp file via MRBOT_ENV_PATH, so a test run can
+    never rewrite the operator's real configuration/credentials file.
+    """
+    override = (os.getenv("MRBOT_ENV_PATH") or "").strip()
+    return Path(override) if override else Path(".env")
+
+
+def _env_write_refusal() -> str:
+    """Reason a `.env` write must be refused, or "" when the write is allowed.
+
+    A test run must be structurally incapable of writing operator config; the
+    escape hatch is an explicit MRBOT_ENV_PATH pointing at a temp file.
+    """
+    if "pytest" in sys.modules and not (os.getenv("MRBOT_ENV_PATH") or "").strip():
+        return ("refusing to write .env during a test run; set MRBOT_ENV_PATH to a "
+                "temporary path to exercise persistence")
+    return ""
+
+
+def set_env_values(values: dict, *, path: Optional[Path] = None) -> bool:
     """Write many KEY=VALUE pairs to `.env` in a single, lock-resilient pass.
 
     Rewrites the whole file (preserving unknown keys/comments) and replaces it
     atomically with retry + guaranteed temp cleanup. Never leaves a `.tmp_*` behind.
+
+    Raises EnvWriteRefused when called from a test run without an explicit
+    MRBOT_ENV_PATH. Empty values for protected model keys are dropped rather than
+    written, so a settings save can never blank a saved model selection.
+    Returns True when a write happened, False when there was nothing to write.
     """
-    env = Path(".env")
+    refusal = _env_write_refusal()
+    if refusal:
+        raise EnvWriteRefused(refusal)
+    env = path or env_file_path()
     lines = _read_env_lines(env)
     keys = {k: (str(v) if v is not None else "") for k, v in values.items()}
+    for k in [k for k in keys if k in _PROTECTED_NONEMPTY_KEYS and not keys[k].strip()]:
+        del keys[k]
+    if not keys:
+        return False
     out = []
     covered = set()
     for ln in lines:
@@ -256,7 +299,7 @@ def set_env_values(values: dict):
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, env)
-            return
+            return True
         except (PermissionError, OSError):
             # temp may be locked by AV/sync; retry after a short backoff.
             if tmp and os.path.exists(tmp):

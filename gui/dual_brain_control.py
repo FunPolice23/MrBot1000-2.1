@@ -989,26 +989,28 @@ class DualBrainControl(QWidget):
                 "BIG_BRAIN_TEMPERATURE": str(self.bb_temp_spin.value()),
                 "AUTO_START_SERVERS": "1" if self.auto_start_check.isChecked() else "0",
             }
+            import pathlib
             try:
-                from main import set_env_values
-                set_env_values(values)
+                from main import EnvWriteRefused, set_env_values
             except Exception:
-                # Fallback: write directly to .env lines (idempotent).
-                import pathlib
-                env_path = pathlib.Path(__file__).resolve().parent.parent / ".env"
-                lines = []
-                existing = {}
-                if env_path.exists():
-                    for ln in env_path.read_text(encoding="utf-8").splitlines():
-                        if "=" in ln and not ln.strip().startswith("#"):
-                            k, _ = ln.split("=", 1)
-                            existing[k.strip()] = ln
-                        else:
-                            lines.append(ln)
-                for k, v in values.items():
-                    lines = [l for l in lines if not l.startswith(f"{k}=")]
-                    lines.append(f"{k}={v}")
-                env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                self._log("⚠️ Settings not persisted: set_env_values unavailable.")
+                return
+            try:
+                set_env_values(values)
+            except EnvWriteRefused as refusal:
+                # Test isolation: a test run must never rewrite operator config.
+                self._log(f"⚠️ Settings not persisted: {refusal}")
+                return
+            except Exception:
+                # Fallback: use the SAME atomic writer with the repo path spelled
+                # out. Never own a second, non-atomic write of the credentials
+                # file — an interrupted write_text can truncate .env.
+                repo_env = pathlib.Path(__file__).resolve().parent.parent / ".env"
+                try:
+                    set_env_values(values, path=repo_env)
+                except Exception as exc:
+                    self._log(f"⚠️ Settings could not be persisted: {exc}")
+                    return
             os.environ["SMALL_BRAIN_MODEL"] = values["SMALL_BRAIN_MODEL"]
             os.environ["BIG_BRAIN_MODEL"] = values["BIG_BRAIN_MODEL"]
             self._log("💾 llama.cpp settings and model defaults saved to .env")
@@ -2528,31 +2530,6 @@ class DualBrainControl(QWidget):
         except Exception:
             pass
 
-    def cleanup(self):
-        """Stop the GPU polling thread before the control is destroyed."""
-        self._closing = True
-        probe_thread = getattr(self, "_provider_probe_thread", None)
-        if probe_thread is not None and probe_thread.is_alive():
-            probe_thread.join(3000)
-        worker = getattr(self, "gpu_worker", None)
-        if worker is not None and worker.isRunning():
-            worker.stop()
-            worker.wait(7000)
-        for name in (
-            "_small_probe_worker", "_big_probe_worker",
-            "_small_stop_worker", "_big_stop_worker",
-            "_small_launch_worker", "_big_launch_worker",
-        ):
-            worker = getattr(self, name, None)
-            try:
-                if worker is not None and worker.isRunning():
-                    if hasattr(worker, "stop"):
-                        worker.stop()
-                    worker.wait(3000)
-            except RuntimeError:
-                # Finished workers may already have processed deleteLater().
-                pass
-
 
 class BrainLaunchWorker(QThread):
     """Background worker for launching llama-server - prevents GUI freeze."""
@@ -3058,7 +3035,7 @@ class BrainLaunchWorker(QThread):
                 self._small_server_process = proc
                 self.we_started_small = True
                 self._log(f"✅ {message}")
-                self._refresh_provider_status()
+                self._on_launch_success_reprobe(True)
             else:
                 self._log(f"❌ {message}")
                 self.we_started_small = False
@@ -3152,7 +3129,7 @@ class BrainLaunchWorker(QThread):
                 self._big_server_process = proc
                 self.we_started_big = True
                 self._log(f"✅ {message}")
-                self._refresh_provider_status()
+                self._on_launch_success_reprobe(False)
             else:
                 self._log(f"❌ {message}")
                 self.we_started_big = False
@@ -3238,8 +3215,14 @@ class BrainLaunchWorker(QThread):
             if self.big_brain is not None:
                 self.big_brain.model = model_name
 
-    def _persist_role_model(self, small: bool, model_name: str, runtime, cfg, *, persist=True):
-        """Apply a model selection, optionally saving it as the next default."""
+    def _persist_role_model(self, small: bool, model_name: str, runtime, cfg, *, persist=False):
+        """Apply a model selection, optionally saving it as the next default.
+
+        ``persist`` defaults to **False**: writing the operator's `.env` requires an
+        explicit opt-in. Every production caller passes it explicitly, and a default
+        of True let a test run rewrite `.env` (resetting BIG_BRAIN_MODEL to a path
+        that need not exist).
+        """
         model_name = str(model_name or "").strip()
         if not model_name:
             return
@@ -3443,8 +3426,30 @@ class BrainLaunchWorker(QThread):
         except RuntimeError:
             pass
 
+    def _on_launch_success_reprobe(self, small: bool, attempts: int = 90):
+        """Re-probe until a just-launched server actually answers.
+
+        The launch worker reports success as soon as the process is alive, but
+        a llama-server loading a model into VRAM does not answer /v1/models for
+        many seconds afterwards. A single immediate probe therefore leaves the
+        status at "Stopped" and the operator has to click Start a second time
+        to see it go reachable. Re-probe every 2s until the just-launched
+        brain reports reachable, or the bounded budget (~3 min) runs out.
+        """
+        if getattr(self, "_closing", False):
+            return
+        flag = "_sb_reachable" if small else "_bb_reachable"
+        if getattr(self, flag, False):
+            return
+        self._refresh_provider_status()
+        if attempts > 0:
+            QTimer.singleShot(
+                2000, lambda: self._on_launch_success_reprobe(small, attempts - 1))
+
     def _apply_provider_status(self, data):
         """Apply probe results on the GUI thread."""
+        self._sb_reachable = bool(data.get("sb_running"))
+        self._bb_reachable = bool(data.get("bb_running"))
         sb_running = data["sb_running"]; sb_models = data["sb_models"]
         sb_external = data.get("sb_external", False)
         sb_selected = data.get("sb_selected", "")
@@ -3541,19 +3546,37 @@ class BrainLaunchWorker(QThread):
     # CLEANUP
     # ═══════════════════════════════════════════════════════════════════
     def cleanup(self):
-        """Stop background threads when widget is destroyed."""
-        self.gpu_worker.stop()
-        self.gpu_worker.wait(7000)
+        """Stop background threads before the widget is destroyed.
+
+        Sets the closing flag first so background callbacks stop re-arming,
+        joins the provider-probe thread, then stops the GPU poller and every
+        per-brain worker. Each stop is guarded: a worker already processed by
+        deleteLater() raises RuntimeError from isRunning(), and letting that
+        escape would abort teardown and leave the remaining threads running
+        (the "QThread: Destroyed while thread is still running" failure).
+        """
+        self._closing = True
+        probe_thread = getattr(self, "_provider_probe_thread", None)
+        if probe_thread is not None and probe_thread.is_alive():
+            probe_thread.join(3000)
+        worker = getattr(self, "gpu_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            worker.wait(7000)
         for name in (
             "_small_probe_worker", "_big_probe_worker",
             "_small_stop_worker", "_big_stop_worker",
             "_small_launch_worker", "_big_launch_worker",
         ):
             worker = getattr(self, name, None)
-            if worker is not None and worker.isRunning():
-                if hasattr(worker, "stop"):
-                    worker.stop()
-                worker.wait(3000)
+            try:
+                if worker is not None and worker.isRunning():
+                    if hasattr(worker, "stop"):
+                        worker.stop()
+                    worker.wait(3000)
+            except RuntimeError:
+                # Finished workers may already have processed deleteLater().
+                pass
 
 
 class ProviderProbeWorker(QThread):
@@ -3632,6 +3655,7 @@ for _handler_name in (
     "_on_start_small_brain", "_probe_before_start", "_on_provider_probe_done",
     "_start_small_brain_after_probe", "_start_external_brain", "_on_small_brain_launched",
     "_on_start_big_brain", "_start_big_brain_after_probe", "_on_big_brain_launched",
+    "_on_launch_success_reprobe",
     "_on_stop_big_brain", "_on_stop_all", "_on_small_brain_model_changed",
     "_on_big_brain_model_changed", "_sync_adapter_model", "_on_start_all",
     "_persist_role_model", "_select_external_model", "_unload_external_model",

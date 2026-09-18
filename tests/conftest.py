@@ -34,3 +34,41 @@ def _qt_app_session():
     if app is None:
         app = QApplication([])
     yield app
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _operator_env_is_untouched():
+    """Fail the session if any test rewrites the operator's `.env`.
+
+    A test run must be structurally incapable of altering operator config, but a
+    guard test alone cannot bracket the suite (pytest gives no ordering
+    guarantee). This snapshots both candidate paths at session start and asserts
+    they are byte-identical at session end:
+
+      * `Path(".env")`                 — CWD-relative, what set_env_values uses
+      * `<repo>/.env`                  — absolute, what the old non-atomic
+                                          `_persist_settings` fallback wrote
+
+    Regression: tests/test_provider_selection.py called `_persist_role_model`
+    without `persist=False`, and the default of True rewrote the live `.env`
+    (resetting BIG_BRAIN_MODEL to a non-existent path).
+    """
+    from pathlib import Path
+
+    repo_env = Path(__file__).resolve().parent.parent / ".env"
+    candidates = [Path(".env"), repo_env]
+
+    def _snapshot(p: Path):
+        try:
+            return p.read_bytes() if p.exists() else None
+        except Exception as exc:  # unreadable: record the reason, don't crash
+            return f"<unreadable: {exc}>".encode()
+
+    before = {p: _snapshot(p) for p in candidates}
+    yield
+    for p, original in before.items():
+        after = _snapshot(p)
+        assert after == original, (
+            f"the test suite modified {p} — a test wrote operator config. "
+            f"Route persistence through MRBOT_ENV_PATH instead."
+        )
