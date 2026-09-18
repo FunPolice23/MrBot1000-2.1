@@ -149,8 +149,9 @@ def push() -> str:
 
 def publish(message: str, pull_first: bool = False) -> str:
     parts = []
-    if pull_first:
-        parts.append(pull())
+    # Always pull to handle diverged branches (rebase fallback handles
+    # the case where --ff-only would fail)
+    parts.append(pull())
     parts.append(sync_source())
     parts.append(commit(message))
     parts.append(push())
