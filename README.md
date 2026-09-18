@@ -294,7 +294,7 @@ Test results are saved to `tests/test_results/test_run_YYYYMMDD_HHMMSS.json`.
 | `database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
 | `theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
 | `version.py` | Public application version source (`2.1.1`) |
-| `Agent.md` / `ARCHITECTURE_CURRENT.md` / `CHANGELOG.md` | Runtime contract, current system design, and release history |
+| `Agent.md` / `README.md` / `CHANGELOG.md` | Runtime contract, current system overview, and release history |
 | `tests/` | Focused regression and subsystem tests |
 
 ## Configuration
@@ -335,19 +335,20 @@ Key settings:
 4. **Safety & Tools** — Tool registry, safety rules, and approval queue
 5. **Chat** — Human conversation with the configured Small Brain
 6. **Dialogue** — Goal-driven Edward/Jacob conversation with Goals, Tasks, and Progress tracking
-7. **Browse Root** — File explorer
-8. **Payments** — Balance and payout verification
-9. **Earnings** — Income tracking, verified revenue, costs, gas, net profit, ROI
-10. **Insights** — Reports and operational summaries
-11. **Approvals** — Human approval queue beside Dialogue, with full request inspection
+7. **Approvals** — Human approval queue beside Dialogue, with full request inspection
+8. **Browse Root** — File explorer
+9. **Payments** — Balance and payout verification
+10. **Earnings** — Income tracking, verified revenue, costs, gas, net profit, ROI
+11. **Insights** — Reports and operational summaries
 12. **Opportunities** — Opportunity portfolio and work queue
-13. **Paper Trading** — Risk-contained trading simulation tools
-14. **Analytics** — Performance and economic analytics
-15. **Reputation** — Platform and opportunity reputation data
-16. **Data Explorer** — Local database and evidence exploration
-17. **Settings** — Provider configuration, model settings, themes, and effect toggles
-18. **Live Logs** — Debug output with severity filtering
-19. **DB Stats** — Database metrics, recent actions, LLM call history, and instruction review queue
+13. **Live Portfolio** — Live trading portfolio
+14. **Strategy Simulator** — Risk-contained paper-trading strategy simulation
+15. **Analytics** — Performance and economic analytics
+16. **Reputation** — Platform and opportunity reputation data
+17. **Data Explorer** — Local database and evidence exploration
+18. **Settings** — Provider configuration, model settings, themes, and effect toggles
+19. **Live Logs** — Debug output with severity filtering
+20. **DB Stats** — Database metrics, recent actions, LLM call history, and instruction review queue
 
 Memory and stream-health controls are integrated into **Management**. The
 Collaboration coordinator remains a backend capability used by the runtime, but
@@ -377,9 +378,8 @@ it is not a separate visible tab.
 ## Documentation
 
 - **Agent.md** — Runtime contract for any model interacting with the system
-- **ARCHITECTURE_CURRENT.md** — Current v2.1 system design and component reference
-- **ARCHITECTURE.md** — Historical full program-review export; retained for reference
-- **CHANGELOG.md** — Full change history through v2.0.36m
+- **README.md** (this file) — Current system overview, tab inventory, and configuration guide
+- **CHANGELOG.md** — Full change history (current release v2.1.1; see the `[Unreleased]` block for in-flight work)
 
 ## Requirements
 

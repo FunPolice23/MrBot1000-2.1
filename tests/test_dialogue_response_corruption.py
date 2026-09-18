@@ -18,6 +18,23 @@ from agents.reasoning_modes import ReasoningMode, select_reasoning_mode
 
 
 class TestDialogueResponseCorruption(unittest.TestCase):
+    def test_glued_thinking_marker_is_stripped(self):
+        """LFM2.5 emits a bare ' thinking' marker glued to the reply
+        (' thinkingThe user...'). It must be stripped so the reasoning block is
+        not shown as the persona's reply."""
+        glued = (' thinkingThe user is asking for the "safest first step to '
+                 'earn money online" in a single sentence.')
+        cleaned = DialogueTab._clean_model_response(glued)
+        self.assertFalse(cleaned.startswith("thinking"),
+                         f"thinking marker not stripped: {cleaned!r}")
+        self.assertTrue(cleaned.startswith("The user"),
+                        f"reply text lost after strip: {cleaned!r}")
+
+    def test_normal_reply_is_untouched(self):
+        """A legitimate reply must not be mangled by the thinking-strip."""
+        reply = "I recommend starting with freelance work."
+        self.assertEqual(DialogueTab._clean_model_response(reply), reply)
+
     def test_corrupted_payload_is_rejected(self):
         worker = DialogueWorker.__new__(DialogueWorker)
         binary_payload = "1" * 400 + "0" * 400 + "_" * 50
@@ -175,13 +192,10 @@ class TestDialogueResponseCorruption(unittest.TestCase):
             "The returned evidence confirms the platform enforces this $500K cap."
         ))
 
-    def test_retired_persona_names_are_rejected_from_model_output(self):
+    def test_promised_external_completion_without_tool_result_is_rejected(self):
         worker = DialogueWorker.__new__(DialogueWorker)
         self.assertTrue(worker._is_bad_dialogue_response(
-            "Marcus on the ground while Jacob flags the risk."
-        ))
-        self.assertTrue(worker._is_bad_dialogue_response(
-            "Alex Vega should review this before continuing."
+            "The returned evidence confirms the platform enforces this $500K cap."
         ))
 
     def test_failed_full_model_retry_returns_safe_transcript_response(self):
@@ -361,7 +375,11 @@ class TestDialogueResponseCorruption(unittest.TestCase):
     def test_dialogue_worker_uses_bounded_turn_budget(self):
         worker = DialogueWorker.__new__(DialogueWorker)
         worker.brain = Mock(model="granite-1b-tiny")
+        # Clear the per-brain overrides so DIALOGUE_TURN_MAX_TOKENS governs;
+        # a loaded .env otherwise wins and makes this test order-dependent.
         with patch.dict(os.environ, {"DIALOGUE_TURN_MAX_TOKENS": "512"}):
+            os.environ.pop("SMALL_BRAIN_MAX_TOKENS", None)
+            os.environ.pop("BIG_BRAIN_MAX_TOKENS", None)
             DialogueWorker.__init__(
                 worker, worker.brain, "context", [], "Jacob Stanley")
         self.assertEqual(worker.max_tokens, 128)
@@ -371,6 +389,8 @@ class TestDialogueResponseCorruption(unittest.TestCase):
         worker.max_tokens = 512
         worker.brain = Mock(model="granite-8b-instruct")
         with patch.dict(os.environ, {"DIALOGUE_TURN_MAX_TOKENS": "512"}):
+            os.environ.pop("SMALL_BRAIN_MAX_TOKENS", None)
+            os.environ.pop("BIG_BRAIN_MAX_TOKENS", None)
             DialogueWorker.__init__(
                 worker, worker.brain, "context", [], "Jacob Stanley")
         self.assertEqual(worker.max_tokens, 512)

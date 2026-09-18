@@ -24,4 +24,4 @@ Write-Host "========================================" -ForegroundColor Cyan
     --ctx-size 32768 `
     --n-gpu-layers all `
     --split-mode none `
-    --model "D:/LMStudio/models/lmstudio-community/Qwen3-4B-Thinking-2507-GGUF/Qwen3-4B-Thinking-2507-Q6_K.gguf"
+    --model "D:/llama.cpp/models/Qwen3.5-4B-UD-Q5_K_XL.gguf"

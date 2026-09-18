@@ -25,7 +25,8 @@ class ProgramKnowledge:
     """Static knowledge about MrBot1000 that both brains need."""
     
     PROGRAM_NAME = "MrBot1000"
-    PROGRAM_VERSION = "2.1"
+    # Displayed to both brains in prompt context; tracks the release version.
+    PROGRAM_VERSION = "2.1.1"
     PROGRAM_PURPOSE = "AI-Powered Online Income & Crypto Opportunity Engine"
     
     CORE_IDENTITY = """

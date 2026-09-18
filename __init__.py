@@ -9,5 +9,6 @@ This package provides:
 - Local Ollama integration with optional cloud provider fallback
 """
 
-__version__ = "2.0.36k"
+# Authoritative release version lives in version.py; keep this in sync.
+__version__ = "2.1.1"
 __author__ = "MrBot1000 Team"

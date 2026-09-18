@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, QObject
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
@@ -788,6 +789,9 @@ class DualBrainControl(QWidget):
                 self.sb_temp_spin.valueChanged.connect(self._persist_settings)
             if hasattr(self, "bb_temp_spin"):
                 self.bb_temp_spin.valueChanged.connect(self._persist_settings)
+            # Auto-start toggle persists its choice to .env (AUTO_START_SERVERS).
+            if hasattr(self, "auto_start_check"):
+                self.auto_start_check.stateChanged.connect(self._persist_settings)
         except RuntimeError:
             # The widget may be in teardown while the delayed singleShot callback
             # is still running; do not crash the parent app during rebuilds.
@@ -983,6 +987,7 @@ class DualBrainControl(QWidget):
                 "BIG_BRAIN_KV_CACHE": self.bb_kv_combo.currentText() or "f16",
                 "SMALL_BRAIN_TEMPERATURE": str(self.sb_temp_spin.value()),
                 "BIG_BRAIN_TEMPERATURE": str(self.bb_temp_spin.value()),
+                "AUTO_START_SERVERS": "1" if self.auto_start_check.isChecked() else "0",
             }
             try:
                 from main import set_env_values
@@ -1342,14 +1347,14 @@ class DualBrainControl(QWidget):
             "Sampling temperature (0.0=precise, 2.0=creative). "
             "Lower for factual Q&A, higher for brainstorming.")
         settings_layout.addWidget(self.sb_temp_spin, 4, 1)
-        sb_temp_presets = QComboBox()
-        sb_temp_presets.addItems(["Custom", "0.0 (Precise)", "0.3 (Low)", "0.5 (Default)",
-                                   "0.7 (Medium)", "1.0 (Creative)", "1.5 (Wild)"])
-        sb_temp_presets.setFixedWidth(120)
-        sb_temp_presets.setStyleSheet(SMALL_SPIN_QSS)
-        sb_temp_presets.currentTextChanged.connect(
-            lambda t: self._on_temp_preset(t, self.sb_temp_spin, "SMALL_BRAIN_TEMPERATURE"))
-        settings_layout.addWidget(sb_temp_presets, 4, 2, 1, 2)
+        self.sb_temp_presets = QComboBox()
+        self.sb_temp_presets.addItems(["Custom", "0.0 (Precise)", "0.3 (Low)", "0.5 (Default)",
+                                       "0.7 (Medium)", "1.0 (Creative)", "1.5 (Wild)"])
+        self.sb_temp_presets.setFixedWidth(120)
+        self.sb_temp_presets.setStyleSheet(SMALL_SPIN_QSS)
+        self.sb_temp_presets.currentTextChanged.connect(
+            lambda t, sp=self.sb_temp_spin: self._on_temp_preset(t, sp, "SMALL_BRAIN_TEMPERATURE"))
+        settings_layout.addWidget(self.sb_temp_presets, 4, 2, 1, 2)
 
         # ── Big Brain Settings ──
         bb_settings_label = QLabel("🧠 Big Brain (5060 Ti, port 1234)")
@@ -1485,14 +1490,14 @@ class DualBrainControl(QWidget):
             "Sampling temperature (0.0=precise, 2.0=creative). "
             "Lower for factual Q&A, higher for brainstorming.")
         settings_layout.addWidget(self.bb_temp_spin, 10, 1)
-        bb_temp_presets = QComboBox()
-        bb_temp_presets.addItems(["Custom", "0.0 (Precise)", "0.3 (Low)", "0.5 (Default)",
-                                   "0.7 (Medium)", "1.0 (Creative)", "1.5 (Wild)"])
-        bb_temp_presets.setFixedWidth(120)
-        bb_temp_presets.setStyleSheet(BIG_SPIN_QSS)
-        bb_temp_presets.currentTextChanged.connect(
+        self.bb_temp_presets = QComboBox()
+        self.bb_temp_presets.addItems(["Custom", "0.0 (Precise)", "0.3 (Low)", "0.5 (Default)",
+                                       "0.7 (Medium)", "1.0 (Creative)", "1.5 (Wild)"])
+        self.bb_temp_presets.setFixedWidth(120)
+        self.bb_temp_presets.setStyleSheet(BIG_SPIN_QSS)
+        self.bb_temp_presets.currentTextChanged.connect(
             lambda t: self._on_temp_preset(t, self.bb_temp_spin, "BIG_BRAIN_TEMPERATURE"))
-        settings_layout.addWidget(bb_temp_presets, 10, 2, 1, 2)
+        settings_layout.addWidget(self.bb_temp_presets, 10, 2, 1, 2)
 
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Hardware preset:"))
@@ -1605,6 +1610,20 @@ class DualBrainControl(QWidget):
         """)
         self.refresh_btn.clicked.connect(self._refresh_provider_status)
         quick_layout.addWidget(self.refresh_btn)
+
+        # Auto-start both llama-server instances when MrBot1000 launches
+        self.auto_start_check = QCheckBox(
+            "Start both servers automatically at launch")
+        self.auto_start_check.setObjectName("autoStartCheck")
+        self.auto_start_check.setToolTip(
+            "When enabled, MrBot1000 launches both llama-server instances "
+            "(big=1234, small=1235) automatically when the program starts, "
+            "using the per-brain settings configured here. Disable to start "
+            "the servers manually with Start All Brains.")
+        self.auto_start_check.setChecked(
+            os.getenv("AUTO_START_SERVERS", "1").strip().lower()
+            in ("1", "true", "yes", "on"))
+        quick_layout.addWidget(self.auto_start_check)
 
         # Save llama.cpp customization to .env (v2.1)
         self.save_settings_btn = QPushButton("💾 Save Local Provider Settings")
@@ -2563,10 +2582,16 @@ class BrainLaunchWorker(QThread):
         try:
             import urllib.request
             req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
-            with urllib.request.urlopen(req, timeout=2) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 return True
         except Exception:
+            # A server under load may not answer /v1/models within 30s.
+            # Treat "process still alive" as ready rather than killing it.
             return False
+
+    def _proc_alive(self):
+        """True if the child process is still running (even if not answering probes)."""
+        return self._proc is not None and self._proc.poll() is None
 
     def run(self):
         """Launch server and wait for it to be ready."""
@@ -2578,7 +2603,7 @@ class BrainLaunchWorker(QThread):
                 self.cmd,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
             )
         except Exception as e:
             self._record_failure(f"Popen failed: {e}")
@@ -2603,6 +2628,17 @@ class BrainLaunchWorker(QThread):
                         detail += " — the selected GGUF is incomplete or incompatible with this llama.cpp build; re-download it or choose a matching model."
                     self.launch_finished.emit(False, f"{self.role_name}: {detail}\n{tail}", None)
                     return
+                # A busy server may not answer /v1/models promptly. Treat a live
+                # process as "launched successfully" rather than failing the launch
+                # and later terminating a server that is mid-generation.
+                if self._proc_alive():
+                    log_file.close()
+                    self.launch_finished.emit(
+                        True,
+                        f"{self.role_name} ready on :{self.port} (process alive, awaiting first request)",
+                        self._proc,
+                    )
+                    return
                 if self.check_fn(self.port):
                     log_file.close()
                     self.launch_finished.emit(True, f"{self.role_name} ready on :{self.port}", self._proc)
@@ -2610,14 +2646,33 @@ class BrainLaunchWorker(QThread):
                 time.sleep(1.0)
 
             log_file.close()
-            if self._proc.poll() is None:
-                self._proc.terminate()
+            if self._proc.poll() is not None:
+                # Process died — report failure with tail.
                 try:
-                    self._proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-            message = "Launch cancelled" if self._stop_requested else "Server did not respond after 120s"
-            self.launch_finished.emit(False, message, None)
+                    with open(log_path, encoding="utf-8", errors="replace") as f:
+                        tail = f.read()[-1200:].strip()
+                except OSError:
+                    tail = ""
+                detail = f"Process exited with code {self._proc.returncode}"
+                if "tensor '" in tail and "not found" in tail:
+                    detail += " — the selected GGUF is incomplete or incompatible with this llama.cpp build; re-download it or choose a matching model."
+                self.launch_finished.emit(False, f"{self.role_name}: {detail}\n{tail}", None)
+                return
+            elif self._stop_requested:
+                self.launch_finished.emit(
+                    False, f"{self.role_name}: launch cancelled before ready", None)
+                return
+            else:
+                # Process alive but probe never confirmed — that means it is
+                # starting slowly (common on large models / cold VRAM). Do NOT
+                # terminate it; report "ready, awaiting first request" and let
+                # the first chat completion be the real readiness proof.
+                self.launch_finished.emit(
+                    True,
+                    f"{self.role_name} ready on :{self.port} (process alive, awaiting first request)",
+                    self._proc,
+                )
+                return
         except Exception as e:
             self._record_failure(f"worker run failed: {e}")
             try:
@@ -3309,6 +3364,21 @@ class BrainLaunchWorker(QThread):
     def _on_start_all(self):
         """Start both brains concurrently through their non-blocking probes."""
         self._log("Starting all providers...")
+        self._on_start_small_brain()
+        self._on_start_big_brain()
+
+    def maybe_auto_start(self):
+        """Auto-start both llama-server instances if the user opted in.
+
+        Called once, deferred, after the app window is shown. Each brain is
+        started through its existing non-blocking probe path, so an instance
+        that is already reachable, disabled, or on a non-local route is left
+        alone (idempotent). Never blocks the GUI thread.
+        """
+        if not self.auto_start_check.isChecked():
+            self._log("ℹ️ Auto-start disabled in Quick Actions; servers not started.")
+            return
+        self._log("🚀 Auto-start enabled — launching both servers...")
         self._on_start_small_brain()
         self._on_start_big_brain()
 

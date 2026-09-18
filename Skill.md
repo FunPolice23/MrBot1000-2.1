@@ -138,5 +138,5 @@ user requests opportunity discovery, or earnings pipeline enters discover phase,
 ## Related Documentation
 
 - `Agent.md` - Agent runtime contract
-- `ARCHITECTURE.md` - Full system architecture
+- `README.md` - System overview, tab inventory, and configuration guide
 - `CHANGELOG.md` - Change history

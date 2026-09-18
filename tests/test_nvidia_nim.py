@@ -275,6 +275,9 @@ class TestBaseWorkerForwardsThink(unittest.TestCase):
         w.db = None
         w._provider_registry = None
         w._max_tokens = None
+        # llm() forwards these to the provider; a real worker sets them in __init__.
+        w._temperature = 0.7
+        w._top_p = 0.9
         # Patch the env-driven flags used inside llm()
         with mock.patch.dict(os.environ, {
                 "THINKING_ENABLED": "true", "MAX_TOKENS": "256"}), \

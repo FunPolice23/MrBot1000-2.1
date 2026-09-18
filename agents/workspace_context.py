@@ -30,11 +30,10 @@ def _short(value: Any, limit: int = 240) -> str:
 
 def _opportunity_context() -> list[str]:
     try:
-        from agents.opportunity_portfolio import OpportunityPortfolio
+        from agents.opportunity_portfolio import OpportunityPortfolio, canonical_portfolio_path
         portfolio = _component("opportunity_portfolio")
         if portfolio is None:
-            db_path = os.path.join(os.path.expanduser("~"), ".mrbot1000", "opportunities.db")
-            portfolio = OpportunityPortfolio(db_path)
+            portfolio = OpportunityPortfolio(canonical_portfolio_path())
         entries = portfolio.list_all()[-8:]
         if not entries:
             return ["- No opportunities are currently recorded in the portfolio."]

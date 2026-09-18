@@ -24,6 +24,9 @@ class TestPromptBudget(unittest.TestCase):
         self.adapter.base_system_prompt = "BASE"
         self.adapter.personality = _Personality()
         self.adapter.knowledge = _Knowledge()
+        # _build_system_prompt consults the active model for its prompt-tier
+        # recommendation; a real adapter always has this set in __init__.
+        self.adapter.model = "Qwen3.5-4B-UD-Q5_K_XL.gguf"
 
     def _prompt(self, tier):
         with patch.dict(os.environ, {"SMALL_BRAIN_PROMPT_TIER": tier}, clear=False):

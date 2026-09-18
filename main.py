@@ -499,8 +499,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self.autonomous_run_store = None
         try:
             from agents.composition_root import build_composition_root
+            from agents.opportunity_portfolio import canonical_portfolio_path
             root = build_composition_root(
                 db_path=os.path.join(ROOT_FOLDER, "earning.db"),
+                portfolio_path=canonical_portfolio_path(),
                 log_fn=lambda msg: self.log_signal.emit(f"[Earning] {msg}"),
             )
             self._composition_root = root
@@ -1422,10 +1424,29 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         tabs.currentChanged.connect(self._on_tab_changed)
 
         # ── Auto-start llama-server on app launch ─────────────────────────────
-        # v2.1: Auto-start is DISABLED. Models must be started manually from
-        # the Providers & GPU tab. This prevents the brains from auto-running
-        # at startup when the operator doesn't want them to.
+        # v2.1.1: Auto-start is OFF by default but user-controllable. When
+        # AUTO_START_SERVERS=1 (toggled via the Providers & GPU → Quick Actions
+        # checkbox and persisted to .env), both llama-server instances launch
+        # after the window is shown using the per-brain settings configured in
+        # the Providers & GPU tab. Purely deferred + non-blocking so startup
+        # stays responsive; the probes/launch run on background threads.
         self._auto_start_timer = None
+        try:
+            if os.getenv("AUTO_START_SERVERS", "1").strip().lower() in (
+                    "1", "true", "yes", "on"):
+                QTimer.singleShot(700, self._maybe_auto_start_servers)
+        except Exception:
+            pass  # never let auto-start scheduling break startup
+
+    def _maybe_auto_start_servers(self):
+        """Deferred hook: delegate to the Providers & GPU tab's auto-start."""
+        try:
+            providers_tab = getattr(self, "providers_gpu_tab", None)
+            if providers_tab is not None and hasattr(providers_tab, "maybe_auto_start"):
+                providers_tab.maybe_auto_start()
+        except Exception as exc:
+            # Auto-start is best-effort; a failure must not crash the app.
+            print(f"[auto-start] deferred server launch failed: {exc}")
 
         # Apply the saved presentation mode after the menu actions exist.
         QTimer.singleShot(0, lambda: self._set_window_mode(self._window_mode, persist=False))

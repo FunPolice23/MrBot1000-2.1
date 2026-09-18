@@ -21,6 +21,19 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 
+def canonical_portfolio_path() -> str:
+    """Return the ONE canonical portfolio database path for the whole app.
+
+    The GUI Opportunities tab, the dual-brain workspace context, and the
+    composition root must all read/write the SAME store. When they diverge, the
+    Dialogue tab can be given an empty portfolio while the Opportunities tab
+    shows dozens of rows (and vice-versa). Every caller that needs a default
+    portfolio location must use this helper instead of building its own path.
+    """
+    import os
+    return os.path.join(os.path.expanduser("~"), ".mrbot1000", "opportunities.db")
+
+
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 class IllegalTransitionError(Exception):

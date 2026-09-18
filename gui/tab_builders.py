@@ -1764,12 +1764,24 @@ class TabBuildersMixin:
         """Create the Opportunities tab — browse, search, and manage discovered opportunities."""
         from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
         from PySide6.QtCore import QTimer
-        from agents.opportunity_portfolio import OpportunityPortfolio
+        from agents.opportunity_portfolio import OpportunityPortfolio, canonical_portfolio_path
         from agents.workspace_context import register_component
 
-        portfolio_path = os.path.join(
-            os.path.expanduser("~"), ".mrbot1000", "opportunities.db")
-        self.opportunity_portfolio = OpportunityPortfolio(portfolio_path)
+        # Reuse the shared portfolio if the composition root (or any earlier
+        # tab) already registered one, so Dialogue and this tab never read
+        # different stores. Fall back to the canonical path otherwise.
+        existing = getattr(self, "opportunity_portfolio", None)
+        if existing is None:
+            try:
+                from agents.workspace_context import _component
+                existing = _component("opportunity_portfolio")
+            except Exception:
+                existing = None
+        if existing is None:
+            self.opportunity_portfolio = OpportunityPortfolio(
+                canonical_portfolio_path())
+        else:
+            self.opportunity_portfolio = existing
         register_component("opportunity_portfolio", self.opportunity_portfolio)
         
         w = QWidget()

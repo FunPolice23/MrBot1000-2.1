@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 
 from agents.tool_safety import command_argv, resolve_command_cwd, resolve_project_path
+from agents.safety_gate import (
+    MUTATING_TOOL_NAMES as _MUTATING_TOOL_NAMES,
+    SafetyDecision,
+    SafetyGate,
+    is_known_tool,
+)
 
 PROJECT_ROOT = resolve_project_path(".")
 _instruction_gate = None
@@ -34,16 +40,22 @@ _instruction_gate_lock = threading.Lock()
 
 # These tools mutate the machine or create an external commitment. The normal
 # chat loop has no human approval callback, so it must refuse them rather than
-# accidentally bypassing Big Brain's separate safety gate.
-_MUTATING_TOOLS = {
-    "run_command",
-    "file_write",
-    "workshop_write",
-    "workshop_mkdir",
-    "workshop_proposal",
-    "workshop_account",
-    "workshop_payment",
-}
+# accidentally bypassing Big Brain's separate safety gate. The set is derived
+# from SafetyGate so the two classifications can never drift apart.
+_MUTATING_TOOLS = set(_MUTATING_TOOL_NAMES)
+
+_safety_gate = None
+_safety_gate_lock = threading.Lock()
+
+
+def _get_safety_gate() -> SafetyGate:
+    """Return the shared authorization gate for chat tool execution."""
+    global _safety_gate
+    if _safety_gate is None:
+        with _safety_gate_lock:
+            if _safety_gate is None:
+                _safety_gate = SafetyGate()
+    return _safety_gate
 
 
 def _get_instruction_gate():
@@ -276,9 +288,21 @@ def get_all_tools() -> List[Dict[str, Any]]:
 # ── Tool Execution ────────────────────────────────────────────────────────
 
 def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
-    """Execute a tool by name with given arguments."""
-    # Check for mutating tools that require approval
-    if name in _MUTATING_TOOLS:
+    """Execute a tool by name with given arguments.
+
+    Authorization is decided in exactly one place: SafetyGate. Unknown tools never
+    reach dispatch, blocked calls return without executing, and state-changing
+    calls are queued for human approval instead of running.
+    """
+    if not is_known_tool(name):
+        return f"[Unknown tool: {name}]"
+
+    _allowed, _reason, _decision = _get_safety_gate().check(name, arguments)
+
+    if _decision == SafetyDecision.BLOCKED:
+        return f"[BLOCKED] {_reason}"
+
+    if _decision == SafetyDecision.NEEDS_APPROVAL:
         try:
             from agents.approval_queue import ApprovalItem, ApprovalKind, HumanApprovalQueue
             approval = HumanApprovalQueue.instance().enqueue(ApprovalItem(
@@ -701,20 +725,45 @@ def chat_with_tools(
         try:
             stream = client.chat.completions.create(**kwargs)
             msg = None
-            for chunk in stream:
-                if not chunk.choices:
+            # Tolerate both real Response iterators and mock iterators used in
+            # tests. Some test mocks return bare iterators of chunk-like objects
+            # whose .choices may be empty or missing; treat those as silent.
+            # Other mocks return a single non-iterator response object with .choices.
+            try:
+                chunks = list(stream)
+            except TypeError:
+                chunks = [stream] if getattr(stream, "choices", None) else []
+            for chunk in chunks:
+                choices = getattr(chunk, "choices", None)
+                if not choices:
                     continue
-                delta = chunk.choices[0].delta
-                content = getattr(delta, "content", None)
-                if content is not None:
-                    answer_parts.append(content)
-                    if stream_progress is not None:
-                        try:
-                            stream_progress(content)
-                        except Exception:
-                            pass
+                choice0 = choices[0]
+                # Streaming chunks carry choices[0].delta; non-streaming
+                # responses carry choices[0].message. Check the delta FIRST:
+                # Mock objects auto-create both attributes, so testing
+                # .message first would misread a streaming mock as a
+                # non-streaming response and lose the content.
+                delta = getattr(choice0, "delta", None)
+                _delta_content = getattr(delta, "content", None) if delta is not None else None
+                if isinstance(_delta_content, str):
+                    if _delta_content:
+                        answer_parts.append(_delta_content)
+                        if stream_progress is not None:
+                            try:
+                                stream_progress(_delta_content)
+                            except Exception:
+                                pass
+                    continue
+                # Fall back to a complete message object (non-streaming shape).
+                message = getattr(choice0, "message", None)
+                _msg_content = getattr(message, "content", None) if message is not None else None
+                if message is not None and isinstance(_msg_content, str):
+                    msg = message
+                    if _msg_content:
+                        answer_parts.append(_msg_content)
+                    continue
             answer = "".join(answer_parts)
-            if not answer.strip():
+            if not answer.strip() and msg is None:
                 raise RuntimeError("empty stream response")
         except TypeError:
             # Some SDK/server combos reject extra_body/stream at call time;
@@ -727,16 +776,25 @@ def chat_with_tools(
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
-            msg = response.choices[0].message
-            answer = msg.content or ""
+            choices = getattr(response, "choices", None)
+            if choices:
+                msg = choices[0].message
+                _content = getattr(msg, "content", None)
+                answer = _content if isinstance(_content, str) else ""
+            else:
+                msg = None
+                answer = ""
         
         if not answer.strip():
             thinking_key = kwargs.get("extra_body", {}).get("chat_template_kwargs", {}).get("enable_thinking")
             if thinking_key:
                 kwargs.pop("extra_body", None)
                 response = client.chat.completions.create(**kwargs)
-                msg = response.choices[0].message
-                answer = getattr(msg, "content", None) or ""
+                _choices = getattr(response, "choices", None)
+                if _choices:
+                    msg = _choices[0].message
+                    _content = getattr(msg, "content", None)
+                    answer = _content if isinstance(_content, str) else ""
         
         # If no tool calls via API, try to parse tool calls from text
         # This handles models that don't support function calling
@@ -761,7 +819,33 @@ def chat_with_tools(
                 executed_text_calls.add(call_key)
                 # Execute the tool
                 try:
-                    result = execute_tool(fn_name, fn_args)
+                    from agents.safety_gate import SafetyGate
+                    _gate = SafetyGate()
+                    _allowed, _reason, _decision = _gate.check(fn_name, fn_args)
+                    if _decision == "blocked":
+                        result = f"[BLOCKED] Tool {fn_name} refused: {_reason}"
+                    elif _decision == "needs_approval":
+                        try:
+                            from agents.approval_queue import ApprovalItem, ApprovalKind, HumanApprovalQueue
+                            _app = HumanApprovalQueue.instance().enqueue(ApprovalItem(
+                                kind=ApprovalKind.ACTION,
+                                title=f"Chat tool request: {fn_name}",
+                                description=(
+                                    f"The chat requested {fn_name}. Review the arguments before "
+                                    "allowing any machine change or external action."
+                                ),
+                                requested_by="dialogue",
+                                details={"tool": fn_name, "arguments": fn_args},
+                                payload={"tool": fn_name, "arguments": fn_args},
+                            ))
+                            result = (
+                                f"[PENDING APPROVAL] request_id={_app.id}; {fn_name} was not "
+                                "executed. Tell the human that this request is awaiting review."
+                            )
+                        except Exception as _exc:
+                            result = f"[Approval unavailable: {fn_name} was not executed: {_exc}]"
+                    else:
+                        result = execute_tool(fn_name, fn_args)
                     if tool_trace is not None:
                         tool_trace.append(_tool_trace_entry(
                             fn_name, fn_args, result, "text_call"))
@@ -809,9 +893,12 @@ def chat_with_tools(
             fn_name = tc.function.name
             try:
                 fn_args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 fn_args = {}
 
+            # Stop a model that keeps re-issuing the identical tool call: the
+            # result is already in the history above, so answer instead of
+            # looping until max_iterations is exhausted.
             call_key = (fn_name, json.dumps(fn_args, sort_keys=True))
             if call_key in executed_function_calls:
                 duplicate_function_call = True
@@ -826,9 +913,35 @@ def chat_with_tools(
                 })
                 continue
             executed_function_calls.add(call_key)
-            
+
             try:
-                result = execute_tool(fn_name, fn_args)
+                from agents.safety_gate import SafetyGate
+                _gate = SafetyGate()
+                _allowed, _reason, _decision = _gate.check(fn_name, fn_args)
+                if _decision == "blocked":
+                    result = f"[BLOCKED] Tool {fn_name} refused: {_reason}"
+                elif _decision == "needs_approval":
+                    try:
+                        from agents.approval_queue import ApprovalItem, ApprovalKind, HumanApprovalQueue
+                        _app = HumanApprovalQueue.instance().enqueue(ApprovalItem(
+                            kind=ApprovalKind.ACTION,
+                            title=f"Chat tool request: {fn_name}",
+                            description=(
+                                f"The chat requested {fn_name}. Review the arguments before "
+                                "allowing any machine change or external action."
+                            ),
+                            requested_by="dialogue",
+                            details={"tool": fn_name, "arguments": fn_args},
+                            payload={"tool": fn_name, "arguments": fn_args},
+                        ))
+                        result = (
+                            f"[PENDING APPROVAL] request_id={_app.id}; {fn_name} was not "
+                            "executed. Tell the human that this request is awaiting review."
+                        )
+                    except Exception as _exc:
+                        result = f"[Approval unavailable: {fn_name} was not executed: {_exc}]"
+                else:
+                    result = execute_tool(fn_name, fn_args)
             except Exception as exc:
                 result = f"[Tool execution error: {exc}]"
             if tool_trace is not None:
@@ -856,8 +969,21 @@ def chat_with_tools(
         max_tokens=max_tokens,
         temperature=temperature,
     )
-    
-    return _visible_response_content(final_response.choices[0].message)
+
+    # Tolerate both real Response objects and mock iterators used in tests.
+    if hasattr(final_response, "choices"):
+        return _visible_response_content(final_response.choices[0].message)
+    acc: list[str] = []
+    for chunk in (final_response or []):
+        if getattr(chunk, "choices", None):
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None):
+                acc.append(delta.content)
+    return _visible_response_content(type('MsgProxy', (), {
+        'content': ''.join(acc),
+        'reasoning_content': None,
+        'tool_calls': None,
+    })())
 
 
 def _remove_tool_syntax(text: str) -> str:

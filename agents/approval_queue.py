@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -123,9 +124,14 @@ class HumanApprovalQueue:
 
     def enqueue(self, item: ApprovalItem) -> ApprovalItem:
         """Add a pending approval item and fire a notification."""
-        item.status = ApprovalStatus.PENDING
-        self._items.append(item)
-        self._maybe_persist()
+        with self._get_lock():
+            existing_ids = {i.id for i in self._items}
+            if not item.id or item.id in existing_ids:
+                import uuid
+                item.id = uuid.uuid4().hex
+            item.status = ApprovalStatus.PENDING
+            self._items.append(item)
+            self._maybe_persist()
         self._notif.approval_required(
             title=f"Approval needed: {item.title}",
             message=item.description,
@@ -196,11 +202,12 @@ class HumanApprovalQueue:
         item = self._find(item_id)
         if item is None or item.status != ApprovalStatus.PENDING:
             return False
-        item.status = decision
-        item.decided_at = time.time()
-        item.decided_by = decided_by
-        item.notes = notes
-        self._maybe_persist()
+        with self._get_lock():
+            item.status = decision
+            item.decided_at = time.time()
+            item.decided_by = decided_by
+            item.notes = notes
+            self._maybe_persist()
         # Notify the outcome
         if decision == ApprovalStatus.APPROVED:
             self._notif.success(
@@ -220,6 +227,12 @@ class HumanApprovalQueue:
                 message=f"Deferred by {decided_by}: {notes or item.description}",
                 source="approval_queue",
             )
+        # Phase 6: fire on_change so GUI panels refresh on any decision.
+        if self.on_change:
+            try:
+                self.on_change(item)
+            except Exception:
+                pass
         return True
 
     def deny(self, item_id: str, notes: str = "") -> bool:
@@ -250,8 +263,9 @@ class HumanApprovalQueue:
 
     def clear_all(self):
         """Remove all items (e.g. on app exit or reset)."""
-        self._items.clear()
-        self._maybe_persist()
+        with self._get_lock():
+            self._items.clear()
+            self._maybe_persist()
 
     # ── Persistence (best-effort JSON) ─────────────────────────────────────────
 
@@ -269,6 +283,24 @@ class HumanApprovalQueue:
                 )
         except Exception:
             pass  # persistence is best-effort
+
+    def _load(self):
+        """Restore persisted items from the JSON log (best-effort)."""
+        if not self._log_path:
+            return
+        try:
+            import json
+            if not os.path.exists(self._log_path):
+                return
+            with open(self._log_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, list):
+                return
+            self._items = [
+                ApprovalItem.from_dict(d) for d in raw if isinstance(d, dict)
+            ]
+        except Exception:
+            pass  # persistence is best-effort; a corrupt log must not crash startup
 
     def _find(self, item_id: str) -> Optional[ApprovalItem]:
         for i in self._items:

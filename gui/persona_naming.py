@@ -24,25 +24,17 @@ def _persona_name(speaker: str) -> str:
     
     # Match big brain
     if s in ("big", "big brain", "driver", "driver (big)",
-             "edward", "edward hurst", "hurst",
-             "marcus", "marcus rivera", "rivera"):
+             "edward", "edward hurst", "hurst"):
         return big
-    
+
     # Match small brain
     if s in ("small", "small brain", "navigator", "navigator (small)",
-             "jacob", "jacob stanley", "stanley",
-             "alex", "alex vega", "vega"):
+             "jacob", "jacob stanley", "stanley"):
         return small
-    
+
     if s == "human":
         return "Human"
-    
-    # Legacy fallback
-    if "marcus" in s or "rivera" in s:
-        return big
-    if "alex" in s or "vega" in s:
-        return small
-    
+
     return speaker or big
 
 

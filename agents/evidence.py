@@ -178,7 +178,16 @@ class Evidence:
         kwargs.setdefault("recorded_at", now)
         kwargs.setdefault("observed_at", now)
         prov = kwargs.setdefault("provenance", {})
-        prov.setdefault("producer_version", os.getenv("MRBOT_VERSION", "2.0.34aq"))
+        # Single-source the release version so exported evidence never stamps a
+        # stale producer lineage. MRBOT_VERSION still overrides when set.
+        try:
+            from version import VERSION as _release_version
+        except Exception:
+            _release_version = "2.1.1"
+        prov.setdefault(
+            "producer_version",
+            os.getenv("MRBOT_VERSION") or _release_version,
+        )
         return cls(**kwargs)
 
     # ── Immutable transition ──
