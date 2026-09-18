@@ -129,7 +129,17 @@ def commit(message: str) -> str:
 
 def pull() -> str:
     ensure_remote()
-    return run_git("pull", "--ff-only").stdout.strip() or "Already up to date."
+    # Try fast-forward first, then fall back to rebase for diverged branches
+    result = run_git("pull", "--ff-only", check=False)
+    if result.returncode == 0:
+        return result.stdout.strip() or "Already up to date."
+    # Branches diverged -- rebase local commits on top of remote
+    result = run_git("pull", "--rebase", check=False)
+    if result.returncode == 0:
+        return result.stdout.strip() or "Rebase complete."
+    raise RuntimeError(
+        "git pull failed. Resolve conflicts manually, then try again."
+    )
 
 
 def push() -> str:
