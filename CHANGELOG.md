@@ -30,6 +30,17 @@ copy of `.env.example` → `.env` was no longer a valid, complete config.
   `CLOUD_FAILOVER_ENABLED`, `SHOW_BRAIN_CONSOLES`); its values were left untouched
   (secrets + working config).
 
+### Changed (docs)
+- **README refreshed to match v2.1.46.** It was 7 versions stale (titled v2.1.39)
+  and still framed entirely as "Dual-Brain". Updated to the device-centric
+  **Multi-Brain** framing; added the N-brain runtime, shared-skills peer-council
+  Dialogue, GoT branch expansion, cloud-failover control, conversational-awareness
+  prompts, and per-brain settings/`--perf` console timings to Highlights; added
+  `agents/autonomy`, `agents/integrations`, `agents/polish` and the new key files
+  (`device_registry.py`, `speaker_registry.py`, `brain_got.py`) to the structure;
+  and expanded the Configuration section with the N-brain keys. All three version
+  authorities (README, `app/version.py`, CHANGELOG) now agree on v2.1.46.
+
 ## [2.1.45] - 2026-10-11 - Publish mirror: stop leaking tools/, test artifacts, bytecode, routine script
 
 ### Fixed

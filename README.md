@@ -1,45 +1,53 @@
-# MrBot1000 v2.1.39 — Dual-Brain AI-Powered Earning Agent
+# MrBot1000 v2.1.46 — Multi-Brain AI-Powered Earning Agent
 
-A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. It is local-first: the default dual-brain runtime runs on your machine, while optional cloud providers are explicitly configured by the operator.
+A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. It is local-first: the default brain runtime runs on your machine across every detected GPU and the CPU/RAM pool, while optional cloud providers are explicitly configured by the operator.
 
-## Highlights (through v2.1.39)
+## Highlights (through v2.1.46)
 
-- **Canonical dual-brain runtime** (`agents/runtime/dual_brain.py`): one source of truth for role→endpoint/model/device. Big Brain uses the available primary GPU when a local provider is enabled; Small Brain can use a second GPU, CPU/system RAM, or be disabled. The active local or cloud provider is selected from Settings.
+- **Device-centric N-brain runtime** (`agents/runtime/device_registry.py` + `agents/runtime/dual_brain.py`): one source of truth for device→slot→role→endpoint/model. The runtime detects every GPU and the CPU/RAM pool and assigns each an ordered slot — slot 0/1 are the classic Big/Small brains (back-compat), slots 2+ are extra devices (e.g. a CPU/RAM brain). Per-device enable/role/model/settings persist in `settings.json`. The active local or cloud provider is selected from Settings.
+- **Shared-skills peer council Dialogue** (`agents/cognition/speaker_registry.py`): every enabled brain runs the same earning-agent skillset, differing only by a customizable per-device name (Edward Hurst, Jacob Stanley, Chris Borrows, …). Each brain independently reads the shared transcript — human + teammates + tool results — and decides whether to answer the human, react to a teammate, or push the goal. Names are editable in the Management tab (`BIG_BRAIN_NAME`/`SMALL_BRAIN_NAME`/`BRAIN_SLOT{n}_NAME`).
+- **Graph-of-Thought branch expansion** (`agents/brains/brain_got.py`): when the reasoning pattern allows branching (tree/graph-of-thoughts), a turn expands into multiple candidate OPTION nodes, scored by deterministic evidence-backed support (`ThoughtGraph.rank_options`), with a scored DECISION selecting the winner. The per-turn graph is a public coordination trace — never private chain-of-thought — and the "Thoughts" view shows the ranking and the selected pattern.
 - **Canonical cross-model collaboration** (`agents/cognition/coordinator.py`): deterministic plan→research→review→execute handoff on the EventBus with a durable MessageLog ledger; model_fn injected (mock-first, cycle-safe).
 - **Durable autonomous runs** (`agents/services/autonomous_run_store.py`): SQLite run/stage/idempotency ledger with restart recovery; autonomous-loop results now survive restarts.
 - **Unified composition root** (`agents/core/composition_root.py`): one shared pipeline/portfolio/run_store/lifecycle per process.
 - **First real paper/human-gated earning capability** (`agents/earning/capability.py`): produces a real TaskWorkspace deliverable, validates it deterministically, stops on human gates, packages locally, and records submission evidence — never fabricates payment or success.
+- **Cloud-failover control** (`CLOUD_FAILOVER_ENABLED`): a real toggle in Provider Configuration that gates whether cloud providers are used as a backup when the local brain fails. When off, only local providers are contacted; a provider whose Role is "Disabled" is never used regardless.
 - **Dialogue and Management consolidation**: Dialogue now tracks goals, tasks,
   and progress; redundant Collaboration and Memory & Stream tabs are removed.
 - **Custom brain names**: Big Brain and Small Brain display names can be edited
   and saved in Provider Configuration. Internal role keys remain stable.
-- **Dialogue evidence visibility**: Edward Hurst and Jacob Stanley retain their
+- **Dialogue evidence visibility**: the personas retain their
   natural narrated reasoning, while dispatcher-confirmed tool calls appear as
   separate events with arguments, status, source, and a bounded result preview.
+- **Conversational awareness**: persona prompts and the Dialogue context header
+  instruct each brain to read what the human and teammates just said and react
+  specifically — answer the human, engage a teammate's point, vary the opening,
+  and hold a genuine opinion — instead of replaying a fixed script.
 - **Opportunity-aware Dialogue**: scanned candidates from the Opportunities tab
-  are supplied to both personas as read-only context, clearly separated from
+  are supplied to all personas as read-only context, clearly separated from
   verified evidence, approval, and execution.
 - **Graph-of-Thought observability**: inspectable goals, claims, options, checks,
   dependencies, support, and contradictions are recorded without storing private
   chain-of-thought. Support measurements guide the next check but never grant
   evidence status, approval, payment truth, or execution authority.
-- **GoT opportunity ranking**: evaluated earning opportunities branch into
-  candidate options and verification checks; GoT ranks expected utility and
-  support, while filtering, lifecycle transitions, human approval, and verified
-  payment remain separate mandatory gates.
 - **Human approval visibility**: Approvals is directly beside Dialogue, and a
   selected request stays highlighted while the queue refreshes. The detail view
   shows the complete read-only request, including structured arguments and
   payload data. When requests are pending, the tab label shows the count and
   changes to an amber alert color with a review tooltip; it clears after the
   human decides.
-- **Explicit local model selection**: Big Brain and Small Brain model fields are
+- **Explicit local model selection**: brain model fields are
   blank by default. The application never guesses a local `.gguf` filename or
   launches a nonexistent model; choose a real model and save it when a role
   should have a persistent default.
+- **Per-brain settings + console timings**: every enabled device (incl. CPU/RAM)
+  has editable context/gpu-layers/threads/batch/kv/split/temperature in Providers
+  & GPU, persisted per device. Temperature no longer reverts after save, and
+  llama-server runs with `--perf` so a visible console shows live token/timing
+  stats.
 - **Performance-aware freshness**: active GUI tabs use fast refresh intervals,
   while hidden operational tabs continue polling every 15 seconds so shared
-  state remains current for Edward and Jacob without keeping every view at full
+  state remains current for the brains without keeping every view at full
   polling cost.
 
 ## Quick Start
@@ -106,7 +114,8 @@ persisted event, learning-history, and autonomous-run stores.
 
 Requires: Python 3.11+, the packages listed in `requirements.txt`, and either
 the default local llama.cpp servers or another configured provider. The default
-dual-brain contract uses llama-server on ports 1234 and 1235. Anthropic and
+brain contract uses llama-server on ports 1234 and 1235; extra devices (CPU/RAM
+or another GPU) get their own sequential port. Anthropic and
 OpenAI are optional cloud integrations; install them only when those providers
 are enabled:
 
@@ -325,23 +334,25 @@ main.py                  Launcher (entry point) — stays at the repo root
 app/                     Application layer: database, manager, ui, earning_pipeline,
                          earning_memory, library, provider_models, theme_config, ...
 agents/                  Agent layer, grouped by domain:
-  brains/                big_brain, small_brain, base_worker, worker_* mixins
+  brains/                big_brain, small_brain, base_worker, worker_* mixins, brain_got (GoT)
   dialogue/              discussion, conversation_memory, chat_router, chat_completion
-  cognition/             personas, fact_ledger, contradictions, memory_promotion, coordinator
+  cognition/             personas, speaker_registry, fact_ledger, contradictions,
+                         memory_promotion, coordinator, graph, reasoning_modes
   earning/               pipeline steps, opportunity_*, task_executor, capability, economic_*
   evidence/              evidence, evidence_store, provenance, verification
   discovery/             discovery engine, scheduler, sources, port
   knowledge/             proposal_*, program_knowledge, help_catalog, prompting
   core/                  comms, event_logger, alerting, composition_root, persistence, ...
   services/              autonomous_loop, summarizer, self_audit, workshop, code_patch, ...
+  autonomy/ integrations/ polish/   autonomous-loop, external integrations, output polish
   safety/                instructions (gate), trust (boundary), guard, tool safety
-  runtime/               dual_brain, manager_metrics, services registry
+  runtime/               dual_brain, device_registry, manager_metrics, services registry
   providers/             anthropic, ollama, openai_compatible, context_table
   platforms/             human-gated PlatformAdapter skeleton (fiverr/upwork/github/...)
 gui/                     Desktop UI, grouped:
   tabs/ builders/ widgets/ workers/ panels/
 tests/                   Grouped by domain:
-  dialogue/ earning/ evidence/ safety/ runtime/ gui/ providers/ sections/
+  dialogue/ earning/ evidence/ safety/ runtime/ gui/ providers/ sections/ cognition/ tools/
 tools/ skills/ scripts/  Supporting assets (publish tooling, skill docs, ops scripts)
 ```
 
@@ -355,7 +366,10 @@ dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 |------|---------|
 | `main.py` | Application entry point, window setup, lazy tab loading, settings, and version display |
 | `app/manager.py` | Manager orchestration, intent routing, heartbeat, approvals, memory, and service coordination |
-| `agents/runtime/dual_brain.py` | Canonical Big Brain/Small Brain provider, endpoint, device, and model configuration |
+| `agents/runtime/dual_brain.py` | Canonical brain provider, endpoint, device, slot, and model configuration |
+| `agents/runtime/device_registry.py` | Device-centric detection + slot assignment (GPU + CPU/RAM pool), per-device policy |
+| `agents/cognition/speaker_registry.py` | N-brain speaker roster, per-device names, team brief, ping-pong order |
+| `agents/brains/brain_got.py` | Per-turn Graph-of-Thought: branch expansion, evidence-backed scoring, decision |
 | `agents/cognition/coordinator.py` | Typed plan → research → review → execute collaboration handoff and run ledger |
 | `agents/cognition/personas.py` | Edward Hurst and Jacob Stanley persona contracts and guardrails |
 | `agents/brains/base_worker.py` | Shared worker behavior, provider calls, secure file I/O, and research utilities |
@@ -381,9 +395,10 @@ dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 | `app/action_pipeline.py` | Proposal validation and controlled execution safeguards |
 | `app/database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
 | `app/theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
-| `app/version.py` | Public application version source (`2.1.39`) |
+| `app/version.py` | Public application version source (`2.1.46`) |
 | `Agent.md` / `README.md` / `CHANGELOG.md` | Runtime contract, current system overview, and release history |
 | `tests/` | Focused regression and subsystem tests |
+| `tools/github_publish/` | Personal publish-mirror tooling (git-ignored; syncs a sanitized copy to GitHub) |
 
 ## Configuration
 
@@ -394,14 +409,20 @@ cp .env.example .env
 ```
 
 Key settings:
-- `BIG_BRAIN_PROVIDER`, `BIG_BRAIN_URL`, `BIG_BRAIN_PORT` — Big Brain provider and endpoint (default llama-server on 1234)
-- `SMALL_BRAIN_PROVIDER`, `SMALL_BRAIN_URL`, `SMALL_BRAIN_PORT` — Small Brain provider and endpoint (default llama-server on 1235)
-- `SMALL_BRAIN_CPU_MODEL` — optional preferred model path/ID selected for CPU fallback when no secondary GPU is detected; any model is allowed
+- `BIG_BRAIN_PROVIDER`, `BIG_BRAIN_URL`, `BIG_BRAIN_PORT` — Big Brain (slot 0) provider and endpoint (default llama-server on 1234)
+- `SMALL_BRAIN_PROVIDER`, `SMALL_BRAIN_URL`, `SMALL_BRAIN_PORT` — Small Brain (slot 1) provider and endpoint (default llama-server on 1235)
 - `BIG_BRAIN_DEVICE` / `SMALL_BRAIN_DEVICE` — GPU device assignment for the two local brains
 - `BIG_BRAIN_MODEL` / `SMALL_BRAIN_MODEL` — optional explicit local model paths
   or provider model IDs; blank means no model is selected and no local launch is
   attempted
-- `SMALL_BRAIN_GPU_LAYERS=0` — optional CPU/system-RAM mode for Jacob when a second GPU is unavailable
+- `BIG_BRAIN_NAME` / `SMALL_BRAIN_NAME` / `BRAIN_SLOT{n}_NAME` — per-device display names (slot 2+ uses `BRAIN_SLOT{n}_NAME`); editable in the Management tab
+- `BIG_BRAIN_ENABLED` / `SMALL_BRAIN_ENABLED` — per-brain enable/disable (persisted by Providers & GPU)
+- `BIG_BRAIN_SHOW_PERF` / `SMALL_BRAIN_SHOW_PERF` — pass `--perf` so a visible console shows token/timing stats (default true)
+- `SHOW_BRAIN_CONSOLES` — show the per-brain llama-server console window
+- `CLOUD_FAILOVER_ENABLED` — when 1, cloud providers are a backup if local fails; when 0, local-only
+- Extra devices (CPU/RAM or another GPU) are managed in Providers & GPU → per-device rows; their enable/role/model/settings persist in `settings.json`, not `.env`
+- `SMALL_BRAIN_CPU_MODEL` — optional preferred model path/ID selected for CPU fallback when no secondary GPU is detected; any model is allowed
+- `SMALL_BRAIN_GPU_LAYERS=0` — optional CPU/system-RAM mode for the Small Brain when a second GPU is unavailable
 - `BIG_BRAIN_CONTEXT` / `SMALL_BRAIN_CONTEXT` — per-role context limits
 - `OLLAMA_MAIN_MODEL` / `OLLAMA_CHAT_MODEL` — optional Ollama fallback model names
 - `OPENAI_STREAM_TIMEOUT_SECONDS` — bounded streaming timeout for OpenAI-compatible providers
@@ -419,7 +440,7 @@ Key settings:
 ## UI Tabs
 
 1. **Management** — Agent controls, pause/resume, pipeline controls, gig proposals, payout verification
-2. **Providers & GPU** — Active-provider routing, dual-brain orchestration, detected hardware, and provider-specific controls
+2. **Providers & GPU** — Active-provider routing, N-brain orchestration (one row per detected device), detected hardware, and provider-specific controls
 3. **Model Library** — Local model discovery and download management
 4. **Safety & Tools** — Tool registry, safety rules, and approval queue
 5. **Chat** — Human conversation with the configured Small Brain
@@ -468,7 +489,7 @@ it is not a separate visible tab.
 
 - **Agent.md** — Runtime contract for any model interacting with the system
 - **README.md** (this file) — Current system overview, tab inventory, and configuration guide
-- **CHANGELOG.md** — Full change history (current release v2.1.39)
+- **CHANGELOG.md** — Full change history (current release v2.1.46)
 
 ## Requirements
 
