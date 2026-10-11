@@ -1,3 +1,35 @@
+## [2.1.46] - 2026-10-11 - .env.example reframed for the N-brain flow + synced with live keys
+
+### Changed
+`.env.example` was stale: it framed everything as a fixed "Dual Brain" (Big/Small)
+and was missing keys the current program and the live `.env` actually use. A fresh
+copy of `.env.example` → `.env` was no longer a valid, complete config.
+
+- **Reframed the brain section as device-centric N-brain** (v2.1): documents that
+  the runtime detects every GPU + the CPU/RAM pool and assigns ordered slots —
+  slot 0/1 = Big/Small (`BIG_BRAIN_*`/`SMALL_BRAIN_*`, back-compat), slots 2+ =
+  extra devices (`BRAIN_SLOT{n}_NAME`, per-device settings in settings.json).
+- Added the missing keys the code reads and the live `.env` already has:
+  `BIG_BRAIN_NAME`/`SMALL_BRAIN_NAME` (moved into the brain section),
+  `BIG_BRAIN_SHOW_PERF`/`SMALL_BRAIN_SHOW_PERF`, `BRAIN_SLOT2_NAME` (documented),
+  `SHOW_BRAIN_CONSOLES`, `CLOUD_FAILOVER_ENABLED`, `ACTIVE_CLOUD_PROVIDER`,
+  `ALLOW_WEB_DISCOVERY`, `MRBOT_ENABLE_*` feature flags +
+  `MRBOT_SELF_IMPROVE_MONITOR_MINUTES`, `OPENAI_BASE_URL`, `NOUS_CHAT_MODEL`,
+  and the NOUS role block (`DISABLE_NOUS`/`NOUS_MAIN_ENABLED`/`NOUS_CHAT_ENABLED`/
+  `NOUS_HIDE`).
+- Removed the now-duplicate `BIG_BRAIN_NAME`/`SMALL_BRAIN_NAME` lines that lived
+  lower in the file.
+
+### Verified
+- `.env.example` parses as a valid dotenv: 229 keys, no duplicates, no malformed
+  lines; loads via `dotenv_values`.
+- Cross-checked `.env.example` vs the live `.env`: every key the operator's `.env`
+  carries is now either present or explicitly documented (commented) in the
+  template. The live `.env` is structurally clean (231 keys, no dupes/malformed)
+  and already N-brain-ready (`BRAIN_SLOT2_NAME=Chris Borrows`,
+  `CLOUD_FAILOVER_ENABLED`, `SHOW_BRAIN_CONSOLES`); its values were left untouched
+  (secrets + working config).
+
 ## [2.1.45] - 2026-10-11 - Publish mirror: stop leaking tools/, test artifacts, bytecode, routine script
 
 ### Fixed
