@@ -947,12 +947,48 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             dr.save_policy(policy)
             if not now_enabled:
                 self._stop_brain_on_disabled_device(dev.id)
+            # v2.1.47 (ARCH-ENG-046): the per-device toggle is the SINGLE source
+            # of truth for whether a brain runs. Persist it to the runtime's own
+            # <ROLE>_ENABLED env key too, so a disabled brain's provider adapter
+            # is never registered (worker_provider_mixin gate) and its settings
+            # block disappears — closing the gap where the device was off in
+            # settings.json but BIG_BRAIN_ENABLED stayed true in .env.
+            self._sync_role_enabled_to_env(dev, now_enabled)
             self._reapply_device_assignment()
         except Exception as exc:
             try:
                 self.log_signal.emit(f"[GUI] Device toggle failed: {exc}")
             except Exception:
                 pass
+
+    def _sync_role_enabled_to_env(self, dev, now_enabled: bool) -> None:
+        """Write <ROLE>_ENABLED for the role bound to `dev` (never raises).
+
+        Keeps the runtime env flag in lockstep with the per-device enable toggle.
+        """
+        try:
+            if self.runtime is None:
+                return
+            cfg = self.runtime.slot_for_device(dev.id)
+            if cfg is None:
+                return
+            slot = getattr(cfg, "slot", -1)
+            key = {0: "BIG_BRAIN_ENABLED", 1: "SMALL_BRAIN_ENABLED"}.get(slot)
+            if not key:
+                return  # slots 2+ are governed by the device policy only
+            value = "true" if now_enabled else "false"
+            os.environ[key] = value
+            try:
+                from main import set_env_values
+                set_env_values({key: value})
+            except Exception:
+                pass
+            self.log_signal.emit(
+                f"[GUI] {key}={value} (device '{dev.label()}' "
+                f"{'enabled' if now_enabled else 'disabled'})"
+            )
+        except Exception:
+            pass
 
     def _stop_brain_on_disabled_device(self, device_id: str):
         """Stop any brain bound to a now-disabled device (never raises)."""
@@ -1022,15 +1058,31 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             # panel is never empty; _apply_runtime fills real values later.
             slots = [None, None]
 
-        for i in range(len(slots)):
-            cfg = slots[i] if slots[i] is not None else None
+        # v2.1.47 (ARCH-ENG-046): a slot whose role config is DISABLED is not a
+        # live brain — BIG_BRAIN_ENABLED/SMALL_BRAIN_ENABLED (and the per-device
+        # enable toggle, which writes the same flag) is the single source of
+        # truth. Render a settings row ONLY for enabled slots, so the llama.cpp
+        # settings/options block disappears when that backend is disabled instead
+        # of showing controls for a brain that will never run. A disabled slot is
+        # skipped entirely (no row, no Start/Stop, no model dropdown).
+        render_slots = []
+        for i, cfg in enumerate(slots):
+            if cfg is not None and not getattr(cfg, "enabled", True):
+                continue
+            render_slots.append(cfg)
+
+        for i in range(len(render_slots)):
+            cfg = render_slots[i] if render_slots[i] is not None else None
             if cfg is not None:
                 role = cfg.role.value if hasattr(cfg.role, "value") else str(cfg.role)
                 label = cfg.gpu_label or ""
             else:
                 role = "big" if i == 0 else "small"
                 label = ""
-            row = BrainControlRow(slot=i, role=role, device_label=label)
+            # slot index passed to the row is its ORIGINAL position so start/stop
+            # routing (which keys on slot 0/1) still targets the right brain.
+            original_index = slots.index(cfg) if cfg in slots else i
+            row = BrainControlRow(slot=original_index, role=role, device_label=label)
             provider_layout.addWidget(row, i, 0, 1, -1)
             row.start_clicked.connect(self._on_provider_row_start)
             row.stop_clicked.connect(self._on_provider_row_stop)

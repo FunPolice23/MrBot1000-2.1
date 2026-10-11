@@ -262,15 +262,20 @@ class EarningTab(QWidget):
         row = QHBoxLayout()
         pay_to = QLineEdit()
         pay_to.setPlaceholderText("To address")
-        self.pay_amount = QDoubleSpinBox()
-        self.pay_amount.setRange(0, 1e9)
-        self.pay_amount.setValue(0.0)
+        # NOTE: do NOT name this `pay_amount` — ManagementTab (built earlier, main.py:1419)
+        # owns self.pay_amount (a QLineEdit) on the SAME parent, and this Earnings tab
+        # is built later (main.py:1428) on that same parent. A same-named QDoubleSpinBox
+        # here clobbered it, so the Management payout verifier read/wrote the wrong widget
+        # (v2.1.47, ARCH-ENG-047: `.setText()` AttributeError / silent wrong-value reads).
+        self.pay_send_amount = QDoubleSpinBox()
+        self.pay_send_amount.setRange(0, 1e9)
+        self.pay_send_amount.setValue(0.0)
         self.pay_currency = QComboBox()
         self.pay_currency.addItems(["ETH", "SOL", "USDC"])
         send_btn = QPushButton("💸 Propose Payment")
         send_btn.clicked.connect(self._on_propose_payment)
         row.addWidget(pay_to)
-        row.addWidget(self.pay_amount)
+        row.addWidget(self.pay_send_amount)
         row.addWidget(self.pay_currency)
         row.addWidget(send_btn)
         lay.addRow("Pay:", row)
@@ -421,7 +426,7 @@ class EarningTab(QWidget):
         # payment fields collected from UI controls in future iteration; for now
         # we use sender as from_address with a placeholder to_address
         to_address = "0x" + "A" * 40
-        amount = float(self.pay_amount.value())
+        amount = float(self.pay_send_amount.value())
         currency = self.pay_currency.currentText()
         if not sender:
             QMessageBox.warning(self, "Error", "Add a wallet first")

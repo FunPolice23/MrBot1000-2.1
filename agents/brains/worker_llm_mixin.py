@@ -76,6 +76,21 @@ class WorkerLLMMixin:
         providers = self._build_providers(chat)
         self.log_signal.emit(f"[LLM] providers={[p[0] for p in providers]}")
 
+        # v2.1.47 (ARCH-ENG-046): fail fast when NO provider is enabled/available.
+        # Previously, with every local brain disabled and no cloud provider on,
+        # the loop still tried a stale adapter and emitted 3× "big-brain failed
+        # (Connection error.)" retry spam before returning "LLM unavailable".
+        # An empty provider list means the operator has not enabled anything —
+        # say so once, clearly, and stop. This is the single gate that prevents
+        # "something attempting to run with no provider enabled/running".
+        if not providers:
+            self.log_signal.emit(
+                "[LLM] no provider enabled — enable a brain in Providers & GPU "
+                "(or a cloud provider) before running. Skipping this call."
+            )
+            self.last_provider = "none"
+            return "ERROR: no provider enabled"
+
         # A4: build a daily LLM cost guard (disabled when budget == 0).
         try:
             from agents.safety.cost import CostGuard

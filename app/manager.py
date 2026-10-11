@@ -1367,6 +1367,22 @@ class ManagerThread(QThread):
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
+        # v2.1.47 (retire legacy Manager): the central "CEO Manager" heartbeat /
+        # job-search / worker-dispatch loop is the OLD architecture. It drove a
+        # single decision-maker orchestrating a team of workers via worker.llm(),
+        # which fired LLM calls even when no brain was enabled (connection-error
+        # spam) and ran with zero effect. In the new model the N-device brains are
+        # independent peers that see each other and collaborate (Dialogue peer
+        # council); there is no central decision-maker. The thread stays resident
+        # so all the .connect() signal wiring in main.py remains valid, but the
+        # loop is disabled by default. Set MANAGER_ENABLED=1 to re-enable the
+        # legacy loop (not recommended — it duplicates/undercuts the peer council).
+        if os.getenv("MANAGER_ENABLED", "0").strip().lower() not in ("1", "true", "yes", "on"):
+            self._sys("Manager loop retired (MANAGER_ENABLED=0) — N-brain peer council is the decision authority")
+            self.log.emit("Manager loop retired (MANAGER_ENABLED=0) — N-brain peer council is the decision authority")
+            self.running = False
+            return
+
         self._sys("CEO ManagerThread started — autonomous heartbeat active")
         self.log.emit("CEO ManagerThread started — autonomous heartbeat active")
 

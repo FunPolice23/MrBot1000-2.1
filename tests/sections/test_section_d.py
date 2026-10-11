@@ -222,6 +222,46 @@ class TestCostAwareRouting(unittest.TestCase):
         w = self._make_worker([])
         self.assertEqual(w._build_providers(chat=False), [])
 
+    def test_llm_with_no_providers_fails_fast(self):
+        # v2.1.47 (ARCH-ENG-046): with nothing enabled, llm() must NOT emit the
+        # "big-brain failed (Connection error.) trying next..." retry spam — it
+        # fails fast with a clear message and last_provider="none".
+        import agents.brains.base_worker as bw
+        w = bw.WorkerAgent.__new__(bw.WorkerAgent)
+        logs = []
+        w.log_signal = type("S", (), {"emit": lambda self, m: logs.append(m)})()
+        w._build_providers = lambda chat: []          # nothing enabled
+        w._provider_hint = lambda chat: None
+        w.last_trigger = "llm"
+        res = w.llm(system="s", user="u")
+        self.assertEqual(res, "ERROR: no provider enabled")
+        self.assertEqual(getattr(w, "last_provider", None), "none")
+        # Exactly one explanatory log, and NO per-provider "trying ... failed" spam.
+        self.assertTrue(any("no provider enabled" in m for m in logs))
+        self.assertFalse(any("failed" in m for m in logs))
+
+    def test_disabled_big_brain_excluded_from_providers(self):
+        # v2.1.47 (ARCH-ENG-046): a role config with enabled=False must not
+        # register its adapter — the Worker never contacts a disabled brain.
+        import agents.brains.base_worker as bw
+        w = bw.WorkerAgent.__new__(bw.WorkerAgent)
+        big = FakeAdapter("big-brain", -10, default_model="m.gguf")
+        big.enabled = False
+        small = FakeAdapter("small-brain", -10, default_model="s.gguf")
+        small.enabled = True
+        w._provider_registry = [big, small]
+        w._role_allows = lambda ad, chat: True
+        w._chat_model_effective = lambda: None
+        w._ollama_model_override = ""
+        w._chat_ollama_model_override = ""
+        # _build_providers skips adapters whose .available() is False; a disabled
+        # brain reports unavailable so it is dropped before the list is built.
+        big.available = lambda: False
+        small.available = lambda: True
+        names = [n for (n, _f, _mk, _dm) in w._build_providers(chat=False)]
+        self.assertNotIn("big-brain", names)
+        self.assertIn("small-brain", names)
+
     def test_cloud_failover_off_excludes_cloud_providers(self):
         # v2.1.37 (ARCH-ENG-044): with CLOUD_FAILOVER_ENABLED off, cloud
         # providers are NOT contacted as a backup — only local providers remain.

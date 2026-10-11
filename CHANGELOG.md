@@ -1,3 +1,88 @@
+## [2.1.48] - 2026-10-11 - Retire legacy Manager heartbeat; gate LLM calls on enabled providers (ARCH-ENG-046)
+
+### Fixed
+Three startup defects reported from Live Logs:
+
+1. **`big-brain failed (Connection error.)` spam with nothing enabled.** The
+   Worker fired `llm()` and retried a stale `big-brain` adapter 3× even when no
+   local model was running and no cloud provider was on. `worker_llm_mixin.llm()`
+   now fails fast: when `_build_providers()` returns an empty list it logs one
+   clear "no provider enabled" line and returns `ERROR: no provider enabled`
+   instead of the retry loop.
+
+2. **llama.cpp settings/options shown while llama.cpp is disabled.** The
+   Providers & GPU panel rendered a settings row for every slot regardless of
+   enabled state. `dual_brain_control._build_provider_rows` now renders a row
+   ONLY for enabled slots, so the llama.cpp block disappears when the backend is
+   disabled. The per-device enable toggle (`_on_device_toggled`) now also writes
+   the runtime's `BIG_BRAIN_ENABLED`/`SMALL_BRAIN_ENABLED` env key
+   (`_sync_role_enabled_to_env`), making the device toggle the single source of
+   truth — closing the gap where a device was off in `settings.json` but
+   `BIG_BRAIN_ENABLED` stayed `true` in `.env`.
+
+3. **Legacy CEO-Manager heartbeat running against the new model.** `ManagerThread`
+   (the old "one decision-maker orchestrating a team of workers" loop) drove the
+   "Heartbeat #N — focus: job search" cycle and dispatched JobSearch/Analyst/
+   Coder via `worker.llm()` — firing LLM calls with no brain and running with
+   zero effect. It is retired: `run()` no-ops by default
+   (`MANAGER_ENABLED` unset/`0`); the thread stays resident so all main.py
+   signal wiring remains valid. The N-device brains are the independent peer
+   council and the sole decision authority. Set `MANAGER_ENABLED=1` to re-enable
+   the legacy loop (not recommended).
+
+### Tests
+- `tests/sections/test_section_d.py`: `test_llm_with_no_providers_fails_fast`
+  (no retry spam, `last_provider="none"`), `test_disabled_big_brain_excluded_from_providers`.
+- `tests/runtime/test_manager_queue_limits.py`: `TestManagerRetirement`
+  (run() retired by default; active only when `MANAGER_ENABLED=1`).
+
+## [2.1.47] - 2026-10-11 - Fix payout-verifier widget collision (ARCH-ENG-047)
+
+### Fixed
+The Management tab's **Verify Payout** workflow was broken by a GUI widget
+namespace collision (ARCH-ENG-047). `ManagementTab` owns `self.pay_amount` — a
+`QLineEdit` for the expected payout USD — on the MainWindow parent, and both
+`main._on_management_verify_paid` (writes it) and
+`main._verify_and_mark_paid` (reads it via `.text()`) depend on that widget.
+The Earnings `EarningTab` is built **later on the same parent** (main.py:1428
+vs Management at main.py:1419), and its crypto "Propose Payment" field was also
+named `self.pay_amount` — but as a `QDoubleSpinBox`. The later build clobbered
+the Management `QLineEdit` on the shared parent:
+
+- `_on_management_verify_paid` called `self.pay_amount.setText(...)` →
+  `AttributeError: 'QDoubleSpinBox' object has no attribute 'setText'`.
+- `_verify_and_mark_paid` read `self.pay_amount.text()` off the spinbox, which
+  returns an **empty** string — so a payout was parsed as `$0` instead of the
+  operator's typed amount. (Reproduced both against the live widget classes
+  before the fix and confirmed resolved after.)
+
+Because a payout verifies only with a positive amount
+(`mark_paid_verified` treats `amount <= 0` as not-realized revenue), the
+collision failed closed rather than inflating revenue — but it made the entire
+GUI payout-verification path unusable.
+
+- **Renamed the Earnings spinbox to `pay_send_amount`** (with its 3 use sites:
+  build, layout add, `_on_propose_payment`) so it no longer shadows the
+  Management field. `pay_amount` now unambiguously refers to ManagementTab's
+  payout `QLineEdit`. No safety/financial gate was weakened — the rename is
+  purely a namespace fix.
+
+### Added
+- `tests/gui/test_payout_widget_namespace.py` (2 tests): asserts the Earnings
+  tab does not carry a `pay_amount` attribute (pins the rename), and that
+  building both tabs on one shared parent leaves `pay_amount` as the Management
+  `QLineEdit` with a working `.setText()`/`.text()` round-trip. This is the
+  regression guard that would have caught the collision at build time.
+
+### Verified
+- Regression suite green: new payout-namespace tests + `test_earning_gui.py`
+  (5 passed).
+- Reproduced the original bug against the real `EarningTab` on a shared parent
+  (`AttributeError` on `.setText()`), then re-ran the same scenario post-fix:
+  `pay_amount` stays a `QLineEdit`, writes/reads `"400"`, parses to `400.0`.
+- Full suite re-run: **1323 passed, 3 skipped** (plus the 2 new tests → 1325
+  passing).
+
 ## [2.1.46] - 2026-10-11 - .env.example reframed for the N-brain flow + synced with live keys
 
 ### Changed
