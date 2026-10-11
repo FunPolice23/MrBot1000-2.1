@@ -1,0 +1,147 @@
+# MrBot1000 - Git Ignore
+
+# Environment files with secrets
+.env
+.env.*
+!.env.example
+.env_dual_brain
+
+# Local secret stores (secrets.json / secrets.key) — NEVER commit, never reach the public mirror
+secrets.*
+secrets.key
+
+# Decrypted .env temp artifacts (git smudge/clean filter scratch — plaintext secrets, never commit)
+.tmp_*
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Wallet secrets (B1): keys encrypted at rest — these must NEVER be committed
+wallets.json
+wallet.key
+gas_ledger.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+*.so
+.py_compile_check/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+crash.log
+logs/
+
+# Data directories
+data/
+cache/*-wal
+*-shm
+*.db-wal
+*.db-shm
+models_cache.json
+settings.json
+local_files_compare.txt
+
+# Personal GitHub publishing tools and their external mirror.
+github_upload/
+tools/github_publish/
+
+# Backup directory created by safe_write_file() pre-edit safety (2.0.19/2.0.20f)
+.mrbot_backups/
+
+# Generated test result JSON (python -m tests)
+tests/test_results/
+
+# Transient scratch from prior fix attempts and local cron checkpoints — never part of the repo
+NUL
+cron_report_*.md
+Cron reports and raw checkpoint/query/session dumps belong in the job output, not the tree.
+
+# Local cron checkpoint/query/session scratch
+_cron_checkpoint_query.txt
+_cron_prompt_session.txt
+_cron_prompt_tmp.txt
+
+# Abandoned one-off fix/verify/transient probes
+# NOTE: `_*.py` also matches every `__init__.py`, which silently untracks all
+# package inits. Negate it so package structure is always committed.
+_*.py
+!__init__.py
+tmp_*.py
+debug_*.py
+fix_*.py
+apply_remaining_fixes*.py
+report*.md
+
+# Reports folder (cron report artifacts)
+reports/
+
+# Hermes profile data (user-specific, never commit)
+.hermes/
+
+# Routine prompt artifacts (transient, regenerated each cycle)
+.hermes_routine_prompt.txt
+routine_prompt.txt
+_cron_prompt.txt
+_cron_prompt_run.txt
+_cron_prompt_this_run.txt
+_lead_prompt.txt
+_lead_prompt_short.txt
+
+# Temporary scratch
+tmp/
