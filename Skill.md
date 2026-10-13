@@ -103,14 +103,20 @@ user requests opportunity discovery, or earnings pipeline enters discover phase,
 
 ## Skill Types in MrBot1000
 
-| Skill | Purpose | Responsible Agent |
-|-------|---------|-------------------|
-| `social-discovery.md` | Find jobs/opportunities | JobSearch |
-| `opportunity-evaluation.md` | Score/rank opportunities | Analyst |
-| `opportunity-filtering.md` | Filter by risk/reward | JobSearch |
-| `opportunity-execution.md` | Execute accepted tasks | Coder |
-| `opportunity-lifecycle.md` | Track and summarize opportunity progress | Summarizer/Manager |
-| `document-qa.md` | Answer questions about files | Summarizer |
+Skills are invoked by the N-brain peer council (any enabled brain slot) and by the
+EarningPipeline's deterministic discovery/execution services — there is no longer a
+fixed per-worker owner. The "Invoked by" column names the typical entry point.
+
+| Skill | Purpose | Invoked by |
+|-------|---------|------------|
+| `social-discovery.md` | Find jobs/opportunities | EarningPipeline discovery / peer council |
+| `opportunity-evaluation.md` | Score/rank opportunities | peer council (analysis) |
+| `opportunity-filtering.md` | Filter by risk/reward | EarningPipeline discovery |
+| `opportunity-execution.md` | Execute accepted tasks | peer council + validated services |
+| `opportunity-lifecycle.md` | Track opportunity progress through the lifecycle | opportunity_lifecycle service |
+| `document-qa.md` | Answer questions about documents | any brain slot |
+| `job-execution-plan.md` | Turn an opportunity into a next-action plan | peer council (planning) |
+| `moltbook-agent.md` | Moltbook social engagement (proposal-gated) | peer council (social decision) |
 
 ---
 
@@ -132,6 +138,7 @@ user requests opportunity discovery, or earnings pipeline enters discover phase,
 |---------|------|---------|
 | 1.0 | 2026-08-04 | Initial template |
 | 1.1 | 2026-08-05 | Added lifecycle-aware skill guidance and updated skill types |
+| 1.2 | 2026-10-13 | Replaced removed-worker "Responsible Agent" column with "Invoked by" (N-brain peer council + EarningPipeline); added job-execution-plan + moltbook-agent skills |
 
 ---
 

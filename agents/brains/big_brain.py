@@ -371,6 +371,14 @@ class BigBrainAdapter:
             return answer
             
         except Exception as e:
+            # ARCH-ENG-109: log the REAL exception type + message (see small_brain).
+            try:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "big_brain chat failed: %s: %s (base_url=%s model=%s)",
+                    type(e).__name__, str(e)[:300], self.base_url, self.model)
+            except Exception:
+                pass
             error_msg = str(e)
             if "not found" in error_msg.lower() or "404" in error_msg:
                 available = self.get_available_models()

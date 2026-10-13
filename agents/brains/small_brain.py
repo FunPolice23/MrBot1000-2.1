@@ -426,22 +426,35 @@ class SmallBrainAdapter:
                                   evidence_by_id=evidence_by_id)
             return answer
         except Exception as e:
-                error_msg = str(e)
-                if "not found" in error_msg.lower() or "404" in error_msg:
-                    available = self.get_available_models()
-                    if available:
-                        return (
-                            f"[{NAVIGATOR.current_name}: Selected model '{self.model}' "
-                            f"is unavailable. Available models: {', '.join(available)}. "
-                            "Choose one explicitly in Providers & GPU.]"
-                        )
+            # ARCH-ENG-109: log the REAL exception type + message so an
+            # intermittent "could not reach its model" in Live mode is
+            # diagnosable. Previously this was swallowed into a user-facing
+            # string and never surfaced, so the true cause (connection reset?
+            # read timeout? stale pool?) was invisible. Goes to the console /
+            # Live Logs.
+            try:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "small_brain chat failed: %s: %s (base_url=%s model=%s)",
+                    type(e).__name__, str(e)[:300], self.base_url, self.model)
+            except Exception:
+                pass
+            error_msg = str(e)
+            if "not found" in error_msg.lower() or "404" in error_msg:
+                available = self.get_available_models()
+                if available:
                     return (
-                        f"[{NAVIGATOR.current_name}: Selected model '{self.model}' is unavailable "
-                        "and no models were reported by the configured server.]"
+                        f"[{NAVIGATOR.current_name}: Selected model '{self.model}' "
+                        f"is unavailable. Available models: {', '.join(available)}. "
+                        "Choose one explicitly in Providers & GPU.]"
                     )
-                error_response = f"[{NAVIGATOR.current_name} Error: {error_msg[:200]}]"
-                self._finish_got_turn(got_turn, error_response, "error")
-                return error_response
+                return (
+                    f"[{NAVIGATOR.current_name}: Selected model '{self.model}' is unavailable "
+                    "and no models were reported by the configured server.]"
+                )
+            error_response = f"[{NAVIGATOR.current_name} Error: {error_msg[:200]}]"
+            self._finish_got_turn(got_turn, error_response, "error")
+            return error_response
     
     def review(self, plan: str) -> str:
         """Review Big Brain's plan for red flags."""

@@ -1,3 +1,28 @@
+## [2.1.87] - 2026-10-13 - Brain chat diagnostics + Agent.md/Skill.md refresh
+
+### Changed
+- **Diagnostic: log the REAL exception on brain chat failure (ARCH-ENG-109).** An
+  intermittent "could not reach its model" in Live mode was swallowed into a
+  user-facing string and never surfaced. `small_brain.chat` and `big_brain.chat` now
+  log the exception type + message + base_url + model via `logging` (console / Live
+  Logs) before formatting the error string, so the next Live run names the exact
+  failure. (Raw-curl reproduction confirmed the CPU server accepts concurrent requests
+  fine and the OpenAI SDK already retries connection errors — so the remaining cause
+  is likely a mid-stream reset or read timeout.)
+- **Agent.md rewritten** (was v2.1.48, described the removed Manager/Summarizer/Coder
+  "Dual-Brain" architecture). Now documents the current **N-brain peer-council**
+  runtime: device_registry → slots, shared-skills peers, EarningPipeline services,
+  live tool chain, Web Browser tab, MTP detection, the current file tree, and an
+  explicit "do NOT reference removed modules" warning. Preserved the still-valid
+  security/ethics constraints, lifecycle state machine, memory tiers, DB architecture,
+  skills list, and execution discipline.
+- **Skill.md**: replaced the stale worker-mapped "Responsible Agent" column
+  (JobSearch/Analyst/Coder/Summarizer — all removed) with an "Invoked by" column
+  mapping skills to the N-brain peer council + EarningPipeline; added the
+  job-execution-plan + moltbook-agent skills; version history → 1.2.
+- Neither file is read by program code — they are documents the autonomous-loop cron
+  prompts point agents at, so they are kept as accurate docs (no code change).
+
 ## [2.1.86] - 2026-10-13 - CPU-brain connect timeout, Web Browser replay, requirements, docs
 
 ### Changed
