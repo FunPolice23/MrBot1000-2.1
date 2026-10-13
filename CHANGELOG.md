@@ -1,3 +1,155 @@
+## [2.1.91] - 2026-10-13 - Test-order pollution root-caused and fixed (ARCH-ENG-112)
+
+Two pre-existing, environment-dependent test failures fixed in one cycle. Both
+made the suite pass in-tree while silently NOT exercising the invariant they
+exist to prove.
+
+### Fixed
+
+- **ARCH-ENG-111 CLOSED: the 4 full-suite failures in
+  `tests/integrations/test_webcontroller_escalation.py` were caused by a split
+  `requests` module identity, not by any of the four hypotheses recorded in the
+  audit (singleton state, cached session, memoised Playwright, leaking patcher).**
+
+  `tests/earning/test_social_writer_factory.py` ended its patched window with:
+
+  ```python
+  sys.modules["requests"] = <fake>
+  tearDown:  sys.modules.pop("requests", None)
+  ```
+
+  `pop` does not restore the previous object — it removes the entry, so the
+  next `import requests` re-executes the real module and mints a **new module
+  object**. `agents.integrations.browser` had already bound the ORIGINAL object
+  at import time and kept calling `requests.get` on it, while
+  `mock.patch("requests.get", ...)` resolves `"requests"` through `sys.modules`
+  and patched the NEW object. The mock applied to nothing.
+
+  Measured, not inferred: `browser.requests is (re-imported) requests` → `False`,
+  and `g.called` (the mock) → `False`. Production therefore hit the real
+  network, `read_page` returned `ok=False`, and 4 of 8 tests failed — but only
+  when that module had run earlier in the session.
+
+  `setUp` now uses `mock.patch.dict(sys.modules, {"requests": fake})` with
+  `addCleanup(patcher.stop)`, restoring the exact prior entry and keeping one
+  `requests` identity for the session. This is a test-infrastructure fix; no
+  production module changed.
+
+  Bumped `__version__` to 2.1.91.
+
+### Tests
+
+- `tests/engineering/test_arch_eng_112_requests_identity.py` (7 tests). The key
+  test imports and drives the REAL `TestFactoryWithKey` through
+  `setUp()` → `tearDown()` → `doCleanups()`, then asserts (a)
+  `sys.modules["requests"]` is still the object `browser` holds and (b) a
+  subsequent `mock.patch("requests.get")` actually reaches
+  `WebController.read_page` (`g.called is True`).
+
+  **Discrimination proven both directions** per the changelog discipline: with
+  the fix stashed, 2 tests fail; with the fix applied, all 7 pass. Verified
+  additionally by re-running
+  `tests/earning/test_social_writer_factory.py tests/integrations/test_webcontroller_escalation.py`
+  together — 13 passed (was 4 failed / 9 passed).
+
+### Docs
+
+- `docs/ARCH_ENG_111_TEST_POLLUTION.md`: status OPEN → RESOLVED, root cause and
+  verification recorded, all four original hypotheses explicitly marked ruled
+  out, and the durable lesson added (a bare `sys.modules[x]=fake` + `pop`
+  teardown is never safe; `addCleanup` fires from `run()`/`doCleanups()`, not
+  `tearDown()`).
+
+### Fixed (2/2) — read-only gate never exercised in a fresh clone
+
+- **`tests/safety/test_query_db_multidb.py::test_write_still_refused` also fixed.**
+
+  Every `*.db` is gitignored runtime state, so a fresh clone has **no
+  `earning.db`**. `_tool_query_db` checks `os.path.exists(db_path)` **before**
+  the SQL read-only validator, so in a clone it returned
+  `"[Database not found: earning.db]"` instead of `"read-only"`. The test passed
+  in-tree only because the operator's live `earning.db` happened to exist —
+  meaning **the read-only gate it exists to prove was never tested from a clone**.
+  Same environment-dependence class as fix (1/2).
+
+  The tests now build their own store DBs in a temp dir and patch
+  `agents.safety.handlers.PROJECT_ROOT` (a `Path`; a bare `str` breaks the `/`
+  operator in `_resolve_db_path`) at it, plus a companion test that an absent
+  store is reported cleanly rather than crashing. No production code changed.
+
+  **Discrimination proven:** with the read-only gate disabled the test fails;
+  with the gate enabled it passes. Fresh clone: `tests/dialogue tests/safety`
+  now **421 passed** (was 1 failed / 419 passed).
+
+### Full-suite result
+
+**1736 passed, 5 skipped, 106 subtests passed** — fully green, up from a
+**4 failed / 1724 passed** baseline at the start of this cycle.
+
+The one remaining clone-only failure class is pre-existing and unrelated:
+`tools/github_publish/` is gitignored, so its 9 tests error in any fresh clone
+while passing in-tree (a pitfall already recorded in the changelog-discipline
+skill). Verified on a clean clone of the parent commit. This needs a product
+decision (ship the tool or drop its tests), not a code fix, so it is recorded
+rather than "fixed" here.
+
+### Docs
+
+- `docs/ARCH_ENG_111_TEST_POLLUTION.md`: both pollution cases marked RESOLVED,
+  root causes and verification recorded, and the earlier cwd-based guess for the
+  second case explicitly corrected (it was the gitignored DB's existence, not a
+  cwd-relative allowlist path).
+
+## [2.1.90] - 2026-10-13 - Repeated bare tool call no longer yields an empty answer
+
+### Fixed
+- **Live "model returned an empty response" ROOT CAUSE was NOT a connection
+  error or a think-block — it was a repeated bare tool call (ARCH-ENG-110).**
+  The v2.1.88/109 fixes retried the *wrong* failure mode, which is why the
+  small brain still failed 100% of the time after them: `brain_failures.log`
+  showed three `small_brain empty answer (attempt 0/1/2)` lines and then the
+  Dialogue error, with **no** accompanying `chat_with_tools EMPTY visible`
+  line — the tell that the empty value bypassed every existing capture point.
+
+  Chain, reproduced deterministically with a mock client that emits the
+  identical tool call each turn:
+  1. LFM2.5 emits a **bare tool call and nothing else**, e.g.
+     `web_search("paid gigs october")` (its normal compact-model pattern).
+  2. `_parse_tool_call_from_text` executes it; the result is appended to the
+     history and the loop continues.
+  3. The model **re-issues the identical call**. The duplicate guard returned
+     `_remove_tool_syntax(visible_content)` — and that strips a pure tool call
+     to `""`.
+  4. `""` reached the small brain, which raised "model returned an empty
+     response", retried 3x (all empty), and Live mode failed. The 3-attempt
+     retry from v2.1.89 could never succeed because the input was not the
+     failure mode it targeted.
+
+  `agents/dialogue/chat_completion.py` now returns a **visible answer** from
+  `_describe_repeated_tool_call()` at both empty-return sites (the duplicate
+  text-call guard and the post-tool final answer). The wording states that the
+  call already ran and that there is **no new evidence** — it deliberately
+  claims nothing about what the tool found, preserving the financial/
+  epistemic truth rule. The empty-visible diagnostic now also records whether
+  the raw content was a pure tool call, so this class of failure is never
+  silent again.
+
+  Bumped `__version__` to 2.1.90.
+
+### Tests
+- `tests/dialogue/test_arch_eng_110_repeated_tool_call.py` (7 tests): the
+  production failure now yields a visible answer; the wording makes no
+  evidence claim; the argument is surfaced; arg-less/None args are safe; a
+  real answer after a tool call passes through untouched (regression guard);
+  the post-tool final-answer path never returns `""`; a bare unbound tool
+  name (`web_read` with no URL) never returns `""`.
+
+### Hardened (same failure class, third site)
+- The no-tool-call-parsed return path could also yield `""`: a reply that is
+  only a bare tool name the parser cannot bind (e.g. `web_read` with no URL)
+  parses to `None` but still strips to empty. It now returns an honest
+  "nothing was executed" statement instead.
+
 ## [2.1.89] - 2026-10-13 - Retry CPU-brain connection resets + empty answers
 
 ### Fixed

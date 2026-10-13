@@ -11,6 +11,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, r"D:\MrBot1000_2.0")
 
@@ -52,11 +53,23 @@ class TestFactoryWithKey(unittest.TestCase):
     def setUp(self):
         os.environ["MOLTBOOK_API_KEY"] = "moltbook_test_key"
         self._requests = _make_requests({"post": {"id": "abc123"}})
-        sys.modules["requests"] = self._requests
+        # Swap sys.modules["requests"] with mock.patch.dict, NOT a bare
+        # assignment + tearDown pop. Popping the key removes the REAL requests
+        # module from sys.modules, so the next `import requests` builds a brand
+        # new module object. Modules that already did `import requests` at their
+        # own import time (e.g. agents.integrations.browser) keep the ORIGINAL
+        # object, while a later `mock.patch("requests.get", ...)` resolves
+        # "requests" through sys.modules and patches the NEW object — so the
+        # patch silently applies to nothing. That made
+        # tests/integrations/test_webcontroller_escalation.py fail 4/8 in the
+        # full suite while passing alone (ARCH-ENG-112). patch.dict restores the
+        # exact prior entry, keeping one requests identity for the session.
+        patcher = mock.patch.dict(sys.modules, {"requests": self._requests})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         os.environ.pop("MOLTBOOK_API_KEY", None)
-        sys.modules.pop("requests", None)
 
     def _writer(self, payload=None):
         from agents.earning.social_writer_factory import build_moltbook_writer

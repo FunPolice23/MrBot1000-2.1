@@ -10,6 +10,45 @@ from agents.safety.calling import (
 )
 
 
+def _describe_repeated_tool_call(fn_name: str, fn_args: dict) -> str:
+    """Visible fallback when a model's reply is only a REPEATED tool call.
+
+    ARCH-ENG-110. A compact local model (observed: LFM2.5 on the CPU small
+    brain) frequently emits a bare tool call and nothing else — e.g.
+    ``web_search("paid gigs october")``. The tool runs once, the result is
+    appended to the history, and the model re-issues the identical call. The
+    duplicate guard then returned ``_remove_tool_syntax(visible_content)``,
+    which strips that pure tool call down to ``""``. An empty string is not a
+    useful answer: the small brain raised "model returned an empty response",
+    retried 3x (all empty), and Live mode showed a hard failure — a 100%
+    failure rate for the small brain with no diagnostic in the log, because
+    the empty return bypassed every existing capture point.
+
+    A repeated call is a genuine, reportable outcome, so state it. The wording
+    deliberately claims NOTHING about what the tool found — the result is
+    already in the transcript above, and this text must never be read as
+    evidence of a successful search (financial/epistemic truth rule).
+    """
+    args = fn_args if isinstance(fn_args, dict) else {}
+    detail = ""
+    for key in ("query", "url", "path", "sql", "command"):
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            detail = f" for {val.strip()[:160]}"
+            break
+    note = args.get("note")
+    if isinstance(note, str) and note.strip():
+        return note.strip()
+    return (
+        f"I already ran {fn_name}{detail} and its result is in our transcript "
+        f"above. I re-requested the same call instead of answering from that "
+        f"result, so here is my position: I have no new evidence beyond what "
+        f"the tool already returned, and I would rather say so than repeat the "
+        f"search. If you want me to go deeper, tell me what specifically to "
+        f"verify next."
+    )
+
+
 def _seed_executed_calls_from_history(history, executed_text_calls: set) -> None:
     """Pre-seed the executed-text-call set from prior turns in the transcript.
 
@@ -275,11 +314,21 @@ def chat_with_tools(
                 from app.failure_log import log_failure
                 _raw_c = getattr(_msg_proxy, "content", None)
                 _raw_r = getattr(_msg_proxy, "reasoning_content", None)
+                # ARCH-ENG-110: a raw_content that is PURELY a tool call is a
+                # distinct, diagnosable case from a think-block-only reply, and
+                # it is the one that produced 100% Live failure for the small
+                # brain. Record which it was so the next diagnosis does not
+                # have to re-derive it from the model's behaviour.
+                _raw_s = str(_raw_c or "")
+                _parsed = _parse_tool_call_from_text(_raw_s) if _raw_s else None
+                _kind = ("pure_tool_call=%s" % (_parsed[0],)) if _parsed else (
+                    "tool_syntax_only" if _raw_s and not _remove_tool_syntax(_raw_s).strip()
+                    else "stripped_to_empty")
                 log_failure(
-                    "chat_with_tools EMPTY visible (model=%s): raw_content=%r "
+                    "chat_with_tools EMPTY visible (model=%s, %s): raw_content=%r "
                     "raw_reasoning=%r" % (
-                        model,
-                        (str(_raw_c)[:600] if _raw_c else None),
+                        model, _kind,
+                        (_raw_s[:600] if _raw_c else None),
                         (str(_raw_r)[:600] if _raw_r else None)))
             except Exception:
                 pass
@@ -293,7 +342,18 @@ def chat_with_tools(
                 if call_key in executed_text_calls:
                     # The model has already received this result. Returning
                     # the current answer prevents an endless read/search loop.
-                    return _remove_tool_syntax(visible_content)
+                    #
+                    # ARCH-ENG-110: the reply is OFTEN nothing but the tool
+                    # call itself ("web_search(\"paid gigs\")"), so stripping
+                    # the tool syntax here returned "" — an empty string with
+                    # no diagnostic, which the small brain rendered as
+                    # "model returned an empty response" and retried 3x
+                    # (100% failure in Live mode). A repeated tool call is a
+                    # real, visible outcome: report it instead of vanishing.
+                    _dedup_answer = _remove_tool_syntax(visible_content)
+                    if _dedup_answer.strip():
+                        return _dedup_answer
+                    return _describe_repeated_tool_call(fn_name, fn_args)
                 executed_text_calls.add(call_key)
                 # Execute the tool
                 try:
@@ -354,7 +414,18 @@ def chat_with_tools(
                         "content": f"[Tool execution error: {e}]",
                     })
                     continue
-            return _remove_tool_syntax(visible_content)
+            # ARCH-ENG-110: a reply whose text is ONLY a bare tool name that
+            # the parser could not bind (e.g. "web_read" with no URL) parses
+            # to None but still strips to "" — the same empty-answer failure
+            # class. Fall back to an honest statement rather than returning "".
+            _plain = _remove_tool_syntax(visible_content)
+            if _plain.strip():
+                return _plain
+            return _describe_repeated_tool_call(
+                "a tool",
+                {"note": "I named a tool without usable arguments, so nothing "
+                         "was executed and I have no result to report. Tell me "
+                         "the specific URL or query and I will run it properly."})
         
         # Add assistant message with tool calls
         messages.append({
@@ -487,6 +558,16 @@ def chat_with_tools(
                 pass
             # Retry-on-empty is handled comprehensively at the small_brain.chat
             # layer (ARCH-ENG-109); no duplicate retry here.
+            #
+            # ARCH-ENG-110: never hand back "" from the post-tool final answer.
+            # A compact model that re-emits the tool call here strips to empty,
+            # and an empty string is what surfaced as "model returned an empty
+            # response" in Live mode. State the outcome instead of vanishing.
+            if not _final_visible.strip():
+                return _describe_repeated_tool_call(
+                    "the requested tool",
+                    {"note": "the model re-issued the tool call after its result "
+                             "was already returned"})
         return _final_visible
     acc: list[str] = []
     for chunk in (final_response or []):
