@@ -34,7 +34,16 @@ class ProgramKnowledge:
     try:
         from app.version import VERSION as PROGRAM_VERSION
     except Exception:  # pragma: no cover - version.py is always present
-        PROGRAM_VERSION = "2.1.31"
+        # Read the literal from app/version.py rather than hardcoding a stale
+        # number here (the old "2.1.31" fallback drifted ~50 releases behind).
+        try:
+            import re as _re
+            _vp = os.path.join(os.path.dirname(__file__), "..", "..", "app", "version.py")
+            with open(_vp, encoding="utf-8") as _vf:
+                _m = _re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _vf.read())
+            PROGRAM_VERSION = _m.group(1) if _m else "unknown"
+        except Exception:
+            PROGRAM_VERSION = "unknown"
     PROGRAM_PURPOSE = "AI-Powered Online Income & Crypto Opportunity Engine"
     
     CORE_IDENTITY = """

@@ -1,28 +1,28 @@
-## [2.1.86] - 2026-10-13 - Fix CPU-brain "could not reach" + Web Browser replay + requirements
+## [2.1.86] - 2026-10-13 - CPU-brain connect timeout, Web Browser replay, requirements, docs
+
+### Changed
+- **CPU Small Brain threads 3 → 5** (`.env` `SMALL_BRAIN_THREADS`): the CPU-bound
+  brain was starved on a 6-core box while the GPU Big Brain held 6 threads — its
+  30-40s prompt-eval saturated the machine and concurrent connections were reset
+  ("could not reach its model"). Giving the CPU brain more cores reduces the
+  contention window.
+- **README refreshed to v2.1.86**: version, tab inventory ("Browse Root" →
+  "Web Browser"), and new highlights (Web Browser live-browsing surface, live
+  tok/s telemetry, robust tool chain + teardown).
+- **`ProgramKnowledge.PROGRAM_VERSION` no longer hardcodes a stale fallback**: the
+  old literal `"2.1.31"` (drifted ~50 releases) now reads the version from
+  `app/version.py` when the import fails, so the Dialogue self-report matches the
+  running app.
 
 ### Fixed
-- **ARCH-ENG-107: CPU/RAM brain logged "could not reach its model" while it was
-  alive and generating.** Root cause: the local **connect timeout was 8s**, but a
-  CPU-hosted brain mid-prompt-eval (a 3-4k-token Dialogue context takes 30s+ at
-  ~125 tok/s on CPU, single request slot) cannot accept a new TCP connection
-  inside 8s — so the NEXT turn's connect timed out and the Dialogue logged a
-  false "could not reach" + retried, even though the server log showed it
-  generating at 12 t/s. Fix: raised the default local connect timeout to 30s
-  (big + small brain) and pass it through `_build_provider_timeout` (new
-  optional `connect` kwarg). A stopped server still fails fast (refused
-  instantly); only a BUSY server is slow to accept. Env-tunable via
-  `LOCAL_LLM_CONNECT_TIMEOUT_SECONDS`. (The CPU perf itself — 64k ctx, 3 threads
-  — is a separate config matter.)
-- **Web Browser tab stayed blank** when agents browsed before the tab was opened.
-  The tab is lazy-built on first show, so its nav-bus connection didn't exist yet
-  when the agents' `web_read`/`web_search` fired — the pages were lost. Fix: the
-  nav bus now keeps a 50-entry ring buffer of recent navigations; the tab drains
-  it on connect, replaying the activity log and loading the most recent URL into
-  the view.
-- **requirements.txt was missing 3 imported runtime deps** (ARCH-ENG-108):
-  `openai` (the brains' HTTP client — a fresh install would ImportError),
-  `psutil` (hardware detection), and `playwright` (web-browser escalation,
-  optional). Pinned to the installed versions. Verified every pin now matches.
+- **ARCH-ENG-107**: CPU brain false "could not reach its model" — raised the local
+  connect timeout to 30s (big + small brain) and pass it through
+  `_build_provider_timeout`. (A stopped server still fails fast; only a busy
+  server is slow to accept.)
+- **Web Browser tab replay**: the nav bus keeps a 50-entry ring buffer so a
+  lazy-built tab replays recent agent browsing on open.
+- **requirements.txt**: added 3 missing imported deps (`openai`, `psutil`,
+  `playwright`) — a fresh install would otherwise ImportError.
 
 ## [2.1.85] - 2026-10-13 - Fix GPU tok/s blank + DB Stats size/tokens
 

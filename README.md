@@ -1,4 +1,4 @@
-# MrBot1000 v2.1.77 — Multi-Brain AI-Powered Earning Agent
+# MrBot1000 v2.1.86 — Multi-Brain AI-Powered Earning Agent
 
 A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. It is local-first: the default brain runtime runs on your machine across every detected GPU and the CPU/RAM pool, while optional cloud providers are explicitly configured by the operator.
 
@@ -6,7 +6,7 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 > function-level map of every file, and [`docs/LEGACY_AUDIT.md`](docs/LEGACY_AUDIT.md)
 > for the status of the retired central-Manager architecture.
 
-## Highlights (through v2.1.77)
+## Highlights (through v2.1.86)
 
 - **Device-centric N-brain runtime** (`agents/runtime/device_registry.py` + `agents/runtime/dual_brain.py`): one source of truth for device→slot→role→endpoint/model. The runtime detects every GPU and the CPU/RAM pool and assigns each an ordered slot — slot 0/1 are the classic Big/Small brains (back-compat), slots 2+ are extra devices (e.g. a CPU/RAM brain). Per-device enable/role/model/settings persist in `settings.json`. The active local or cloud provider is selected from Settings.
 - **Shared-skills peer council Dialogue** (`agents/cognition/speaker_registry.py`): every enabled brain runs the same earning-agent skillset, differing only by a customizable per-device name (Edward Hurst, Jacob Stanley, Chris Borrows, …). Each brain independently reads the shared transcript — human + teammates + tool results — and decides whether to answer the human, react to a teammate, or push the goal. Names are editable in the Management tab (`BIG_BRAIN_NAME`/`SMALL_BRAIN_NAME`/`BRAIN_SLOT{n}_NAME`).
@@ -18,6 +18,23 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 - **Cloud-failover control** (`CLOUD_FAILOVER_ENABLED`): a real toggle in Provider Configuration that gates whether cloud providers are used as a backup when the local brain fails. When off, only local providers are contacted; a provider whose Role is "Disabled" is never used regardless.
 - **Dialogue and Management consolidation**: Dialogue now tracks goals, tasks,
   and progress; redundant Collaboration and Memory & Stream tabs are removed.
+- **Web Browser tab = the agents' live browsing surface** (v2.1.84): a
+  `QWebEngineView` renders each page the personas fetch with real page loading,
+  driven by a GUI-thread-safe nav bus (`gui/widgets/web_nav_bus.py`). When a
+  persona runs `web_read`/`web_search`, the URL loads here in real time and a
+  timestamped activity log records every action; recent activity is replayed when
+  the (lazy-built) tab is first opened. The agents' data still comes from
+  `web_eyes` text extraction — the tab is the visual mirror.
+- **Live tok/s telemetry** (v2.1.80-85): the Providers & GPU window shows live
+  generation speed (tok/s, tokens, elapsed) per device during Dialogue and Chat,
+  tracking total generation (thinking + answer). DB Stats reports avg tok/s,
+  prompt/completion tokens, and DB size. MTP (multi-token prediction) is detected
+  per model and greyed out when unsupported.
+- **Robust tool chain + teardown** (v2.1.81-83): the agents' `web_search`/
+  `web_read`/tool dispatch works end-to-end (fixed a handler-map import that
+  broke every tool); narrated-but-never-executed "I need to verify" stalls are
+  rejected; and DialogueWorker teardown aborts cleanly so a window close never
+  crashes the app (the `Qt6Core 0xc0000409` class).
 - **Custom brain names**: Big Brain and Small Brain display names can be edited
   and saved in Provider Configuration. Internal role keys remain stable.
 - **Dialogue evidence visibility**: the personas retain their
@@ -406,7 +423,7 @@ dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 | `app/action_pipeline.py` | Proposal validation and controlled execution safeguards |
 | `app/database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
 | `app/theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
-| `app/version.py` | Public application version source (`2.1.77`) |
+| `app/version.py` | Public application version source (`2.1.86`) |
 | `Agent.md` / `README.md` / `CHANGELOG.md` | Runtime contract, current system overview, and release history |
 | `tests/` | Focused regression and subsystem tests |
 | `tools/github_publish/` | Personal publish-mirror tooling (git-ignored; syncs a sanitized copy to GitHub) |
@@ -457,7 +474,7 @@ Key settings:
 5. **Chat** — Human conversation with the configured Small Brain
 6. **Dialogue** — Goal-driven Edward/Jacob conversation with Goals, Tasks, and Progress tracking
 7. **Approvals** — Human approval queue beside Dialogue, with full request inspection
-8. **Browse Root** — File explorer
+8. **Web Browser** — Live view of the agents' web browsing (real page loading via `QWebEngineView`); also accepts a manual URL
 9. **Payments** — Balance and payout verification
 10. **Earnings** — Income tracking, verified revenue, costs, gas, net profit, ROI
 11. **Insights** — Reports and operational summaries
@@ -505,7 +522,7 @@ it is not a separate visible tab.
 
 - **Agent.md** — Runtime contract for any model interacting with the system
 - **README.md** (this file) — Current system overview, tab inventory, and configuration guide
-- **CHANGELOG.md** — Full change history (current release v2.1.77)
+- **CHANGELOG.md** — Full change history (current release v2.1.86)
 - **docs/codemap/** — Full function-level codebase map (every file, every function)
 - **docs/LEGACY_AUDIT.md** — Status of the retired central-Manager / worker-team architecture
 - **ARCHITECTURE_MAP.md** — Subsystem map, dependency assessment, consolidation plan
