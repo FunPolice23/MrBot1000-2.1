@@ -32,6 +32,17 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Route Python `logging` to stderr so diagnostics (e.g. ARCH-ENG-109 brain
+# chat-failure logging) are visible in the launch console. Without a handler
+# the root logger drops records, which is why those diagnostics were invisible.
+import logging as _logging  # noqa: E402
+if not _logging.getLogger().handlers:
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
 # ── Runtime interpreter isolation (v2.0.36x) ──────────────────────────────
 # A parent process (e.g. a desktop app / agent shell) may set a global PYTHONPATH
 # pointing at ITS OWN venv's site-packages. When this app is launched via the

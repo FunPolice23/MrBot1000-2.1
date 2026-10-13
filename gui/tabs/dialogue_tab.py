@@ -1613,6 +1613,17 @@ class DialogueTab(QWidget):
             or "model returned an empty response" in response_lower
         )
         if is_transport_error:
+            # ARCH-ENG-109: capture the exact response_text that triggered the
+            # "could not reach its model" decision so the root cause is
+            # recoverable even when the console/stderr is not visible. Uses the
+            # shared repo-anchored log (not cwd — a GUI launch cwd is unreliable).
+            try:
+                from app.failure_log import log_failure
+                log_failure(
+                    "DIALOGUE transport-error (%s): %r" % (
+                        speaker, response_text[:500]))
+            except Exception:
+                pass
             retry = True
             if self.live_running:
                 retry = self._record_live_failure(

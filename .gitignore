@@ -150,3 +150,6 @@ tmp/
 
 # Personal codebase-map generator (local tooling, not for the mirror)
 tools/gen_codemap.py
+
+# ARCH-ENG-109 runtime diagnostic (brain chat-failure capture)
+brain_failures.log

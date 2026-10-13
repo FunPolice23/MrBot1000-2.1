@@ -364,25 +364,68 @@ class SmallBrainAdapter:
             # Track timing for stats.
             import time as _time
             _t0 = _time.time()
-            answer = chat_with_tools(
-                client=client,
-                model=self.model,
-                system_prompt=full_system,
-                user_message=user_message,
-                history=history,
-                max_tokens=request_max_tokens,
-                temperature=self.temperature,
-                # Text-form tool calls need a second round to execute and
-                # return evidence to the persona.
-                max_iterations=2 if dialogue_mode else 2,
-                use_function_calling=False,
-                flatten_system_prompt=protocol["flatten_system_prompt"],
-                extra_body=final_extra_body,
-                tool_trace=self.last_tool_trace,
-                stream_progress=stream_progress,
-                on_tool_trace=tool_trace_cb,
-                images=images,
-            )
+            # ARCH-ENG-109: retry wrapper. Two confirmed Live failure modes for
+            # the CPU small brain (LFM2.5): (1) a mid-stream ReadError
+            # (WinError 10054 "connection forcibly closed") from llama.cpp
+            # resetting the SSE stream — httpx shows the POST returns 200 but
+            # the stream dies mid-read; (2) an empty visible answer because the
+            # template forces thinking mode and the model emits thinking only.
+            # Retry up to 3x: connection errors get a FRESH client (stale
+            # socket), empty answers get a plain-text nudge. Read-only dialogue
+            # tools are safe to re-run.
+            _NUDGE = ("\n\n[SYSTEM: Answer in plain text, 1-3 sentences. State "
+                      "your actual decision or finding. Do not think silently.]")
+            answer = None
+            _last_exc = None
+            for _attempt in range(3):
+                try:
+                    _u = user_message if _attempt == 0 else (user_message + _NUDGE)
+                    answer = chat_with_tools(
+                        client=client,
+                        model=self.model,
+                        system_prompt=full_system,
+                        user_message=_u,
+                        history=history,
+                        max_tokens=request_max_tokens,
+                        temperature=self.temperature,
+                        max_iterations=2 if dialogue_mode else 2,
+                        use_function_calling=False,
+                        flatten_system_prompt=protocol["flatten_system_prompt"],
+                        extra_body=final_extra_body,
+                        tool_trace=self.last_tool_trace,
+                        stream_progress=stream_progress,
+                        on_tool_trace=tool_trace_cb,
+                        images=images,
+                    )
+                    if str(answer or "").strip():
+                        break  # real answer
+                    # empty -> log + retry with nudge
+                    try:
+                        from app.failure_log import log_failure
+                        log_failure(
+                            "small_brain empty answer (attempt %d, model=%s)"
+                            % (_attempt, self.model))
+                    except Exception:
+                        pass
+                    answer = None
+                except Exception as _ce:
+                    _last_exc = _ce
+                    try:
+                        from app.failure_log import log_failure
+                        log_failure(
+                            "small_brain attempt %d raised %s: %s"
+                            % (_attempt, type(_ce).__name__, str(_ce)[:200]))
+                    except Exception:
+                        pass
+                    answer = None
+                    # Fresh client for the next attempt (drop the stale socket).
+                    try:
+                        client = self._get_client()
+                    except Exception:
+                        pass
+                    continue
+            if _last_exc is not None and not str(answer or "").strip():
+                raise _last_exc  # let the outer handler format the error
             elapsed = _time.time() - _t0
             
             # Log to DB with real tokens/tps.
@@ -433,10 +476,23 @@ class SmallBrainAdapter:
             # read timeout? stale pool?) was invisible. Goes to the console /
             # Live Logs.
             try:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "small_brain chat failed: %s: %s (base_url=%s model=%s)",
-                    type(e).__name__, str(e)[:300], self.base_url, self.model)
+                import logging, sys
+                _diag = ("small_brain chat failed: %s: %s "
+                         "(base_url=%s model=%s)") % (
+                             type(e).__name__, str(e)[:300],
+                             self.base_url, self.model)
+                # print() to stderr: guaranteed visible in the launch console.
+                # logging alone goes nowhere in this GUI app (no handler wired),
+                # which is why ARCH-ENG-109's log line was invisible.
+                print(_diag, file=sys.stderr, flush=True)
+                logging.getLogger(__name__).warning(_diag)
+                # Shared repo-anchored failure log (survives an invisible console
+                # and an unpredictable GUI-launch cwd).
+                try:
+                    from app.failure_log import log_failure
+                    log_failure(_diag)
+                except Exception:
+                    pass
             except Exception:
                 pass
             error_msg = str(e)

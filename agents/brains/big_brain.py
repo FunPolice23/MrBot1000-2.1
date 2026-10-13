@@ -373,10 +373,18 @@ class BigBrainAdapter:
         except Exception as e:
             # ARCH-ENG-109: log the REAL exception type + message (see small_brain).
             try:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "big_brain chat failed: %s: %s (base_url=%s model=%s)",
-                    type(e).__name__, str(e)[:300], self.base_url, self.model)
+                import logging, sys
+                _diag = ("big_brain chat failed: %s: %s "
+                         "(base_url=%s model=%s)") % (
+                             type(e).__name__, str(e)[:300],
+                             self.base_url, self.model)
+                print(_diag, file=sys.stderr, flush=True)
+                logging.getLogger(__name__).warning(_diag)
+                try:
+                    from app.failure_log import log_failure
+                    log_failure(_diag)
+                except Exception:
+                    pass
             except Exception:
                 pass
             error_msg = str(e)

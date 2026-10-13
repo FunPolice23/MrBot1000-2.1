@@ -1,4 +1,88 @@
+## [2.1.89] - 2026-10-13 - Retry CPU-brain connection resets + empty answers
+
+### Fixed
+- **Live "could not reach its model": retry both failure modes at the brain
+  layer (ARCH-ENG-109).** `brain_failures.log` + httpx logs confirmed TWO
+  distinct CPU-small-brain (LFM2.5) failure modes, both returning HTTP 200 at
+  the socket level:
+  1. **Mid-stream `ReadError` [WinError 10054] "connection forcibly closed by
+     the remote host"** — llama.cpp resets the SSE stream during a slow CPU
+     generation. httpx logs the POST as 200 OK (connection opened) but the
+     stream dies mid-read; `chat_with_tools` materializes the whole stream via
+     `list(stream)` with no connection-error handler, so it propagated unlabeled.
+  2. **Empty visible answer** — the LFM2.5 template forces thinking mode, so the
+     model frequently emits thinking only (server log: ~290-490 tokens,
+     truncated=0) and `_visible_response_content` strips it to empty; the
+     Dialogue transport-error branch misclassifies it as a connection failure
+     and retries 8x.
+  `small_brain.chat` (`agents/brains/small_brain.py`) now wraps the
+  `chat_with_tools` call in a 3-attempt retry: connection errors get a FRESH
+  client (drop the stale socket), empty answers get a plain-text nudge ("answer
+  in plain text, do not think silently"). Read-only dialogue tools are safe to
+  re-run. Removed the narrower duplicate retry from `chat_completion.py` (kept
+  its diagnostic capture). Bumped `__version__` to 2.1.89.
+
+## [2.1.88] - 2026-10-13 - Fix Live "could not reach" = LFM2.5 empty final answer
+
+### Fixed
+- **ROOT CAUSE: Live "could not reach its model" is an EMPTY final answer, not
+  a connection error (ARCH-ENG-109).** The LFM2.5 chat template hardcodes the
+  assistant generation prompt to begin with an open think tag, forcing the model
+  into thinking mode. After a tool call, the final-answer create() frequently
+  returns thinking-only output with no visible text (server log: failing attempts
+  stop at ~290 tokens, truncated=0; the succeeding attempt generated ~527).
+  `_visible_response_content` strips the think block to empty, `small_brain`
+  reports "empty response", and the Dialogue transport-error branch misclassifies
+  it as a connection failure and retries 8x. `chat_with_tools`
+  (`agents/dialogue/chat_completion.py`) now retries the final answer ONCE with a
+  plain-text nudge ("state your final answer now... do not think silently") when
+  the visible answer is empty, and captures the raw pre-strip content to
+  `brain_failures.log`. Safe: the retry only fires when the answer is genuinely
+  empty.
+
 ## [2.1.87] - 2026-10-13 - Brain chat diagnostics + Agent.md/Skill.md refresh
+
+### Fixed
+- **Diagnostics were invisible (ARCH-ENG-109 follow-up).** The ARCH-ENG-109 brain
+  chat-failure logging used `logging.getLogger().warning()`, but this GUI app wires
+  no `logging` handler, so the record went to the root logger and was dropped —
+  never shown in the launch console or Live Logs. Two fixes: (1) `main.py` now
+  calls `logging.basicConfig(stream=sys.stderr)` at startup so any `logging` call
+  reaches the console; (2) both brain exception handlers also `print(...,
+  file=sys.stderr, flush=True)` the diagnostic so it is guaranteed visible.
+- **Version authority drift.** `app/version.py` still read `2.1.86` after the 2.1.87
+  CHANGELOG entry was added, so the GUI showed a stale version and the new build
+  looked unchanged. Bumped `__version__` to `2.1.87` (single source of truth).
+- **File-based failure capture (ARCH-ENG-109 follow-up).** The stderr diagnostic
+  still didn't surface (launch console not visible), so brain chat failures and the
+  Dialogue "could not reach its model" decision now ALSO append to
+  `brain_failures.log` (cwd, git-ignored) — recoverable straight from disk. The
+  Dialogue-level capture records the exact `response_text` that tripped the
+  transport-error branch, so the root cause is visible whether it came from an
+  exception or an error string. Also fixed: `chat_with_tools` streaming
+  (`agents/dialogue/chat_completion.py`) materializes the whole SSE stream via
+  `list(stream)` and has no connection-error handler, so a mid-stream disconnect
+  propagates up unlabeled — the file log will name it.
+- **Root cause identified: "could not reach its model" is actually an EMPTY
+  RESPONSE, not a connection error.** `brain_failures.log` captured the exact
+  text: `"[Jacob Stanley Error: model returned an empty response for
+  'LFM2.5-2.6B-Q5_K_M.gguf' at http://127.0.0.1:1235/v1 ...]"`. The small brain
+  (LFM2.5-2.6B) returns a completed generation whose visible content strips to
+  empty (small_brain.py:410 `if not str(answer).strip()`), which the Dialogue
+  transport-error branch (dialogue_tab.py:1604) misclassifies as a connection
+  failure and retries 8x. No exception, no disconnect — the model just emits
+  nothing usable (likely all inside a think block, tool-call syntax only, or a
+  chat-template artifact). Added raw pre-strip content capture in
+  `chat_completion.py` so the next reproduction shows exactly what LFM2.5 emits
+  before it strips to empty.
+- **Failure log is now repo-anchored, not cwd-relative (ARCH-ENG-109 follow-up).**
+  The first file-capture used `os.getcwd()`, but a GUI launch's cwd is
+  unpredictable (desktop shortcut "Start in" dir), so the write silently went
+  elsewhere and the log never updated. New `app/failure_log.py` derives the path
+  from `__file__` (repo root) so `brain_failures.log` always lands at
+  `D:\MrBot1000_2.0\brain_failures.log`. All three capture sites (both brains +
+  the Dialogue transport-error branch + the chat_completion empty-visible
+  branch) now use the shared helper.
 
 ### Changed
 - **Diagnostic: log the REAL exception on brain chat failure (ARCH-ENG-109).** An
@@ -8,7 +92,8 @@
   Logs) before formatting the error string, so the next Live run names the exact
   failure. (Raw-curl reproduction confirmed the CPU server accepts concurrent requests
   fine and the OpenAI SDK already retries connection errors — so the remaining cause
-  is likely a mid-stream reset or read timeout.)
+  is likely a mid-stream reset or read timeout. The llama-server token log confirms
+  EVERY request completes at ~15 t/s, so the failure is client-side abandonment.)
 - **Agent.md rewritten** (was v2.1.48, described the removed Manager/Summarizer/Coder
   "Dual-Brain" architecture). Now documents the current **N-brain peer-council**
   runtime: device_registry → slots, shared-skills peers, EarningPipeline services,

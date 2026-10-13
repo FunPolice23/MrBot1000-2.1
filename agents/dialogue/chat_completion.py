@@ -266,6 +266,24 @@ def chat_with_tools(
         })()
         visible_content = _visible_response_content(_msg_proxy)
 
+        # ARCH-ENG-109: when the visible answer is empty, capture the RAW
+        # content/reasoning the model actually produced (pre-strip) so we can
+        # see WHY it stripped to nothing (whole output inside a think block?
+        # tool-call syntax only? template artifact?). Goes to brain_failures.log.
+        if not visible_content.strip():
+            try:
+                from app.failure_log import log_failure
+                _raw_c = getattr(_msg_proxy, "content", None)
+                _raw_r = getattr(_msg_proxy, "reasoning_content", None)
+                log_failure(
+                    "chat_with_tools EMPTY visible (model=%s): raw_content=%r "
+                    "raw_reasoning=%r" % (
+                        model,
+                        (str(_raw_c)[:600] if _raw_c else None),
+                        (str(_raw_r)[:600] if _raw_r else None)))
+            except Exception:
+                pass
+
         if not _msg_proxy.tool_calls:
             # Parse tool calls from text (works for all models)
             text_tool_call = _parse_tool_call_from_text(visible_content)
@@ -448,7 +466,28 @@ def chat_with_tools(
 
     # Tolerate both real Response objects and mock iterators used in tests.
     if hasattr(final_response, "choices"):
-        return _visible_response_content(final_response.choices[0].message)
+        _final_visible = _visible_response_content(final_response.choices[0].message)
+        # ARCH-ENG-109: the post-tool final answer is the other place an empty
+        # response can originate (the loop's line-267 capture only covers the
+        # first generation). If the final answer strips to empty, capture the
+        # raw content/reasoning so we can see WHY (think-block? template?).
+        if not _final_visible.strip():
+            try:
+                from app.failure_log import log_failure
+                _fm = final_response.choices[0].message
+                _fc = getattr(_fm, "content", None)
+                _fr = getattr(_fm, "reasoning_content", None)
+                log_failure(
+                    "chat_with_tools EMPTY FINAL (model=%s): raw_content=%r "
+                    "raw_reasoning=%r" % (
+                        model,
+                        (str(_fc)[:600] if _fc else None),
+                        (str(_fr)[:600] if _fr else None)))
+            except Exception:
+                pass
+            # Retry-on-empty is handled comprehensively at the small_brain.chat
+            # layer (ARCH-ENG-109); no duplicate retry here.
+        return _final_visible
     acc: list[str] = []
     for chunk in (final_response or []):
         if getattr(chunk, "choices", None):
