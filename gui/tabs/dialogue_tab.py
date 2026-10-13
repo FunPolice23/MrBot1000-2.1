@@ -179,6 +179,10 @@ class DialogueTab(QWidget):
         self._retired_workers = []
         self._queued_manual_turn = None
         self._agent_runtime = None
+        # Phase F (ARCH-ENG-090): per-response rate limit for continuous/live
+        # mode. Built lazily so the env value is read after settings load.
+        self._response_bucket = None
+        self._social_turn_counter = 0
         self._live_last_speaker = None
         self._live_failure_count = 0
         self.current_speaker = big_brain_name()  # Big Brain (Driver) opens the dialogue
@@ -1082,6 +1086,35 @@ class DialogueTab(QWidget):
             # Dialogue must remain usable if its optional memory store is unavailable.
             pass
 
+    def _response_rate_gate(self) -> bool:
+        """Enforce a minimum interval between continuous/live responses.
+
+        Returns True to proceed now, or False if the turn was deferred (a
+        cooldown timer will re-fire respond()). Reads
+        ``DIALOGUE_MIN_SECONDS_PER_RESPONSE`` (default 1.5s) so the operator can
+        tune it in Settings/.env. Manual turns bypass this gate at the call site.
+        """
+        import os
+        try:
+            min_s = float(os.getenv("DIALOGUE_MIN_SECONDS_PER_RESPONSE", "1.5"))
+        except (TypeError, ValueError):
+            min_s = 1.5
+        if min_s <= 0:
+            return True
+        if self._response_bucket is None:
+            from app.library import TokenBucket
+            # rate = 1/min_s calls per second, capacity 1 (no burst).
+            self._response_bucket = TokenBucket(rate=1.0 / min_s, capacity=1.0)
+        if self._response_bucket.try_acquire(1.0, timeout=0.0):
+            return True
+        # Over rate: reschedule this turn after the cooldown rather than firing.
+        delay_ms = int(min_s * 1000) + 50
+        try:
+            QTimer.singleShot(delay_ms, lambda: self.respond(manual=False))
+        except Exception:
+            pass
+        return False
+
     def respond(self, manual=False):
         """Generate a response from the current speaker on a background thread.
 
@@ -1105,6 +1138,14 @@ class DialogueTab(QWidget):
                 self._queued_manual_turn = (self.current_speaker, True)
                 return
             return
+
+        # Phase F (ARCH-ENG-090): per-response rate limit in continuous/live
+        # mode. Manual turns are never throttled (the human asked for it). An
+        # over-rate continuous turn is rescheduled after the cooldown instead of
+        # firing immediately, so the loop can't flood or burn provider budget.
+        if (self.live_running or self.is_running) and not manual:
+            if not self._response_rate_gate():
+                return
 
         self.append_system(f"Generating {self.current_speaker}'s response...")
 
@@ -1150,6 +1191,28 @@ class DialogueTab(QWidget):
                 note = self._honesty.epistemic_context_note(max_claims=5)
                 if note:
                     system_prompt = (system_prompt + "\n" + note) if system_prompt else note
+        # Phase F (ARCH-ENG-090): opt-in per-turn social decision. When enabled,
+        # each continuous turn the agent may DECIDE whether to post/reply/upvote
+        # on Moltbook — an extra decision alongside the others. Any social action
+        # is only a PROPOSAL routed through the approval-gated social_post tool;
+        # the agent never posts silently, and this is rate-limited elsewhere.
+        try:
+            import os as _os
+            if _os.getenv("DIALOGUE_SOCIAL_AUTOPOST", "false").lower() in ("1", "true", "yes"):
+                social_block = (
+                    "\n# SOCIAL DECISION (each turn)\n"
+                    "You have access to the Moltbook social network for AI agents. "
+                    "Each turn, decide whether to engage: post something new, reply "
+                    "to a community post, or upvote. Prefer replying/engaging over "
+                    "posting into the void; never spam. To act, state a single "
+                    "clear intent like 'social_post: <submolt> | <title> | <body>' "
+                    "or 'social_reply: <post_id> | <body>'. This is only a PROPOSAL — "
+                    "a human must approve before anything is published. If you have "
+                    "nothing worth sharing this turn, say nothing about social.\n"
+                )
+                system_prompt = (system_prompt + social_block) if system_prompt else social_block
+        except Exception:
+            pass
         # ``context`` already contains the summarized and recent transcript.
         # Passing the same history again makes models see every turn twice and
         # repeatedly issue the same search/read request.
@@ -1797,6 +1860,39 @@ class DialogueTab(QWidget):
             self.progress_bar.hide()
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setFormat("Ready")
+
+    def cleanup(self):
+        """Stop all dialogue background work before this tab is destroyed.
+
+        v2.1.61 (ARCH-ENG-074): Live mode is driven by a self-rearming
+        `QTimer.singleShot(250, self._start_live_opportunity)` loop that keeps
+        launching `DialogueWorker` threads, and Auto-Step re-arms via
+        `QTimer.singleShot(0, self.respond)`. On window close mid-session those
+        timers are still armed and workers are mid-generation, so they keep
+        spawning/emitting into widgets being torn down — the queued cross-thread
+        signals then dereference dead C++ objects and abort the interpreter
+        (python.exe Qt6Core.dll 0xc0000409). `stop_live()` already bumps the
+        generation id, clears `live_running`/`is_running` (which every re-arm
+        path gates on), cancels + retires workers, and tears down the progress
+        throttler. Calling it here stops the loops before destruction. Idempotent
+        and never raises, matching the cleanup() contract main.py expects.
+        """
+        try:
+            self.stop_live()
+        except Exception:
+            pass
+        # Defensive: also clear the auto-step flag and cancel the single worker
+        # in case a non-live auto pass was running when the tab was closed.
+        try:
+            self.is_running = False
+            self._auto_steps_left = 0
+            worker = getattr(self, "worker", None)
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                self._retired_workers.append(worker)
+            self.worker = None
+        except Exception:
+            pass
 
     def _on_dialogue_progress(self, batches):
         """Throttled GUI update for streamed dialogue progress.
@@ -2556,14 +2652,58 @@ class DialogueWorker(QThread):
         else:
             budget = floor
 
-        # Thinking models spend part of the budget on a reasoning channel, so
-        # give them headroom when thinking is explicitly enabled for dialogue.
-        thinking_enabled = os.getenv("DIALOGUE_ENABLE_THINKING", "").lower() in ("1", "true", "yes")
-        if thinking_enabled and any(
-            name in model_lower for name in ("qwen", "deepseek", "nemotron", "thinking")
-        ):
-            budget = max(budget, 2048)
+        # ── Adjustable thinking headroom (v2.1.51, ARCH-ENG-051) ─────────────
+        # Reasoning models spend part of the reply budget on a hidden thinking
+        # channel BEFORE the visible answer. If the budget is too small they burn
+        # it all on reasoning and return an empty visible reply (finish_reason:
+        # length) — the exact failure a 27B reasoning model hit on the CPU brain.
+        # Detection is now NAME-AGNOSTIC: any model may emit a reasoning channel,
+        # so we look for a generic reasoning signal, not a hardcoded name list.
+        # The headroom is ADJUSTABLE per device class via env so CPU / N-device
+        # brains (1B .. MoE, any size) can be given room for think+answer.
+        thinking_requested = os.getenv("DIALOGUE_ENABLE_THINKING", "").lower() in ("1", "true", "yes")
+        # A model is treated as a reasoning model when it is named as one, when
+        # its profile reports a thinking channel, or when the operator explicitly
+        # turned thinking on. `_emits_reasoning` is the generic runtime signal.
+        emits_reasoning = False
+        try:
+            from agents.brains.worker_thinking import model_emits_reasoning as _mer
+            emits_reasoning = bool(_mer(getattr(brain, "model", "") or ""))
+        except Exception:
+            emits_reasoning = False
+        named_reasoning = any(
+            name in model_lower for name in ("qwen", "deepseek", "nemotron", "thinking", "bonsai")
+        )
+        if thinking_requested or emits_reasoning or named_reasoning:
+            # Per-class adjustable thinking budget (default 2048). CPU / N-device
+            # brains can raise this so think AND answer both fit.
+            headroom = DialogueWorker._dialogue_thinking_headroom(is_small)
+            budget = max(budget, headroom)
         return budget
+
+    @staticmethod
+    def _dialogue_thinking_headroom(is_small: bool) -> int:
+        """Adjustable thinking-channel token reserve for a brain.
+
+        v2.1.51 (ARCH-ENG-051): CPU / N-device brains run any model size (1B ..
+        MoE), and reasoning models need enough budget to think AND then answer.
+        Precedence:
+          1. `DIALOGUE_THINK_TOKENS` — explicit global override.
+          2. Per-class `DIALOGUE_THINK_TOKENS_SMALL` / `_BIG` (CPU / N-device use
+             the SMALL class). Default 2048.
+        Never raises; returns a sane positive int.
+        """
+        def _env_int(name, default):
+            try:
+                v = int(os.getenv(name, "").strip() or default)
+                return v if v > 0 else default
+            except (TypeError, ValueError):
+                return default
+        explicit = _env_int("DIALOGUE_THINK_TOKENS", 0)
+        if explicit > 0:
+            return explicit
+        key = "DIALOGUE_THINK_TOKENS_SMALL" if is_small else "DIALOGUE_THINK_TOKENS_BIG"
+        return _env_int(key, 2048)
 
     def _safe_fallback_response(self) -> str:
         """Return a bounded, phase-aware fallback when retries are exhausted."""
@@ -2665,7 +2805,7 @@ class DialogueWorker(QThread):
                     retry_kwargs = kwargs
                     # Qwen-style inline reasoning can consume a short turn
                     # budget before producing the visible answer. Give only
-                    # this recovery attempt a bounded larger budget; normal
+                    # this recovery attempt a strictly LARGER budget; normal
                     # turns retain the fast model-size budget.
                     if (
                         isinstance(response, str)
@@ -2673,7 +2813,18 @@ class DialogueWorker(QThread):
                         and "</think>" not in response.lower()
                     ):
                         retry_kwargs = dict(kwargs)
-                        retry_kwargs["max_tokens"] = max(self.max_tokens, 2048)
+                        # ARCH-ENG-056: `max(self.max_tokens, 2048)` returned
+                        # self.max_tokens UNCHANGED for every reasoning model —
+                        # since v2.1.51 a reasoning brain's base budget is
+                        # already >= the 2048 thinking headroom, so the recovery
+                        # turn got no extra room and burned out on the hidden
+                        # channel exactly as the first turn did. Grow it by the
+                        # larger of +2048 or +50%: strictly more room, still a
+                        # fraction of the model's context (the base budget is
+                        # already ctx//8-bounded), and only this one attempt.
+                        _base = int(self.max_tokens)
+                        retry_kwargs["max_tokens"] = max(_base + 2048,
+                                                         int(_base * 1.5))
                     response = self.brain.chat(
                         retry_context, self.history, **retry_kwargs)
                     if self._cancelled:

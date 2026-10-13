@@ -97,6 +97,33 @@ def build_composition_root(
         portfolio=portfolio,
         run_store=run_store,
     )
+    # Phase D (ARCH-ENG-084): make the record_payment HIGH-TRUST tool operate
+    # on the authoritative lifecycle tracker. Failure here must never block
+    # startup — the tool just stays unavailable.
+    try:
+        from agents.safety.handlers import set_lifecycle_tracker
+        set_lifecycle_tracker(pipeline.lifecycle)
+    except Exception as exc:  # pragma: no cover - never block startup
+        emit_log_startup = log_fn or print
+        emit_log_startup(f"record_payment tool not wired: {exc}")
+    # Phase E (ARCH-ENG-086): wire the confirmed Moltbook writer so the
+    # social_post tool can really post/respond (still behind its approval gate).
+    try:
+        from agents.earning.social_writer_factory import build_moltbook_writer
+        from agents.safety.handlers import set_social_writer
+        writer = build_moltbook_writer()
+        if writer is not None:
+            set_social_writer(writer)
+    except Exception as exc:  # pragma: no cover - never block startup
+        _l = log_fn or print
+        _l(f"social_post writer not wired: {exc}")
+    # Phase F (ARCH-ENG-091): ensure the per-provider daily-calls table exists.
+    try:
+        from agents.safety.provider_rate_limiter import ensure_table
+        ensure_table()
+    except Exception as exc:  # pragma: no cover - never block startup
+        _l2 = log_fn or print
+        _l2(f"provider rate-limiter table not ensured: {exc}")
     from agents.core.state_reconciliation import reconcile_many
     opportunity_ids = {
         state.get("opportunity_id")

@@ -64,6 +64,33 @@ class EconomicProfile:
     })
     realized_expense: float = 0.0
 
+    # ARCH-ENG-092: monetary evidence whose currency has no known USD rate, kept
+    # in NATIVE units by currency so it is visible rather than silently dropped.
+    # A 250,000 JPY payout converts to 0.0 USD (fail safe — it must never be
+    # booked as revenue at a guessed rate) but the operator still needs to see
+    # that it exists. {"JPY": 250000.0}.
+    unconvertible_payment_amounts: Dict[str, float] = field(default_factory=dict)
+    unconvertible_expense_amounts: Dict[str, float] = field(default_factory=dict)
+
+    # ARCH-ENG-092 F5 (expense side): the two buckets above are only auditable if
+    # something acts on them. `to_usd` fails safe by converting an unmapped
+    # currency to 0.0, which is CORRECT for revenue (it can only reduce a
+    # previously overstated number) but WRONG for an expense: `realized_expense`
+    # then omits a cost that really exists, so `realized_net = gross - expense`
+    # and `roi = net / expense` are both computed against a cost base that is too
+    # small. Zeroing an unmapped EXPENSE therefore RAISES net and ROI — a hidden
+    # cost is presented as free margin.
+    #
+    # This flag is the annotation: True whenever at least one VERIFIED expense
+    # could not be valued, i.e. `realized_expense` is a LOWER BOUND on the real
+    # cost and `realized_net`/`roi` are UPPER BOUNDS that must not be trusted for
+    # ranking or reporting. It is exposed through `to_dict()` and honoured by
+    # `aggregate()`, which refuses to report a net/ROI that silently ignores an
+    # unvalued cost. The supported remedy stays what it always was: add a rate
+    # for the currency (or re-book the evidence in a mapped currency) and the
+    # flag clears itself.
+    has_unconvertible_expense: bool = False
+
     # Profitability
     realized_net: float = 0.0
     roi: float = 0.0               # net / expense (0 if no expense)
@@ -100,6 +127,12 @@ class EconomicProfile:
             "expenses": self.expenses,
             "realized_expense": self.realized_expense,
             "realized_net": self.realized_net,
+            "unconvertible_payment_amounts": dict(self.unconvertible_payment_amounts),
+            "unconvertible_expense_amounts": dict(self.unconvertible_expense_amounts),
+            # F5: surfaced next to the numbers it qualifies. A consumer that
+            # reports `realized_net`/`roi` MUST surface this alongside them —
+            # those figures are upper bounds whenever it is True.
+            "has_unconvertible_expense": self.has_unconvertible_expense,
             "roi": self.roi,
             "net_hourly_rate": self.net_hourly_rate,
             "effort_hours": self.effort_hours,
@@ -138,13 +171,73 @@ _DEFAULT_RATES: Dict[str, float] = {
 }
 
 
-def to_usd(amount: float, currency: str, rates: Optional[Dict[str, float]] = None) -> float:
-    """Convert an amount in `currency` to USD equivalent."""
+# ARCH-ENG-092: `to_usd` used `.get(currency, 1.0)`, so EVERY currency the rate
+# table did not know was valued at exactly 1.0 USD. A 250,000 JPY payout was
+# booked as $250,000 of verified revenue, a 250x overstatement, and so was an
+# empty/None currency (the `Evidence.currency` default is `""`). An unknown
+# currency is an UNKNOWN VALUE, not a USD-denominated one, and inventing a rate
+# is the most expensive guess a financial report can make.
+#
+# FAIL SAFE, and the reason it fails safe this way: an unmapped currency
+# converts to 0.0 USD, so the amount can never enter verified/unverified
+# revenue, realized_gross or realized_net. It is 0.0 rather than None or an
+# exception because EVERY caller feeds the result straight into `sum(...)` /
+# `+=` — `EconomicAccounting.get_profile`, `get_verified_revenue`,
+# `get_total_expenses` and `agents/core/state_reconciliation.py`. Returning
+# None would raise TypeError inside those sums and raising would abort the
+# accounting pass: both trade a wrong number for a crash, which is not an
+# improvement. `is_convertible` is the escape hatch that keeps the money from
+# being silently lost — `get_profile` records unmapped amounts on
+# `unconvertible_payment_amounts` so an operator can see that 250,000 JPY
+# exists and was NOT counted, instead of wondering where it went.
+_UNCONVERTIBLE_USD = 0.0
+
+
+def is_convertible(currency: str, rates: Optional[Dict[str, float]] = None) -> bool:
+    """True iff `currency` has a known USD rate (ARCH-ENG-092).
+
+    An empty/blank currency is NOT convertible: it is an unknown denomination,
+    not a USD one.
+    """
     r = rates or _DEFAULT_RATES
-    return float(amount) * r.get((currency or "usd").lower(), 1.0)
+    key = str(currency or "").strip().lower()
+    return bool(key) and key in r
+
+
+def _record_unconvertible(bucket: Dict[str, float], currency: str, amount: float) -> None:
+    """Accumulate a native, unvalued amount into `bucket` keyed by currency.
+
+    ARCH-ENG-092: the single place that turns "this money exists but cannot be
+    priced" into an auditable fact. Keys are the upper-cased currency code, or
+    ``UNSPECIFIED`` when the evidence carries no currency at all.
+    """
+    key = str(currency or "").strip().upper() or "UNSPECIFIED"
+    bucket[key] = bucket.get(key, 0.0) + float(amount or 0.0)
+
+
+def to_usd(amount: float, currency: str, rates: Optional[Dict[str, float]] = None) -> float:
+    """Convert an amount in `currency` to USD equivalent.
+
+    ARCH-ENG-092: an unmapped/empty/unknown currency yields 0.0 USD (never face
+    value). See the block comment above `_UNCONVERTIBLE_USD` for why this fails
+    safe with 0.0 instead of None/raise, and use :func:`is_convertible` to
+    distinguish "worth nothing" from "not convertible".
+    """
+    r = rates or _DEFAULT_RATES
+    key = str(currency or "").strip().lower()
+    rate = r.get(key)
+    if rate is None:
+        return _UNCONVERTIBLE_USD
+    return float(amount) * float(rate)
 
 
 # Evidence types that represent outgoing costs (expenses).
+# ARCH-ENG-067: the `payment_*` names are what the money evidence producers actually
+# emit — `make_money_evidence_set` (agents/evidence/evidence.py) and the autonomous
+# loop's `_stage_account` both write `payment_fee` / `payment_gas` /
+# `payment_llm_cost` / `payment_other_expense`. None of them was recognised here, so
+# `realized_expense` was always 0.0 and `realized_net` always equalled
+# `verified_revenue` — a $280 fee/gas/LLM bill on a $1000 payout was invisible.
 EXPENSE_EVIDENCE_TYPES = {
     "platform_fee",
     "transaction_fee",
@@ -154,6 +247,10 @@ EXPENSE_EVIDENCE_TYPES = {
     "tool_cost",
     "other_expense",
     "cost",
+    "payment_fee",
+    "payment_gas",
+    "payment_llm_cost",
+    "payment_other_expense",
 }
 
 # Map evidence type → expense category
@@ -166,6 +263,10 @@ EVIDENCE_TYPE_TO_EXPENSE: Dict[str, str] = {
     "tool_cost": ExpenseCategory.TOOL_COST.value,
     "other_expense": ExpenseCategory.OTHER.value,
     "cost": ExpenseCategory.OTHER.value,
+    "payment_fee": ExpenseCategory.PLATFORM_FEE.value,
+    "payment_gas": ExpenseCategory.GAS.value,
+    "payment_llm_cost": ExpenseCategory.LLM_COST.value,
+    "payment_other_expense": ExpenseCategory.OTHER.value,
 }
 
 
@@ -221,9 +322,19 @@ class EconomicAccounting:
         profile.unverified_revenue = sum(
             to_usd(e.amount, e.currency, self.rates) for e in unverified_payments
         )
+        # ARCH-ENG-092: record what could NOT be converted so fail-safe zeroing
+        # is auditable rather than a silent disappearance of real money.
+        for e in payment_evidences:
+            if not is_convertible(e.currency, self.rates):
+                _record_unconvertible(profile.unconvertible_payment_amounts, e.currency, e.amount)
         profile.pending_revenue = sum(
             to_usd(e.amount, e.currency, self.rates) for e in unverified_payments
-            if e.status.value == "unverified"
+            # ARCH-ENG-069: `EvidenceStatus.UNVERIFIED.value` is the UPPERCASE string
+            # "UNVERIFIED", so the old lowercase comparison never matched and
+            # `pending_revenue` was permanently 0.0 — manual/L1 money silently landed
+            # in `unverified_revenue` instead of the "Pending verification" bucket the
+            # design requires.
+            if str(e.status.value).lower() == "unverified"
         )
         profile.realized_gross = profile.verified_revenue
         profile.payment_count = len(payment_evidences)
@@ -235,6 +346,8 @@ class EconomicAccounting:
             cat = EVIDENCE_TYPE_TO_EXPENSE.get(e.evidence_type, ExpenseCategory.OTHER.value)
             amount_usd = to_usd(e.amount, e.currency, self.rates)
             profile.expenses[cat] += amount_usd
+            if not is_convertible(e.currency, self.rates):
+                _record_unconvertible(profile.unconvertible_expense_amounts, e.currency, e.amount)
         profile.realized_expense = sum(profile.expenses.values())
         profile.expense_count = len(verified_expenses)
 
@@ -242,23 +355,44 @@ class EconomicAccounting:
         for e in verified_payments:
             if e.fees:
                 profile.expenses[ExpenseCategory.PLATFORM_FEE.value] += to_usd(e.fees, e.currency, self.rates)
+                if not is_convertible(e.currency, self.rates):
+                    _record_unconvertible(profile.unconvertible_expense_amounts, e.currency, e.fees)
             if e.gas:
                 profile.expenses[ExpenseCategory.GAS.value] += to_usd(e.gas, e.currency, self.rates)
+                if not is_convertible(e.currency, self.rates):
+                    _record_unconvertible(profile.unconvertible_expense_amounts, e.currency, e.gas)
             if e.other_expenses:
                 profile.expenses[ExpenseCategory.OTHER.value] += to_usd(e.other_expenses, e.currency, self.rates)
+                if not is_convertible(e.currency, self.rates):
+                    _record_unconvertible(profile.unconvertible_expense_amounts, e.currency, e.other_expenses)
         profile.realized_expense = sum(profile.expenses.values())
+
+        # ARCH-ENG-092 F5: an unvalued expense makes `realized_expense` a lower
+        # bound, so `realized_net` and `roi` computed from it are upper bounds.
+        # Annotate it so no consumer can present them as trustworthy.
+        profile.has_unconvertible_expense = bool(profile.unconvertible_expense_amounts)
 
         # Net profit
         profile.realized_net = profile.realized_gross - profile.realized_expense
 
         # ROI
-        if profile.realized_expense > 0:
+        # ARCH-ENG-092 F5: `realized_net / realized_expense` is a ratio whose
+        # denominator is known to be too small when any expense is unvalued — the
+        # true cost is >= the booked cost, so the true ROI is <= this number and
+        # could be negative. Publishing it would rank an opportunity whose real
+        # cost is hidden above one whose cost is fully known. 0.0 is the module's
+        # existing "not computable" sentinel (it is what an expense-free profile
+        # reports), so the number stays numeric for `sum()`/`+=` consumers while
+        # no longer being read as a return.
+        if profile.has_unconvertible_expense:
+            profile.roi = 0.0
+        elif profile.realized_expense > 0:
             profile.roi = profile.realized_net / profile.realized_expense
         else:
             profile.roi = 0.0
 
         # Net hourly rate
-        if effort_hours > 0:
+        if effort_hours > 0 and not profile.has_unconvertible_expense:
             profile.net_hourly_rate = profile.realized_net / effort_hours
 
         # Prediction accuracy
@@ -288,6 +422,8 @@ class EconomicAccounting:
                 "roi": 0.0, "net_hourly_rate": 0.0,
                 "avg_revenue_error": 0.0, "avg_effort_error": 0.0,
                 "opportunity_count": 0, "verified_count": 0,
+                "has_unconvertible_expense": False,
+                "unconvertible_expense_amounts": {},
             }
 
         total_advertised = sum(p.advertised_value for p in profiles)
@@ -305,11 +441,32 @@ class EconomicAccounting:
             for cat, amt in p.expenses.items():
                 by_cat[cat] = by_cat.get(cat, 0.0) + amt
 
+        # ARCH-ENG-092 F5: an unvalued expense is a cost that exists but cannot
+        # be priced. Every `realized_net` that excluded it is an UPPER BOUND, so
+        # the portfolio net/ROI built from them is an upper bound too — and the
+        # failure mode of an upper bound on profit is that the bot ranks an
+        # opportunity whose real cost is hidden above one whose cost is known.
+        # Carry the annotation through so a consumer cannot present the totals
+        # as a clean figure, and name the currencies involved.
+        unconvertible_expenses: Dict[str, float] = {}
+        for p in profiles:
+            for cur, amt in (p.unconvertible_expense_amounts or {}).items():
+                unconvertible_expenses[cur] = unconvertible_expenses.get(cur, 0.0) + amt
+        has_unconvertible_expense = bool(unconvertible_expenses)
+
         avg_rev_err = sum(p.revenue_error for p in profiles) / len(profiles)
         avg_eff_err = sum(p.effort_error for p in profiles) / len(profiles)
 
-        roi = (total_net / total_expenses) if total_expenses > 0 else 0.0
-        hourly = (total_net / total_effort) if total_effort > 0 else 0.0
+        # F5: refuse to publish a ratio whose denominator is known to be too
+        # small. When any expense is unvalued the true cost is >= the booked
+        # cost, so the honest ROI is not computable; 0.0 keeps the number from
+        # being read as a return while the raw sums stay visible for an operator.
+        if has_unconvertible_expense:
+            roi = 0.0
+            hourly = 0.0
+        else:
+            roi = (total_net / total_expenses) if total_expenses > 0 else 0.0
+            hourly = (total_net / total_effort) if total_effort > 0 else 0.0
 
         return {
             "total_advertised": total_advertised,
@@ -321,6 +478,9 @@ class EconomicAccounting:
             "total_effort_hours": total_effort,
             "roi": roi,
             "net_hourly_rate": hourly,
+            # F5: the cost base for the above is incomplete; these say so.
+            "has_unconvertible_expense": has_unconvertible_expense,
+            "unconvertible_expense_amounts": unconvertible_expenses,
             "avg_revenue_error": avg_rev_err,
             "avg_effort_error": avg_eff_err,
             "opportunity_count": len(profiles),
@@ -368,6 +528,7 @@ __all__ = [
     "EconomicProfile",
     "EconomicAccounting",
     "to_usd",
+    "is_convertible",
     "PAYMENT_EVIDENCE_TYPES",
     "EXPENSE_EVIDENCE_TYPES",
     "EVIDENCE_TYPE_TO_EXPENSE",

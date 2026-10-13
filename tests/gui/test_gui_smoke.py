@@ -192,10 +192,25 @@ def test_management_tab_builds(qt_app):
     # N-brain: one name field per enabled device (>= the two primary personas).
     edits = getattr(tab, "_persona_name_edits", [])
     assert len(edits) >= 2
-    # Slots 0/1 persist to the legacy persona-name keys.
+    # Slots 0/1 persist to the legacy persona-name keys — but only when that
+    # slot actually holds the matching TIER. Tier comes from live capability,
+    # not from the slot number: on a box whose CPU/RAM pool is big-class
+    # (>= 12 GB system RAM) slot 1 hosts a BIG-tier brain, so it persists to
+    # BRAIN_SLOT1_NAME and the SMALL_BRAIN_NAME persona simply does not exist.
+    # Asserting SMALL_BRAIN_NAME unconditionally made this test pass or fail
+    # purely on the machine's RAM (ARCH-ENG-059).
+    from agents.runtime import device_registry as dr
+    from agents.cognition.speaker_registry import build_speakers
+    speakers = build_speakers(dr.brain_placements(dr.resolve_assignments(
+        dr.detect_devices(include_cpu=True), dr.load_policy())))
+    by_slot = {s.slot: s for s in speakers}
     keys = {slot: key for slot, key, _ in edits}
-    assert keys.get(0) == "BIG_BRAIN_NAME"
-    assert keys.get(1) == "SMALL_BRAIN_NAME"
+    if by_slot.get(1) is not None and by_slot[1].tier == "small":
+        assert keys.get(0) == "BIG_BRAIN_NAME"
+        assert keys.get(1) == "SMALL_BRAIN_NAME"
+    else:
+        assert keys.get(0) == "BIG_BRAIN_NAME"
+        assert keys.get(1) == "BRAIN_SLOT1_NAME"
     assert tab.request_run_cycle is not None
     assert tab.request_force_improve is not None
     assert tab.request_force_rescan is not None

@@ -306,6 +306,38 @@ def validate_model(path: str) -> list[str]:
     return []
 
 
+# Architectures this llama.cpp line is known to accept (gathered from the
+# models that load on this box + llama.cpp's registry). Used ONLY for a SOFT
+# warning — never a hard block, so a llama.cpp update that adds a new arch is
+# not falsely rejected. An unknown arch simply means "this build may not load
+# it"; the operator can still try.
+KNOWN_ARCHITECTURES = {
+    "llama", "qwen2", "qwen3", "qwen3_8", "qwen3_6", "qwen35", "qwen35moe",
+    "qwen3moe", "gemma", "gemma2", "gemma3", "gemma4", "phi3", "phi4",
+    "mistral", "mistral3", "mixtral", "falcon", "starcoder", "starcoder2",
+    "deepseek", "deepseek2", "deepseek_v2", "deepseek_v3", "nemotron",
+    "nemotron_h", "nemotron_h_moe", "glm", "glm4", "glm4_moe", "lfm", "lfm2",
+    "granitehybrid", "mamba", "rwkv6", "plm", "baichuan", "internlm2",
+    "minicpm", "command-r", "cohere", "jamba", "zamba2", "grovemoe",
+    "chameleon", "arctic", "persimmon", "refact", "bert", "nomic-bert",
+    "stablelm", "orca", "bloom", "gpt2", "gptj", "gptneox", "mpt", "dbrx",
+    "olmo", "olmo2", "olmoe", "granite", "granitemoe", "exaone", "dots1",
+}
+
+
+def detect_arch(path: str) -> str:
+    """Return the GGUF's architecture string ("" if unreadable)."""
+    return str(read_header_metadata(path).get("general.architecture", "") or "")
+
+
+def arch_supported(path: str) -> bool:
+    """True if the model's arch is in the known-supported set (soft check)."""
+    arch = detect_arch(path)
+    if not arch:
+        return True  # unreadable handled elsewhere; don't double-warn
+    return arch.lower() in KNOWN_ARCHITECTURES
+
+
 def estimate_vram_gb(path: str, context: int = 8192,
                      kv_type_bytes: int = 2) -> Dict[str, Any]:
     """Estimate a model's VRAM footprint.

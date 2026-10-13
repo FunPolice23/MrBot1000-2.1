@@ -321,6 +321,44 @@ class ChatTab(QWidget):
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def cleanup(self):
+        """Stop chat background workers before this tab is destroyed.
+
+        v2.1.61 (ARCH-ENG-074): the Chat tab runs InferenceWorker/EscalationWorker
+        QThreads that make long provider HTTP calls (the 27B Big Brain). On window
+        close mid-generation those workers are still running; their queued
+        `finished`/`big_done`/`small_summary`/`failed`/`exchange_complete` signals
+        land on widgets being torn down and dereference dead C++ objects, aborting
+        the interpreter (python.exe Qt6Core.dll 0xc0000409). Disconnect the
+        workers' signals here (the same disconnect-before-destroy treatment
+        main.py gives the manager threads) so a late emission is harmless. Do NOT
+        terminate() — a thread blocked in socket I/O corrupts the process; a
+        disconnected worker that outlives teardown is reaped at process exit.
+        Idempotent and never raises, matching the cleanup() contract main.py
+        expects. (The main.py orphan sweep also disconnects, but this makes the
+        intent explicit and covers tabs built after that sweep ran.)
+        """
+        for attr in ("worker", "escalation_worker"):
+            worker = getattr(self, attr, None)
+            if worker is None:
+                continue
+            try:
+                for sig_name in ("finished", "big_done", "small_summary", "failed"):
+                    sig = getattr(worker, sig_name, None)
+                    if sig is not None:
+                        try:
+                            sig.disconnect()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Best-effort graceful stop; never terminate (socket-blocked threads).
+            try:
+                if hasattr(worker, "requestInterruption"):
+                    worker.requestInterruption()
+            except Exception:
+                pass
+
 
 class InferenceWorker(QThread):
     """Background worker for running LLM inference without blocking GUI."""

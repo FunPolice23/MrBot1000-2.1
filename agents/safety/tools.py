@@ -194,13 +194,48 @@ def get_all_tools() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "query_db",
-                "description": "Run a read-only SQL query against the local database.",
+                "description": "Run a read-only SQL query against an allowlisted local database (default: agent).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "sql": {"type": "string", "description": "SELECT-only SQL query"}
+                        "sql": {"type": "string", "description": "SELECT-only SQL query"},
+                        "db": {"type": "string", "description": "Store name: agent (default) | earning | memory | portfolio | autonomous_runs | goals | job_search | dual_brain"},
+                        "limit": {"type": "integer", "description": "Max rows (default 50, max 500)"}
                     },
                     "required": ["sql"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "record_payment",
+                "description": "Record a verified payment against an opportunity. HIGH-TRUST: requires an approved approval_id; never invents an amount.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "opportunity_id": {"type": "string"},
+                        "amount": {"type": "number", "description": "Positive payout amount (from the human/evidence, never invented)"},
+                        "evidence_ref": {"type": "string", "description": "Payment reference / evidence id"},
+                        "approval_id": {"type": "string", "description": "APPROVED approval item id (required)"}
+                    },
+                    "required": ["opportunity_id", "amount", "approval_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "social_post",
+                "description": "Post content to a social/agent network. HIGH-TRUST: requires an approved approval_id and a confirmed write endpoint; never fabricates a post.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "network": {"type": "string", "description": "Target network (e.g. moltbook)"},
+                        "content": {"type": "string"},
+                        "approval_id": {"type": "string", "description": "APPROVED approval item id (required)"}
+                    },
+                    "required": ["network", "content", "approval_id"]
                 }
             }
         },

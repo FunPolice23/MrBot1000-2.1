@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QTreeView, QVBoxLayout, QWidget, QAbstractItemView,
 )
 
-from gui.builders.tab_workers import DataExplorerWorker, LivePortfolioWorker, SocialDiscoveryWorker
+from gui.builders.tab_workers import DataExplorerWorker, LivePortfolioWorker, SocialDiscoveryWorker, MoltbookFeedWorker
 from app.ui import AgentSprite, AgentsTab
 
 
@@ -216,6 +216,17 @@ class FeatureTabBuildersMixin:
         """Create the Safety & Tools tab."""
         from gui.tabs.safety_tools_tab import SafetyTab
         self.safety_tools_tab = SafetyTab(parent=self)
+        # Hand the tab a real guard when one exists. Without this the tab
+        # permanently took its `approval_queue` fallback and never saw a
+        # SafetyGuard-queued item. Since HumanApprovalLayer now mirrors into
+        # HumanApprovalQueue, the fallback is correct either way — this only
+        # makes the guard-sourced view available where a guard is wired.
+        guard = getattr(self, "safety_guard", None)
+        if guard is None:
+            earning = getattr(self, "_earning_tab", None)
+            guard = getattr(earning, "safety_guard", None) if earning else None
+        if guard is not None:
+            self.safety_tools_tab.safety_guard = guard
         return self.safety_tools_tab
 
     def create_collaboration_tab(self):
@@ -556,6 +567,24 @@ class FeatureTabBuildersMixin:
             w = QWidget()
             lay = QVBoxLayout(w)
             lay.addWidget(QLabel(f"Approval queue unavailable: {e}"))
+            return w
+
+    def create_registration_tab(self):
+        """Gated platform sign-up panel (Phase B)."""
+        try:
+            from gui.panels.registration_panel import RegistrationPanel
+            from agents.safety.approval import HumanApprovalQueue
+
+            panel = RegistrationPanel(
+                parent=self,
+                approval_queue=HumanApprovalQueue.instance(),
+            )
+            self._registration_panel = panel
+            return panel
+        except Exception as e:
+            w = QWidget()
+            lay = QVBoxLayout(w)
+            lay.addWidget(QLabel(f"Registration unavailable: {e}"))
             return w
 
     def create_logs_tab(self):
@@ -984,6 +1013,87 @@ class FeatureTabBuildersMixin:
             worker.start()
 
         scan_button.clicked.connect(scan)
+
+        # ── Moltbook live feed + gated posting (Phase E, ARCH-ENG-088) ──
+        # Agents and the human can both SEE the moltbook feed here, and the
+        # agent can post/respond — but only through an approved approval item
+        # (the social_post tool enforces the gate; a pending post is never
+        # shown as sent).
+        mb_row = QHBoxLayout()
+        mb_load = QPushButton("🦞 Load Moltbook Feed")
+        mb_load.setToolTip(
+            "Read the live Moltbook feed (needs MOLTBOOK_API_KEY). Read-only.")
+        mb_post = QPushButton("✍️ Post to Moltbook…")
+        mb_post.setToolTip(
+            "Draft a post/response. Opens a human approval first; the agent "
+            "only posts after it is approved (social_post tool).")
+        mb_row.addWidget(mb_load)
+        mb_row.addWidget(mb_post)
+        mb_row.addStretch(1)
+        widget.layout().insertLayout(3, mb_row)
+
+        mb_box = QGroupBox("Moltbook Activity (posts + our responses)")
+        mb_lay = QVBoxLayout(mb_box)
+        mb_table = QTableWidget()
+        mb_table.setColumnCount(5)
+        mb_table.setHorizontalHeaderLabels(
+            ["Submolt", "Title", "Author", "Preview", "Link"])
+        mb_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        mb_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        mb_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        mb_lay.addWidget(mb_table)
+        widget.layout().insertWidget(4, mb_box)
+        holder["mb_table"] = mb_table
+        holder["mb_load"] = mb_load
+        holder["mb_post"] = mb_post
+
+        def mb_feed_finished(result):
+            mb_load.setEnabled(True)
+            status = holder["widget"]._feature_status
+            if not result.get("ok"):
+                status.setText(f"Moltbook feed: {result.get('error', 'unavailable')}")
+                mb_table.setRowCount(0)
+                holder.pop("mb_worker", None)
+                return
+            rows = result.get("rows", [])
+            mb_table.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                for c, val in enumerate((row["submolt"], row["title"],
+                                         row["author"], row["preview"],
+                                         row["url"])):
+                    mb_table.setItem(r, c, QTableWidgetItem(val))
+            status.setText(f"Moltbook feed: {len(rows)} posts (read-only view)")
+
+        def mb_load_feed():
+            mb_load.setEnabled(False)
+            holder["widget"]._feature_status.setText("Loading Moltbook feed…")
+            worker = MoltbookFeedWorker(sort="hot", limit=25)
+            holder["mb_worker"] = worker
+            worker.finished.connect(mb_feed_finished)
+            worker.start()
+
+        mb_load.clicked.connect(mb_load_feed)
+
+        def mb_start_post():
+            # Route through the approval queue first. social_post only fires
+            # once the item is APPROVED — a pending draft is never a sent post.
+            try:
+                from agents.safety.approval import HumanApprovalQueue
+                item = HumanApprovalQueue.instance().enqueue_submission(
+                    "Post to Moltbook",
+                    "Draft a post/response for the Moltbook social network. "
+                    "Approve to let the agent publish it via the social_post "
+                    "tool; the post will still require Moltbook's verification "
+                    "challenge to become visible.")
+                holder["widget"]._feature_status.setText(
+                    f"Moltbook post queued for approval (id {item.id}); "
+                    "it posts only after you approve it.")
+            except Exception as exc:
+                holder["widget"]._feature_status.setText(
+                    f"Could not queue Moltbook post: {exc}")
+
+        mb_post.clicked.connect(mb_start_post)
+
         refresh()
         return widget
 
@@ -1148,9 +1258,65 @@ class FeatureTabBuildersMixin:
     def create_autonomous_learning_tab(self):
         """Show autonomous run and stage progress from the durable run store."""
         db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "autonomous_runs.db")
+        portfolio_path = os.path.join(os.path.dirname(db_path), "opportunity_portfolio.db")
         holder = {}
         _QUERY = ("SELECT run_id, opportunity_id, status, success, updated_at, decision_reason "
                   "FROM autonomous_runs ORDER BY updated_at DESC LIMIT 100")
+
+        def _feedback_summary() -> str:
+            """Per-platform outcome summary from recorded runs (Phase C).
+
+            Read-only aggregation over the run store joined to the portfolio's
+            platform. Runs off the GUI thread (called from apply via the worker
+            path); returns '' when unavailable so the tab degrades gracefully.
+            """
+            try:
+                import sqlite3
+                from agents.earning.strategy_feedback import StrategyFeedback
+
+                class _Store:
+                    def list_runs(self, limit=100):
+                        if not os.path.exists(db_path):
+                            return []
+                        with sqlite3.connect(db_path) as conn:
+                            conn.row_factory = sqlite3.Row
+                            rows = conn.execute(
+                                "SELECT opportunity_id, success, paid, payment_amount, "
+                                "decision FROM autonomous_runs "
+                                "ORDER BY updated_at DESC LIMIT ?", (limit,))
+                            return [dict(r) for r in rows]
+
+                def _resolve(opportunity_id: str) -> str:
+                    if not opportunity_id or not os.path.exists(portfolio_path):
+                        return ""
+                    try:
+                        with sqlite3.connect(portfolio_path) as conn:
+                            row = conn.execute(
+                                "SELECT platform FROM opportunity_portfolio "
+                                "WHERE opportunity_id = ?", (opportunity_id,)).fetchone()
+                            return (row[0] or "") if row else ""
+                    except Exception:
+                        return ""
+
+                fb = StrategyFeedback(_Store(), _resolve)
+                lines = fb.summary_lines()
+                if not lines:
+                    return ""
+                return "Strategy feedback (recorded outcomes): " + " | ".join(lines)
+            except Exception:
+                return ""
+
+        def _compute_feedback_async():
+            """Compute the per-platform feedback summary OFF the GUI thread and
+            cache it for apply() to read (never blocks the 5s poll)."""
+            import threading
+
+            def _work():
+                summary = _feedback_summary()
+                holder["feedback"] = summary
+
+            t = threading.Thread(target=_work, daemon=True)
+            t.start()
 
         def apply(rows, error):
             # Runs on the GUI thread (worker callback) — safe to touch widgets.
@@ -1176,9 +1342,15 @@ class FeatureTabBuildersMixin:
                     next_action = "Next action: verify payment evidence before treating the run as successful."
                 else:
                     next_action = "Next action: run the next eligible opportunity through evaluation."
+            # Use the cached (off-thread-computed) feedback; kick off a refresh
+            # for the next poll if it isn't ready yet.
+            feedback = holder.get("feedback") or ""
+            if not feedback:
+                _compute_feedback_async()
+            suffix = ("  " + feedback) if feedback else ""
             status.setText(
                 f"{len(rows)} durable autonomous runs; {next_action} "
-                "Learning cannot bypass evidence or authorization.")
+                "Learning cannot bypass evidence or authorization." + suffix)
 
         def refresh():
             # Run the SQLite read off the GUI thread so the tab never freezes
@@ -1964,6 +2136,48 @@ class FeatureTabBuildersMixin:
         llml.addRow(winrate_note)
         lay.addWidget(llmg)
 
+        # ── Provider Rate & Budget (Phase F, ARCH-ENG-091) ──
+        # Per-provider calls/sec + daily call cap so a cloud subscription/budget
+        # isn't burned too fast. Local providers are hardware-bound (no $ cap
+        # unless the operator opts in). Values persist via save_settings and the
+        # runtime reads <PROVIDER>_RATE_PER_SEC / <PROVIDER>_MAX_CALLS_PER_DAY.
+        from agents.safety.provider_rate_limiter import is_local_provider
+        prg = QGroupBox("Provider Rate & Budget")
+        prl_box = QFormLayout(prg)
+        prl_box.setContentsMargins(12, 12, 12, 12)
+        prl_box.setVerticalSpacing(8)
+        self._provider_rate_edits = {}
+        self._provider_cap_edits = {}
+        _PROVIDERS = ("openai", "anthropic", "groq", "openrouter", "nous",
+                      "deepseek", "gemini", "mistral", "ollama")
+        for prov in _PROVIDERS:
+            up = prov.upper()
+            rate_edit = QLineEdit()
+            rate_edit.setPlaceholderText("calls/sec")
+            cur_rate = os.getenv(f"{up}_RATE_PER_SEC", "").strip()
+            rate_edit.setText(cur_rate if cur_rate else
+                              ("2.0" if is_local_provider(prov) else "1.0"))
+            cap_edit = QLineEdit()
+            cap_edit.setPlaceholderText("0 = unlimited")
+            cur_cap = os.getenv(f"{up}_MAX_CALLS_PER_DAY", "").strip()
+            cap_edit.setText(cur_cap if cur_cap else
+                             ("0" if is_local_provider(prov) else "500"))
+            tag = " (local, hardware-bound)" if is_local_provider(prov) else ""
+            prl_box.addRow(f"{prov}{tag} — rate/sec:", rate_edit)
+            prl_box.addRow(f"{prov} — max calls/day:", cap_edit)
+            self._provider_rate_edits[up] = rate_edit
+            self._provider_cap_edits[up] = cap_edit
+        prb_note = QLabel(
+            "Per-provider rate limit (calls/sec) and daily call cap. Cloud "
+            "providers are capped by default so a budget lasts; local providers "
+            "are hardware-bound (0 = unlimited) unless you set a cap. Over-limit "
+            "calls are refused and the bot falls back to the next provider.")
+        prb_note.setWordWrap(True)
+        prb_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
+        self._themeable.append((prb_note, "caption", "font-size:10px;padding-top:3px;"))
+        prl_box.addRow(prb_note)
+        lay.addWidget(prg)
+
         # ── Model Info (relocated from the removed "Model & GPU" tab) ──
         infog = QGroupBox("Model Info")
         infol = QVBoxLayout(infog)
@@ -2052,6 +2266,20 @@ class FeatureTabBuildersMixin:
             int(os.getenv("MRBOT_SELF_IMPROVE_MONITOR_MINUTES", "30")))
         self.self_improve_monitor_spin.setSuffix(" min")
         featurel.addRow("Self-improve monitor interval:", self.self_improve_monitor_spin)
+
+        # Web discovery opt-in (Phase E, ARCH-ENG-087). Enables the generic web
+        # discovery source (ddgs/tavily/brave) for real feed/web search. OFF by
+        # default (human-review-gated). This mirrors the toggle in the
+        # Opportunities tab; both persist ALLOW_WEB_DISCOVERY to .env and the
+        # runtime reads that env in agents/discovery/web_discovery.py.
+        web_on = os.getenv("ALLOW_WEB_DISCOVERY", "false").lower() in ("1", "true", "yes")
+        self.settings_web_discovery_check = QCheckBox()
+        self.settings_web_discovery_check.setChecked(web_on)
+        self.settings_web_discovery_check.setToolTip(
+            "Enable the generic web discovery source (ddgs/tavily/brave) for "
+            "real web/feed discovery. Persists ALLOW_WEB_DISCOVERY to .env. "
+            "Also available in the Opportunities tab.")
+        featurel.addRow("Enable web discovery:", self.settings_web_discovery_check)
 
         feature_note = QLabel(
             "Disabled features do not load their optional adapters. Saving a "

@@ -16,6 +16,7 @@ vetoing means the action is blocked.
 import time
 import logging
 import threading
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, Any
 from enum import Enum
@@ -127,26 +128,52 @@ class CostGuardLayer(SafetyLayer):
 
 
 class RecursionDetectorLayer(SafetyLayer):
-    """Detects and blocks recursive loops."""
-    
+    """Detects and blocks recursive loops.
+
+    Two distinct rules, and they need two distinct histories:
+
+    * DEPTH — how many calls are in flight *right now*. This is genuine
+      nesting, so ``check`` pushes and ``SafetyGuard.check`` pops when the
+      action returns.
+    * REPEATS — how many *identical* calls happened recently in sequence.
+      This is temporal, not nested, so it must survive the pop.
+
+    Both used to read one ``_call_stack`` that nothing ever popped, which
+    coupled them wrongly in both directions. Reproduced before the fix: 11
+    *distinct* submissions on one long-lived ``SafetyGuard()`` returned
+    ``block / "Call depth exceeded: 10/10"`` — ordinary sequential work
+    refused as a recursion loop, because the depth stack only ever grew.
+    Naively adding the pop instead silently disabled the repeat rule (a pop
+    after every check leaves nothing for it to count). Hence the split: the
+    depth stack is bracketed and self-balancing, and repeats are counted from
+    a separate bounded history of completed calls.
+    """
+
     name = "recursion_detector"
     priority = 90
-    
+
     def __init__(self, config: Dict = None):
         super().__init__(config)
         self.max_depth = self.config.get("max_depth", 10)
         self.timeout = self.config.get("timeout", 30)
+        self.repeat_threshold = self.config.get("repeat_threshold", 3)
+        self.repeat_window = self.config.get("repeat_window", 5)
+        # Live nesting depth. Bracketed by SafetyGuard.check (push in check,
+        # pop when the action returns).
         self._call_stack: List[Dict] = []
+        # Completed calls, oldest first, pruned to the timeout window. This is
+        # what the repeat rule counts; it deliberately outlives the pop.
+        self._recent: List[Dict] = []
         self._lock = threading.Lock()
-    
+
     def check(self, action: SafetyAction) -> Optional[SafetyResult]:
         if not self.enabled:
             return None
-        
+
         with self._lock:
             now = time.time()
-            
-            # Check depth
+
+            # Check depth (concurrent nesting)
             if len(self._call_stack) >= self.max_depth:
                 return SafetyResult(
                     allowed=False,
@@ -156,10 +183,16 @@ class RecursionDetectorLayer(SafetyLayer):
                     layer=self.name,
                     suggested_action="Break the recursion loop or reduce depth"
                 )
-            
-            # Check for repeated calls with same args (pattern detection)
-            recent = [c for c in self._call_stack[-5:] if c["name"] == action.name]
-            if len(recent) >= 3:
+
+            # Check for repeated calls with same args (pattern detection).
+            # Counted over recent COMPLETED calls, so it still fires for a
+            # sequential loop — the case it exists for — without being
+            # disabled by the depth pop.
+            self._recent = [c for c in self._recent
+                            if now - c["timestamp"] <= self.timeout]
+            recent = [c for c in self._recent[-self.repeat_window:]
+                      if c["name"] == action.name]
+            if len(recent) >= self.repeat_threshold:
                 return SafetyResult(
                     allowed=False,
                     level=SafetyLevel.BLOCK,
@@ -168,7 +201,7 @@ class RecursionDetectorLayer(SafetyLayer):
                     layer=self.name,
                     suggested_action="Stop repeated calls or change parameters"
                 )
-            
+
             # Check timeout
             if self._call_stack:
                 elapsed = now - self._call_stack[-1]["timestamp"]
@@ -181,25 +214,33 @@ class RecursionDetectorLayer(SafetyLayer):
                         layer=self.name,
                         suggested_action="Reduce operation complexity or increase timeout"
                     )
-            
+
             # Push current call
-            self._call_stack.append({
+            entry = {
                 "name": action.name,
                 "timestamp": now,
                 "action": action.action_type,
-            })
-            
+            }
+            self._call_stack.append(entry)
+
             return None
-    
+
     def pop(self):
-        """Pop the last call from the stack."""
+        """Retire the last in-flight call, recording it for the repeat rule."""
         with self._lock:
-            if self._call_stack:
-                self._call_stack.pop()
-    
+            if not self._call_stack:
+                return
+            entry = self._call_stack.pop()
+            # Keep the repeat window bounded; a long session must not grow
+            # without limit.
+            if len(self._recent) >= self.repeat_window * 4:
+                self._recent = self._recent[-(self.repeat_window * 2):]
+            self._recent.append(entry)
+
     def reset(self):
         with self._lock:
             self._call_stack = []
+            self._recent = []
 
 
 class ToolFirewallLayer(SafetyLayer):
@@ -267,14 +308,24 @@ class HumanApprovalLayer(SafetyLayer):
     def __init__(self, config: Dict = None):
         super().__init__(config)
         self.threshold_usd = self.config.get("threshold_usd", 50.0)
-        self.pending_approvals: List[Dict] = []
+        # approval_id -> the legacy pending dict (carries the SafetyAction).
+        # The DECISION lives in HumanApprovalQueue; this map only remembers
+        # which queued items this layer asked for, so get_pending() can scope
+        # itself to its own requests instead of reporting the whole queue.
+        self._owned: Dict[str, Dict] = {}
+        self._owned_max = self.config.get("owned_max", 256)
         self._lock = threading.Lock()
         self._callback = None
-    
+
     def set_approval_callback(self, callback: Callable):
         """Set callback for when human approves/rejects."""
         self._callback = callback
-    
+
+    @property
+    def pending_approvals(self) -> List[Dict]:
+        """Back-compat view of this layer's still-pending requests."""
+        return self.get_pending()
+
     def check(self, action: SafetyAction) -> Optional[SafetyResult]:
         if not self.enabled:
             return None
@@ -291,30 +342,52 @@ class HumanApprovalLayer(SafetyLayer):
             needs_approval = True
             reasons.append(f"Estimated cost ${action.estimated_cost:.2f} >= threshold ${self.threshold_usd:.2f}")
         
-        # Platform-specific high-trust actions
+        # Platform-specific high-trust actions. The identity of the action may
+        # arrive in EITHER field: ``agents.earning.platform_submitter`` and
+        # ``agents.earning.real_crypto_operator`` both put the verb in
+        # ``action_type`` and a descriptive label in ``name``. Matching only
+        # ``name`` let a real submission request read as ``allow`` and
+        # auto-approve an irreversible action. The two vocabularies do not
+        # overlap (production action_types are tool_call/api_call/llm_call plus
+        # these verbs), so checking both fields cannot misfire.
         high_trust_actions = {
             "submit_proposal", "post_comment", "send_message",
             "create_pr", "create_issue", "send_payment"
         }
-        if action.name in high_trust_actions:
+        high_trust_hit = action.name in high_trust_actions or action.action_type in high_trust_actions
+        if high_trust_hit:
             needs_approval = True
-            reasons.append(f"'{action.name}' is a high-trust action")
+            label = action.name if action.name in high_trust_actions else action.action_type
+            reasons.append(f"'{label}' is a high-trust action")
         
         if not needs_approval:
             return None
-        
-        # Queue for human approval
+
+        # Queue for human approval. The authoritative queue is
+        # HumanApprovalQueue — the one the GUI Approvals panel and
+        # safety_tools_tab actually read. This layer used to keep its own
+        # private list, so a submission it flagged appeared NOWHERE the
+        # operator could approve it: the Approvals panel showed "No pending
+        # approvals" while the submitter waited forever. Reproduced:
+        # guard.check(submit_proposal) -> guard pending=1, queue pending=0.
+        approval_id = f"approval_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+        record = {
+            "id": approval_id,
+            "action": action,
+            "reasons": reasons,
+            "requested_at": time.time(),
+            "status": "pending",
+        }
+        queued = self._enqueue_to_shared_queue(approval_id, action, reasons)
         with self._lock:
-            approval_id = f"approval_{int(time.time()*1000)}"
-            approval = {
-                "id": approval_id,
-                "action": action,
-                "reasons": reasons,
-                "requested_at": time.time(),
-                "status": "pending",
-            }
-            self.pending_approvals.append(approval)
-        
+            self._owned[approval_id] = record
+            self._prune_owned_locked()
+            if not queued:
+                # Queue unavailable: keep the local record so the request is
+                # still visible to get_pending()/approve()/reject() rather
+                # than silently vanishing.
+                pass
+
         return SafetyResult(
             allowed=False,
             level=SafetyLevel.WARN,
@@ -323,33 +396,174 @@ class HumanApprovalLayer(SafetyLayer):
             layer=self.name,
             suggested_action=f"Approve or reject approval ID: {approval_id}"
         )
-    
+
+    def _enqueue_to_shared_queue(self, approval_id: str, action: SafetyAction,
+                                 reasons: List[str]) -> bool:
+        """Mirror this request into HumanApprovalQueue. Best-effort.
+
+        Returns True when the item reached the shared queue. A failure here
+        must not lose the request, so the caller keeps its local record.
+        """
+        try:
+            from agents.safety.approval import (
+                ApprovalItem,
+                ApprovalKind,
+                HumanApprovalQueue,
+            )
+            kind = ApprovalKind.ACTION
+            verb = action.action_type if action.action_type in (
+                "submit_proposal", "post_comment", "create_pr", "create_issue",
+                "send_message") else ""
+            if verb == "submit_proposal":
+                kind = ApprovalKind.SUBMISSION
+            elif action.action_type == "send_payment" or action.requires_funds:
+                kind = ApprovalKind.PAYMENT
+            item = ApprovalItem(
+                id=approval_id,
+                kind=kind,
+                title=f"{action.action_type}: {action.name}",
+                description="; ".join(reasons),
+                requested_by="safety_guard",
+                details={
+                    "action_type": action.action_type,
+                    "name": action.name,
+                    "platform": action.platform,
+                    "arguments": dict(action.arguments or {}),
+                    "reasons": list(reasons),
+                    "estimated_cost": action.estimated_cost,
+                },
+                payload={
+                    "action_type": action.action_type,
+                    "name": action.name,
+                    "arguments": dict(action.arguments or {}),
+                    "platform": action.platform,
+                },
+            )
+            enqueued = HumanApprovalQueue.instance().enqueue(item)
+            # enqueue() reassigns the id when it collides with an existing
+            # item. Using the returned id keeps _owned and the queue keyed
+            # identically; ignoring it would silently desync them.
+            if enqueued.id != approval_id:
+                with self._lock:
+                    self._owned.pop(approval_id, None)
+                return False
+            return True
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("SafetyGuard could not enqueue approval: %s", exc)
+            return False
+
+    def _prune_owned_locked(self):
+        """Drop decided records so _owned cannot grow without bound.
+
+        The Earning tab holds one process-lifetime guard and the Safety & Tools
+        tab polls get_pending() on a timer, so an ever-growing map of decided
+        requests would be walked on every refresh forever.
+
+        Only DECIDED records are dropped. A PENDING one is never pruned: it is
+        an approval request a human has not answered yet, and losing it would
+        lose the request itself. A long run of genuinely unanswered requests is
+        therefore expected to grow the map — that is correct, not a leak.
+        """
+        if len(self._owned) <= self._owned_max:
+            return
+        stale = [k for k, v in self._owned.items()
+                 if v.get("status") != "pending"]
+        for key in stale[:len(self._owned) - self._owned_max]:
+            self._owned.pop(key, None)
+
     def approve(self, approval_id: str) -> bool:
         """Approve a pending action."""
         with self._lock:
-            for approval in self.pending_approvals:
-                if approval["id"] == approval_id:
-                    approval["status"] = "approved"
-                    if self._callback:
-                        self._callback(approval, True)
-                    return True
-        return False
-    
+            record = self._owned.get(approval_id)
+            if record is None or record.get("status") != "pending":
+                return False
+            record["status"] = "approved"
+        decided = self._decide_in_shared_queue(approval_id, approved=True)
+        if not decided:
+            # The queue did not record the decision. Roll the local state back
+            # so a caller that ignores the return value cannot mistake a failed
+            # write for a human approval, and do not fire the callback.
+            with self._lock:
+                if record.get("status") == "approved":
+                    record["status"] = "pending"
+            return False
+        if self._callback:
+            try:
+                self._callback(record, True)
+            except Exception as exc:
+                logger.error("approval callback failed: %s", exc)
+        return True
+
     def reject(self, approval_id: str) -> bool:
         """Reject a pending action."""
         with self._lock:
-            for approval in self.pending_approvals:
-                if approval["id"] == approval_id:
-                    approval["status"] = "rejected"
-                    if self._callback:
-                        self._callback(approval, False)
-                    return True
-        return False
-    
+            record = self._owned.get(approval_id)
+            if record is None or record.get("status") != "pending":
+                return False
+            record["status"] = "rejected"
+        decided = self._decide_in_shared_queue(approval_id, approved=False)
+        if not decided:
+            with self._lock:
+                if record.get("status") == "rejected":
+                    record["status"] = "pending"
+            return False
+        if self._callback:
+            try:
+                self._callback(record, False)
+            except Exception as exc:
+                logger.error("rejection callback failed: %s", exc)
+        return True
+
+    def _decide_in_shared_queue(self, approval_id: str, approved: bool) -> bool:
+        """Record the human's decision in the shared queue, if we mirrored it."""
+        try:
+            from agents.safety.approval import HumanApprovalQueue
+            queue = HumanApprovalQueue.instance()
+            item = queue.find_by_id(approval_id)
+            if item is None:
+                return False
+            if approved:
+                return queue.approve(approval_id, notes="Approved via SafetyGuard")
+            return queue.deny(approval_id, notes="Rejected via SafetyGuard")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("SafetyGuard could not record decision: %s", exc)
+            return False
+
     def get_pending(self) -> List[Dict]:
-        """Get all pending approvals."""
+        """Get all pending approvals.
+
+        Sourced from HumanApprovalQueue (the operator-visible queue) and
+        scoped to the requests this layer raised, so the legacy dict shape
+        callers depend on is preserved while the decision state stays in one
+        place.
+        """
+        try:
+            from agents.safety.approval import (
+                ApprovalStatus,
+                HumanApprovalQueue,
+            )
+            queue = HumanApprovalQueue.instance()
+            by_id = {i.id: i for i in queue.all()}
+        except Exception:
+            by_id = {}
         with self._lock:
-            return [a for a in self.pending_approvals if a["status"] == "pending"]
+            owned = list(self._owned.items())
+        pending: List[Dict] = []
+        for approval_id, record in owned:
+            if record.get("status") != "pending":
+                continue
+            item = by_id.get(approval_id)
+            if item is not None and item.status != ApprovalStatus.PENDING:
+                # Decided in the GUI queue: mirror it back so a second
+                # approve() cannot run the same action twice.
+                record["status"] = ("approved"
+                                    if item.status == ApprovalStatus.APPROVED
+                                    else "rejected")
+                continue
+            pending.append(record)
+        if len(self._owned) > self._owned_max:
+            self._prune_owned_locked()
+        return pending
 
 
 class RateLimiterLayer(SafetyLayer):
@@ -465,8 +679,6 @@ class SafetyGuard:
         for layer in self.layers:
             try:
                 result = layer.check(action)
-                if result is not None:
-                    return result
             except Exception as e:
                 logger.error(f"Safety layer '{layer.name}' error: {e}")
                 # Fail safe: block on layer error
@@ -478,7 +690,22 @@ class SafetyGuard:
                     layer=layer.name,
                     suggested_action="Review safety configuration"
                 )
-        
+            finally:
+                # The recursion detector models NESTED depth: check() pushes,
+                # and the caller must pop. Nothing outside the layer ever
+                # called pop(), so on a long-lived guard the stack only grew
+                # and every later action was refused as a recursion loop
+                # ("Call depth exceeded: 10/10"). Bracketing the call here
+                # makes the layer self-balancing regardless of caller.
+                pop = getattr(layer, "pop", None)
+                if callable(pop):
+                    try:
+                        pop()
+                    except Exception as e:
+                        logger.error(f"Safety layer '{layer.name}' pop failed: {e}")
+            if result is not None:
+                return result
+
         # All layers passed
         return SafetyResult(
             allowed=True,

@@ -121,6 +121,14 @@ class TestRestartRecovery(unittest.TestCase):
         self.assertIn("interrupted by restart", loaded["decision_reason"])
 
 
+def _submitting_stub(opp, draft):
+    """A pipeline whose submit_gig_proposal succeeds (irreversible)."""
+    class _R:
+        success = True
+        message = "submitted"
+    return _R()
+
+
 class TestLoopPersistence(unittest.TestCase):
     """A real AutonomousLoop run must persist when a run_store is injected."""
 
@@ -142,8 +150,25 @@ class TestLoopPersistence(unittest.TestCase):
         loaded = store.get_run(store.list_runs()[0]["run_id"])
         self.assertEqual(loaded["opportunity_id"], "opp-1")
         self.assertEqual(loaded["decision"], result.decision)
-        # Idempotency key recorded for the opportunity.
-        self.assertTrue(store.is_idempotent("opportunity:opp-1"))
+        # No idempotency key: this pipeline has no submission path, so nothing
+        # irreversible happened. The key is marked only when an irreversible
+        # action actually goes out (ARCH-ENG-074) — marking it at finalize
+        # made every completed run un-replayable and blocked the re-entry
+        # _stage_deduplicate allows for failures, rejections and
+        # await_approval pauses.
+        self.assertFalse(store.is_idempotent("opportunity:opp-1"))
+        self.assertEqual(loaded["status"], result.status)
+
+    def test_loop_marks_idempotent_after_an_irreversible_submission(self):
+        """A real submission must block a replay across a restart."""
+        from tests.earning.test_autonomous_loop import FakePipeline, FakeOpp
+        store = AutonomousRunStore(self._path)
+        pipeline = FakePipeline()
+        pipeline.submit_gig_proposal = _submitting_stub
+        loop = AutonomousLoop(pipeline, run_store=store)
+        loop.run(FakeOpp(advertised_amount=50, task_type="freelance"))
+        self.assertTrue(store.is_idempotent("opportunity:opp-1"),
+                        "a submitted opportunity was left replayable")
 
 
 class TestCompositionRoot(unittest.TestCase):

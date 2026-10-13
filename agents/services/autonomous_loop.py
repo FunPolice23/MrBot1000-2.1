@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import time
 import os
+import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents.evidence.provenance import FactStore
+
+logger = logging.getLogger(__name__)
 
 
 # ── Stage result ────────────────────────────────────────────────────────────────
@@ -34,6 +37,8 @@ class StageStatus:
 @dataclass
 class AutonomousResult:
     opportunity_id: str = ""
+    run_id: str = ""
+    status: str = ""          # "" until _begin_run writes it; then RUNNING/DONE
     success: bool = False
     paid: bool = False
     payment_amount: float = 0.0
@@ -48,6 +53,8 @@ class AutonomousResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "opportunity_id": self.opportunity_id,
+            "run_id": self.run_id,
+            "status": self.status,
             "success": self.success,
             "paid": self.paid,
             "payment_amount": self.payment_amount,
@@ -401,6 +408,19 @@ class AutonomousLoop:
             facts = FactStore(opp_id)
 
         try:
+            # Durable ledger BEFORE any irreversible stage. The row used to be
+            # written only in _finalize, so a hard kill after _stage_submit
+            # left nothing for recover_incomplete() and a restart happily
+            # re-ran the same opportunity — submitting twice. Writing the
+            # in-flight row here makes the interruption visible and recoverable.
+            # The IDEMPOTENCY KEY is deliberately NOT marked here: an
+            # await_approval pause, a rejection, and a transient failure are all
+            # legitimately re-entry-able (see _stage_deduplicate). It is marked
+            # only once an irreversible action has actually been dispatched.
+            if self._replay_guard(opp_id):
+                return self._finalize(result, facts, t0, "reject",
+                                      "Opportunity already executed an irreversible action")
+            self._begin_run(result, opp_id)
             self._check_limits(opp_id, started)
             self._stage_discovered(result, opportunity, facts)
             self._check_limits(opp_id, started)
@@ -597,9 +617,19 @@ class AutonomousLoop:
 
     def _stage_prioritize(self, result, opp, facts):
         t0 = time.time()
+        # A pipeline may legitimately have no portfolio (the constructor takes
+        # any object); every other portfolio-touching stage guards with
+        # `is not None`. This one did not, so a portfolio-less pipeline raised
+        # AttributeError here and the entire run was reported as a generic
+        # "Loop error" instead of completing (ARCH-ENG-058).
+        try:
+            portfolio_size = (len(self.portfolio.load_all())
+                              if self.portfolio is not None else 0)
+        except Exception:
+            portfolio_size = 0
         result.stages.append(StageResult(stage="prioritize", status=StageStatus.COMPLETED,
             opportunity_id=facts.opportunity_id,
-            data={"portfolio_size": len(self.portfolio.load_all())}, duration_s=time.time()-t0))
+            data={"portfolio_size": portfolio_size}, duration_s=time.time()-t0))
 
     def _stage_plan(self, result, opp, facts):
         t0 = time.time()
@@ -749,6 +779,11 @@ class AutonomousLoop:
             opportunity_id=facts.opportunity_id, data={"submitted": submitted, "error": error},
             duration_s=time.time()-t0))
         if not submitted: result.errors.append(error or "submission failed")
+        elif self.run_store is not None:
+            # An external commitment now exists. Mark it BEFORE the process can
+            # be killed, so a restart's _replay_guard refuses to re-run this
+            # opportunity instead of submitting the same work twice.
+            self._mark_irreversible(result, getattr(opp, "id", getattr(opp, "opportunity_id", "")))
 
     def _stage_wait(self, result, opp, facts):
         t0 = time.time()
@@ -788,8 +823,15 @@ class AutonomousLoop:
                 try:
                     lifecycle_state = self.lifecycle.mark_paid_verified(opp.id or opp.opportunity_id,
                         amount=payment_amount)
-                    verified = getattr(lifecycle_state, "status", "paid") == "paid"
-                except Exception: pass
+                    # Fail CLOSED: if the lifecycle did not actually reach "paid" —
+                    # including when it returned None or raised — the payment is NOT
+                    # verified. Defaulting the getattr to "paid" here previously
+                    # booked unverified payouts as wins (ARCH-ENG-060).
+                    verified = getattr(lifecycle_state, "status", "") == "paid"
+                except Exception as e:
+                    # A lifecycle/DB error must never be read as a successful payout.
+                    verified = False
+                    result.errors.append(f"Lifecycle paid-verification failed: {e}")
             result.paid = verified
             result.payment_amount = payment_amount
         except Exception as e:
@@ -890,6 +932,10 @@ class AutonomousLoop:
         result.decision = decision
         result.decision_reason = reason
         result.duration_s = time.time() - t0
+        # Terminal ledger state. _begin_run wrote RUNNING; leaving it there would
+        # make the next startup's recover_incomplete() report a finished run as
+        # interrupted.
+        result.status = "DONE" if result.success else "FAILED"
         # Build structured explanation from stage data
         result.explanation = ExplanationBuilder(result.stages, facts, decision, reason).build()
         # Sync final state to lifecycle and portfolio
@@ -901,9 +947,13 @@ class AutonomousLoop:
     def _persist_run(self, result: "AutonomousResult", facts: Any) -> None:
         """Persist a finished run to the durable store (optional, best-effort).
 
-        Uses the opportunity_id as the idempotency key so a restart/replay of
-        the same opportunity cannot re-execute an irreversible action. Never
-        raises — persistence must not break the loop's return value.
+        Does NOT mark the idempotency key: that is ``_mark_irreversible``'s
+        job, at the moment an irreversible action actually goes out. Marking it
+        here (at finalize) made every completed run un-replayable, which
+        blocked the re-entry ``_stage_deduplicate`` explicitly allows for a
+        prior failure, a rejection, and an ``await_approval`` pause.
+
+        Never raises — persistence must not break the loop's return value.
         """
         store = self.run_store
         if store is None:
@@ -912,10 +962,72 @@ class AutonomousLoop:
             opp_id = result.opportunity_id or getattr(facts, "opportunity_id", "")
             if not opp_id:
                 return
-            run_id = store.save_run(result, opp_id)
-            store.mark_idempotent(f"opportunity:{opp_id}", run_id, opp_id)
+            store.save_run(result, opp_id)
         except Exception as exc:
             result.errors.append(f"Run persistence error: {exc}")
+
+    def _replay_guard(self, opp_id: str) -> bool:
+        """True when this opportunity already made an irreversible commitment.
+
+        Checked before the first stage. The key is written by
+        ``_mark_irreversible`` right after a submission actually goes out, so
+        without this guard a process killed mid-run and restarted would
+        re-execute that submission.
+
+        Fails CLOSED: if the ledger cannot be read we must not risk a second
+        irreversible action, so we refuse the run. The row is already durable
+        (``_begin_run``) so a locked ledger also means an interrupted run is
+        recoverable — refusing is the safe side, and a transient lock clears.
+        """
+        store = self.run_store
+        if store is None or not opp_id:
+            return False
+        try:
+            return bool(store.is_idempotent(f"opportunity:{opp_id}"))
+        except Exception as exc:
+            logger.warning(
+                "Replay guard could not read the ledger for %s; refusing to "
+                "run rather than risk a duplicate irreversible action: %s",
+                opp_id, exc)
+            return True
+
+    def _begin_run(self, result: "AutonomousResult", opp_id: str) -> None:
+        """Write the in-flight run row before stage 1.
+
+        Makes the run visible to ``recover_incomplete()`` (which fails any
+        non-terminal row at startup) so a hard kill is recorded as interrupted
+        instead of silently vanishing. Does NOT mark the idempotency key —
+        marking it here would permanently block re-entry for an
+        ``await_approval`` pause or a transient failure, both of which
+        ``_stage_deduplicate`` explicitly allows back in.
+        """
+        store = self.run_store
+        if store is None or not opp_id:
+            return
+        try:
+            result.status = "RUNNING"
+            if not result.run_id:
+                result.run_id = f"run-{opp_id}"
+            store.save_run(result, opp_id)
+        except Exception as exc:
+            result.errors.append(f"Run start persistence error: {exc}")
+
+    def _mark_irreversible(self, result: "AutonomousResult", opp_id: str) -> None:
+        """Mark the idempotency key once an irreversible action has been sent.
+
+        Called from ``_stage_submit`` AFTER the external call returns, so the
+        window in which a restart could re-submit is as small as the call
+        itself. Paired with ``_replay_guard`` this is what stops a
+        killed-then-restarted process submitting the same work twice.
+        """
+        store = self.run_store
+        if store is None or not opp_id:
+            return
+        try:
+            run_id = result.run_id or f"run-{opp_id}"
+            store.mark_idempotent(f"opportunity:{opp_id}", run_id, opp_id)
+        except Exception as exc:
+            result.errors.append(f"Idempotency mark error: {exc}")
 
     def _sync_final_state(self, result: AutonomousResult, facts: Any) -> None:
         """Sync the loop's final decision to the lifecycle and portfolio."""

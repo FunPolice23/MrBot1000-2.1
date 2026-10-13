@@ -6,16 +6,56 @@ this module owns the single authorization and routing entry point.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict
 
 
-def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
-    """Authorize and dispatch one tool without bypassing safety policy."""
+def _accepts_authorization(handler: Any) -> bool:
+    """True when a tool handler declares the dispatch ``authorization`` kwarg.
+
+    Only the mutating handlers do; the read-only ones take a single positional
+    ``args``. Passing ``authorization=`` to a handler that does not declare it
+    raises TypeError, which would take out every read-only tool — exactly the
+    ones the gate auto-allows.
+    """
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.name == "authorization" and param.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
+
+
+def execute_tool(name: str, arguments: Dict[str, Any],
+                 approved: bool = False) -> str:
+    """Authorize and dispatch one tool without bypassing safety policy.
+
+    ``approved`` is the human's decision for a tool the gate returned as
+    NEEDS_APPROVAL: the caller must have obtained it from the approval queue,
+    never assume it. It only upgrades a NEEDS_APPROVAL decision; a BLOCKED tool
+    stays blocked.
+    """
     from agents.safety import calling as runtime
     if not runtime.is_known_tool(name):
         return f"[Unknown tool: {name}]"
 
-    authorization = runtime._get_action_dispatcher().authorize(name, arguments)
+    # Resolve documented aliases ONCE, up front. ``is_known_tool`` and
+    # ``SafetyGate`` both accept an alias and classify it by its canonical
+    # target, but the handler table below is keyed on canonical names only —
+    # so an alias passed the gate, was queued for approval, and then died at
+    # the handler lookup with "[Unknown tool: write_file]". The operator
+    # approved an action that could never run. Reproduced:
+    # execute_tool("write_file", ..., approved=True) -> "[Unknown tool:
+    # write_file]" even though the identical file_write call succeeded.
+    name = runtime.canonical_tool_name(name)
+
+    authorization = runtime._get_action_dispatcher().authorize(
+        name, arguments, approved=approved)
     if authorization.decision == runtime.SafetyDecision.BLOCKED:
         return f"[BLOCKED] {authorization.reason}"
 
@@ -62,11 +102,20 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
         "file_list": runtime._tool_file_list,
         "run_command": runtime._tool_run_command,
         "query_db": runtime._tool_query_db,
+        "record_payment": runtime._tool_record_payment,
+        "social_post": runtime._tool_social_post,
     }
     handler = handlers.get(name)
     if handler is None:
         return f"[Unknown tool: {name}]"
     try:
+        # The gate above is the authorization. Hand it to the handler as the
+        # dispatch capability so mutating tools (which refuse any call that did
+        # not come through here) can run. Read-only handlers do not take the
+        # kwarg, so only pass it where it is declared — passing it
+        # unconditionally raises TypeError for every read-only tool.
+        if _accepts_authorization(handler):
+            return handler(arguments, authorization=runtime._DISPATCH_CAPABILITY)
         return handler(arguments)
     except Exception as exc:
         return f"[Tool error: {exc}]"

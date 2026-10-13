@@ -10,6 +10,41 @@ from agents.safety.calling import (
 )
 
 
+def _seed_executed_calls_from_history(history, executed_text_calls: set) -> None:
+    """Pre-seed the executed-text-call set from prior turns in the transcript.
+
+    Scans each history message's text for text-form tool calls of the shape
+    ``web_read("url")`` / ``web_search("query")`` and records
+    ``(tool_name, {"url"|"query": arg})`` so the within-turn duplicate guard
+    treats an already-shown result as already delivered. This stops the
+    cross-turn re-read loop without caching page content: it only suppresses a
+    call whose exact invocation is already visible in the conversation, and the
+    last-10-message window means a stale entry ages out naturally.
+    Never raises; a malformed history is simply skipped.
+    """
+    if not history:
+        return
+    import re
+    # tool_name("arg")  — same shape _parse_tool_call_from_text recognizes.
+    call_re = re.compile(
+        r'\b(web_read|web_search|web_check)\s*\(\s*["\']([^"\']+)["\']',
+        re.IGNORECASE,
+    )
+    arg_key = {"web_read": "url", "web_search": "query", "web_check": "url"}
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        for m in call_re.finditer(content):
+            name = m.group(1).lower()
+            arg = m.group(2).strip()
+            if not arg:
+                continue
+            executed_text_calls.add((name, json.dumps({arg_key[name]: arg}, sort_keys=True)))
+
+
 def chat_with_tools(
     client,
     model: str,
@@ -94,12 +129,23 @@ def chat_with_tools(
     if history:
         for msg in history[-10:]:
             messages.append(msg)
-    
+
     if not flatten_system_prompt:
         messages.append({"role": "user", "content": _user_content()})
     executed_text_calls = set()
     executed_function_calls = set()
-    
+
+    # Cross-turn re-read guard (Phase A): the within-turn sets above stop a
+    # model re-issuing the identical call in ONE chat_with_tools run, but each
+    # new dialogue turn builds fresh sets — so a persona that already read a URL
+    # in a PRIOR turn would read it again, forever (the "agents keep re-reading
+    # the same page" loop). Seed the sets from the conversation history: if the
+    # exact tool call already appears in the transcript, its result is already
+    # visible to the model, so re-issuing it is stopped and it is told to answer
+    # from what it has. Uses real history (not a cache), so a genuinely changed
+    # page is still re-readable once it ages out of the last-10 window.
+    _seed_executed_calls_from_history(history, executed_text_calls)
+
     for iteration in range(max_iterations):
         kwargs = {
             "model": model,

@@ -74,4 +74,59 @@ class SocialDiscoveryWorker(QThread):
             self.finished.emit({"ok": False, "error": str(exc)})
 
 
-__all__ = ["DataExplorerWorker", "LivePortfolioWorker", "SocialDiscoveryWorker"]
+class MoltbookFeedWorker(QThread):
+    """Read the Moltbook feed off the GUI thread (Phase E, ARCH-ENG-088).
+
+    Builds a read-only MoltbookPoster over requests and returns normalized
+    rows (submolt / title / author / preview / id) so the Social Activity tab
+    can render them without blocking. Needs only MOLTBOOK_API_KEY (reads are
+    not approval-gated); emits ok=False with a reason when the key is absent.
+    """
+
+    finished = Signal(dict)
+
+    def __init__(self, sort: str = "hot", limit: int = 25):
+        super().__init__()
+        self.sort = sort
+        self.limit = limit
+
+    def run(self):
+        try:
+            import os
+            if not os.getenv("MOLTBOOK_API_KEY", "").strip():
+                self.finished.emit({"ok": False,
+                                    "error": "MOLTBOOK_API_KEY not set"})
+                return
+            import requests
+            from agents.earning.moltbook_agent import MoltbookPoster
+            poster = MoltbookPoster(http_client=requests)
+            result = poster.get_feed(sort=self.sort, limit=self.limit)
+            if not result.get("ok"):
+                self.finished.emit({"ok": False,
+                                    "error": result.get("reason", "feed error")})
+                return
+            feed = result.get("feed", {}) or {}
+            posts = feed.get("posts", []) if isinstance(feed, dict) else []
+            rows = []
+            for p in posts if isinstance(posts, list) else []:
+                if not isinstance(p, dict):
+                    continue
+                submolt = p.get("submolt") or {}
+                rows.append({
+                    "id": str(p.get("id") or p.get("post_id") or ""),
+                    "submolt": str(submolt.get("display_name")
+                                   or submolt.get("name") or ""),
+                    "title": str(p.get("title", "")),
+                    "author": str((p.get("author") or {}).get("name")
+                                  or p.get("author_name") or ""),
+                    "preview": str(p.get("content", ""))[:160],
+                    "url": f"https://www.moltbook.com/post/{p.get('id') or ''}",
+                })
+            self.finished.emit({"ok": True, "rows": rows,
+                                "count": len(rows)})
+        except Exception as exc:
+            self.finished.emit({"ok": False, "error": str(exc)})
+
+
+__all__ = ["DataExplorerWorker", "LivePortfolioWorker", "SocialDiscoveryWorker",
+           "MoltbookFeedWorker"]

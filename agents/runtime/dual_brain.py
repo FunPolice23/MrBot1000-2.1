@@ -151,6 +151,7 @@ class BrainConfig:
     flash_attn: str = ""          # on|off|auto  (--flash-attn)
     cache_reuse: Optional[int] = None   # --cache-reuse N
     ctx_checkpoints: Optional[int] = None  # --ctx-checkpoints N
+    context_shift: Optional[bool] = None  # True -> --context-shift, False -> --no-context-shift
     kv_offload: Optional[bool] = None      # False -> --no-kv-offload
     show_perf: bool = True                 # True -> --perf (print token/prompt timings)
     n_cpu_moe: Optional[int] = None        # --n-cpu-moe N (MoE experts to CPU)
@@ -174,6 +175,15 @@ class BrainConfig:
     # ── llama.cpp reasoning flags (v2.1.9) ──────────────────────────────────
     reasoning_budget: Optional[int] = None   # --reasoning-budget N (-1 unrestricted)
     reasoning_format: str = ""               # none|auto|deepseek|... (--reasoning-format)
+
+    # ── Multi-Token Prediction / speculative decoding (Phase G, ARCH-ENG-092) ──
+    # "draft-mtp" enables llama.cpp MTP (predicts several tokens per pass using
+    # the model's native multi-token head). Only meaningful for models that carry
+    # an MTP head — see agents/providers/model_capabilities.detect_mtp. Empty =
+    # flag omitted (byte-identical command for untouched configs). The GUI greys
+    # the toggle when the selected model has no MTP head.
+    spec_type: str = ""                      # "" | "draft-mtp" (--spec-type)
+    spec_draft_n_max: Optional[int] = None   # --spec-draft-n-max N (default 3)
 
     # ── multimodal projector (v2.1.9) ───────────────────────────────────────
     # Path to an mmproj-*.gguf companion file. Empty -> omit --mmproj entirely so
@@ -271,6 +281,15 @@ class BrainConfig:
             # Reuse a KV prefix across turns via KV shifting. Big win for the
             # Dialogue tab, where every turn re-sends a long shared prefix.
             cmd += ["--cache-reuse", str(self.cache_reuse)]
+        if self.context_shift is not None:
+            # v2.1.64 (ARCH-ENG-075): --context-shift lets llama.cpp roll the
+            # context window forward when a conversation exceeds --ctx-size
+            # instead of erroring ("context length exceeded") mid-dialogue. It
+            # is DISABLED by default in llama.cpp, so without this a long
+            # Chat/Dialogue thread dies on the question that overflows the
+            # window. Off-by-default in the app too (flag omitted when unset)
+            # so an untouched config is byte-identical to before.
+            cmd += ["--context-shift" if self.context_shift else "--no-context-shift"]
         if self.ctx_checkpoints is not None and self.ctx_checkpoints >= 0:
             cmd += ["--ctx-checkpoints", str(self.ctx_checkpoints)]
         if self.kv_offload is False:
@@ -330,6 +349,15 @@ class BrainConfig:
             cmd += ["--mmproj", self.mmproj]
             if self.mmproj_offload is False:
                 cmd += ["--no-mmproj-offload"]
+
+        # Phase G (ARCH-ENG-092): Multi-Token Prediction. Only emitted when the
+        # operator enabled it for a model that actually carries an MTP head (the
+        # GUI greys the toggle otherwise). Omitted when unset so an untouched
+        # config produces a byte-identical command.
+        if self.spec_type == "draft-mtp":
+            cmd += ["--spec-type", "draft-mtp"]
+            if self.spec_draft_n_max is not None and self.spec_draft_n_max > 0:
+                cmd += ["--spec-draft-n-max", str(self.spec_draft_n_max)]
 
         # Check if model template uses raise_exception and provide fallback
         if model and self._model_needs_raise_exception(model):
@@ -541,6 +569,17 @@ def _apply_saved_settings(cfg: "BrainConfig", saved: Dict[str, object]) -> None:
         v = saved.get(key)
         if isinstance(v, str) and v:
             setattr(cfg, attr, v)
+    # Phase G (ARCH-ENG-092): restore MTP / speculative decoding. Only the
+    # documented value is honored; anything else is ignored (fail safe).
+    st = saved.get("spec_type")
+    if isinstance(st, str) and st == "draft-mtp":
+        cfg.spec_type = "draft-mtp"
+        try:
+            n = saved.get("spec_draft_n_max")
+            if n is not None:
+                cfg.spec_draft_n_max = int(n)
+        except (TypeError, ValueError):
+            pass
 
 
 def apply_hardware_fallback(config: BrainConfig, gpu_indexes: set[int]) -> BrainConfig:
@@ -687,6 +726,7 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
         # performance
         flash_attn=_g("FLASH_ATTN", ""),
         cache_reuse=_opt_int("CACHE_REUSE"),
+        context_shift=_opt_bool("CONTEXT_SHIFT"),
         ctx_checkpoints=_opt_int("CTX_CHECKPOINTS"),
         kv_offload=_opt_bool("KV_OFFLOAD"),
         show_perf=_b("SHOW_PERF", True),
@@ -828,6 +868,7 @@ class DualBrainRuntime:
                     _policy_models = {}
                     _policy_settings = {}
                 for i, placement in enumerate(placements):
+                    is_cpu_placement = bool(placement.get("is_cpu"))
                     if i < 2:
                         cfg = self._slots[i] if i < len(self._slots) else \
                             self._configs[BrainRole.BIG if i == 0 else BrainRole.SMALL]
@@ -837,11 +878,39 @@ class DualBrainRuntime:
                         # target follows detected hardware, but keep every other
                         # field the operator set in the GUI.
                         cfg.port = int(placement.get("port", cfg.port))
-                        if not placement.get("is_cpu"):
+                        if not is_cpu_placement:
                             cfg.device = int(placement.get("index", cfg.device))
                         label = placement.get("label") or placement.get("name", "")
                         if label:
                             cfg.gpu_label = label
+                        # v2.1.49 (ARCH-ENG-049): a CPU/RAM pool that lands in
+                        # slot 0/1 must be forced system-RAM-only, exactly as a
+                        # slot-2+ placement is (build_slot_config). Without this
+                        # a single-GPU box kept the role config's GPU defaults —
+                        # gpu_layers=None -> full offload and `--device CUDA1`
+                        # aimed at a card that does not exist, so the Small Brain
+                        # failed to launch and the settings never round-tripped
+                        # through the device policy.
+                        if is_cpu_placement:
+                            cfg.gpu_layers = 0
+                            cfg.decision_support_only = True
+                            cfg.device = 0
+                        else:
+                            cfg.decision_support_only = False
+                        # Slots 0/1 persist via .env, but a CPU-pool or
+                        # extra-device role ALSO has a device-policy entry (the
+                        # operator edited it in Per-Device Settings). Adopt the
+                        # saved settings after the CPU forcing above so an
+                        # operator-chosen context/threads still wins.
+                        saved_settings = _policy_settings.get(cfg.device_id, {})
+                        if saved_settings:
+                            _apply_saved_settings(cfg, saved_settings)
+                            if is_cpu_placement:
+                                cfg.gpu_layers = 0
+                                cfg.decision_support_only = True
+                        saved = _policy_models.get(cfg.device_id, "")
+                        if saved:
+                            cfg.model = saved
                         new_slots.append(cfg)
                     else:
                         role = role_map.get(str(placement.get("role", "")), BrainRole.SMALL)

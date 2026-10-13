@@ -1,8 +1,8 @@
-# MrBot1000 v2.1.47 — Multi-Brain AI-Powered Earning Agent
+# MrBot1000 v2.1.48 — Multi-Brain AI-Powered Earning Agent
 
 A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. It is local-first: the default brain runtime runs on your machine across every detected GPU and the CPU/RAM pool, while optional cloud providers are explicitly configured by the operator.
 
-## Highlights (through v2.1.47)
+## Highlights (through v2.1.48)
 
 - **Device-centric N-brain runtime** (`agents/runtime/device_registry.py` + `agents/runtime/dual_brain.py`): one source of truth for device→slot→role→endpoint/model. The runtime detects every GPU and the CPU/RAM pool and assigns each an ordered slot — slot 0/1 are the classic Big/Small brains (back-compat), slots 2+ are extra devices (e.g. a CPU/RAM brain). Per-device enable/role/model/settings persist in `settings.json`. The active local or cloud provider is selected from Settings.
 - **Shared-skills peer council Dialogue** (`agents/cognition/speaker_registry.py`): every enabled brain runs the same earning-agent skillset, differing only by a customizable per-device name (Edward Hurst, Jacob Stanley, Chris Borrows, …). Each brain independently reads the shared transcript — human + teammates + tool results — and decides whether to answer the human, react to a teammate, or push the goal. Names are editable in the Management tab (`BIG_BRAIN_NAME`/`SMALL_BRAIN_NAME`/`BRAIN_SLOT{n}_NAME`).
@@ -308,11 +308,14 @@ recommended trim sequence, see [ARCHITECTURE_MAP.md](ARCHITECTURE_MAP.md).
 - **Message routing**: Chat and Dialogue use the configured brain adapters; task and command intents are routed through the Manager and deterministic service boundaries
 - **Cross-model communication**: EventBus typed handoffs plus the durable collaboration/message ledger
 - **Opportunity lifecycle tracking**: Explicit, auditable stage transitions for discovered, researched, applied, in progress, submitted, paid, and failed opportunities
+- **Enforced lifecycle state machine** (v2.1.57): the allowed-transition table is authoritative — a rejected transition is audited (`transition_ok=False`, `last_transition_error`) but never moves the stage or commits `status`; every `paid` flip is routed through `_mark_paid`; terminal stages have no successors, so a `failed` or already-settled opportunity cannot be promoted to `paid`; the crypto/airdrop route uses an explicit `claimed` stage
 - **Startup validation**: Checks configuration, provider availability, and safe-mode status before workflows begin
 - **Secure execution**: 14-step action pipeline with validation + human gates
 - **Instruction provenance gate** (v2.0.22): any external `SKILL.md`/playbook is untrusted data until human-approved; quarantined in a Review Queue
 - **Evidence & Verification subsystem** (v2.0.34au): domain-scoped evidence types, EvidenceStore, verification policy (L1 self-reported → L2 platform API → L3 on-chain/crypto → L4 independent audit), reconciliation gates lifecycle transitions
 - **Canonical payment evidence vocabulary**: broad monetary observations remain available to accounting, while a strict L3+ transition subset gates lifecycle payment truth; legacy producer labels remain recognized
+- **Fail-closed verification** (v2.1.57): a lifecycle/DB error during paid-verification is recorded as NOT verified rather than as a payout, and independent reconciliation (`evidence_policy.reconcile`) escalates only for an explicit allow-list of externally-produced methods — an unknown or manual method is refused, never granted VERIFIED@L4
+- **Merge-only settings writes** (v2.1.57): every writer to `settings.json` goes through `device_registry.merge_settings_file` / `save_policy`, which merge-read outside the write try, quarantine an unparseable file, and write atomically — no writer may replace the whole file and destroy the per-device `devices` block
 - **Unified Economic Accounting** (v2.0.36j): revenue only from externally verified payment evidence; USD + crypto conversion; expenses by category; verified/unverified split; ROI; net hourly rate; prediction accuracy tracking
 - **Read-only state reconciliation**: compares lifecycle, portfolio, evidence, accounting, and durable runs without automatic repair; conflicts are surfaced for human review
 - **Runtime Diagnostics tab**: exposes sanitized Big Brain/Small Brain health and current reconciliation conflicts without secrets or evidence payloads
@@ -360,6 +363,11 @@ Every package directory carries an `__init__.py`. Modules are imported by their 
 dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 `agents/*.py`, `gui/*.py` and root-module import paths no longer exist.
 
+> **Full per-file codebase map:** see [`docs/codemap/`](docs/codemap/README.md) — an
+> index of every tracked file (525 files / 490 Python modules) with a one-line purpose
+> and its key classes/functions, split by folder. It is the single source of truth for
+> "what is this file" and should be updated as files change.
+
 ## Key Files
 
 | File | Purpose |
@@ -395,7 +403,7 @@ dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 | `app/action_pipeline.py` | Proposal validation and controlled execution safeguards |
 | `app/database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
 | `app/theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
-| `app/version.py` | Public application version source (`2.1.47`) |
+| `app/version.py` | Public application version source (`2.1.48`) |
 | `Agent.md` / `README.md` / `CHANGELOG.md` | Runtime contract, current system overview, and release history |
 | `tests/` | Focused regression and subsystem tests |
 | `tools/github_publish/` | Personal publish-mirror tooling (git-ignored; syncs a sanitized copy to GitHub) |
@@ -489,7 +497,7 @@ it is not a separate visible tab.
 
 - **Agent.md** — Runtime contract for any model interacting with the system
 - **README.md** (this file) — Current system overview, tab inventory, and configuration guide
-- **CHANGELOG.md** — Full change history (current release v2.1.47)
+- **CHANGELOG.md** — Full change history (current release v2.1.48)
 
 ## Requirements
 

@@ -10,6 +10,7 @@ controls.
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -139,6 +140,11 @@ class LiveTradingService:
             in {"1", "true", "yes"}
             if live_enabled is None else bool(live_enabled)
         )
+        # Approval ids already submitted. A decided item stays APPROVED
+        # forever, so the ledger — not the queue status — enforces
+        # once-per-approval.
+        self._executed_approval_ids: set = set()
+        self._lock = threading.Lock()
 
     def status(self) -> Dict[str, Any]:
         enabled = self.live_enabled and self.adapter is not None
@@ -272,23 +278,234 @@ class LiveTradingService:
             "liquidity_multiple": liquidity_ratio,
             "asset_class": intent.asset_class,
             "daily_loss_pct": daily_loss_pct,
+            # ARCH-ENG-092: the market and portfolio inputs this decision was
+            # made from are stored with it. `execute_order` re-derives the
+            # assessment at execution time and needs the same numbers the
+            # human actually reviewed — a fresh fetch could have moved, which
+            # would either refuse a legitimate approval or wave through an
+            # order the risk model never saw. These are also what the
+            # Approvals panel shows the operator.
+            "symbol": intent.symbol,
+            "exchange": intent.exchange,
+            "last_price": market.last_price,
+            "volatility_pct": market.volatility_pct,
+            "spread_pct": market.spread_pct,
+            "liquidity_usd": market.liquidity_usd,
+            "fetched_at": market.fetched_at,
+            "total_equity_usd": portfolio.total_equity_usd,
+            "free_cash_usd": portfolio.free_cash_usd,
+            "balances": dict(portfolio.balances or {}),
         }, tuple(reasons))
 
     def execute_order(self, intent: TradeIntent, assessment: RiskAssessment,
                       approval_id: str = "") -> Dict[str, Any]:
+        """Submit one live order, or refuse.
+
+        Order of the checks matters and each has a distinct job:
+
+        1. If an approval id is offered, verify it names THIS order. Done
+           first so a swapped order reports the reason it was really refused
+           ("the approved order does not match") rather than an incidental
+           error from re-assessing it.
+        2. Re-derive the risk verdict from LIVE exchange state. Neither the
+           caller's ``decision`` nor its ``factors`` are trusted.
+        3. Compare the live verdict against the assessment the human actually
+           reviewed, and refuse if the market or the account moved enough to
+           change the risk picture.
+        4. Require a matching approval when the live verdict says one is
+           needed, then consume it so one approval submits at most one order.
+
+        Verification and consumption are deliberately separate:
+        ``_require_approval_for`` only VERIFIES (and is called up to twice,
+        since the verdict is re-derived between the two calls), while the
+        approval is CONSUMED exactly once here, after every gate has passed.
+        """
         self._require_adapter()
         if not self.live_enabled:
             raise LiveTradingError("Live trading is disabled; no order was submitted")
-        if assessment.decision == "blocked":
-            raise LiveTradingError("Order blocked: " + "; ".join(assessment.reasons))
-        if assessment.decision == "needs_approval" and not self._is_approved(approval_id):
-            raise LiveTradingError("Human approval is required before live execution")
+        if approval_id:
+            self._require_approval_for(intent, approval_id)
+
+        verdict = self._reassess(intent, approval_id)
+        if verdict.decision == "blocked":
+            raise LiveTradingError("Order blocked: " + "; ".join(verdict.reasons))
+
+        # Keyed on the RE-DERIVED verdict, not the caller's: a caller who
+        # claimed "preapproved" for an order the risk model still flags must
+        # still produce a matching approval, and with no id that fails closed.
+        if verdict.decision == "needs_approval":
+            self._require_approval_for(intent, approval_id)
+
+        # Every gate has passed. Consume the approval so this id cannot submit
+        # a second order. The item stays APPROVED forever, so without this a
+        # re-delivered decision — a duplicated Qt signal, a caller retry loop,
+        # a second operator click — replays the same live order against real
+        # funds. Keyed on the queue item id so a second, distinct approval
+        # still runs.
+        if approval_id:
+            with self._lock:
+                if approval_id in self._executed_approval_ids:
+                    raise LiveTradingError(
+                        f"Approval {approval_id} has already been executed; "
+                        f"one human approval submits at most one live order")
+                self._executed_approval_ids.add(approval_id)
+
         order = self.adapter.create_order(
             intent.symbol, intent.order_type, intent.side, intent.quantity,
             intent.limit_price or None,
         )
         return {"ok": True, "execution_mode": "live", "client_order_id": uuid.uuid4().hex,
                 "order": order}
+
+    def _reassess(self, intent: TradeIntent,
+                  approval_id: str = "") -> RiskAssessment:
+        """Re-derive the risk verdict from LIVE exchange state.
+
+        Neither the caller's ``decision`` nor its ``factors`` are trusted. The
+        portfolio and market data are re-fetched from the adapter, so the
+        verdict is computed from what the account and the market actually are
+        at submission time.
+
+        Trusting the caller's factors was a real defect: a forged
+        ``RiskAssessment("preapproved", 0.0, {"last_price": 0.000001,
+        "liquidity_usd": 1e12, "total_equity_usd": 1e12, ...})`` makes a
+        999999-unit order a $1.00 notional, every policy gate passes, and the
+        order reaches the exchange with no approval item at all. Fixing the
+        forgery target from ``decision`` to ``factors`` without removing it
+        would have been no fix at all.
+        """
+        try:
+            portfolio = self.sync_portfolio()
+            market = self.fetch_market_snapshot(intent.symbol)
+        except LiveTradingError as exc:
+            # Live state cannot be read, so the order cannot be shown to be
+            # within policy. Fail closed rather than act on the caller's claim.
+            return RiskAssessment("blocked", 1.0, {}, (
+                f"live account state could not be read at execution time "
+                f"({exc}); no order was submitted",))
+        verdict = self.assess_order(intent, portfolio, market)
+        # Compare the LIVE verdict against what the operator was shown, so an
+        # approval cannot be replayed against a market that has moved.
+        self._check_still_matches_what_was_approved(verdict, approval_id)
+        return verdict
+
+    def _check_still_matches_what_was_approved(self, verdict: RiskAssessment,
+                                               approval_id: str) -> None:
+        """Refuse when live conditions no longer match the approved assessment.
+
+        An approval authorizes a specific order against a specific market and
+        account. If the market or the balance moved enough to change the risk
+        picture, the human's decision no longer covers what would be
+        submitted, so the order must be re-assessed and re-approved rather
+        than waved through on a stale approval.
+        """
+        if not approval_id:
+            return
+        from agents.safety.approval import HumanApprovalQueue
+        item = HumanApprovalQueue.instance().find_by_id(approval_id)
+        if item is None:
+            return
+        shown = ((item.details or {}).get("assessment") or {})
+        if not isinstance(shown, dict) or not shown:
+            # No recorded assessment to compare against (e.g. an item enqueued
+            # by hand): the live re-derivation above is the only gate, and it
+            # already ran against real state.
+            return
+        for key in ("notional_usd", "position_pct", "liquidity_multiple",
+                    "last_price", "total_equity_usd", "free_cash_usd"):
+            if key not in shown or key not in verdict.factors:
+                continue
+            try:
+                before = float(shown[key])
+                after = float(verdict.factors[key])
+            except (TypeError, ValueError):
+                continue
+            if before == after:
+                continue
+            # Relative tolerance: a 1% move in any risk input invalidates the
+            # approval. Absolute tolerances are meaningless across symbols
+            # quoted from $0.000001 to $100000.
+            if abs(after - before) > max(abs(before), abs(after), 1.0) * 0.01:
+                raise LiveTradingError(
+                    f"The approved risk assessment no longer holds: {key} was "
+                    f"{before:g} when approved and is {after:g} now. "
+                    f"Re-assess and re-approve the order.")
+
+    def _require_approval_for(self, intent: TradeIntent,
+                              approval_id: str) -> None:
+        """Fail closed unless a live APPROVED queue item names THIS order.
+
+        Every check here is derived from the queue's own record, never from a
+        caller-supplied argument: the payload is what the Approvals panel
+        rendered for the human, so it is the only thing that can establish
+        what was actually authorized.
+        """
+        if not approval_id:
+            raise LiveTradingError("Human approval is required before live execution")
+        from agents.safety.approval import ApprovalStatus, HumanApprovalQueue
+        item = HumanApprovalQueue.instance().find_by_id(approval_id)
+        if item is None:
+            raise LiveTradingError(
+                "Approved order not found in the human approval queue; "
+                "no order was submitted")
+        if item.status != ApprovalStatus.APPROVED:
+            raise LiveTradingError("Human approval is required before live execution")
+
+        approved = (item.payload or {}).get("intent")
+        if not isinstance(approved, dict):
+            raise LiveTradingError(
+                "Approval item does not name the order it authorized; "
+                "no order was submitted")
+        if self._intent_differs(intent, approved):
+            raise LiveTradingError(
+                "The approved order does not match the order being executed "
+                f"(approved {self._describe(approved)}, requested "
+                f"{self._describe(intent.__dict__)}); no order was submitted")
+        # One approval authorizes one order. The item stays APPROVED forever,
+        # so without a ledger a re-delivered decision replays the same live
+        # order N times against real funds. The consume itself lives in
+        # execute_order so it runs exactly once, after every gate passes.
+        return
+
+    @staticmethod
+    def _describe(d: Dict[str, Any]) -> str:
+        return (f"{d.get('side', '?')} {d.get('quantity', '?')} "
+                f"{d.get('symbol', '?')}")
+
+    @staticmethod
+    def _intent_differs(intent: TradeIntent, approved: Dict[str, Any]) -> bool:
+        """Compare every field that changes what the exchange would receive.
+
+        Only the order-shaping fields are compared. ``reasoning`` and the
+        scoring hints (``expected_profit_pct``/``strategy_confidence``) are
+        advisory: they inform the risk decision, not the order itself, so a
+        refreshed estimate must not invalidate a legitimate approval.
+        """
+        for key in ("exchange", "symbol", "side", "quantity", "order_type",
+                    "limit_price", "asset_class"):
+            if key not in approved:
+                # An approval payload that omits an order-shaping field cannot
+                # be shown to authorize this order, so it authorizes nothing.
+                return True
+            want = getattr(intent, key)
+            got = approved[key]
+            try:
+                want_n = float(want)
+                got_n = float(got)
+            except (TypeError, ValueError):
+                # Non-numeric fields compare case-insensitively, so an approval
+                # recorded as "BTC/USD" authorizes an order written as
+                # "btc/usd". Every string field is treated the same way.
+                if str(want).strip().lower() != str(got).strip().lower():
+                    return True
+                continue
+            # RELATIVE tolerance: an absolute epsilon is meaningless across
+            # instruments quoted from $0.000001 to $100000, where the same
+            # absolute difference is noise on one and a different order on
+            # another. A quantity or price must match to a part in 1e9.
+            if abs(want_n - got_n) > max(abs(want_n), abs(got_n), 1e-12) * 1e-9:
+                return True
+        return False
 
     def propose_order(self, intent: TradeIntent, assessment: RiskAssessment) -> Dict[str, Any]:
         """Create an approval item for an order that cannot be preapproved."""

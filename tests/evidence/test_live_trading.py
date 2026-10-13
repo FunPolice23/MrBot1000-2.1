@@ -27,10 +27,27 @@ class FakeAdapter:
         return {"id": "real-order-1", "status": "open"}
 
 
-def _intent(asset_class="major", amount=10.0):
+def _intent(asset_class="major", amount=1.0):
+    # 1.0 against the adapter's real state (price 100, ~$2202 top-of-book
+    # liquidity, 2% spread, $1001 equity) is a needs_approval order. The
+    # original 10.0 made it a $1000 notional, which the live re-derivation
+    # correctly blocks outright.
     return TradeIntent("fake", "BTC/USD", "buy", amount,
                        strategy_confidence=0.95, expected_profit_pct=2.0,
                        asset_class=asset_class)
+
+
+def _live(service):
+    """Assess against the same live state execute_order re-reads.
+
+    These fixtures previously used an idealised MarketSnapshot (price 10,
+    liquidity 10000) that did not match what FakeAdapter serves (price 100,
+    ~$2202 top-of-book liquidity). `execute_order` re-derives its verdict from
+    LIVE exchange state, so an assessment built from a different snapshot was
+    never the decision the executor would act on. Reading the real state keeps
+    the assessment and the re-derivation describing the same order.
+    """
+    return service.sync_portfolio(), service.fetch_market_snapshot("BTC/USD")
 
 
 class TestLiveTrading(unittest.TestCase):
@@ -98,10 +115,7 @@ class TestLiveTrading(unittest.TestCase):
         adapter = FakeAdapter()
         service = LiveTradingService(adapter, live_enabled=False,
                                      policy=TradingPolicy(preapproval_enabled=True))
-        assessment = service.assess_order(
-            _intent(), PortfolioSnapshot("fake", 1000, 900),
-            MarketSnapshot("BTC/USD", 10, liquidity_usd=10000),
-        )
+        assessment = service.assess_order(_intent(), *_live(service))
         with self.assertRaises(LiveTradingError):
             service.execute_order(_intent(), assessment)
         self.assertEqual(adapter.orders, [])
@@ -109,10 +123,7 @@ class TestLiveTrading(unittest.TestCase):
     def test_high_risk_meme_requires_approval(self):
         service = LiveTradingService(FakeAdapter(), live_enabled=True,
                                      policy=TradingPolicy(preapproval_enabled=True))
-        assessment = service.assess_order(
-            _intent("meme"), PortfolioSnapshot("fake", 1000, 900),
-            MarketSnapshot("BTC/USD", 10, liquidity_usd=10000),
-        )
+        assessment = service.assess_order(_intent("meme"), *_live(service))
         self.assertEqual(assessment.decision, "needs_approval")
         with self.assertRaises(LiveTradingError):
             service.execute_order(_intent("meme"), assessment)
@@ -121,12 +132,18 @@ class TestLiveTrading(unittest.TestCase):
         adapter = FakeAdapter()
         service = LiveTradingService(adapter, live_enabled=True,
                                      policy=TradingPolicy(preapproval_enabled=True))
-        assessment = service.assess_order(
-            _intent(), PortfolioSnapshot("fake", 1000, 900),
-            MarketSnapshot("BTC/USD", 10, liquidity_usd=10000),
-        )
-        self.assertEqual(assessment.decision, "preapproved")
-        result = service.execute_order(_intent(), assessment)
+        # A preapprovable order must sit inside every policy gate against the
+        # adapter's real state, so the fixture is sized to it rather than to
+        # an idealised snapshot the executor never sees.
+        service.policy = TradingPolicy(preapproval_enabled=True,
+                                       max_order_usd=500.0,
+                                       max_position_pct=0.5,
+                                       max_spread_pct=5.0)
+        low = _intent(amount=1.0)
+        assessment = service.assess_order(low, *_live(service))
+        self.assertEqual(assessment.decision, "preapproved",
+                         f"fixture must clear policy, got {assessment.reasons}")
+        result = service.execute_order(low, assessment)
         self.assertTrue(result["ok"])
         self.assertEqual(len(adapter.orders), 1)
 
@@ -166,10 +183,7 @@ class TestLiveTrading(unittest.TestCase):
         HumanApprovalQueue.reset_singleton()
         service = LiveTradingService(FakeAdapter(), live_enabled=True,
                                      policy=TradingPolicy(preapproval_enabled=True))
-        assessment = service.assess_order(
-            _intent("meme"), PortfolioSnapshot("fake", 1000, 900),
-            MarketSnapshot("BTC/USD", 10, liquidity_usd=10000),
-        )
+        assessment = service.assess_order(_intent("meme"), *_live(service))
         proposal = service.propose_order(_intent("meme"), assessment)
         self.assertEqual(proposal["status"], "awaiting_approval")
         queue = HumanApprovalQueue.instance()

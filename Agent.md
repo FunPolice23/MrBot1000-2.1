@@ -8,7 +8,7 @@ MrBot1000 is a real-time AI agent system for **automated earning opportunity dis
 ## Identity
 - **Name**: MrBot1000
 - **Mode**: Real operation, not simulation
-- **Version**: 2.1.47
+- **Version**: 2.1.48
 - **Goal**: discover real earning opportunities, execute actionable work, validate outputs, and persist outcomes in local database
 
 ---
@@ -64,6 +64,7 @@ User Input → Manager / UI route → Brain role or deterministic service:
 
 ### Current Operating Capabilities
 - **Opportunity lifecycle tracking** for discovered → researched → applied → in progress → submitted → paid/failed stages
+- **Enforced lifecycle state machine** (v2.1.57): the allowed-transition table is authoritative — a rejected transition is audited with `transition_ok=False` but never moves the stage or changes `status`, every `paid` flip is routed through the machine, and terminal stages (`paid`/`completed`/`failed`/`rejected`) have no successors so a failed or settled opportunity can never be resurrected to `paid`. The crypto/airdrop route reaches revenue through an explicit `claimed` stage.
 - **Workflow planning** that turns a discovered opportunity into a practical next-action plan
 - **Shared-context runtime awareness** so chat can answer status questions using live program state
 - **UI notifications** that highlight lifecycle changes and opportunity progress updates

@@ -20,6 +20,7 @@ Hard safety rules (per project security policy):
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from typing import List
@@ -31,8 +32,10 @@ from agents.earning.opportunity_models import Opportunity, BaseOpportunitySource
 # fetched when web discovery is explicitly enabled by a human. Do NOT add private
 # or ToS-restricted targets without review.
 DEFAULT_FEEDS: List[str] = [
-    "https://cryptoslate.com/feed/",
-    "https://cointelegraph.com/rss",
+    "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+    "https://weworkremotely.com/categories/remote-design-jobs.rss",
+    "https://weworkremotely.com/categories/remote-writing-jobs.rss",
+    "https://www.reddit.com/r/forhire/.rss",
     "https://www.reddit.com/r/WorkOnline/.rss",
 ]
 
@@ -124,7 +127,12 @@ class WebDiscoverySource(BaseOpportunitySource):
                         continue
                     cat = classify_category(f"{title}")
                     out.append(Opportunity(
-                        opportunity_id=f"web_{abs(hash(link or title)) % 10**10}",
+                        # Stable id: hash() is salted per process, so the same
+                        # feed item got a new id after every restart and never
+                        # deduped. sha1 of the link is stable across runs.
+                        opportunity_id="web_" + hashlib.sha1(
+                            (link or title).encode("utf-8", "ignore")
+                        ).hexdigest()[:12],
                         source=self.name, platform=feed,
                         title=title, description=title, category=cat,
                         payment_type="usd", currency="USD",
@@ -145,7 +153,9 @@ class WebDiscoverySource(BaseOpportunitySource):
                         continue
                     cat = classify_category(f"{title} {query}")
                     out.append(Opportunity(
-                        opportunity_id=f"web_{abs(hash(url)) % 10**10}",
+                        opportunity_id="web_" + hashlib.sha1(
+                            url.encode("utf-8", "ignore")
+                        ).hexdigest()[:12],
                         source=self.name, platform="web_search",
                         title=title, description=r.get("snippet", "") or title,
                         category=cat, payment_type="usd", currency="USD",

@@ -6,12 +6,13 @@ MrBot1000 is feature-rich and has strong safety, evidence, and recovery
 concepts, but it is larger and more coupled than a single-process desktop
 application needs to be. The repository currently contains approximately:
 
-- 328 tracked files.
-- 301 tracked Python files.
-- 78,340 tracked Python lines.
+- 525 tracked files.
+- 490 tracked Python files.
 - 158 modules under `agents/`.
 - 23 modules under `gui/`.
-- 99 test modules.
+- 203 test modules.
+
+A per-file index of the whole tree lives in `docs/codemap/` (see its README).
 
 The size is not uniformly problematic. Most of the complexity is concentrated
 in a small number of integration hubs and in several overlapping subsystems.

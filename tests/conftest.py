@@ -17,6 +17,38 @@ import os
 # Offscreen platform: no display required (CI / headless / SSH sessions).
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# Redirect every `set_env_values` write to a throwaway file for the whole
+# session. Production code correctly persists to the real `.env`, but a test
+# run must be structurally incapable of altering operator config — and without
+# this, GUI paths that legitimately save (e.g. the per-device enable toggle
+# writing <ROLE>_ENABLED) rewrote the live `.env` and tripped the guard below
+# (ARCH-ENG-049). `app.environment.env_file_path()` honours this override.
+import atexit  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_MRBOT_TEST_ENV = _Path(tempfile.gettempdir()) / "mrbot_test_env_do_not_edit"
+try:
+    _MRBOT_TEST_ENV.write_text("", encoding="utf-8")
+    os.environ["MRBOT_ENV_PATH"] = str(_MRBOT_TEST_ENV)
+    atexit.register(lambda: _MRBOT_TEST_ENV.unlink(missing_ok=True))
+except OSError:
+    pass
+
+# Same isolation for the device policy (`settings.json`). GUI tests construct a
+# real `DualBrainControl`, whose widget seeding fires `valueChanged` ->
+# `_on_brain_settings_changed` -> `save_policy()` with no root, so without this a
+# test run rewrites the operator's LIVE settings.json (ARCH-ENG-057). A canary
+# run proved it: the operator's saved per-device model and every llama.cpp
+# setting were wiped by merely building the widget.
+_MRBOT_TEST_SETTINGS = _Path(tempfile.gettempdir()) / "mrbot_test_settings_do_not_edit.json"
+try:
+    _MRBOT_TEST_SETTINGS.write_text("{}", encoding="utf-8")
+    os.environ["MRBOT_DEVICE_SETTINGS_PATH"] = str(_MRBOT_TEST_SETTINGS)
+    atexit.register(lambda: _MRBOT_TEST_SETTINGS.unlink(missing_ok=True))
+except OSError:
+    pass
+
 # Park the autonomous manager loop for the whole test session. `MainWindow`
 # starts ManagerThread, whose first cycle makes a real provider call; with no
 # llama-server listening that call blocks in TCP connect / retry-sleep and the
@@ -178,7 +210,8 @@ def _live_qt_threads():
 
 @pytest.fixture(scope="session", autouse=True)
 def _operator_env_is_untouched():
-    """Fail the session if any test rewrites the operator's `.env`.
+    """Fail the session if any test rewrites the operator's `.env` or
+    `settings.json`.
 
     A test run must be structurally incapable of altering operator config, but a
     guard test alone cannot bracket the suite (pytest gives no ordering
@@ -188,6 +221,11 @@ def _operator_env_is_untouched():
       * `Path(".env")`                 — CWD-relative, what set_env_values uses
       * `<repo>/.env`                  — absolute, what the old non-atomic
                                           `_persist_settings` fallback wrote
+      * `<repo>/settings.json`         — the device policy (models + per-device
+                                          llama.cpp settings). `MRBOT_ENV_PATH`
+                                          only covered `.env`; GUI tests that
+                                          build a `DualBrainControl` still wrote
+                                          this file until ARCH-ENG-057.
 
     Regression: tests/test_provider_selection.py called `_persist_role_model`
     without `persist=False`, and the default of True rewrote the live `.env`
@@ -195,8 +233,9 @@ def _operator_env_is_untouched():
     """
     from pathlib import Path
 
-    repo_env = Path(__file__).resolve().parent.parent / ".env"
-    candidates = [Path(".env"), repo_env]
+    repo_root = Path(__file__).resolve().parent.parent
+    repo_env = repo_root / ".env"
+    candidates = [Path(".env"), repo_env, repo_root / "settings.json"]
 
     def _snapshot(p: Path):
         try:
@@ -210,5 +249,6 @@ def _operator_env_is_untouched():
         after = _snapshot(p)
         assert after == original, (
             f"the test suite modified {p} — a test wrote operator config. "
-            f"Route persistence through MRBOT_ENV_PATH instead."
+            f"Route persistence through MRBOT_ENV_PATH / "
+            f"MRBOT_DEVICE_SETTINGS_PATH instead."
         )

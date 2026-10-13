@@ -95,6 +95,8 @@ cache/*-wal
 *.db-shm
 models_cache.json
 settings.json
+settings.json.corrupt-*
+settings.json.tmp-*
 local_files_compare.txt
 
 # Personal GitHub publishing tools and their external mirror.

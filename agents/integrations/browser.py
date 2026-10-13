@@ -30,6 +30,19 @@ import requests
 from bs4 import BeautifulSoup
 
 
+# ── robots.txt (shared, cached) ─────────────────────────────────────────────
+_robots = None
+
+
+def _robots_checker():
+    """Lazy singleton RobotsChecker (caches fetched robots.txt per host)."""
+    global _robots
+    if _robots is None:
+        from agents.integrations.scraper import RobotsChecker
+        _robots = RobotsChecker()
+    return _robots
+
+
 class WebController:
     def __init__(self, headless: bool = True, timeout: int = 30):
         self.headless = headless
@@ -100,21 +113,50 @@ class WebController:
     # ── read_page / scrape ─────────────────────────────────────────────────
 
     def read_page(self, url: str) -> Dict[str, Any]:
-        """Read a page with requests+BeautifulSoup. Returns text, title, links."""
+        """Read a page and extract usable data, escalating to a headless
+        browser when the plain fetch comes back blocked or thin.
+
+        Mirrors the escalation contract in ``web_eyes.WebEyes.read_page`` so the
+        earning modules (freelance_finder, microtask_earner) get the same
+        robustness the Dialogue brains already have: a non-200 status OR a
+        successful read whose extracted text is under ~200 chars (a JS shell /
+        bot wall) triggers one Playwright attempt. Hosts that block even the
+        browser (e.g. Reddit, which answers scripted clients with a
+        "prove your humanity" wall and a robots.txt that forbids the path) come
+        back marked human-open-only rather than as a misleading stub.
+        """
         try:
+            # Respect robots.txt before fetching: a host that disallows the
+            # path is human-open-only (e.g. Reddit answers scripted clients
+            # with a bot wall). We return a clear marker instead of scraping
+            # it or looping. Fail-open when there is no robots.txt.
+            from agents.integrations.scraper import RobotsChecker
+            if not _robots_checker().is_allowed(url):
+                return {
+                    "ok": False, "url": url,
+                    "error": "Blocked by robots.txt (human-open-only)",
+                    "human_open_only": True,
+                }
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
             }
             resp = requests.get(url, headers=headers, timeout=self.timeout)
-            resp.raise_for_status()
 
-            # Save final URL after redirects
+            if resp.status_code != 200:
+                pw = self._read_with_playwright(url)
+                if pw and pw.get("ok"):
+                    return pw
+                return {
+                    "ok": False, "url": url, "status_code": resp.status_code,
+                    "error": f"HTTP {resp.status_code}",
+                    "human_open_only": True,
+                }
+
             final_url = resp.url
             soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Remove non-content
             for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "aside"]):
                 tag.decompose()
 
@@ -126,6 +168,13 @@ class WebController:
             text = soup.get_text(separator="\n", strip=True)
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             clean_text = "\n".join(lines)
+
+            # JS-only shell / bot wall? Escalate to the browser before returning
+            # a near-empty stub that would send a model into a re-read loop.
+            if len(clean_text) < 200:
+                pw = self._read_with_playwright(url)
+                if pw and pw.get("ok") and len(pw.get("text", "")) >= 200:
+                    return pw
 
             links: List[Dict[str, str]] = []
             for a in soup.find_all("a", href=True):
@@ -147,6 +196,46 @@ class WebController:
             }
         except Exception as e:
             return {"ok": False, "url": url, "error": str(e)}
+
+    def _read_with_playwright(self, url: str) -> Dict[str, Any]:
+        """One headless-browser attempt for JS-rendered / bot-gated pages.
+
+        Returns {} when Playwright is unavailable so callers fall back to the
+        plain result. Never raises.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return {}
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    )
+                )
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                title = page.title()
+                body_text = page.inner_text("body")
+                lines = [ln.strip() for ln in body_text.splitlines() if ln.strip()]
+                final_url = page.url
+                browser.close()
+                clean = "\n".join(lines)
+                return {
+                    "ok": True,
+                    "url": url,
+                    "final_url": final_url,
+                    "title": title or "",
+                    "text": clean[:12000],
+                    "text_length": len(clean),
+                    "links": [],
+                    "rendered": True,
+                }
+        except Exception as e:
+            return {"ok": False, "url": url, "error": f"Playwright fallback failed: {e}"}
 
     def scrape(self, url: str) -> Dict[str, Any]:
         """Scrape a URL and return structured data."""

@@ -399,21 +399,30 @@ class ProviderLifecycleBackend:
                 from agents.runtime.dual_brain import (
                     choose_cpu_decision_model, is_cpu_decision_model)
                 configured_cpu_model = os.getenv("SMALL_BRAIN_CPU_MODEL", "").strip()
+                # v2.1.51 (ARCH-ENG-051): CPU/RAM mode accepts ANY model the
+                # operator picks — a 27B Q1 (3.5 GB) runs fine on system RAM and
+                # is far more capable than a 2B dense. The old <=2B cap was wrong:
+                # the model never crashed, it ran out of TOKEN BUDGET on internal
+                # reasoning before it could emit an answer (finish_reason: length,
+                # empty content). So we no longer substitute by size; we only
+                # resolve a fallback model when NONE is configured, and we let the
+                # caller's token-budget fix give reasoning models room to think.
                 model = selected_model or configured_cpu_model
                 if not model:
                     model = choose_cpu_decision_model(
                         "", self._discover_gguf_models())
-                if model and not is_cpu_decision_model(model):
-                    self._log(
-                        f"⚠️ Small Brain CPU/RAM mode selected {os.path.basename(model)}; "
-                        "larger models may be slower but are allowed.")
                 if not model:
                     self._log(
-                        "❌ Small Brain CPU fallback requires a configured or discovered "
-                        "dense/similar model at or below 2B parameters "
-                        "(SMALL_BRAIN_CPU_MODEL).")
+                        "❌ CPU/RAM mode: no model configured or discovered. Set "
+                        "SMALL_BRAIN_MODEL / SMALL_BRAIN_CPU_MODEL or pick a model, "
+                        "then Start.")
                     self._set_loading(True, False, "")
                     return
+                if not is_cpu_decision_model(model):
+                    # Informational only — larger CPU models are allowed and run.
+                    self._log(
+                        f"ℹ️ CPU/RAM mode: {os.path.basename(model)} is a larger model; "
+                        "generation on system RAM will be slower (~a few tok/s).")
                 owner = self.parent()
                 adapter = getattr(owner, "small_brain", None)
                 if adapter is not None:
@@ -470,19 +479,109 @@ class ProviderLifecycleBackend:
 
         The widget snapshot happens HERE (GUI thread — cheap reads of
         .value()/.currentText()); only the ~350ms atomic .env rewrite runs on a
-        background thread. Coalesced: a call while one is in flight is dropped.
-        This is what stops a Start click from stuttering on disk I/O.
+        background thread. Coalesced with a DIRTY re-arm: an edit arriving while
+        a write is in flight is not dropped — the writer runs again so the
+        operator's latest change always lands. This is what stops a Start click
+        from stuttering on disk I/O.
         """
         if getattr(self, "_persist_thread", None) is not None                 and self._persist_thread.is_alive():
+            # A write is in flight and this snapshot is newer than what it is
+            # writing. Record that so the drain re-runs the write instead of
+            # silently losing the operator's last change.
+            self._persist_dirty = True
+            self._arm_persist_drain()
             return
         values = self._snapshot_settings_values()
         if not values:
             return
+        self._persist_dirty = False
+        # Arm the drain BEFORE spawning the writer (see _persist_settings_async).
+        self._arm_persist_drain()
+        self._start_persist_write(values)
+
+    def _start_persist_write(self, values: dict):
+        """Spawn the background .env writer. Called on the GUI thread only."""
         import threading
         self._persist_thread = threading.Thread(
-            target=self._write_env_values, args=(values,),
+            target=self._persist_settings_worker, args=(values,),
             name="persist-settings", daemon=True)
         self._persist_thread.start()
+
+    def _arm_persist_drain(self):
+        """Poll for a pending re-write FROM THE GUI THREAD.
+
+        A ``QTimer.singleShot`` posted by the background writer never fires:
+        Qt delivers a functor-only singleShot to the *posting* thread, and that
+        thread runs no event loop. So the re-snapshot must be driven from here,
+        where both the timer and the widgets live. Purely file I/O stays on the
+        worker.
+
+        The facade ``self`` is a QWidget, so ``QTimer(self)`` gives the timer
+        GUI-thread affinity and a real owner. If ``self`` is not a QObject
+        (unit-test doubles), fall back to an ownerless timer and drive it
+        manually.
+        """
+        if getattr(self, "_persist_drain_timer", None) is not None:
+            return
+        try:
+            timer = QTimer(self)
+        except Exception:
+            timer = QTimer()
+        try:
+            timer.setInterval(50)
+            timer.timeout.connect(self._drain_persist_dirty)
+            self._persist_drain_timer = timer
+            timer.start()
+        except Exception:
+            self._persist_drain_timer = None
+
+    def _drain_persist_dirty(self):
+        """GUI-thread slot: deliver queued messages and re-write if dirty."""
+        thread = getattr(self, "_persist_thread", None)
+        busy = thread is not None and thread.is_alive()
+        message = getattr(self, "_pending_persist_message", None)
+        if message:
+            self._pending_persist_message = None
+            try:
+                self._log(message)
+            except Exception:
+                pass
+        if busy:
+            return  # still writing; check again on the next tick
+        if getattr(self, "_persist_dirty", False):
+            self._persist_dirty = False
+            try:
+                values = self._snapshot_settings_values()
+            except Exception:
+                self._stop_persist_drain()
+                return
+            if values:
+                self._start_persist_write(values)
+                return
+        # Idle: nothing queued, nothing left to write. The worker sets its
+        # confirmation AFTER its final write, so stay armed for one extra tick
+        # to be sure it is delivered rather than racing the shutdown.
+        if message is None:
+            self._persist_idle_ticks = getattr(self, "_persist_idle_ticks", 0) + 1
+            if self._persist_idle_ticks >= 3:
+                self._persist_idle_ticks = 0
+                self._stop_persist_drain()
+        else:
+            self._persist_idle_ticks = 0
+
+    def _stop_persist_drain(self):
+        timer = getattr(self, "_persist_drain_timer", None)
+        self._persist_drain_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+
+    def _persist_settings_worker(self, values: dict):
+        """Background .env writer — pure file I/O, never touches Qt."""
+        self._write_env_values(values)
 
     def _write_env_values(self, values: dict):
         """Background .env writer — pure file I/O, no Qt/widget access."""
@@ -505,9 +604,28 @@ class ProviderLifecycleBackend:
             for k in ("SMALL_BRAIN_MODEL", "BIG_BRAIN_MODEL", "SHOW_BRAIN_CONSOLES"):
                 if k in values:
                     os.environ[k] = values[k]
-            self._log("💾 llama.cpp settings and model defaults saved to .env")
+            # Never touch Qt widgets from this thread — hand the message back
+            # to the GUI thread. _log() appends to a QTextEdit directly.
+            self._emit_persist_saved()
         except Exception:
             pass
+
+    def _emit_persist_saved(self):
+        """Queue the .env save confirmation for the GUI-thread drain.
+
+        ``_log()`` appends to a QTextEdit, so calling it from the writer thread
+        is unsafe. Runs ON THE WORKER THREAD, so it must only set a flag: it
+        must not create a QTimer here. Qt delivers a functor-only
+        ``QTimer.singleShot`` to the *posting* thread, which runs no event loop,
+        so that never fired and the message vanished; and ``QTimer(self)`` from
+        this thread is refused outright ("Cannot create children for a parent
+        that is in a different thread"), leaving a dead timer in
+        ``_persist_drain_timer`` that would permanently short-circuit the
+        "already armed" guard. The drain was already armed on the GUI thread
+        before the writer started, so setting the message is all that is needed.
+        """
+        self._pending_persist_message = (
+            "💾 llama.cpp settings and model defaults saved to .env")
 
     def _dispatch_launch_prep(self, small: bool, model: str, cfg):
         """Run the slow launch-prep (GGUF preflight, VRAM estimate, command
@@ -684,6 +802,22 @@ class ProviderLifecycleBackend:
         if not model:
             discovered = self._discover_gguf_models() if hasattr(self, "_discover_gguf_models") else []
             model = discovered[0] if discovered else ""
+        # v2.1.51 (ARCH-ENG-051): CPU/RAM slots accept ANY model — no size cap.
+        # A 27B Q1 (3.5 GB) runs fine on system RAM; the earlier <=2B substitution
+        # was based on a wrong OOM theory. Larger CPU models are allowed (just
+        # slower); the real fix for "no answer" is the token budget, not the model
+        # size. Only log an informational note when the slot is CPU-bound and the
+        # model is large, so the operator knows generation will be slow.
+        try:
+            is_cpu_slot = (cfg.gpu_layers == 0) or bool(getattr(cfg, "decision_support_only", False))
+        except Exception:
+            is_cpu_slot = False
+        if is_cpu_slot and model:
+            from agents.runtime.dual_brain import is_cpu_decision_model
+            if not is_cpu_decision_model(model):
+                self._log(
+                    f"ℹ️ {label} (CPU/RAM): {os.path.basename(model)} is a larger model; "
+                    "generation on system RAM will be slower (~a few tok/s).")
         if not model:
             self._log(f"❌ {label}: no model found. Pick a model, then Start.")
             return
@@ -1051,6 +1185,14 @@ class ProviderLifecycleBackend:
         import threading
         if self._closing:
             return
+        # v2.1.60 (ARCH-ENG-073): the periodic liveness timer (4s) can fire while
+        # a previous probe is still running (a hung port blocks up to the probe
+        # timeout). Spawning a thread every tick would pile them up. Skip this
+        # tick if the last probe thread is still alive; it will emit its result
+        # and the next tick resumes normal polling.
+        prev = getattr(self, "_provider_probe_thread", None)
+        if prev is not None and prev.is_alive():
+            return
         thread = threading.Thread(target=self._probe_providers, daemon=True)
         self._provider_probe_thread = thread
         thread.start()
@@ -1069,7 +1211,11 @@ class ProviderLifecycleBackend:
             if cfg is None or not cfg.enabled:
                 return False, [], False, ""
             if cfg.provider == "llamacpp":
-                running, models = self.provider_checker.check_llama_server(cfg.port)
+                # v2.1.60 (ARCH-ENG-073): short timeout so a hung/dead port is
+                # detected within the 4s liveness window instead of the 10s
+                # default, which would leave a dead brain showing "Running".
+                running, models = self.provider_checker.check_llama_server(
+                    cfg.port, timeout=2)
                 return running, models, False, cfg.model
             server_running, models = self.provider_checker.check_endpoint(cfg.models_path)
             if cfg.provider in ("lmstudio", "ollama"):
@@ -1100,9 +1246,9 @@ class ProviderLifecycleBackend:
                 "external": external, "selected": selected,
             })
         # Legacy keys for slots 0/1 (back-compat with existing consumers).
-        sb = slot_results[0] if len(slot_results) > 0 else None
-        bb = slot_results[1] if len(slot_results) > 1 else None
-        # slot 0 is Big, slot 1 is Small in the runtime ordering.
+        # Slot 0 = Big Brain, slot 1 = Small Brain (runtime ordering).
+        bb = slot_results[0] if len(slot_results) > 0 else None
+        sb = slot_results[1] if len(slot_results) > 1 else None
         def _legacy(entry):
             if entry is None:
                 return False, [], False, ""
@@ -1146,67 +1292,82 @@ class ProviderLifecycleBackend:
         """Apply probe results on the GUI thread."""
         self._sb_reachable = bool(data.get("sb_running"))
         self._bb_reachable = bool(data.get("bb_running"))
-        sb_running = data["sb_running"]; sb_models = data["sb_models"]
-        sb_external = data.get("sb_external", False)
-        sb_selected = data.get("sb_selected", "")
-        if sb_running:
-            sb_selected_available = (
-                not sb_selected or not sb_models
-                or any(self.provider_checker.model_ids_match(sb_selected, model)
-                       for model in sb_models)
-            )
-            self.sb_status.setText(
-                "● Running" if sb_selected_available
-                else "● Running · selected model differs from loaded")
-            self.sb_status.setStyleSheet(
-                "color: #4caf50; font-weight: bold;" if sb_selected_available
-                else "color: #ffb74d; font-weight: bold;")
-            model_name = sb_selected or (sb_models[0] if sb_models else "")
-            if model_name:
-                self.sb_model_label.setText(f"Model: {os.path.basename(model_name)}")
-            self._repopulate_model_combo(True, model_name, sb_models)
-            self.sb_start_btn.setEnabled(not sb_external)
-            self.sb_stop_btn.setEnabled(not sb_external)
-        else:
-            self.sb_status.setText("● Stopped")
-            self.sb_status.setStyleSheet("color: #ff5252; font-weight: bold;")
-            self.sb_model_label.setText("Model: —")
-            self._repopulate_model_combo(True, "")
-            self.sb_start_btn.setEnabled(not sb_external)
-            self.sb_stop_btn.setEnabled(False)
+        # ── Legacy sb_/bb_ attribute path (slots 0/1) ──────────────────────
+        # v2.1.52 (ARCH-ENG-052): this block touches self.sb_status / bb_status,
+        # which are only aliased when >=2 provider rows exist (see
+        # _alias_legacy_provider_attrs, which returns early for <2 rows). When a
+        # brain is disabled (e.g. CPU unchecked on a single-GPU box) the alias is
+        # absent and these setText() calls raise AttributeError — which aborted
+        # the WHOLE method before _apply_slot_statuses() ran, leaving every row
+        # stuck at its placeholder. The per-slot path below is authoritative for
+        # the N-brain UI, so this legacy block is best-effort and must NEVER
+        # abort the method. Wrap it and fall through.
+        try:
+            sb_running = data["sb_running"]; sb_models = data["sb_models"]
+            sb_external = data.get("sb_external", False)
+            sb_selected = data.get("sb_selected", "")
+            if sb_running:
+                sb_selected_available = (
+                    not sb_selected or not sb_models
+                    or any(self.provider_checker.model_ids_match(sb_selected, model)
+                           for model in sb_models)
+                )
+                self.sb_status.setText(
+                    "● Running" if sb_selected_available
+                    else "● Running · selected model differs from loaded")
+                self.sb_status.setStyleSheet(
+                    "color: #4caf50; font-weight: bold;" if sb_selected_available
+                    else "color: #ffb74d; font-weight: bold;")
+                model_name = sb_selected or (sb_models[0] if sb_models else "")
+                if model_name:
+                    self.sb_model_label.setText(f"Model: {os.path.basename(model_name)}")
+                self._repopulate_model_combo(True, model_name, sb_models)
+                self.sb_start_btn.setEnabled(not sb_external)
+                self.sb_stop_btn.setEnabled(not sb_external)
+            else:
+                self.sb_status.setText("● Stopped")
+                self.sb_status.setStyleSheet("color: #ff5252; font-weight: bold;")
+                self.sb_model_label.setText("Model: —")
+                self._repopulate_model_combo(True, "")
+                self.sb_start_btn.setEnabled(not sb_external)
+                self.sb_stop_btn.setEnabled(False)
 
-        bb_running = data["bb_running"]; bb_models = data["bb_models"]
-        bb_external = data.get("bb_external", False)
-        bb_selected = data.get("bb_selected", "")
-        if bb_running:
-            bb_selected_available = (
-                not bb_selected or not bb_models
-                or any(self.provider_checker.model_ids_match(bb_selected, model)
-                       for model in bb_models)
-            )
-            self.bb_status.setText(
-                "● Running" if bb_selected_available
-                else "● Running · selected model differs from loaded")
-            self.bb_status.setStyleSheet(
-                "color: #4caf50; font-weight: bold;" if bb_selected_available
-                else "color: #ffb74d; font-weight: bold;")
-            model_name = bb_selected or (bb_models[0] if bb_models else "")
-            if model_name:
-                self.bb_model_label.setText(f"Model: {os.path.basename(model_name)}")
-            self._repopulate_model_combo(False, model_name, bb_models)
-            self.bb_start_btn.setEnabled(not bb_external)
-            self.bb_stop_btn.setEnabled(not bb_external)
-        else:
-            self.bb_status.setText("● Stopped")
-            self.bb_status.setStyleSheet("color: #ff5252; font-weight: bold;")
-            self.bb_model_label.setText("Model: —")
-            self._repopulate_model_combo(False, "")
-            self.bb_start_btn.setEnabled(not bb_external)
-            self.bb_stop_btn.setEnabled(False)
-
-        # Update Start All button state
-        both_running = sb_running and bb_running
-        any_running = sb_running or bb_running
+            bb_running = data["bb_running"]; bb_models = data["bb_models"]
+            bb_external = data.get("bb_external", False)
+            bb_selected = data.get("bb_selected", "")
+            if bb_running:
+                bb_selected_available = (
+                    not bb_selected or not bb_models
+                    or any(self.provider_checker.model_ids_match(bb_selected, model)
+                           for model in bb_models)
+                )
+                self.bb_status.setText(
+                    "● Running" if bb_selected_available
+                    else "● Running · selected model differs from loaded")
+                self.bb_status.setStyleSheet(
+                    "color: #4caf50; font-weight: bold;" if bb_selected_available
+                    else "color: #ffb74d; font-weight: bold;")
+                model_name = bb_selected or (bb_models[0] if bb_models else "")
+                if model_name:
+                    self.bb_model_label.setText(f"Model: {os.path.basename(model_name)}")
+                self._repopulate_model_combo(False, model_name, bb_models)
+                self.bb_start_btn.setEnabled(not bb_external)
+                self.bb_stop_btn.setEnabled(not bb_external)
+            else:
+                self.bb_status.setText("● Stopped")
+                self.bb_status.setStyleSheet("color: #ff5252; font-weight: bold;")
+                self.bb_model_label.setText("Model: —")
+                self._repopulate_model_combo(False, "")
+                self.bb_start_btn.setEnabled(not bb_external)
+                self.bb_stop_btn.setEnabled(False)
+            both_running = sb_running and bb_running
+            any_running = sb_running or bb_running
+        except (AttributeError, RuntimeError):
+            # Missing legacy attrs (disabled brain) or torn-down widget: the
+            # per-slot path below is authoritative, so just skip the legacy UI.
+            sb_running = data.get("sb_running"); bb_running = data.get("bb_running")
+            both_running = bool(sb_running and bb_running)
+            any_running = bool(sb_running or bb_running)
         try:
             if hasattr(self, "start_all_btn") and self.start_all_btn is not None:
                 self.start_all_btn.setEnabled(not both_running)

@@ -23,6 +23,45 @@ def _wait_detected(app, timeout=12):
         time.sleep(0.05)
 
 
+# ── Topology-independent slot resolution ──────────────────────────────────
+# These tests exercise slot-2+ ("extra device") behaviour, which used to be
+# written against a hardcoded 3-device box (big GPU + small GPU + CPU at slot
+# 2). When the second GPU is absent (single-GPU box, card unseated, driver
+# reset) `brain_placements` yields only 2 slots, so every `[2]` index raised
+# IndexError and 15 tests failed deterministically — silently disabling all
+# regression coverage for the N-brain slot logic. Resolve the CPU's ACTUAL slot
+# instead, and skip only the tests whose premise genuinely requires a 3rd
+# device (ARCH-ENG-049).
+
+def _cpu_slot_index(w):
+    """Return the runtime slot index bound to the CPU/RAM pool, or None."""
+    try:
+        from agents.runtime import device_registry as dr
+        cpu = next((d for d in dr.detect_devices(include_cpu=True) if d.is_cpu), None)
+        if cpu is None:
+            return None
+        cfg = w.runtime.slot_for_device(cpu.id)
+        return None if cfg is None else getattr(cfg, "slot", None)
+    except Exception:
+        return None
+
+
+def _row_for_slot(w, slot):
+    """Return the provider row whose .slot == slot (index != slot when a
+    disabled slot is skipped by _build_provider_rows), or None."""
+    for row in getattr(w, "_provider_rows", []):
+        if getattr(row, "slot", None) == slot:
+            return row
+    return None
+
+
+def _settings_row_for_slot(w, slot):
+    for row in getattr(w, "_settings_rows", []):
+        if getattr(row, "slot", None) == slot:
+            return row
+    return None
+
+
 class TestSlotLifecycle(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -40,7 +79,12 @@ class TestSlotLifecycle(unittest.TestCase):
         w = self._widget()
         try:
             slot2 = w.runtime.slot_config(2)
-            self.assertIsNotNone(slot2)
+            if slot2 is None:
+                # Fewer than 3 devices on this box: no extra slot exists, so
+                # there is nothing to access — the accessor's out-of-range
+                # contract is what we can assert here.
+                self.assertIsNone(w._slot_config(99))
+                return
             self.assertIs(w._slot_config(2), slot2)
             self.assertIsNone(w._slot_config(99))
         finally:
@@ -49,7 +93,10 @@ class TestSlotLifecycle(unittest.TestCase):
     def test_slot2_cpu_config_forces_system_ram(self):
         w = self._widget()
         try:
-            slot2 = w.runtime.slot_config(2)
+            cpu_slot = _cpu_slot_index(w)
+            if cpu_slot is None:
+                self.skipTest("no CPU/RAM pool device detected")
+            slot2 = w.runtime.slot_config(cpu_slot)
             self.assertEqual(slot2.device_id, "cpu")
             self.assertEqual(slot2.gpu_layers, 0)
             self.assertTrue(slot2.decision_support_only)
@@ -59,7 +106,10 @@ class TestSlotLifecycle(unittest.TestCase):
     def test_slot_launch_command_targets_slot_port(self):
         w = self._widget()
         try:
-            slot2 = w.runtime.slot_config(2)
+            cpu_slot = _cpu_slot_index(w)
+            if cpu_slot is None:
+                self.skipTest("no CPU/RAM pool device detected")
+            slot2 = w.runtime.slot_config(cpu_slot)
             cmd = slot2.build_llama_command("dummy-model.gguf")
             self.assertIn(str(slot2.port), cmd)
             self.assertIn("--n-gpu-layers", cmd)  # CPU => n-gpu-layers 0
@@ -79,11 +129,15 @@ class TestSlotLifecycle(unittest.TestCase):
     def test_row_start_routes_slot2_to_start_slot(self):
         w = self._widget()
         try:
+            cpu_slot = _cpu_slot_index(w)
+            row = _row_for_slot(w, cpu_slot) if cpu_slot is not None else None
+            if row is None or cpu_slot < 2:
+                self.skipTest("no extra (slot 2+) device on this box")
             called = []
             orig = w._start_slot
             w._start_slot = lambda s: called.append(s)
-            w._provider_rows[2].start_btn.click()
-            self.assertEqual(called, [2])
+            row.start_btn.click()
+            self.assertEqual(called, [cpu_slot])
             w._start_slot = orig
         finally:
             w._closing = True
@@ -91,12 +145,16 @@ class TestSlotLifecycle(unittest.TestCase):
     def test_row_stop_routes_slot2_to_stop_slot(self):
         w = self._widget()
         try:
+            cpu_slot = _cpu_slot_index(w)
+            row = _row_for_slot(w, cpu_slot) if cpu_slot is not None else None
+            if row is None or cpu_slot < 2:
+                self.skipTest("no extra (slot 2+) device on this box")
             called = []
             orig = w._stop_slot
             w._stop_slot = lambda s: called.append(s)
-            w._provider_rows[2].set_running(True)
-            w._provider_rows[2].stop_btn.click()
-            self.assertEqual(called, [2])
+            row.set_running(True)
+            row.stop_btn.click()
+            self.assertEqual(called, [cpu_slot])
             w._stop_slot = orig
         finally:
             w._closing = True
@@ -166,26 +224,43 @@ class TestDevicePolicyLiveRebuild(unittest.TestCase):
     def test_disable_device_stops_its_brain_and_shrinks_rows(self):
         from agents.runtime import device_registry as dr
         w = self._widget()
+        prev_env = {k: os.environ.get(k) for k in
+                    ("BIG_BRAIN_ENABLED", "SMALL_BRAIN_ENABLED")}
         try:
             cpu = self._cpu_device()
             row = w._device_rows.get(cpu.id)
             self.assertIsNotNone(row)
+            cpu_slot = _cpu_slot_index(w)
             stopped = []
             orig = w._stop_slot
+            orig_big, orig_small = w._on_stop_big_brain, w._on_stop_small_brain
             w._stop_slot = lambda s: stopped.append(s)
+            w._on_stop_big_brain = lambda *a: stopped.append(0)
+            w._on_stop_small_brain = lambda *a: stopped.append(1)
             try:
                 row["enable"].setChecked(False)
                 self.app.processEvents()
             finally:
                 w._stop_slot = orig
-            # The disabled device's brain was stopped.
-            self.assertIn(2, stopped)
+                w._on_stop_big_brain, w._on_stop_small_brain = orig_big, orig_small
+            # The disabled device's brain was stopped (whatever slot it holds).
+            self.assertIn(cpu_slot, stopped)
             # Policy persisted as disabled.
             self.assertFalse(dr.load_policy().enabled.get(cpu.id))
-            # Rows shrank to match the enabled devices.
-            self.assertEqual(len(w._provider_rows), len(w.runtime.slots()))
+            # Rows match the ENABLED devices. sync_slots deliberately never
+            # drops below the two role configs, so on a 2-device box the slot
+            # count stays 2 while the disabled device's row is gone — the
+            # invariant is "one row per enabled slot", not "rows == slots".
+            enabled_slots = [c for c in w.runtime.slots()
+                             if getattr(c, "enabled", True)]
+            self.assertEqual(len(w._provider_rows), len(enabled_slots))
         finally:
             # Restore default policy so other tests aren't affected.
+            for k, v in prev_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             pol = dr.load_policy()
             pol.enabled[cpu.id] = True
             dr.save_policy(pol)
@@ -194,6 +269,8 @@ class TestDevicePolicyLiveRebuild(unittest.TestCase):
     def test_reenable_device_restores_rows(self):
         from agents.runtime import device_registry as dr
         w = self._widget()
+        prev_env = {k: os.environ.get(k) for k in
+                    ("BIG_BRAIN_ENABLED", "SMALL_BRAIN_ENABLED")}
         try:
             cpu = self._cpu_device()
             row = w._device_rows.get(cpu.id)
@@ -202,8 +279,20 @@ class TestDevicePolicyLiveRebuild(unittest.TestCase):
             shrunk = len(w._provider_rows)
             row["enable"].setChecked(True)
             self.app.processEvents()
-            self.assertGreater(len(w._provider_rows), shrunk)
+            # Re-enabling restores the row. On a 2-device box the CPU occupies
+            # slot 1 (one of the two always-present role slots), so the count
+            # legitimately stays the same — assert the row is BACK and bound to
+            # the device rather than requiring a strictly larger count.
+            cpu_row = _row_for_slot(w, _cpu_slot_index(w))
+            self.assertIsNotNone(cpu_row)
+            self.assertIsNotNone(w.runtime.slot_for_device(cpu.id))
+            self.assertGreaterEqual(len(w._provider_rows), shrunk)
         finally:
+            for k, v in prev_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             pol = dr.load_policy()
             pol.enabled[cpu.id] = True
             dr.save_policy(pol)
@@ -219,7 +308,6 @@ class TestDevicePolicyLiveRebuild(unittest.TestCase):
             w._on_stop_small_brain = lambda *a: calls.append("small")
             w._stop_slot = lambda s: calls.append(f"slot{s}")
             try:
-                # The CPU is bound to slot 2 in the default policy.
                 cpu = self._cpu_device()
                 cfg = w.runtime.slot_for_device(cpu.id)
                 w._stop_brain_on_disabled_device(cpu.id)
@@ -227,7 +315,11 @@ class TestDevicePolicyLiveRebuild(unittest.TestCase):
                 w._on_stop_big_brain = orig_big
                 w._on_stop_small_brain = orig_small
                 w._stop_slot = orig_slot
-            self.assertIn(f"slot{cfg.slot}", calls)
+            # The CPU's brain was stopped through the handler its slot routes to
+            # (slot 0 -> big, 1 -> small, 2+ -> _stop_slot) — not a hardcoded 2.
+            slot = getattr(cfg, "slot", -1)
+            expected = {0: "big", 1: "small"}.get(slot, f"slot{slot}")
+            self.assertIn(expected, calls)
         finally:
             w._closing = True
 
@@ -268,11 +360,13 @@ class TestPerSlotModelSelection(unittest.TestCase):
         w = self._widget()
         try:
             cpu = self._cpu_device()
-            cfg2 = w.runtime.slot_config(2)
+            cpu_slot = _cpu_slot_index(w)
+            cfg2 = w.runtime.slot_config(cpu_slot)
             self.assertIsNotNone(cfg2)
             self.assertEqual(cfg2.device_id, cpu.id)
             # Put a fake model in the row's dropdown and "pick" it.
-            row2 = w._provider_rows[2]
+            row2 = _row_for_slot(w, cpu_slot)
+            self.assertIsNotNone(row2)
             fake = "D:/llama.cpp/models/fake-cpu-model.gguf"
             row2.set_models([fake])
             row2.model_combo.setCurrentIndex(1)  # select fake
@@ -291,13 +385,16 @@ class TestPerSlotModelSelection(unittest.TestCase):
     def test_model_dropdown_signal_routes_to_handler(self):
         w = self._widget()
         try:
+            cpu_slot = _cpu_slot_index(w)
+            row2 = _row_for_slot(w, cpu_slot)
+            if row2 is None:
+                self.skipTest("no CPU/RAM row rendered on this box")
             seen = []
             orig = w._on_provider_row_model_changed
             w._on_provider_row_model_changed = lambda s, p: seen.append((s, p))
-            row2 = w._provider_rows[2]
             row2.set_models(["/a.gguf", "/b.gguf"])
             row2.model_combo.setCurrentIndex(2)
-            self.assertEqual(seen, [(2, "/b.gguf")])
+            self.assertEqual(seen, [(cpu_slot, "/b.gguf")])
             w._on_provider_row_model_changed = orig
         finally:
             w._closing = True
@@ -361,16 +458,21 @@ class TestRowStatusNotStuckChecking(unittest.TestCase):
     def test_apply_slot_statuses_marks_running(self):
         w = self._widget()
         try:
-            w._apply_slot_statuses([
-                {"slot": 0, "running": True, "models": ["m.gguf"], "selected": ""},
-                {"slot": 1, "running": False, "models": [], "selected": ""},
-                {"slot": 2, "running": True, "models": ["c.gguf"], "selected": ""},
-            ])
-            self.assertIn("Running", w._provider_rows[0].status.text())
-            self.assertEqual(w._provider_rows[1].status.text(), "● Stopped")
-            self.assertIn("Running", w._provider_rows[2].status.text())
-            self.assertTrue(w._provider_rows[2].stop_btn.isEnabled())
-            self.assertFalse(w._provider_rows[2].start_btn.isEnabled())
+            n_rows = len(w._provider_rows)
+            self.assertGreaterEqual(n_rows, 2)
+            # Build a status list covering EVERY rendered row, alternating
+            # running/stopped, instead of assuming a 3-row box.
+            statuses = [{"slot": i, "running": (i % 2 == 0),
+                         "models": [f"m{i}.gguf"] if i % 2 == 0 else [],
+                         "selected": ""} for i in range(n_rows)]
+            w._apply_slot_statuses(statuses)
+            for i, row in enumerate(w._provider_rows):
+                if i % 2 == 0:
+                    self.assertIn("Running", row.status.text())
+                    self.assertTrue(row.stop_btn.isEnabled())
+                    self.assertFalse(row.start_btn.isEnabled())
+                else:
+                    self.assertEqual(row.status.text(), "● Stopped")
         finally:
             w._closing = True
 
@@ -415,14 +517,22 @@ class TestPerDeviceSettings(unittest.TestCase):
         w = self._widget()
         try:
             self.assertEqual(len(w._settings_rows), len(w.runtime.slots()))
-            self.assertGreaterEqual(len(w._settings_rows), 3)
+            # At least the two role brains always render; a 3rd device (CPU or
+            # an extra GPU) adds a row. Assert the invariant, not the box.
+            self.assertGreaterEqual(len(w._settings_rows), 2)
+            # Every rendered row must correspond to a real runtime slot.
+            for row in w._settings_rows:
+                self.assertIsNotNone(w.runtime.slot_config(row.slot))
         finally:
             w._closing = True
 
     def test_cpu_settings_row_locks_gpu_layers(self):
         w = self._widget()
         try:
-            cpu_row = w._settings_rows[2]
+            cpu_slot = _cpu_slot_index(w)
+            cpu_row = _settings_row_for_slot(w, cpu_slot)
+            if cpu_row is None:
+                self.skipTest("no CPU/RAM settings row rendered on this box")
             self.assertTrue(cpu_row.is_cpu)
             self.assertEqual(cpu_row.gpu_layers_spin.value(), 0)
             self.assertFalse(cpu_row.gpu_layers_spin.isEnabled())
@@ -457,8 +567,12 @@ class TestPerDeviceSettings(unittest.TestCase):
         w = self._widget()
         try:
             cpu = self._cpu_device()
-            cfg2 = w.runtime.slot_config(2)
-            w._settings_rows[2].ctx_spin.setValue(16384)
+            cpu_slot = _cpu_slot_index(w)
+            cfg2 = w.runtime.slot_config(cpu_slot)
+            self.assertIsNotNone(cfg2)
+            cpu_srow = _settings_row_for_slot(w, cpu_slot)
+            self.assertIsNotNone(cpu_srow)
+            cpu_srow.ctx_spin.setValue(16384)
             self.app.processEvents()
             self.assertEqual(cfg2.context, 16384)
             persisted = dr.load_policy().settings.get(cpu.id, {})
@@ -474,6 +588,9 @@ class TestPerDeviceSettings(unittest.TestCase):
         w = self._widget()
         try:
             cpu = self._cpu_device()
+            cpu_slot = _cpu_slot_index(w)
+            if cpu_slot is None:
+                self.skipTest("no CPU/RAM slot on this box")
             # Persist a context for the CPU device, then re-sync.
             pol = dr.load_policy()
             pol.settings[cpu.id] = {"context": 20000, "threads": 10, "batch": 512,
@@ -482,7 +599,8 @@ class TestPerDeviceSettings(unittest.TestCase):
             dr.save_policy(pol)
             w.runtime.sync_slots(dr.brain_placements(
                 dr.resolve_assignments(dr.detect_devices(include_cpu=True), dr.load_policy())))
-            cfg2 = w.runtime.slot_config(2)
+            cfg2 = w.runtime.slot_for_device(cpu.id)
+            self.assertIsNotNone(cfg2)
             self.assertEqual(cfg2.context, 20000)
             self.assertEqual(cfg2.threads, 10)
             self.assertEqual(cfg2.kv_cache, "q8_0")

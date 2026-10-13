@@ -24,6 +24,39 @@ from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 
+# ── Atomic JSON writes ────────────────────────────────────────────────────
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    """Write `data` to `path` atomically (temp + fsync + os.replace).
+
+    ARCH-ENG-066: the workshop's account/payment stores wrote in place, so a crash
+    mid-write left a truncated file. The paired read then failed, returned `{}`, and
+    the next save overwrote the file with that empty dict — permanent, silent loss of
+    every stored account or payment method. `os.replace` is atomic on Windows, so a
+    reader sees either the complete old file or the complete new one, never a partial.
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    # Unique per process: two Workshop instances sharing a root would otherwise
+    # collide on the same temp filename and clobber each other's write.
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        # Never leave a half-written temp behind to be mistaken for real data.
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # ── Workspace Paths ───────────────────────────────────────────────────────
 
 WORKSHOP_ROOT = os.getenv("MRBOT_WORKSHOP_ROOT") or os.getenv(
@@ -421,7 +454,13 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         """Add a platform account."""
         try:
             accounts = self._load_accounts()
-            
+            if accounts is None:
+                # ARCH-ENG-066: the store is corrupt/unreadable. Writing now would
+                # replace it with a single-account dict and erase every other stored
+                # account while this call reported success. Refuse instead; the
+                # operator can repair or delete the file.
+                return False
+
             accounts[platform] = {
                 "platform": platform,
                 "username": username,
@@ -440,17 +479,20 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
     def get_account(self, platform: str) -> Dict[str, str]:
         """Get account info for a platform."""
         accounts = self._load_accounts()
-        return accounts.get(platform, {})
+        return (accounts or {}).get(platform, {})
     
     def list_accounts(self) -> List[Dict[str, str]]:
         """List all accounts."""
         accounts = self._load_accounts()
-        return list(accounts.values())
+        return list((accounts or {}).values())
     
     def remove_account(self, platform: str) -> bool:
         """Remove an account."""
         try:
             accounts = self._load_accounts()
+            if accounts is None:
+                # ARCH-ENG-066: refuse to write over an unreadable store.
+                return False
             if platform in accounts:
                 del accounts[platform]
                 self._save_accounts(accounts)
@@ -459,20 +501,33 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             return False
     
     def _load_accounts(self) -> Dict[str, Dict[str, str]]:
-        """Load accounts from file."""
+        """Load accounts from file.
+
+        ARCH-ENG-066: this used to swallow the parse error and `return {}`. The paired
+        `_save_accounts` then wrote that empty dict over the file, so ONE truncated or
+        corrupt byte erased every stored platform account — and `add_account()` still
+        returned True. The caller is now told the store is unreadable instead of being
+        handed a silent empty dict to overwrite with.
+        """
+        if not os.path.exists(self._accounts_file):
+            return {}
         try:
-            if os.path.exists(self._accounts_file):
-                with open(self._accounts_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
-    
+            with open(self._accounts_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return None  # type: ignore[return-value]
+        if not isinstance(data, dict):
+            return None  # type: ignore[return-value]
+        return data
+
     def _save_accounts(self, accounts: Dict[str, Dict[str, str]]):
-        """Save accounts to file."""
-        os.makedirs(os.path.dirname(self._accounts_file), exist_ok=True)
-        with open(self._accounts_file, "w", encoding="utf-8") as f:
-            json.dump(accounts, f, indent=2)
+        """Save accounts to file atomically (temp + fsync + os.replace).
+
+        A crash mid-write can no longer leave a truncated policy behind — that
+        truncation is what made the read above fail and destroyed the data
+        (ARCH-ENG-066).
+        """
+        _atomic_write_json(self._accounts_file, accounts)
     
     # ── Payment Methods ────────────────────────────────────────────────────
     
@@ -481,7 +536,11 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         """Add a payment method."""
         try:
             payments = self._load_payments()
-            
+            if payments is None:
+                # ARCH-ENG-066: writing now would erase every other stored payment
+                # method while this call reported success.
+                return False
+
             payments[method] = {
                 "method": method,
                 "identifier": identifier,
@@ -489,36 +548,44 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
                 "is_crypto": is_crypto,
                 "added": datetime.now().strftime("%Y-%m-%d %H:%M"),
             }
-            
+
             self._save_payments(payments)
             return True
         except Exception:
             return False
-    
+
     def get_payment_method(self, method: str) -> Dict[str, str]:
         """Get payment method info."""
         payments = self._load_payments()
-        return payments.get(method, {})
-    
+        return (payments or {}).get(method, {})
+
     def list_payment_methods(self) -> List[Dict[str, str]]:
         """List all payment methods."""
         payments = self._load_payments()
-        return list(payments.values())
+        return list((payments or {}).values())
     
     def _load_payments(self) -> Dict[str, Dict[str, str]]:
-        """Load payments from file."""
+        """Load payments from file.
+
+        ARCH-ENG-066: same corrupt-read data-loss defect as `_load_accounts` — a
+        truncated file returned `{}`, and `add_payment_method` then wrote that empty
+        dict over the file, erasing every other payment method while reporting
+        success. `None` signals "unreadable" so the caller can refuse to write.
+        """
+        if not os.path.exists(self._payments_file):
+            return {}
         try:
-            if os.path.exists(self._payments_file):
-                with open(self._payments_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
-    
+            with open(self._payments_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return None  # type: ignore[return-value]
+        if not isinstance(data, dict):
+            return None  # type: ignore[return-value]
+        return data
+
     def _save_payments(self, payments: Dict[str, Dict[str, str]]):
-        """Save payments to file."""
-        with open(self._payments_file, "w", encoding="utf-8") as f:
-            json.dump(payments, f, indent=2)
+        """Save payments to file atomically (temp + fsync + os.replace)."""
+        _atomic_write_json(self._payments_file, payments)
     
     # ── Deliverables ───────────────────────────────────────────────────────
     

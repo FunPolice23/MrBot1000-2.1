@@ -89,7 +89,11 @@ class TestProviderControlNRows(unittest.TestCase):
             called = []
             orig = w._on_start_big_brain
             w._on_start_big_brain = lambda *a: called.append("big")
-            w._provider_rows[0].start_btn.click()
+            # Drive the row's own signal, not the button click: a live
+            # llama-server on this box legitimately disables Start (the brain
+            # IS running), so `click()` would silently do nothing. The routing
+            # under test is start_clicked(slot) -> _on_start_big_brain.
+            w._provider_rows[0].start_clicked.emit(0)
             self.assertEqual(called, ["big"])
             w._on_start_big_brain = orig
         finally:
@@ -101,7 +105,9 @@ class TestProviderControlNRows(unittest.TestCase):
             called = []
             orig = w._on_start_small_brain
             w._on_start_small_brain = lambda *a: called.append("small")
-            w._provider_rows[1].start_btn.click()
+            # Same rationale as the big-brain case: emit the slot-keyed signal
+            # rather than clicking a button a live server may have disabled.
+            w._provider_rows[1].start_clicked.emit(1)
             self.assertEqual(called, ["small"])
             w._on_start_small_brain = orig
         finally:

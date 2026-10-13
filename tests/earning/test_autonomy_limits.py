@@ -33,12 +33,29 @@ class TestAutonomyLimits(unittest.TestCase):
 
         def slow_stage(*args):
             original(*args)
-            time.sleep(0.01)
+            # Windows' time.monotonic() has ~15.6 ms granularity, so a 10 ms
+            # sleep sometimes reads back as 0 elapsed and the limit check
+            # passes — the test then failed on the NEXT unrelated stage. Sleep
+            # past at least one full tick so the measurement is deterministic.
+            time.sleep(0.05)
 
         loop._stage_discovered = slow_stage
         result = loop.run(SimpleNamespace(id="opp-timeout"))
         self.assertEqual(result.decision, "failed")
         self.assertIn("exceeded", result.decision_reason.lower())
+
+    def test_portfolio_less_pipeline_does_not_crash_prioritize(self):
+        # v2.1.55 (ARCH-ENG-058): _stage_prioritize called
+        # self.portfolio.load_all() unguarded. Every other portfolio stage
+        # checks `is not None`; this one turned a portfolio-less pipeline into
+        # a generic "Loop error: 'NoneType' object has no attribute
+        # 'load_all'" and aborted the run. Drive a full run with a pipeline
+        # that has no portfolio at all.
+        loop = AutonomousLoop(SimpleNamespace())
+        result = loop.run(SimpleNamespace(id="opp-no-portfolio"))
+        stage_names = [s.stage for s in result.stages]
+        self.assertIn("prioritize", stage_names)
+        self.assertNotIn("load_all", " ".join(result.errors))
 
 
 if __name__ == "__main__":

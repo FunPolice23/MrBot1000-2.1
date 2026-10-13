@@ -28,6 +28,39 @@ def _short(value: Any, limit: int = 240) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+def _untrusted(value: Any, source: str, limit: int = 240) -> str:
+    """Bound external-origin text, neutralize injection, mark it UNTRUSTED.
+
+    Trust boundary: opportunity titles, platform names, approval-request titles
+    and descriptions are attacker-influenced data. They must never reach a brain
+    prompt as a bare string, because the model can parse an embedded "IGNORE
+    ALL PREVIOUS INSTRUCTIONS" / "<system>" / "[INST]" span as a directive
+    aimed at itself. This is the same calling convention used at
+    app/manager.py:1140 (gig proposal prompt) and agents/safety/handlers.py:65
+    (platform skill.md): bound the text FIRST, then hand the bounded fragment to
+    ``prompt_sanitize.sanitize_external_text``, which neutralizes the known
+    injection patterns and wraps the result in the
+    ``--- BEGIN/END UNTRUSTED <SOURCE> DATA ---`` envelope.
+
+    Order matters and is deliberate. Sanitizing an already-truncated string
+    would cut the envelope in half and emit a dangling "BEGIN UNTRUSTED" marker
+    with no terminator (or drop the terminator mid-line), which is worse than no
+    marker at all: the model would be told "everything that follows is
+    untrusted data" while this snapshot's own framing lines then read as part of
+    that untrusted span. Building the envelope on the bounded text and never
+    truncating afterwards cannot produce that fragment. Truncating first also
+    removes nothing — the cap only limits payload length, and every injection
+    pattern that survives it inside the retained window is still neutralized.
+
+    One envelope per emitted line (not one per field) keeps the added prompt
+    overhead bounded: the small brain budgets this snapshot to a few thousand of
+    characters, and a head-truncating budget would otherwise cut the snapshot's
+    own tail.
+    """
+    from agents.knowledge.prompt_sanitize import sanitize_external_text
+    return sanitize_external_text(_short(value, limit), source=source)
+
+
 def _opportunity_context() -> list[str]:
     try:
         from agents.earning.opportunity_portfolio import OpportunityPortfolio, canonical_portfolio_path
@@ -40,10 +73,20 @@ def _opportunity_context() -> list[str]:
         lines = []
         for entry in entries:
             ref = entry.opportunity_ref or {}
+            # External-origin free text, bounded field by field and then
+            # wrapped once: the title comes straight from the platform listing
+            # and is fully attacker-controlled; platform/category are carried
+            # from the same listing. The status/value/evidence fields are
+            # internal bookkeeping and stay outside the envelope.
+            external = "; ".join((
+                f"title={_short(ref.get('title', 'Untitled'), 160)}",
+                f"platform={_short(entry.platform or 'unknown', 40)}",
+                f"category={_short(entry.category or 'unknown', 40)}",
+            ))
             lines.append(
-                f"- {entry.opportunity_id}: {_short(ref.get('title', 'Untitled'), 100)}; "
-                f"status={entry.work_status.value}; platform={entry.platform or 'unknown'}; "
-                f"category={entry.category or 'unknown'}; expected_value=${entry.expected_value:,.2f}; "
+                f"- {entry.opportunity_id}: {_untrusted(external, 'opportunity', 320)}; "
+                f"status={entry.work_status.value}; "
+                f"expected_value=${entry.expected_value:,.2f}; "
                 f"evidence={entry.evidence_status}; payment={entry.payment_status}"
             )
         return lines
@@ -57,11 +100,22 @@ def _approval_context() -> list[str]:
         pending = HumanApprovalQueue.instance().pending()[-8:]
         if not pending:
             return ["- No approvals are currently pending."]
-        return [
-            f"- {item.id}: kind={item.kind.value}; title={_short(item.title, 100)}; "
-            f"requested_by={item.requested_by or 'unknown'}; description={_short(item.description, 180)}"
-            for item in pending
-        ]
+        lines = []
+        for item in pending:
+            # Approval titles/descriptions are not always internal: a
+            # SafetyGuard item embeds the platform action name (a gig title),
+            # and a code-patch item embeds the model-authored patch detail.
+            # Both are external/model output, so they cross the same trust
+            # boundary as the opportunity title above.
+            external = "; ".join((
+                f"title={_short(item.title, 120)}",
+                f"requested_by={_short(item.requested_by or 'unknown', 40)}",
+                f"description={_short(item.description, 180)}",
+            ))
+            lines.append(
+                f"- {item.id}: kind={item.kind.value}; {_untrusted(external, 'approval request', 400)}"
+            )
+        return lines
     except Exception as exc:
         return [f"- Approval context unavailable: {_short(exc, 160)}"]
 

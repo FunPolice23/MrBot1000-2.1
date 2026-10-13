@@ -124,9 +124,28 @@ def _settings_path(root: Optional[str] = None) -> str:
     return os.path.join(base, SETTINGS_FILE)
 
 
+def policy_path(root: Optional[str] = None) -> str:
+    """Return the device-policy file path, honoring the test isolation override.
+
+    ``MRBOT_DEVICE_SETTINGS_PATH`` redirects every read AND write to a throwaway
+    file, exactly as ``MRBOT_ENV_PATH`` does for ``.env`` (ARCH-ENG-057). Without
+    it, GUI tests that construct a real ``DualBrainControl`` (or call
+    ``save_policy`` with no root) silently rewrite the operator's LIVE
+    ``settings.json`` — a canary run wiped the operator's saved per-device model
+    and every llama.cpp setting, and a test suite run is not supposed to be able
+    to touch operator config at all. ``root`` still wins when passed explicitly.
+    """
+    if root:
+        return _settings_path(root)
+    override = (os.getenv("MRBOT_DEVICE_SETTINGS_PATH") or "").strip()
+    if override:
+        return override
+    return _settings_path(None)
+
+
 def load_policy(root: Optional[str] = None) -> DevicePolicy:
     """Read the device policy from settings.json (absent/partial -> defaults)."""
-    path = _settings_path(root)
+    path = policy_path(root)
     policy = DevicePolicy()
     try:
         with open(path, encoding="utf-8") as f:
@@ -142,23 +161,122 @@ def load_policy(root: Optional[str] = None) -> DevicePolicy:
     return policy
 
 
-def save_policy(policy: DevicePolicy, root: Optional[str] = None) -> bool:
-    """Merge the device policy into settings.json, preserving other keys."""
-    path = _settings_path(root)
-    try:
-        data = {}
-        if os.path.exists(path):
+def merge_settings_file(updates: dict, root: Optional[str] = None) -> bool:
+    """Merge `updates` into settings.json, preserving every other top-level key.
+
+    ARCH-ENG-070: `main.py:_save_provider_list` (the Settings-tab Save button) wrote a
+    whole-file dict containing only `{"providers": [...]}`. `save_policy` carefully
+    preserves sibling keys; this writer did the opposite, so one click on Save erased
+    the entire `devices` block — every per-device model choice, every
+    context/threads/temperature setting, and every device-disable. On restart each
+    device reverted to default-ENABLED, so a device the operator deliberately took
+    out of use came back online, and nothing logged an error. Nothing in the codebase
+    ever reads the `providers` key, so the write had zero readers and a purely
+    destructive effect.
+
+    Every writer to this shared file must go through this function.
+    """
+    path = policy_path(root)
+    data: dict = {}
+    corrupt: Optional[str] = None
+    if os.path.exists(path):
+        try:
             with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        data.setdefault("devices", {})
-        data["devices"]["enabled"] = dict(policy.enabled)
-        data["devices"]["role"] = dict(policy.role)
-        data["devices"]["models"] = dict(policy.models)
-        data["devices"]["settings"] = {k: dict(v) for k, v in policy.settings.items()}
-        with open(path, "w", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                corrupt = "not a JSON object"
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            corrupt = f"{type(exc).__name__}: {exc}"
+    if corrupt is not None:
+        # Same quarantine as save_policy: never overwrite operator data we could
+        # not read, and never delete it.
+        try:
+            n = 1
+            while True:
+                cand = f"{path}.corrupt-{n}"
+                if not os.path.exists(cand):
+                    break
+                n += 1
+            os.replace(path, cand)
+        except OSError:
+            pass
+    data.update(updates)
+    try:
+        tmp = f"{path}.tmp-{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
         return True
-    except Exception:
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def save_policy(policy: DevicePolicy, root: Optional[str] = None) -> bool:
+    """Merge the device policy into settings.json, preserving other keys.
+
+    Writes atomically (temp file + os.replace) so a crash mid-write cannot
+    leave a truncated/corrupt policy. A pre-existing settings.json that cannot
+    be parsed (corrupt / truncated / not JSON at all) is rotated aside to
+    ``<name>.corrupt-<n>`` and replaced with a fresh policy instead of making
+    every future save fail silently (ARCH-ENG-055): previously the merge-read
+    lived inside the same ``try`` as the write, so one unreadable byte made
+    ``save_policy`` return False forever and per-device settings never
+    persisted again — the operator lost every edit with no error anywhere.
+    """
+    path = policy_path(root)
+    data: dict = {}
+    corrupt: Optional[str] = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                corrupt = "not a JSON object"
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            corrupt = f"{type(exc).__name__}: {exc}"
+    if corrupt is not None:
+        # Quarantine the bad file so the operator can inspect it, then write a
+        # clean policy. Never delete operator data outright.
+        try:
+            n = 1
+            while True:
+                cand = f"{path}.corrupt-{n}"
+                if not os.path.exists(cand):
+                    break
+                n += 1
+            os.replace(path, cand)
+        except OSError:
+            pass
+    data.setdefault("devices", {})
+    data["devices"]["enabled"] = dict(policy.enabled)
+    data["devices"]["role"] = dict(policy.role)
+    data["devices"]["models"] = dict(policy.models)
+    data["devices"]["settings"] = {k: dict(v) for k, v in policy.settings.items()}
+    try:
+        tmp = f"{path}.tmp-{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
         return False
 
 
@@ -364,5 +482,6 @@ def format_assignments(assignments: List[DeviceAssignment]) -> str:
 __all__ = [
     "ComputeDevice", "DevicePolicy", "DeviceAssignment",
     "detect_devices", "load_policy", "save_policy", "resolve_assignments",
-    "brain_placements", "format_assignments", "BIG_VRAM_GB", "SMALL_VRAM_GB",
+    "brain_placements", "format_assignments", "policy_path",
+    "BIG_VRAM_GB", "SMALL_VRAM_GB",
 ]

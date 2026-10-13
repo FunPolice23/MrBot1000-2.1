@@ -3,11 +3,48 @@ from __future__ import annotations
 
 import time
 import os
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from agents.core.notifications import NotificationService, NotifLevel
+
+# Env override for the persisted queue location. Tests point this at a
+# throwaway file (the same isolation pattern as MRBOT_ENV_PATH / conftest.py).
+_APPROVAL_LOG_ENV = "MRBOT_APPROVAL_QUEUE_PATH"
+
+# Upper bound on the persisted approval history. It caps DECIDED history only:
+# PENDING items and decisions made in the current process are never evicted
+# (see _maybe_persist), so the file can exceed this bound while live work is
+# outstanding. Restored DECIDED items are history, not authorization — see
+# find_by_id().
+_MAX_RETAINED_ITEMS = 200
+
+
+def default_log_path() -> str:
+    """Resolve where the approval queue is persisted. "" means in-memory only.
+
+    Convention follows the rest of the app's agent state: ``~/.mrbot1000``
+    holds reputation.json, wallets.json, opportunities.db, submissions/ and
+    microtasks/ (opportunity_portfolio.py, reputation.py, wallet.py,
+    platform_submitter.py). It is derived from the user's home directory, never
+    a hardcoded absolute path, and never inside the source tree (which may be
+    read-only, and which a re-clone would silently replace).
+
+    A test run must be structurally incapable of writing the operator's LIVE
+    queue — several existing tests call ``HumanApprovalQueue.instance()`` and
+    then ``clear_all()``, which would otherwise persist an empty list over real
+    pending approvals. Same rule as app/environment.py's ``.env`` write
+    refusal: under pytest the queue stays in memory unless a test opts in by
+    setting MRBOT_APPROVAL_QUEUE_PATH.
+    """
+    override = (os.environ.get(_APPROVAL_LOG_ENV) or "").strip()
+    if override:
+        return override
+    if "pytest" in sys.modules:
+        return ""
+    return os.path.join(os.path.expanduser("~"), ".mrbot1000", "approvals.json")
 
 
 class ApprovalKind(str, Enum):
@@ -94,9 +131,20 @@ class HumanApprovalQueue:
 
     def __init__(self, log_path: Optional[str] = None):
         self._items: List[ApprovalItem] = []
-        self._log_path = log_path
+        # "" means "in memory only" (the value default_log_path() returns under
+        # pytest); normalize it to None so `if self._log_path:` guards elsewhere
+        # in this class all mean the same thing.
+        self._log_path = log_path or None
         self._notif = NotificationService.instance()
         self.on_change: Optional[Callable[[ApprovalItem], None]] = None  # Phase 6
+        # Ids of items that were DECIDED in a previous process and restored from
+        # disk. See find_by_id() for why these are history, not authorization.
+        self._restored_decided: set[str] = set()
+        # Ids of items a human decided IN THIS PROCESS. The eviction bound in
+        # _maybe_persist() must never drop one: a decision recorded seconds ago
+        # is a live authorization the operator is still acting on, plus the
+        # audit record of it — not history that may be pruned.
+        self._decided_in_process: set[str] = set()
         if log_path:
             self._load()
 
@@ -111,8 +159,15 @@ class HumanApprovalQueue:
     def instance(cls) -> "HumanApprovalQueue":
         with cls._get_lock():
             if cls._instance is None:
-                cls._instance = cls.__new__(cls)
-                cls._instance.__init__()
+                # The queue is the app's ONLY record of a human decision, so the
+                # singleton must resolve a real path. Calling __init__() with no
+                # argument left log_path=None: _maybe_persist() returned
+                # immediately and _load() never ran, so every pending approval
+                # was silently discarded on exit and an operator who restarted
+                # found an empty Approvals tab with no record anything had been
+                # requested. default_log_path() is "" (in-memory) under pytest
+                # so a test run can never overwrite the live queue.
+                cls._instance = cls(default_log_path())
             return cls._instance
 
     @classmethod
@@ -207,6 +262,9 @@ class HumanApprovalQueue:
             item.decided_at = time.time()
             item.decided_by = decided_by
             item.notes = notes
+            # A decision made in THIS process is live authorization and must
+            # survive the history bound; see _maybe_persist().
+            self._decided_in_process.add(item.id)
             self._maybe_persist()
         # Notify the outcome
         if decision == ApprovalStatus.APPROVED:
@@ -253,7 +311,24 @@ class HumanApprovalQueue:
         return list(self._items)
 
     def find_by_id(self, item_id: str) -> Optional[ApprovalItem]:
-        return self._find(item_id)
+        """Look up an item by id, refusing decisions restored from a prior run.
+
+        This is the lookup every execution consumer uses to confirm a human
+        decision (platform_submitter.execute_approved, live_trading._is_approved,
+        code_patch_service._is_approved, SafetyGuard._decide_in_shared_queue).
+        Returning None for an id decided in a previous process makes those
+        consumers fail CLOSED — "cannot confirm a human decision" — so a restart
+        can never turn a stale approval into a live one and run an irreversible
+        action against content the human no longer sees. A PENDING item restored
+        from disk is returned normally: it authorizes nothing until a human
+        decides it in this process. ``all()`` still exposes the full history.
+        """
+        item = self._find(item_id)
+        if item is None:
+            return None
+        if item.id in self._restored_decided:
+            return None
+        return item
 
     def items_for_kind(self, kind: ApprovalKind) -> List[ApprovalItem]:
         return [i for i in self._items if i.kind == kind and i.status == ApprovalStatus.PENDING]
@@ -265,6 +340,8 @@ class HumanApprovalQueue:
         """Remove all items (e.g. on app exit or reset)."""
         with self._get_lock():
             self._items.clear()
+            self._restored_decided.clear()
+            self._decided_in_process.clear()
             self._maybe_persist()
 
     # ── Persistence (best-effort JSON) ─────────────────────────────────────────
@@ -274,8 +351,43 @@ class HumanApprovalQueue:
             return
         try:
             import json
-            os = __import__("os")
             os.makedirs(os.path.dirname(self._log_path) or ".", exist_ok=True)
+            # Bound the history: this file is rewritten in full on every change,
+            # so an unbounded queue would grow the write cost forever. Two
+            # classes of item are NEVER evicted:
+            #
+            #   * PENDING items — losing one is the defect this file exists to
+            #     fix: a request nobody can see is a request nobody can approve.
+            #   * items a human DECIDED IN THIS PROCESS — approving a $5000
+            #     payment and then enqueueing 210 more items used to delete that
+            #     approval from memory AND from disk, destroying both the live
+            #     authorization and the audit record of a human decision. A
+            #     decision is not history the moment it is made; it is history
+            #     only once the process that made it has exited (at which point
+            #     _restored_decided already refuses to honour it).
+            #
+            # The bound therefore caps the decided HISTORY only, oldest first.
+            keep = list(self._items)
+            if len(keep) > _MAX_RETAINED_ITEMS:
+                live = [i for i in keep
+                        if i.status == ApprovalStatus.PENDING
+                        or i.id in self._decided_in_process]
+                history = [i for i in keep
+                           if i.status != ApprovalStatus.PENDING
+                           and i.id not in self._decided_in_process]
+                history.sort(key=lambda i: i.decided_at or i.requested_at)
+                slots = max(0, _MAX_RETAINED_ITEMS - len(live))
+                keep = live + history[-slots:] if slots else list(live)
+                self._items = sorted(keep, key=lambda i: i.requested_at)
+            # The tracking sets must not drift from the list they describe: an
+            # id whose item is gone is neither "restored decided" nor "decided
+            # in process" for anything (find_by_id already returns None for a
+            # missing item). This intersection is the ONLY removal path besides
+            # clear_all(), so without it both sets would grow monotonically for
+            # the life of the process while _items stayed bounded.
+            retained = {i.id for i in self._items}
+            self._restored_decided &= retained
+            self._decided_in_process &= retained
             with open(self._log_path, "w", encoding="utf-8") as f:
                 json.dump(
                     [i.to_dict() for i in self._items],
@@ -285,7 +397,32 @@ class HumanApprovalQueue:
             pass  # persistence is best-effort
 
     def _load(self):
-        """Restore persisted items from the JSON log (best-effort)."""
+        """Restore persisted items from the JSON log (best-effort).
+
+        Restore uses ``ApprovalItem.from_dict`` and appends directly to
+        ``self._items`` — it NEVER calls ``enqueue()``. ``enqueue()``
+        unconditionally resets ``item.status = ApprovalStatus.PENDING``, so a
+        re-enqueueing restore would resurrect every already-DENIED or
+        already-APPROVED item as a fresh pending request, erasing the recorded
+        human decision and manufacturing approvals nobody gave. (A prior cycle
+        fixed exactly this in a test fixture; it must not come back here.)
+
+        STALE-APPROVAL SAFETY. A decision recorded in a previous process is
+        history, not a live authorization, and a restart must never by itself
+        make an irreversible action runnable against content that may have
+        changed since the human looked at it (a submission whose copy was
+        rewritten, a payment approved days ago, a live order). So restored
+        DECIDED ids are recorded in ``self._restored_decided`` and
+        ``find_by_id()`` — the single lookup every execution consumer uses
+        (platform_submitter.execute_approved, live_trading._is_approved,
+        code_patch_service._is_approved) — refuses them. Those consumers fail
+        CLOSED on a missing id ("cannot confirm a human decision"), so nothing
+        executes on a stale approval. Restored PENDING items are returned
+        normally: they authorize nothing until a human decides them in THIS
+        process, which is the re-validation we want. The full history stays in
+        ``all()`` so the operator can still see what was decided and re-request
+        it deliberately.
+        """
         if not self._log_path:
             return
         try:
@@ -296,11 +433,24 @@ class HumanApprovalQueue:
                 raw = json.load(f)
             if not isinstance(raw, list):
                 return
-            self._items = [
-                ApprovalItem.from_dict(d) for d in raw if isinstance(d, dict)
-            ]
+            self._restored_decided = set()
+            restored: List[ApprovalItem] = []
+            for d in raw:
+                if not isinstance(d, dict):
+                    continue
+                try:
+                    item = ApprovalItem.from_dict(d)
+                except Exception:
+                    continue  # one malformed record must not drop the rest
+                if item.status != ApprovalStatus.PENDING:
+                    self._restored_decided.add(item.id)
+                restored.append(item)
+            self._items = restored
         except Exception:
-            pass  # persistence is best-effort; a corrupt log must not crash startup
+            # A corrupt or unreadable log must not crash startup, and must not
+            # be overwritten before it is read: keep _items empty but leave the
+            # file in place so the operator can inspect it.
+            pass
 
     def _find(self, item_id: str) -> Optional[ApprovalItem]:
         for i in self._items:

@@ -69,6 +69,28 @@ class TokenBucket:
                 sleep_for = (tokens - self._tokens) / self._rate
                 time.sleep(min(sleep_for, 0.1))
 
+    def try_acquire(self, tokens: float = 1.0, timeout: float = 0.0) -> bool:
+        """Non-blocking acquire.
+
+        Returns True and consumes a token if one is available now. With
+        ``timeout > 0`` it waits up to that many seconds for a token before
+        giving up (returns False). Never blocks longer than ``timeout``.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last
+                self._tokens = min(self._capacity,
+                                   self._tokens + elapsed * self._rate)
+                self._last = now
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  retry_llm  — decorator

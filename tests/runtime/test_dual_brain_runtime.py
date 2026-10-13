@@ -105,6 +105,35 @@ class TestRoleDefaults(unittest.TestCase):
         command = cfg.build_llama_command(model_path="big.gguf")
         self.assertNotIn("--perf", command)
 
+    def test_context_shift_enabled_emits_flag(self):
+        # v2.1.64 (ARCH-ENG-075): --context-shift lets llama.cpp roll the
+        # context window forward when a conversation exceeds --ctx-size instead
+        # of erroring "context length exceeded" mid-dialogue. Without it a long
+        # Chat/Dialogue thread dies on the question that overflows the window.
+        cfg = build_config(BrainRole.BIG, {"BIG_BRAIN_CONTEXT_SHIFT": "true"})
+        command = cfg.build_llama_command(model_path="big.gguf")
+        self.assertIn("--context-shift", command)
+        self.assertNotIn("--no-context-shift", command)
+
+    def test_context_shift_disabled_emits_negative_flag(self):
+        cfg = build_config(BrainRole.BIG, {"BIG_BRAIN_CONTEXT_SHIFT": "false"})
+        command = cfg.build_llama_command(model_path="big.gguf")
+        self.assertIn("--no-context-shift", command)
+        self.assertNotIn("--context-shift", command)
+
+    def test_context_shift_unset_omits_flag(self):
+        # Off-by-default: an untouched config is byte-identical to before, so
+        # llama.cpp keeps its own default (disabled) and nothing changes.
+        cfg = build_config(BrainRole.BIG, {})
+        command = cfg.build_llama_command(model_path="big.gguf")
+        self.assertNotIn("--context-shift", command)
+        self.assertNotIn("--no-context-shift", command)
+
+    def test_context_shift_applies_to_small_brain(self):
+        cfg = build_config(BrainRole.SMALL, {"SMALL_BRAIN_CONTEXT_SHIFT": "true"})
+        command = cfg.build_llama_command(model_path="small.gguf")
+        self.assertIn("--context-shift", command)
+
     def test_cpu_decision_model_policy_prefers_configured_small_model(self):
         self.assertEqual(estimate_model_size_b("LFM2.5-1.2B-Q4.gguf"), 1.2)
         self.assertTrue(is_cpu_decision_model("qwen2.5-1.5b-instruct.gguf"))

@@ -16,7 +16,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QPushButton, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QWidget,
 )
 
 
@@ -52,6 +52,7 @@ class BrainControlRow(QWidget):
     start_clicked = Signal(int)
     stop_clicked = Signal(int)
     model_changed = Signal(int, str)  # slot, full model path ("" = unselected)
+    mtp_changed = Signal(int, bool)   # slot, enabled (Phase G, ARCH-ENG-093)
 
     def __init__(self, slot: int, role: str, device_label: str = "",
                  parent: Optional[QWidget] = None):
@@ -85,6 +86,17 @@ class BrainControlRow(QWidget):
             "Select the model this brain runs (auto-detected local .gguf files)")
         self.model_combo.currentIndexChanged.connect(self._emit_model_changed)
         layout.addWidget(self.model_combo, 1)
+
+        # MTP (multi-token prediction) toggle — Phase G, ARCH-ENG-093. Enabled
+        # only when the selected model carries an MTP head; otherwise greyed out
+        # with a plain-language tooltip so it can't be turned on for a model that
+        # would no-op or error. Re-evaluated on every model change.
+        self.mtp_check = QCheckBox("MTP")
+        self.mtp_check.setToolTip(
+            "Multi-Token Prediction: faster generation on models with an MTP head.")
+        self.mtp_check.setEnabled(False)
+        self.mtp_check.stateChanged.connect(self._emit_mtp_changed)
+        layout.addWidget(self.mtp_check)
 
         self.start_btn = QPushButton(f"▶ Start {role_name}")
         self.start_btn.setStyleSheet(f"""
@@ -144,6 +156,7 @@ class BrainControlRow(QWidget):
             self.model_combo.setCurrentIndex(select)
         finally:
             self.model_combo.blockSignals(False)
+        self._refresh_mtp_availability()
 
     def current_model(self) -> str:
         """Full path behind the dropdown's current item ("" if unselected)."""
@@ -151,7 +164,52 @@ class BrainControlRow(QWidget):
         return str(data) if data else ""
 
     def _emit_model_changed(self, _index):
+        self._refresh_mtp_availability()
         self.model_changed.emit(self.slot, self.current_model())
+
+    # ── MTP availability (Phase G, ARCH-ENG-093) ─────────────────────────────
+    def _refresh_mtp_availability(self) -> None:
+        """Enable the MTP checkbox only when the selected model supports it.
+
+        Greys it out (with a reason) otherwise, so the operator can never turn on
+        a flag that would no-op or error on a model without an MTP head.
+        """
+        model = self.current_model()
+        supported = False
+        reason = "select a model to check MTP support"
+        if model:
+            try:
+                from agents.providers.model_capabilities import detect_mtp
+                info = detect_mtp(model)
+                supported = bool(info.get("supported"))
+                reason = info.get("reason") or reason
+            except Exception as exc:
+                reason = f"could not check MTP support: {exc}"
+        self.mtp_check.blockSignals(True)
+        try:
+            self.mtp_check.setEnabled(supported)
+            if not supported:
+                self.mtp_check.setChecked(False)
+            tip = ("MTP available — predicts multiple tokens per pass for faster "
+                   "generation on this model." if supported else reason)
+            self.mtp_check.setToolTip(tip)
+        finally:
+            self.mtp_check.blockSignals(False)
+
+    def _emit_mtp_changed(self, _state):
+        self.mtp_changed.emit(self.slot, self.mtp_check.isChecked())
+
+    def mtp_enabled(self) -> bool:
+        """True only if the box is both enabled (model supports MTP) and checked."""
+        return self.mtp_check.isEnabled() and self.mtp_check.isChecked()
+
+    def set_mtp(self, enabled: bool) -> None:
+        """Programmatically set the MTP checkbox (after availability is known)."""
+        self.mtp_check.blockSignals(True)
+        try:
+            self.mtp_check.setChecked(bool(enabled) and self.mtp_check.isEnabled())
+        finally:
+            self.mtp_check.blockSignals(False)
 
     # ── Live updates (called by the parent panel) ────────────────────────────
     def set_device_label(self, label: str) -> None:
@@ -184,6 +242,7 @@ class BrainControlRow(QWidget):
                     self.model_combo.setCurrentIndex(i)
                 finally:
                     self.model_combo.blockSignals(False)
+                self._refresh_mtp_availability()
                 return
 
     def set_running(self, running: bool) -> None:

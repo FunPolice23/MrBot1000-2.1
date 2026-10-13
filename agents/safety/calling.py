@@ -31,6 +31,7 @@ from agents.safety.gate import (
     MUTATING_TOOL_NAMES as _MUTATING_TOOL_NAMES,
     SafetyDecision,
     SafetyGate,
+    canonical_tool_name,
     is_known_tool,
 )
 from agents.safety.authorization import AuthorizedActionDispatcher

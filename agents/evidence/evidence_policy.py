@@ -47,6 +47,21 @@ class EvidenceRequirement:
 # independently verified payment (manual 0.30 < authenticated_api 0.70 < crypto 1.0).
 _PAYMENT_SLOT = tuple(sorted(TRANSITION_PAYMENT_EVIDENCE_TYPES))
 
+# ARCH-ENG-065: the ONLY methods that may escalate a non-affirmative evidence record to
+# VERIFIED. Each is produced by a source outside this process (an authenticated platform
+# API, an on-chain read, or an independent external reconciliation), so none can be
+# self-asserted. Manual/human/local methods are deliberately absent, and an UNKNOWN
+# method is refused — a deny-list let `method="heuristic"` reach VERIFIED@L4.
+_INDEPENDENT_RECONCILIATION_METHODS = frozenset({
+    "external_reconciliation",
+    "authenticated_api_response",
+    "authenticated_api_lookup",
+    "api_response",
+    "platform_transaction",
+    "blockchain_transaction_receipt",
+    "blockchain_balance_delta",
+})
+
 REQUIREMENTS: Dict[str, EvidenceRequirement] = {
     "DISCOVERED->RESEARCHED": EvidenceRequirement(
         "DISCOVERED->RESEARCHED", [("discovery", "research_summary")], VerificationLevel.L1_SELF_REPORTED,
@@ -176,8 +191,15 @@ def reconcile(ev: Evidence, reconciler: str, note: str = "",
     confirming). It is NEVER called by the LLM path. Manual attestation alone cannot reconcile —
     `method` must be an independent verification method (external_reconciliation / api / on-chain).
     """
-    if method in ("manual_attestation", "human_attestation", "human_confirmation", "local_record"):
-        # Manual/local re-assertion is NOT independent reconciliation — refuse to escalate.
+    # ARCH-ENG-065: this was a DENY-list of four manual method strings, so ANY other
+    # string escalated the evidence to VERIFIED at L4 — reproduced with
+    # `method="heuristic"` and `method="whatever"`. The docstring's "requires real
+    # external reconciliation" was unenforced. An allow-list makes the trust floor
+    # structural: only these methods, produced outside this process, may flip a
+    # non-affirmative record. An unknown method is refused, not granted.
+    if method not in _INDEPENDENT_RECONCILIATION_METHODS:
+        # Manual/local re-assertion (or an unrecognised method) is NOT independent
+        # reconciliation — refuse to escalate.
         return ev
     return ev.verify(VerificationResult(
         status=EvidenceStatus.VERIFIED, method=method, level=level,

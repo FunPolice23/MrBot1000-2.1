@@ -47,6 +47,7 @@ class EarningTab(QWidget):
         self.platform_submitter = None
         self.microtask_earner = None
         self.crypto_operator = None
+        self.safety_guard = None
 
         self._init_backends()
 
@@ -73,12 +74,25 @@ class EarningTab(QWidget):
             from agents.earning.microtask_earner import MicrotaskEarner
             from agents.earning.real_crypto_operator import RealCryptoOperator
             from agents.services.autonomous_loop import AutonomousLoop
+            from agents.safety.guard import SafetyGuard
 
             self.freelance_finder = FreelanceFinder()
             self.proposal_writer = ProposalWriter()
-            self.platform_submitter = PlatformSubmitter()
+            # A real guard, shared by the submitter and the crypto operator.
+            # PlatformSubmitter() with no guard fails CLOSED ("no safety guard
+            # configured"), which is the safe direction but made Submit
+            # permanently unusable — the approval gate could never flag
+            # anything because nothing ever called it. Injecting the guard
+            # makes the gate reachable: a submission is now queued into the
+            # same HumanApprovalQueue the Approvals panel reads (see
+            # HumanApprovalLayer._enqueue_to_shared_queue), so the operator
+            # can actually approve it.
+            self.safety_guard = SafetyGuard()
+            self.platform_submitter = PlatformSubmitter(
+                safety_guard=self.safety_guard)
             self.microtask_earner = MicrotaskEarner()
-            self.crypto_operator = RealCryptoOperator(None)
+            self.crypto_operator = RealCryptoOperator(
+                None, safety_guard=self.safety_guard)
 
             self.autonomous_loop = AutonomousLoop(None)
         except Exception as e:
@@ -360,8 +374,39 @@ class EarningTab(QWidget):
         if not proposal:
             QMessageBox.warning(self, "Error", "Draft a proposal first")
             return
+        row = self.freelance_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Error", "Select an opportunity first")
+            return
+        if self.platform_submitter is None:
+            QMessageBox.warning(self, "Error", "Submission backend unavailable")
+            return
+        opp = {
+            "title": self.freelance_table.item(row, 0).text(),
+            "platform": self.freelance_table.item(row, 1).text(),
+            "budget": self.freelance_table.item(row, 2).text(),
+        }
         try:
-            result = self.platform_submitter.submit(proposal_text=proposal)
+            # The real API is prepare_submission -> request_approval -> submit.
+            # Calling submit() directly (or with proposal_text=) either raises
+            # TypeError or bypasses the approval gate entirely.
+            record = self.platform_submitter.prepare_submission(
+                opp["platform"] or "unknown", opp, proposal)
+            gate = self.platform_submitter.request_approval(record)
+            if not gate.get("ok"):
+                QMessageBox.critical(
+                    self, "Submission blocked",
+                    f"{gate.get('error', gate.get('status', 'blocked'))}\n\n"
+                    "The submission was NOT sent.")
+                return
+            if gate.get("status") == "awaiting_approval":
+                QMessageBox.information(
+                    self, "Awaiting approval",
+                    f"Queued for human approval (id {gate.get('approval_id')}).\n"
+                    "It will not be sent until a human approves it in the "
+                    "Approvals tab.")
+                return
+            result = self.platform_submitter.submit(record)
             QMessageBox.information(self, "Submission", str(result))
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))

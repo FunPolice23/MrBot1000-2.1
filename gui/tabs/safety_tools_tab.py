@@ -18,8 +18,35 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 
+from agents.safety.approval import ApprovalKind
+
 
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "settings.json")
+
+
+# The approval kinds ``main.MainWindow._on_approval_decided`` can actually route
+# to an execution path: ACTION -> ``_execute_approved_action``, SUBMISSION ->
+# ``_execute_approved_submission``. Those are its only two branches.
+#
+# An approval of any other kind is recorded in the queue and then goes
+# nowhere: the operator sees the request, clicks Approve, watches it turn
+# APPROVED, and nothing happens — with no log explaining why (F7).
+# ``SafetyGuard`` sets ``kind=PAYMENT`` for any action with ``requires_funds``
+# and ``human_gates`` enqueues GATE items, so both were selectable and
+# approvable here while no execution path existed for them. Offering an Approve
+# button that cannot do anything is the "silently dropped decision" class this
+# tab was already changed to fix, so this surface only lists what it can route.
+#
+# Those requests are NOT hidden from the operator. The Approvals panel
+# (``gui/panels/approval_panel.py``, wired in main.py as ``_approval_panel``)
+# lists EVERY pending item of every kind with full detail, and every enqueue
+# raises a sticky ``approval_required`` notification
+# (``HumanApprovalQueue.enqueue``), so a payment request stays fully visible.
+# Note that panel has the same unroutable-approval gap (it lists everything and
+# routes through the same two-branch handler); that is a separate defect in a
+# file this change does not touch. What this filter guarantees is that the
+# Safety & Tools table stops offering a button that is a guaranteed no-op.
+_ROUTABLE_APPROVAL_KINDS = (ApprovalKind.ACTION, ApprovalKind.SUBMISSION)
 
 
 class SafetyTab(QWidget):
@@ -380,53 +407,161 @@ class SafetyTab(QWidget):
             self.layers_table.setItem(i, 3, QTableWidgetItem(desc))
     
     def _refresh_approvals(self):
-        """Refresh pending approvals display."""
+        """Refresh pending approvals display.
+
+        Every PENDING item in ``HumanApprovalQueue`` is listed, not only the
+        ones the SafetyGuard raised itself. Guard-owned records carry the
+        richer ``action``/``reasons`` shape, so they are used when available
+        and the queue item's ``to_dict()`` fills in the rest — otherwise a
+        ``run_command`` / ``file_write`` request the chat or the Big Brain
+        enqueued directly was invisible here, and an item the operator cannot
+        see is an item the operator cannot approve.
+        Reproduced: queue.pending()==2 (dispatch-origin items) while the table
+        showed 0 rows.
+
+        BUT only for the kinds this surface can actually act on
+        (``_ROUTABLE_APPROVAL_KINDS``). ``main.py:_on_approval_decided`` routes
+        ACTION and SUBMISSION approvals to an execution path and has no branch
+        for anything else, so listing a PAYMENT or GATE request here made it
+        selectable and approvable while nothing could ever run it: the click
+        turned the row APPROVED and stopped, silently. A filtered item stays
+        PENDING and stays visible in the Approvals panel and its sticky
+        notification — see the comment on that constant.
+        """
         self.approvals_table.setRowCount(0)
-        
-        # Get pending approvals from safety guard
+
+        guard_by_id = {}
         if self.safety_guard:
-            pending = self.safety_guard.get_pending_approvals()
-        else:
-            pending = [item.to_dict() for item in self.approval_queue.pending()]
-        
-        for i, approval in enumerate(pending):
+            try:
+                for record in self.safety_guard.get_pending_approvals():
+                    record_id = record.get("id")
+                    if record_id:
+                        guard_by_id[record_id] = record
+            except Exception:
+                guard_by_id = {}
+
+        try:
+            pending = list(self.approval_queue.pending())
+        except Exception:
+            pending = []
+
+        rows = []
+        for item in pending:
+            if item.kind not in _ROUTABLE_APPROVAL_KINDS:
+                continue
+            approval = item.to_dict()
+            guard_record = guard_by_id.get(item.id)
+            if guard_record:
+                # The guard owns this request and its record carries the real
+                # SafetyAction; merge it over the queue dict but keep the
+                # queue's authoritative id so the approve path keys correctly.
+                approval.update(guard_record)
+                approval["id"] = item.id
+            rows.append(approval)
+
+        for i, approval in enumerate(rows):
             self.approvals_table.insertRow(i)
-            self.approvals_table.setItem(i, 0, QTableWidgetItem(approval.get("id", "")))
+            self.approvals_table.setItem(i, 0, QTableWidgetItem(str(approval.get("id", ""))))
             action = approval.get("action") or approval.get("title", "")
             reason = approval.get("reasons") or approval.get("description", "")
             self.approvals_table.setItem(i, 1, QTableWidgetItem(str(action)))
             self.approvals_table.setItem(i, 2, QTableWidgetItem(str(reason)))
+            # requested_at is a float timestamp in both shapes, but neither is
+            # guaranteed to have it (a guard record pruned mid-refresh, a queue
+            # item restored from a hand-edited log), and a missing key here
+            # would raise inside a table refresh and blank the whole panel.
+            try:
+                requested_at = float(approval.get("requested_at") or 0.0)
+            except (TypeError, ValueError):
+                requested_at = 0.0
             self.approvals_table.setItem(i, 3, QTableWidgetItem(
-                datetime.fromtimestamp(approval.get("requested_at", 0)).strftime("%H:%M:%S")
+                datetime.fromtimestamp(requested_at).strftime("%H:%M:%S")
+                if requested_at else ""
             ))
-    
+
     def _on_approve(self):
-        """Approve selected action."""
+        """Approve selected action.
+
+        The decision must then be routed to the same execution path the
+        Approvals tab uses. Recording it in the queue alone left this surface
+        half-wired: an approved submission showed APPROVED here and was never
+        sent, because only ``ApprovalPanel`` emits ``item_decided``.
+
+        The human's click is NEVER dropped. ``SafetyGuard.approve()`` only
+        knows the ids it raised itself, so an approval the chat dispatcher or
+        the Big Brain enqueued straight into ``HumanApprovalQueue`` made it
+        return False — and the item stayed PENDING forever, silently, with no
+        log and no error. Reproduced: guard.approve(dispatch_id) -> False, the
+        queue item never left 'pending', and ``_route_decision`` never ran.
+
+        The guard is still tried FIRST (it owns its records and mirrors the
+        decision into the queue), but the queue is the authority: when the
+        guard does not recognise the id, the decision is recorded there
+        instead. This cannot fabricate an approval — the id came from a row a
+        human selected, and ``_on_approval_decided`` re-reads the queue before
+        executing anything.
+        """
         # Get selected approval
         row = self.approvals_table.currentRow()
         if row < 0:
             return
-        
+
         approval_id = self.approvals_table.item(row, 0).text()
+        ok = False
         if self.safety_guard:
-            self.safety_guard.approve(approval_id)
-        else:
-            self.approval_queue.approve(approval_id, notes="Approved from Safety & Tools")
+            ok = self.safety_guard.approve(approval_id)
+        if not ok:
+            # The guard does not own this id (or already decided it). The queue
+            # is the authority for a human decision, so record it there.
+            ok = self.approval_queue.approve(
+                approval_id, notes="Approved from Safety & Tools")
+        if ok:
+            self._route_decision(approval_id)
         self.refresh()
-    
+
     def _on_reject(self):
-        """Reject selected action."""
+        """Reject selected action.
+
+        Same never-dropped rule as ``_on_approve``: a rejection the guard does
+        not recognise is recorded in the queue instead of being swallowed, so
+        an operator who clicks Reject never leaves an irreversible request
+        looking pending and re-approvable.
+        """
         row = self.approvals_table.currentRow()
         if row < 0:
             return
-        
+
         approval_id = self.approvals_table.item(row, 0).text()
+        ok = False
         if self.safety_guard:
-            self.safety_guard.reject(approval_id)
-        else:
-            self.approval_queue.deny(approval_id, notes="Rejected from Safety & Tools")
+            ok = self.safety_guard.reject(approval_id)
+        if not ok:
+            ok = self.approval_queue.deny(
+                approval_id, notes="Rejected from Safety & Tools")
         self.refresh()
-    
+
+    def _route_decision(self, approval_id):
+        """Hand a freshly recorded approval to the app's decision handler.
+
+        Best-effort and fail-safe: this only notifies. It cannot execute
+        anything by itself — the handler re-reads the decision from the queue,
+        so a decision this tab did not actually record will not run.
+        """
+        handler = getattr(self.parent(), "_on_approval_decided", None)
+        if not callable(handler):
+            return
+        try:
+            from agents.safety.approval import ApprovalStatus
+            item = self.approval_queue.find_by_id(approval_id)
+            if item is None or item.status != ApprovalStatus.APPROVED:
+                return
+            handler(approval_id, ApprovalStatus.APPROVED,
+                    "Approved from Safety & Tools")
+        except Exception:
+            # A routing failure must not lose the recorded decision, and must
+            # never surface as a crash in the middle of an approval click.
+            pass
+
     def _on_save_config(self):
         """Save safety configuration."""
         config = {

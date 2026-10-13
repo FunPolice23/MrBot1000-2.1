@@ -87,6 +87,13 @@ class SocialEarningPlatform:
         except Exception as e:
             print(f"[Social] Forum scan error: {e}")
 
+        # Remote job boards with public RSS (WeWorkRemotely, etc.)
+        try:
+            opps = self._scan_remote_job_boards(page=page, query=query)
+            all_opps.extend(opps)
+        except Exception as e:
+            print(f"[Social] Remote-board scan error: {e}")
+
         return all_opps
 
     # Entries per feed page. Reddit's RSS returns ~25; rotating a window over
@@ -176,39 +183,66 @@ class SocialEarningPlatform:
         return []
 
     def _scan_linkedin_jobs(self) -> List[SocialOpportunity]:
-        """Scan LinkedIn job posts."""
+        """Scan LinkedIn job posts via public RSS.
+
+        v2.1.68: previously hardcoded min_amount=100 / estimated_value=200 for
+        every listing — invented revenue at the producer, which the financial-
+        truth rule forbids (a balance/amount is never fabricated). Amounts are
+        now parsed from the listing text; 0 = not stated (unknown). Entries with
+        no payment signal are skipped so nothing is presented as a paid gig
+        without evidence. The public jobs/rss feed currently returns 0 entries,
+        so this contributes nothing until LinkedIn exposes a working feed — which
+        is correct (fail-closed, never fabricate).
+        """
         opps = []
-        
-        # LinkedIn jobs RSS feeds (limited)
+
         feeds = [
             "https://www.linkedin.com/jobs/rss",
         ]
-        
+
         for feed_url in feeds:
             try:
                 import feedparser
                 feed = feedparser.parse(feed_url)
-                
+
                 for entry in feed.entries[:10]:
-                    title = entry.title
-                    desc = entry.description[:300] if hasattr(entry, 'description') else ''
-                    
+                    title = entry.get("title", "") if hasattr(entry, "get") else entry.title
+                    desc = ""
+                    if hasattr(entry, "description"):
+                        desc = entry.description[:300]
+                    link = entry.get("link", "") if hasattr(entry, "get") else getattr(entry, "link", "")
+
+                    text = f"{title} {desc}"
+                    # Only keep listings that actually mention pay — never invent
+                    # an amount to make a posting look like paid work.
+                    if not any(x in text.lower() for x in
+                               ["$", "salary", "usd", "pay", "budget", "rate", "compensation"]):
+                        continue
+
+                    pay_amount = 0.0
+                    m = re.search(r"\$\s*([\d,]+)(?:\.\d{2})?", text)
+                    if m:
+                        try:
+                            pay_amount = float(m.group(1).replace(",", ""))
+                        except ValueError:
+                            pay_amount = 0.0
+
                     opps.append(SocialOpportunity(
                         id="linkedin_" + hashlib.sha1(
-                            (entry.link or title).encode("utf-8", "ignore")
+                            (link or title).encode("utf-8", "ignore")
                         ).hexdigest()[:12],
                         source="linkedin",
                         title=title,
                         description=desc,
                         platform="LinkedIn",
                         payment_type="usd",
-                        min_amount=100.0,
-                        estimated_value=200.0,
-                        url=entry.link,
+                        min_amount=pay_amount,
+                        estimated_value=pay_amount,
+                        url=link,
                     ))
             except Exception as e:
                 print(f"[LinkedIn] Feed error: {e}")
-        
+
         return opps
 
     def _scan_forum_jobs(self) -> List[SocialOpportunity]:
@@ -226,6 +260,79 @@ class SocialEarningPlatform:
         # All forum entries below are static — they were never fetched.
         # Without platform-specific API credentials, we must not fabricate.
         return []
+
+    def _scan_remote_job_boards(self, page: int = 1,
+                                query: Optional[str] = None) -> List[SocialOpportunity]:
+        """Scan remote-job boards that publish public RSS (WeWorkRemotely).
+
+        Real, machine-readable freelance/remote listings — broadens discovery
+        beyond the two Reddit gig subs and the crypto/airdrop feeds. Amounts are
+        parsed from the listing text; when no salary is stated the amount is 0
+        (unknown), NEVER a fabricated default. IDs are stable (sha1 of the link).
+        """
+        opps: List[SocialOpportunity] = []
+        feeds = [
+            "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+            "https://weworkremotely.com/categories/remote-design-jobs.rss",
+            "https://weworkremotely.com/categories/remote-writing-jobs.rss",
+            "https://weworkremotely.com/categories/remote-customer-support-jobs.rss",
+        ]
+        start = (max(1, int(page or 1)) - 1) * self.PAGE_SIZE
+        term = (query or "").strip().lower()
+
+        def _window(entries):
+            n = len(entries)
+            if n == 0:
+                return []
+            if n <= self.PAGE_SIZE:
+                return list(entries)
+            s = start % n
+            if s + self.PAGE_SIZE <= n:
+                return entries[s:s + self.PAGE_SIZE]
+            return entries[s:] + entries[:self.PAGE_SIZE - (n - s)]
+
+        for feed_url in feeds:
+            try:
+                import feedparser
+                feed = feedparser.parse(feed_url)
+                for entry in _window(list(feed.entries)):
+                    title = entry.get("title", "") if hasattr(entry, "get") else entry.title
+                    desc = ""
+                    if hasattr(entry, "description"):
+                        desc = entry.description[:500]
+                    link = entry.get("link", "") if hasattr(entry, "get") else getattr(entry, "link", "")
+
+                    if term and term not in f"{title} {desc}".lower():
+                        continue
+
+                    # Parse a real salary from the listing (e.g. "$80,000" or
+                    # "$60 - $90 / hour"); 0 = not stated, never invented.
+                    pay_amount = 0.0
+                    m = re.search(r"\$\s*([\d,]+)(?:\.\d{2})?", f"{title} {desc}")
+                    if m:
+                        try:
+                            pay_amount = float(m.group(1).replace(",", ""))
+                        except ValueError:
+                            pay_amount = 0.0
+
+                    opps.append(SocialOpportunity(
+                        id="wwr_" + hashlib.sha1(
+                            (link or title).encode("utf-8", "ignore")
+                        ).hexdigest()[:12],
+                        source="remote_board",
+                        title=title,
+                        description=desc,
+                        platform="WeWorkRemotely",
+                        payment_type="usd",
+                        min_amount=pay_amount,
+                        estimated_value=pay_amount,
+                        url=link,
+                        author=getattr(entry, "author", "unknown"),
+                    ))
+            except Exception as e:
+                print(f"[RemoteBoard] Feed error: {e}")
+
+        return opps
 
     def scan_reddit_jobs(self) -> List[SocialOpportunity]:
         """Public method for Reddit scanning."""

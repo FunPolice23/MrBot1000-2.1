@@ -119,6 +119,21 @@ class WorkerLLMMixin:
                         f"[Budget] daily cap reached — skipping paid provider '{name}', "
                         f"falling back to local")
                     continue
+                # Phase F (ARCH-ENG-091): per-provider rate limit + daily call
+                # cap. Fail closed for billable providers (a clear skip so we
+                # fall through to the next provider); local providers are never
+                # $-capped. Guarded: a limiter error must never block calls.
+                try:
+                    from agents.safety.provider_rate_limiter import (
+                        get_provider_rate_limiter)
+                    _rl = get_provider_rate_limiter().acquire(
+                        name, block=False, timeout=0.0)
+                    if not _rl.get("allow"):
+                        self.log_signal.emit(
+                            f"[RateLimit] skipping '{name}': {_rl.get('reason','')}")
+                        continue
+                except Exception:
+                    pass
                 try:
                     model = default_model
                     self.last_model = model

@@ -27,6 +27,14 @@ _ROLE_STYLE = {
     "small": ("🤖", "#03dac6"),
 }
 
+# Phase G (ARCH-ENG-094): mouse-hover help for each advanced setting.
+def _help(key: str) -> str:
+    try:
+        from agents.knowledge.llama_setting_help import tooltip
+        return tooltip(key)
+    except Exception:
+        return ""
+
 _SPIN_QSS = """
     QSpinBox, QDoubleSpinBox {
         background: #1a1a1a; color: #e0e0e0;
@@ -83,6 +91,7 @@ class BrainSettingsRow(QWidget):
         self.ctx_spin.setSuffix(" tok")
         self.ctx_spin.setFixedWidth(110)
         self.ctx_spin.setStyleSheet(_SPIN_QSS)
+        self.ctx_spin.setToolTip(_help("ctx"))
         self.ctx_spin.valueChanged.connect(lambda: self.changed.emit(self.slot))
         outer.addWidget(self.ctx_spin)
 
@@ -91,7 +100,7 @@ class BrainSettingsRow(QWidget):
         self.gpu_layers_spin = QSpinBox()
         self.gpu_layers_spin.setRange(-1, 999)
         self.gpu_layers_spin.setValue(-1)  # -1 = Auto
-        self.gpu_layers_spin.setToolTip("-1 = Auto (offload all), 0 = CPU only, N = offload N layers")
+        self.gpu_layers_spin.setToolTip(_help("gpu_layers"))
         self.gpu_layers_spin.setFixedWidth(70)
         self.gpu_layers_spin.setStyleSheet(_SPIN_QSS)
         self.gpu_layers_spin.valueChanged.connect(lambda: self.changed.emit(self.slot))
@@ -108,6 +117,7 @@ class BrainSettingsRow(QWidget):
         self.threads_spin.setValue(8 if role == "big" else 4)
         self.threads_spin.setFixedWidth(60)
         self.threads_spin.setStyleSheet(_SPIN_QSS)
+        self.threads_spin.setToolTip(_help("threads"))
         self.threads_spin.valueChanged.connect(lambda: self.changed.emit(self.slot))
         outer.addWidget(self.threads_spin)
 
@@ -118,6 +128,7 @@ class BrainSettingsRow(QWidget):
         self.batch_spin.setValue(2048)
         self.batch_spin.setFixedWidth(80)
         self.batch_spin.setStyleSheet(_SPIN_QSS)
+        self.batch_spin.setToolTip(_help("batch"))
         self.batch_spin.valueChanged.connect(lambda: self.changed.emit(self.slot))
         outer.addWidget(self.batch_spin)
 
@@ -128,6 +139,7 @@ class BrainSettingsRow(QWidget):
         self.kv_combo.setCurrentText("f16")
         self.kv_combo.setFixedWidth(80)
         self.kv_combo.setStyleSheet(_COMBO_QSS)
+        self.kv_combo.setToolTip(_help("kv_cache"))
         self.kv_combo.currentTextChanged.connect(lambda: self.changed.emit(self.slot))
         outer.addWidget(self.kv_combo)
 
@@ -138,6 +150,7 @@ class BrainSettingsRow(QWidget):
         self.split_combo.setCurrentText("none")
         self.split_combo.setFixedWidth(80)
         self.split_combo.setStyleSheet(_COMBO_QSS)
+        self.split_combo.setToolTip(_help("split_mode"))
         self.split_combo.currentTextChanged.connect(lambda: self.changed.emit(self.slot))
         outer.addWidget(self.split_combo)
 
@@ -149,6 +162,7 @@ class BrainSettingsRow(QWidget):
         self.temp_spin.setValue(0.5)
         self.temp_spin.setFixedWidth(70)
         self.temp_spin.setStyleSheet(_SPIN_QSS)
+        self.temp_spin.setToolTip(_help("temperature"))
         self.temp_spin.valueChanged.connect(lambda: self.changed.emit(self.slot))
         outer.addWidget(self.temp_spin)
 

@@ -255,6 +255,132 @@ def _tool_file_list(args: Dict[str, Any]) -> str:
         return f"[List error: {e}]"
 
 
+# ── Payment Tool (Phase D, ARCH-ENG-084) ──────────────────────────────────────
+# The lifecycle tracker is injected by the composition root (handlers are
+# stateless). record_payment is HIGH_TRUST: it only runs behind an APPROVED
+# approval item and never invents an amount or evidence.
+_lifecycle_tracker = None
+
+
+def set_lifecycle_tracker(tracker) -> None:
+    """Inject the OpportunityLifecycleTracker for the record_payment tool."""
+    global _lifecycle_tracker
+    _lifecycle_tracker = tracker
+
+
+def _tool_record_payment(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Record a verified payment against an opportunity (HIGH_TRUST).
+
+    Refuses unless `approval_id` names an APPROVED approval item. The amount and
+    evidence reference are supplied by the caller (human/vault) — this never
+    invents either, and routes through the evidence-gated
+    `mark_paid_verified` so an unverified/zero payment is not booked as revenue.
+    """
+    blocked = _require_mutation_capability(authorization, "record_payment")
+    if blocked:
+        return blocked
+    if _lifecycle_tracker is None:
+        return "[record_payment unavailable: no lifecycle tracker wired]"
+    opportunity_id = str(args.get("opportunity_id", "")).strip()
+    if not opportunity_id:
+        return "[record_payment: opportunity_id is required]"
+    try:
+        amount = float(args.get("amount", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return "[record_payment: amount must be a number]"
+    if amount <= 0.0:
+        return "[record_payment: amount must be positive; the agent never invents a payout]"
+    approval_id = str(args.get("approval_id", "")).strip()
+    if not approval_id:
+        return "[record_payment: HIGH-TRUST — an approved approval_id is required]"
+    # Verify the approval is recorded + APPROVED before mutating.
+    try:
+        from agents.safety.approval import HumanApprovalQueue, ApprovalStatus
+        item = HumanApprovalQueue.instance().find_by_id(approval_id)
+        if item is None:
+            return f"[record_payment: approval {approval_id} not found]"
+        if item.status != ApprovalStatus.APPROVED:
+            return (f"[record_payment: approval {approval_id} is "
+                    f"{item.status.value}, not approved]")
+    except Exception as exc:
+        return f"[record_payment: approval check failed: {exc}]"
+    evidence_ref = str(args.get("evidence_ref", "")).strip()
+    try:
+        state = _lifecycle_tracker.mark_paid_verified(
+            opportunity_id, amount=amount,
+            evidence={"verified": True, "method": "manual",
+                      "reference": evidence_ref or "agent-recorded",
+                      "note": f"recorded via approval {approval_id}"})
+    except Exception as exc:
+        return f"[record_payment: lifecycle update failed: {exc}]"
+    status = getattr(state, "work_status", None) or getattr(state, "status", "")
+    return (f"[record_payment: opportunity {opportunity_id} -> {status} "
+            f"amount=${amount:.2f} behind approval {approval_id}]")
+
+
+# ── Social Post Tool (Phase D, ARCH-ENG-085) ──────────────────────────────────
+# Posting to a social/agent network is HIGH-TRUST and must be approval-gated.
+# CRITICAL: we only post to a CONFIRMED write endpoint. If the target network
+# exposes no public post/publish API (moltbook currently only offers read/search
+# + agent registration), this REFUSES with a clear reason rather than faking a
+# post — the user's standing rule is "never fabricate, truthful only".
+_social_writer = None
+
+
+def set_social_writer(writer) -> None:
+    """Inject a callable(post_payload) -> result for confirmed write endpoints.
+
+    The writer is supplied by the composition root ONLY when a real, human-
+    approved posting path exists. Left unset, social_post refuses.
+    """
+    global _social_writer
+    _social_writer = writer
+
+
+def _tool_social_post(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Post content to a social/agent network (HIGH-TRUST, approval-gated).
+
+    Refuses unless invoked through the dispatcher, requires an APPROVED
+    approval_id, and requires a confirmed writer to be wired. Never fabricates
+    a post: if no confirmed write endpoint is available it says so plainly.
+    """
+    blocked = _require_mutation_capability(authorization, "social_post")
+    if blocked:
+        return blocked
+    network = str(args.get("network", "")).strip().lower()
+    content = str(args.get("content", "")).strip()
+    if not network:
+        return "[social_post: network is required]"
+    if not content:
+        return "[social_post: content is required]"
+    approval_id = str(args.get("approval_id", "")).strip()
+    if not approval_id:
+        return "[social_post: HIGH-TRUST — an approved approval_id is required]"
+    try:
+        from agents.safety.approval import HumanApprovalQueue, ApprovalStatus
+        item = HumanApprovalQueue.instance().find_by_id(approval_id)
+        if item is None:
+            return f"[social_post: approval {approval_id} not found]"
+        if item.status != ApprovalStatus.APPROVED:
+            return (f"[social_post: approval {approval_id} is "
+                    f"{item.status.value}, not approved]")
+    except Exception as exc:
+        return f"[social_post: approval check failed: {exc}]"
+    if _social_writer is None:
+        return (f"[social_post: no confirmed write endpoint is wired for "
+                f"'{network}' (moltbook exposes read/search + registration only, "
+                f"no public post API). Refusing to fabricate a post. Wire a "
+                f"confirmed writer via set_social_writer() to enable.]")
+    try:
+        result = _social_writer({"network": network, "content": content,
+                                 "approval_id": approval_id})
+    except Exception as exc:
+        return f"[social_post: writer failed: {exc}]"
+    return f"[social_post: posted to {network} behind approval {approval_id}: {result}]"
+
+
 # ── System Tool Implementations ───────────────────────────────────────────
 
 def _tool_run_command(
@@ -284,13 +410,39 @@ def _tool_run_command(
         return f"[Command error: {e}]"
 
 
+def _resolve_db_path(db_name: str) -> str:
+    """Resolve an allowlisted store name to its DB path under PROJECT_ROOT.
+
+    Phase D (ARCH-ENG-083): agents previously could only read ``agent.db``. This
+    maps a store NAME (from the canonical ``STORE_AUTHORITIES`` contract) to its
+    file, so agents can read the earning/portfolio/runs/memory stores too.
+    Unknown names raise (never fall back to an arbitrary path); the default is
+    ``agent`` for back-compat. Read-only enforcement is unchanged (the caller
+    still runs execute_readonly_query).
+    """
+    from agents.core.persistence_contract import STORE_AUTHORITIES, authority_for
+    name = (db_name or "agent").strip().lower()
+    try:
+        store = authority_for(name)
+    except KeyError:
+        known = ", ".join(s.name for s in STORE_AUTHORITIES)
+        raise ValueError(f"unknown db '{name}'; allowed: {known}")
+    return str(PROJECT_ROOT / store.filename)
+
+
 def _tool_query_db(args: Dict[str, Any]) -> str:
-    """Query the database."""
+    """Run a read-only SQL query against an allowlisted store (default agent.db).
+
+    Phase D (ARCH-ENG-083): optional ``db`` arg names a canonical store
+    (agent|earning|memory|portfolio|autonomous_runs|goals|job_search|dual_brain);
+    unknown names are rejected and the query is always SELECT-only
+    (execute_readonly_query + the gate's SQL validation).
+    """
     try:
         from agents.safety.sql import execute_readonly_query
-        db_path = str(PROJECT_ROOT / "agent.db")
+        db_path = _resolve_db_path(args.get("db", "agent"))
         if not os.path.exists(db_path):
-            return "[Database not found]"
+            return f"[Database not found: {os.path.basename(db_path)}]"
         return execute_readonly_query(args["sql"], db_path, args.get("limit", 50))
     except Exception as e:
         return f"[Query error: {e}]"

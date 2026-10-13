@@ -187,17 +187,34 @@ class TestDialogueResponseCorruption(unittest.TestCase):
                 kwargs["stream_progress"]("partial")
                 if len(calls) == 1:
                     return "<think>still reasoning without a final answer"
-                return "<think>brief</think>\nHello there."
+                return "\nHello there."
 
-        worker = DialogueWorker(
-            ReasoningBrain(), "current context", [], "Edward Hurst",
-            max_retries=1,
-        )
-        worker.run()
+        # Pin the turn budget so the assertion does not depend on the operator's
+        # .env (v2.1.51's thinking headroom already pushes a reasoning brain's
+        # base budget to >= 2048, which made the old `max(base, 2048)` recovery
+        # a no-op — ARCH-ENG-056).
+        env = {"DIALOGUE_AUTO_TOKENS": "false",
+               "DIALOGUE_MAX_TOKENS_BIG": "1024",
+               "DIALOGUE_MAX_TOKENS_SMALL": "512"}
+        with patch.dict(os.environ, env):
+            os.environ.pop("DIALOGUE_MAX_TOKENS", None)
+            os.environ.pop("DIALOGUE_THINK_TOKENS", None)
+            os.environ.pop("DIALOGUE_THINK_TOKENS_BIG", None)
+            os.environ.pop("DIALOGUE_ENABLE_THINKING", None)
+            worker = DialogueWorker(
+                ReasoningBrain(), "current context", [], "Edward Hurst",
+                max_retries=1,
+            )
+            worker.run()
 
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0]["max_tokens"], worker.max_tokens)
-        self.assertEqual(calls[1]["max_tokens"], 2048)
+        # The recovery turn MUST be strictly larger than the turn that just
+        # failed, otherwise the retry repeats the same truncation.
+        self.assertGreater(calls[1]["max_tokens"], calls[0]["max_tokens"])
+        # +2048 over the base turn (the old code returned base unchanged).
+        self.assertEqual(calls[1]["max_tokens"],
+                         calls[0]["max_tokens"] + 2048)
 
     def test_malformed_fallback_is_not_added_as_persona_turn(self):
         tab = DialogueTab.__new__(DialogueTab)

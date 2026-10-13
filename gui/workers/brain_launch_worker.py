@@ -53,7 +53,35 @@ class BrainLaunchPrepWorker(QThread):
                     "and llama.cpp build.", None)
                 return
 
-            # 2) VRAM-affinity estimate (warn-but-allow; never aborts here).
+            # 1b) Soft arch-support warning (Phase G, ARCH-ENG-097). A model
+            # whose architecture this llama.cpp build doesn't know (e.g. a very
+            # new arch) fails to load with 'unknown model architecture'. Warn
+            # the operator up front but do NOT hard-block — a llama.cpp update
+            # may add it, and the operator can still try.
+            try:
+                from agents.providers.gguf_meta import arch_supported, detect_arch
+                if not arch_supported(model):
+                    arch = detect_arch(model)
+                    self.prep_finished.emit(
+                        self.small, True,
+                        f"⚠️ {label} Brain: architecture '{arch}' is not known to "
+                        f"this llama.cpp build — it will likely fail to load "
+                        f"('unknown model architecture'). Update llama.cpp or "
+                        f"pick a supported model.", None)
+                    return
+            except Exception:
+                pass
+
+            # 2) VRAM-affinity estimate (v2.1.52, ARCH-ENG-052).
+            # Two brains can share ONE GPU (e.g. a single-GPU box where the CPU
+            # pool is disabled). llama.cpp WILL spill weights/KV to system RAM
+            # when VRAM is short, so we do NOT hard-block — but a large over-
+            # allocation makes the CUDA allocator fail hard, which on Windows
+            # routinely triggers a TDR driver reset -> full crash/reboot. The 32k
+            # KV cache is usually the avoidable part (a 4B dense @32k is ~7.5 GB,
+            # ~4.3 GB of it KV). So warn LOUDLY with the exact shortfall and the
+            # fix (lower context / stop the other brain / smaller model) instead
+            # of the old quiet note.
             try:
                 from agents.providers.gguf_meta import estimate_vram_gb
                 kv_bytes = {"f32": 4, "f16": 2, "q8_0": 1, "q4_0": 0.5,
@@ -61,12 +89,36 @@ class BrainLaunchPrepWorker(QThread):
                 est = estimate_vram_gb(model, context=self.cfg.context,
                                        kv_type_bytes=kv_bytes)
                 need = est.get("total_gb") or est.get("estimate_gb") or 0.0
+                kv_gb = est.get("kv_gb") or 0.0
                 free = self._gpu_free_vram_gb(self.gpu_device_index)
                 if free is not None and need > 0 and need > free:
-                    # Non-fatal: llama.cpp spills to system RAM. Logged, not blocked.
-                    self._warn = (f"⚠️ {label} Brain: {os.path.basename(model)} "
-                                  f"needs ~{need:.1f} GB but only ~{free:.1f} GB "
-                                  "VRAM is free; system-RAM spill is expected.")
+                    over = need - free
+                    self._warn = (
+                        f"⚠️ {label} Brain VRAM RISK: {os.path.basename(model)} needs "
+                        f"~{need:.1f} GB but only ~{free:.1f} GB is free (short by "
+                        f"~{over:.1f} GB) — another brain may already be on this GPU. "
+                        f"It will spill to system RAM, but a large overrun can crash "
+                        f"the Windows GPU driver. Lower the context (KV cache is "
+                        f"~{kv_gb:.1f} GB at {self.cfg.context} tokens), stop the other "
+                        f"brain, or pick a smaller model.")
+            except Exception:
+                pass
+
+            # 2b) System-RAM contention guard (v2.1.55, ARCH-ENG-055).
+            # A GPU brain is NOT VRAM-isolated: llama.cpp mmaps the GGUF, so the
+            # model's weights live in the system page cache and are faulted into
+            # resident RAM under memory pressure. When the CPU/RAM brain then
+            # generates and builds its KV cache, it drains system RAM, which
+            # forces the GPU brain's ~10 GB model pages resident — the two
+            # footprints collide and the GPU brain's llama-server hits a failed
+            # allocation and ABORTS (silently: no OS crash, no GPU TDR). This is
+            # the "big brain terminal just exits when I Chat the small brain"
+            # report. We measure REAL running-server RAM for the other brains
+            # (not an estimate), add this brain's own weights+KV, and warn LOUDLY
+            # when the total would leave too little headroom — warn-only, never a
+            # hard block (llama.cpp legitimately spills; the operator decides).
+            try:
+                self._warn = self._system_ram_contention_warn(label, model) or getattr(self, "_warn", "")
             except Exception:
                 pass
 
@@ -93,6 +145,144 @@ class BrainLaunchPrepWorker(QThread):
         except Exception:
             return None
         return None
+
+    # ── System-RAM contention guard (v2.1.55, ARCH-ENG-055) ──────────────
+    # A GPU brain is not VRAM-isolated: llama.cpp mmaps the GGUF, so the
+    # model's weights occupy the system page cache and get faulted into
+    # resident RAM under pressure. When the CPU/RAM brain generates it
+    # builds its KV cache and drains system RAM; the GPU brain's weights
+    # then go resident, the footprints collide, and the GPU brain's
+    # llama-server hits a failed allocation and ABORTS — silently (no OS
+    # crash, no GPU TDR). Measured live: a 10.7 GB GPU model spiked
+    # 378 MB → 11.4 GB resident right as the CPU brain built its 32k KV,
+    # then died. We sum the REAL resident RAM of the OTHER running servers
+    # (via a single CIM query) plus this brain's own projected weights+KV,
+    # compare against currently-available RAM, and warn LOUDLY when the
+    # total would leave too little headroom. Warn-only — llama.cpp
+    # legitimately spills, so the operator decides, never a hard block.
+
+    #: Keep at least this much system RAM free after this brain loads.
+    _RAM_HEADROOM_GB = 4.0
+
+    @staticmethod
+    def _available_ram_gb() -> float:
+        """Currently-available physical RAM in GB (Windows perf counters)."""
+        try:
+            import ctypes
+
+            class _MEMSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _MEMSTATUSEX()
+            st.dwLength = ctypes.sizeof(_MEMSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            return st.ullAvailPhys / (1024.0 ** 3)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _other_servers_ram_gb(exclude_port: int) -> tuple:
+        """(total_gb, [(role, ram_gb), ...]) for every OTHER running llama-server.
+
+        Uses a single ``tasklist``-style CIM query so it works without psutil.
+        The role is derived from the --port in the command line.
+        """
+        total = 0.0
+        details = []
+        try:
+            import json
+            # PowerShell is guaranteed present on the target (Windows) host and
+            # returns structured JSON; keep the timeout tight so a slow shell
+            # can never stall the launch.
+            ps = (
+                "Get-CimInstance Win32_Process -Filter \"name='llama-server.exe'\" "
+                "| Select-Object ProcessId,WorkingSetSize,CommandLine "
+                "| ConvertTo-Json -Compress"
+            )
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=6,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                return 0.0, []
+            data = json.loads(r.stdout)
+            if isinstance(data, dict):
+                data = [data]
+            for proc in data:
+                cl = proc.get("CommandLine") or ""
+                # crude port parse
+                import re
+                m = re.search(r"--port\s+(\d+)", cl)
+                port = int(m.group(1)) if m else None
+                if port is not None and port == exclude_port:
+                    continue
+                ram_gb = float(proc.get("WorkingSetSize") or 0) / (1024.0 ** 3)
+                total += ram_gb
+                role = {1234: "Big/GPU", 1235: "Small/CPU"}.get(port, f"port{port}")
+                details.append((role, ram_gb))
+        except Exception:
+            return 0.0, []
+        return total, details
+
+    def _system_ram_contention_warn(self, label: str, model: str) -> str:
+        """Return a loud warning string when launching ``model`` as ``label``
+        would leave too little system RAM given the other running brains."""
+        try:
+            avail = self._available_ram_gb()
+            if avail <= 0:
+                return ""
+            # This brain's own footprint: weights (file size) + KV cache.
+            try:
+                weights_gb = os.path.getsize(model) / (1024.0 ** 3)
+            except OSError:
+                weights_gb = 0.0
+            try:
+                from agents.providers.gguf_meta import estimate_vram_gb
+                kv_bytes = {"f32": 4, "f16": 2, "q8_0": 1, "q4_0": 0.5,
+                            "auto": 2}.get(getattr(self.cfg, "kv_cache", "auto"), 2)
+                est = estimate_vram_gb(model, context=self.cfg.context,
+                                       kv_type_bytes=kv_bytes)
+                kv_gb = est.get("kv_gb") or 0.0
+            except Exception:
+                kv_gb = 0.0
+            own_gb = weights_gb + kv_gb
+            other_gb, details = self._other_servers_ram_gb(self.port)
+            projected = own_gb + other_gb
+            headroom_after = avail - projected
+            if headroom_after >= self._RAM_HEADROOM_GB:
+                return ""
+            other_txt = ""
+            if details:
+                other_txt = (" Another brain is already using "
+                             + ", ".join(f"{r} ~{g:.1f} GB" for r, g in details)
+                             + " of system RAM.")
+            short = self._RAM_HEADROOM_GB - headroom_after
+            return (
+                f"⚠️ {label} Brain SYSTEM-RAM RISK: {os.path.basename(model)} needs "
+                f"~{own_gb:.1f} GB (weights ~{weights_gb:.1f} GB + KV ~{kv_gb:.1f} GB "
+                f"at {self.cfg.context} tokens), and only ~{avail:.1f} GB is free."
+                f"{other_txt} After this loads only ~{max(headroom_after, 0):.1f} GB "
+                f"would remain (want ≥{self._RAM_HEADROOM_GB:.0f} GB, short by "
+                f"~{short:.1f} GB). A GPU brain is NOT VRAM-isolated — its model "
+                f"lives in system RAM too — so when the other brain generates it "
+                f"drains RAM and this server can hit a failed allocation and abort "
+                f"(its terminal just closes). Lower the context (KV is the big "
+                f"chunk), stop the other brain, or pick a smaller model."
+            )
+        except Exception:
+            return ""
+
 
 
 class BrainLaunchWorker(QThread):

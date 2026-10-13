@@ -142,6 +142,39 @@ class TestPersistence(unittest.TestCase):
             self.assertEqual(pol.enabled, {})
             self.assertEqual(pol.role, {})
 
+    def test_corrupt_settings_json_does_not_block_future_saves(self):
+        # v2.1.55 (ARCH-ENG-055): a corrupt settings.json (here: NUL bytes, the
+        # exact corruption this box hit) made save_policy return False forever —
+        # the merge-read raised inside the same try as the write — so per-device
+        # settings silently never persisted again. save must quarantine the bad
+        # file and write a clean policy.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "settings.json")
+            with open(path, "wb") as f:
+                f.write(b"\x00" * 512)
+            self.assertTrue(dr.save_policy(dr.DevicePolicy(enabled={"x": True}),
+                                           root=tmp))
+            loaded = dr.load_policy(root=tmp)
+            self.assertTrue(loaded.enabled["x"])
+            # The bad file is preserved for inspection, never deleted.
+            self.assertTrue(any(n.startswith("settings.json.corrupt-")
+                                for n in os.listdir(tmp)))
+
+    def test_truncated_json_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "settings.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"providers": [{"name": "oll')
+            self.assertTrue(dr.save_policy(dr.DevicePolicy(role={"cpu": "small"}),
+                                           root=tmp))
+            self.assertEqual(dr.load_policy(root=tmp).role["cpu"], "small")
+
+    def test_save_is_atomic_no_partial_file_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dr.save_policy(dr.DevicePolicy(enabled={"a": True}), root=tmp)
+            leftovers = [n for n in os.listdir(tmp) if ".tmp-" in n]
+            self.assertEqual(leftovers, [])
+
 
 class TestDetection(unittest.TestCase):
     def test_detect_devices_never_raises(self):

@@ -68,8 +68,16 @@ class M1LifecyclePersistsAcrossRestart(unittest.TestCase):
         # Recovered in-memory state is a real OpportunityState (post-restart transitions work).
         self.assertIsInstance(t2._states.get("op_X"), OpportunityState)
         # A post-restart transition must NOT raise on the recovered object.
+        # ARCH-ENG-061: `paid` is a TERMINAL stage, so the demotion is now REFUSED
+        # rather than applied — the old code let `paid -> failed` overwrite the
+        # stage and demote a revenue-booked opportunity. The contract this test
+        # guards is that the call still succeeds and records its refusal.
         t2.mark_failed("op_X", "re-evaluated after restart")
-        self.assertEqual(t2._states["op_X"].status, "failed")
+        self.assertEqual(t2._states["op_X"].status, "paid",
+                         "a terminal paid opportunity must not be demoted")
+        self.assertEqual(t2._states["op_X"].current_stage, "paid")
+        self.assertTrue(t2._states["op_X"].last_transition_error)
+        self.assertFalse(t2._states["op_X"].history[-1].transition_ok)
 
 
 # --------------------------------------------------------------------------- M-2

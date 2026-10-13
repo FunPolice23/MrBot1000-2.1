@@ -42,6 +42,8 @@ MUTATING_TOOL_NAMES: FrozenSet[str] = frozenset({
     "workshop_account",
     "workshop_payment",
     "run_command",
+    "record_payment",
+    "social_post",
 })
 
 # Read-only tools: no machine mutation and no external commitment.

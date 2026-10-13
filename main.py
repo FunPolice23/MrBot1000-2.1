@@ -480,6 +480,14 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # Human-approval queue (submissions, payments, gates)
         self.approval_queue = HumanApprovalQueue.instance()
 
+        # Consumed-once ledger for approved ACTION execution. A decided queue
+        # item stays APPROVED forever, and two GUI surfaces route the same
+        # human decision to `_execute_approved_action` (ApprovalPanel's
+        # `item_decided` and SafetyTab's `_route_decision`), so the id set —
+        # not the queue status — is what makes one approval run an irreversible
+        # action at most once.
+        self._executed_approval_ids: set = set()
+
         # Alerting rule engine — evaluates events against rules and fires
         # notifications. Cloud-only spend alerts, tier changes, safety blocks,
         # pending-approval aging.
@@ -843,25 +851,73 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         A QThread that has stopped may still have queued cross-thread signal
         deliveries in the GUI event queue. If those land after the receiving
         widgets are destroyed, Qt dereferences a dead C++ object and the process
-        dies with an access violation. Disconnecting here makes teardown safe.
+        dies with an access violation (python.exe Qt6Core.dll 0xc0000409).
+        Disconnecting here makes teardown safe.
+
+        v2.1.61 (ARCH-ENG-074): this was a silent no-op. It tested
+        ``method.isSignal()``, but this PySide6 (6.11) has no
+        ``QMetaMethod.isSignal()`` — it raises ``AttributeError`` on the first
+        signal, which the outer ``except: pass`` swallowed, so the loop aborted
+        and NOT ONE signal was ever disconnected. The "disconnect before wait"
+        protection for the manager/summarizer threads (and, until now, every
+        orphaned tab worker) never actually ran. Detect signals via
+        ``methodType() == MethodType.Signal`` (with an isSignal() fallback for
+        other PySide builds). Iterate by relativeMethodIndex so a failure on one
+        method cannot abort the rest.
+
+        v2.1.77 (ARCH-ENG-096): disconnecting a signal on a worker whose C++
+        object is already torn down emits a noisy ``RuntimeWarning: Failed to
+        disconnect (None) from signal ...`` on exit. That is a WARNING, not an
+        exception, so the ``except`` never caught it. Guard with
+        ``shiboken6.isValid`` (skip a dead object entirely) and suppress the
+        residual warning so exit is clean and silent.
         """
         try:
-            from PySide6.QtCore import QObject
+            from PySide6.QtCore import QObject, QMetaMethod
+            signal_type = QMetaMethod.MethodType.Signal
         except Exception:
-            return
+            try:
+                from PySide6.QtCore import QObject
+            except Exception:
+                return
+            signal_type = None
+        # A worker whose C++ object is already gone can't be disconnected from;
+        # calling .disconnect() on it only warns. Skip it.
         try:
-            meta = worker.metaObject()
-            for i in range(meta.methodCount()):
-                method = meta.method(i)
-                if not method.isSignal():
-                    continue
-                name = bytes(method.name()).decode("utf-8", "ignore")
-                try:
-                    getattr(worker, name).disconnect()
-                except Exception:
-                    pass
+            import shiboken6
+            if not shiboken6.isValid(worker):
+                return
         except Exception:
             pass
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            try:
+                meta = worker.metaObject()
+                for i in range(meta.methodCount()):
+                    method = meta.method(i)
+                    is_signal = False
+                    if signal_type is not None:
+                        try:
+                            is_signal = method.methodType() == signal_type
+                        except Exception:
+                            is_signal = False
+                    else:
+                        try:
+                            is_signal = bool(method.isSignal())
+                        except Exception:
+                            is_signal = False
+                    if not is_signal:
+                        continue
+                    name = bytes(method.name()).decode("utf-8", "ignore")
+                    try:
+                        sig = getattr(worker, name, None)
+                        if sig is not None:
+                            sig.disconnect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def _stop_tab_background_threads(self):
         """Stop QThread/QTimer resources owned by lazily-built tab widgets.
@@ -902,7 +958,20 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self._stop_orphan_tab_threads(tabs)
 
     def _stop_orphan_tab_threads(self, tabs):
-        """Stop any QThread still running inside a tab widget's subtree."""
+        """Stop any QThread still running inside a tab widget's subtree.
+
+        v2.1.61 (ARCH-ENG-074): disconnect each worker's signals BEFORE waiting.
+        A worker still mid-generation (blocked in a long provider HTTP read, e.g.
+        the 27B Big Brain) cannot finish inside the wait() grace period, so it
+        survives teardown. Any queued cross-thread emission it delivers after its
+        receiving widgets are destroyed dereferences a dead C++ object and aborts
+        the interpreter with an access violation (observed: python.exe
+        Qt6Core.dll 0xc0000409, constant fault offset, every session). This is the
+        same disconnect-before-wait treatment `_disconnect_worker_signals` already
+        gives the manager/summarizer threads; extend it to every orphaned tab
+        worker (Chat/Dialogue InferenceWorker / EscalationWorker / DialogueWorker,
+        which have no cleanup() of their own).
+        """
         try:
             from PySide6.QtCore import QThread
         except Exception:
@@ -925,6 +994,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 try:
                     if not thread.isRunning():
                         continue
+                    # Disconnect BEFORE the graceful wait so a worker that
+                    # outlives the wait cannot deliver a signal into a widget
+                    # that is about to be destroyed.
+                    self._disconnect_worker_signals(thread)
                     if hasattr(thread, "stop"):
                         thread.stop()
                     elif hasattr(thread, "requestInterruption"):
@@ -1043,8 +1116,139 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self._refresh_approval_alert()
 
     def _on_approval_decided(self, item_id, status, notes):
-        """Refresh the approval tab alert after a human decision."""
+        """Refresh the approval tab alert after a human decision.
+
+        When the human APPROVES an ``ACTION`` approval whose payload names a
+        tool, the queued action must actually run. Before this the payload was
+        stored and never read, so an approved mutating tool was terminal: the
+        operator approved it and nothing happened.
+
+        The decision is re-read from the QUEUE, never taken from the signal
+        argument: the argument is whatever the emitter passed, so trusting it
+        would let a spurious/forged signal execute an action nobody approved.
+        Only an item the queue itself records as APPROVED runs, and only when
+        its kind is ACTION. ``approved=True`` still cannot unblock a BLOCKED
+        tool, and nothing self-approves.
+
+        A ``SUBMISSION`` approval is handled the same way: the decision is
+        re-read from the queue and the Earning tab's submitter is asked to
+        send it. Before this an approved freelance submission was also
+        terminal — the request was queued, the operator approved it, and it
+        was never submitted.
+        """
         self._refresh_approval_alert()
+        try:
+            queue = getattr(self, "approval_queue", None)
+            item = queue.find_by_id(item_id) if queue is not None else None
+            if item is None:
+                return
+            if item.status != ApprovalStatus.APPROVED:
+                return
+            if item.kind == ApprovalKind.ACTION:
+                self._execute_approved_action(item)
+            elif item.kind == ApprovalKind.SUBMISSION:
+                self._execute_approved_submission(item)
+        except Exception as e:
+            self.log_signal.emit(f"[Approval] Approved action failed to execute: {e}")
+
+    def _execute_approved_action(self, item):
+        """Run an approved ACTION item's tool, re-reading the queue decision.
+
+        A decided queue item stays APPROVED forever, and TWO surfaces route the
+        same human decision here (``ApprovalPanel`` emits ``item_decided`` and
+        ``SafetyTab._route_decision`` calls the handler directly), so the queue
+        status alone cannot distinguish "first delivery of this approval" from
+        "the same approval delivered again". Reproduced: one approval ran
+        ``run_command`` twice — two irreversible executions, with the queue
+        still reporting 1 item / 0 pending, so nothing looked wrong.
+
+        The consumed-once ledger fixes that the same way
+        ``PlatformSubmitter.submit_if_approved`` does for submissions: an
+        approval id may execute at most once per process. A SECOND, distinct
+        approval (a different id, for a different item) still runs — only a
+        re-delivery of an id that already executed is refused. The check lives
+        AFTER the caller's queue re-read, so the approval must still be genuine
+        and still valid before the ledger is even consulted; this guard can
+        only ever refuse an execution, never cause one. A re-emission is
+        logged, because from the operator's side the click simply appears to
+        do nothing and that must be explainable.
+        """
+        executed = getattr(self, "_executed_approval_ids", None)
+        if executed is None:
+            executed = set()
+            self._executed_approval_ids = executed
+        item_id = getattr(item, "id", "") or ""
+        if item_id and item_id in executed:
+            self.log_signal.emit(
+                "[Approval] Ignored duplicate decision for approval "
+                f"{item_id}: the approved action was already executed once "
+                "(one human approval executes an irreversible action at most "
+                "once).")
+            return
+        payload = getattr(item, "payload", None) or {}
+        tool = payload.get("tool")
+        arguments = payload.get("arguments")
+        if not tool or not isinstance(arguments, dict):
+            return
+        from agents.safety.dispatch import execute_tool
+        try:
+            result = execute_tool(tool, arguments, approved=True)
+        except Exception:
+            # NOT consumed. The id is deliberately left out of the ledger: an
+            # execution that raised may not have taken effect (a network
+            # timeout leaves the outcome unknown), so the operator must be
+            # able to re-deliver the same approval. Consuming it here would
+            # make a transient failure permanently unretryable, and the log
+            # would then claim the action "was already executed once" when it
+            # never ran. Failing to consume is the safe direction: the worst
+            # case is a duplicate delivery, which the caller's own
+            # once-per-emission contract already bounds.
+            self.log_signal.emit(
+                f"[Approval] Approved action {tool} FAILED to execute; the "
+                f"approval was NOT consumed and may be retried: see the "
+                f"error above.")
+            raise
+        if item_id:
+            executed.add(item_id)
+        self.log_signal.emit(
+            f"[Approval] Executed approved action {tool}: {result}")
+
+    def _execute_approved_submission(self, item):
+        """Send an approved SUBMISSION via the Earning tab's submitter.
+
+        The record id travels in the queued payload; the decision itself is
+        re-read by ``PlatformSubmitter.submit_if_approved`` from the queue,
+        so this method cannot cause a submission on its own.
+
+        No idempotency guard is added here ON PURPOSE: the submitter already
+        refuses to send a record twice (it checks ``record.status`` and
+        ``record.submitted_at``), so the submission path is consumed-once by
+        construction. Adding a second ledger would guard the same invariant
+        twice and, worse, would refuse a legitimate resend the submitter
+        itself would still accept. The ACTION path has no equivalent guard at
+        its sink, which is why ``_execute_approved_action`` needs one.
+        """
+        details = getattr(item, "details", None) or {}
+        arguments = details.get("arguments")
+        record_id = None
+        if isinstance(arguments, dict):
+            record_id = arguments.get("record_id")
+        tab = getattr(self, "_earning_tab", None)
+        submitter = getattr(tab, "platform_submitter", None) if tab else None
+        if submitter is None or not record_id:
+            self.log_signal.emit(
+                "[Approval] Approved submission could not be routed: "
+                f"record_id={record_id!r}, submitter="
+                f"{'present' if submitter else 'missing'}")
+            return
+        record = submitter.get_record(record_id)
+        if record is None:
+            self.log_signal.emit(
+                f"[Approval] Approved submission record {record_id} not found")
+            return
+        result = submitter.submit_if_approved(record)
+        self.log_signal.emit(
+            f"[Approval] Submission {record_id}: {result}")
 
     def _refresh_approval_alert(self):
         """Update the Approvals tab label, color, and pending-count tooltip."""
@@ -1423,6 +1627,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                     ("Chat",           self.create_chat_tab),
                     ("Dialogue",       self.create_dialogue_tab),
                     ("Approvals",      self.create_approval_tab),
+                    ("Registration",   self.create_registration_tab),
                     ("Browse Root",    self.create_file_browser_tab),
                     ("Payments",       self.create_payments_tab),
                     ("Earnings",       self.create_earnings_tab),
@@ -2850,6 +3055,33 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         values["PIPELINE_ALLOW_WRITE"] = str(self.pipeline_allow_write_check.isChecked())
         values["PIPELINE_ALLOW_SELF_IMPROVE"] = str(self.pipeline_allow_selfimprove_check.isChecked())
 
+        # Phase E (ARCH-ENG-087): web-discovery opt-in from the Settings tab
+        # (mirrors the Opportunities-tab toggle; both write ALLOW_WEB_DISCOVERY).
+        # Read defensively — the Settings tab is built lazily, so the checkbox
+        # may not exist yet; fall back to the current env value so Save never
+        # clobbers a choice made in the other tab.
+        try:
+            web_check = getattr(self, "settings_web_discovery_check", None)
+            if web_check is not None:
+                values["ALLOW_WEB_DISCOVERY"] = str(web_check.isChecked())
+        except Exception:
+            pass
+
+        # Phase F (ARCH-ENG-091): persist per-provider rate + daily call caps.
+        # Read defensively (Settings tab built lazily); only write a key the
+        # operator actually set so we never clobber an env value with a blank.
+        try:
+            for up, edit in getattr(self, "_provider_rate_edits", {}).items():
+                v = edit.text().strip()
+                if v:
+                    values[f"{up}_RATE_PER_SEC"] = v
+            for up, edit in getattr(self, "_provider_cap_edits", {}).items():
+                v = edit.text().strip()
+                if v:
+                    values[f"{up}_MAX_CALLS_PER_DAY"] = v
+        except Exception:
+            pass
+
         # Persist payout destinations (wallet/cashApp) from the (possibly lazily-built) Settings tab
         try:
             cashapp_widget = getattr(self, "cashapp_payout_edit", None)
@@ -3072,9 +3304,16 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         add("lm-studio", "LM_STUDIO", "")
         add("koboldcpp", "KOBOLDCPP", "")
         # Order: Ollama first by default (user can reorder later via settings).
-        settings = {"providers": providers}
-        with open("settings.json", "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
+        # ARCH-ENG-070: this used to write `settings = {"providers": providers}` with a
+        # bare whole-file open(...,"w"), which DESTROYED the entire `devices` block
+        # that `device_registry.save_policy` maintains — every per-device model,
+        # every llama.cpp setting, every device-disable, on a single Save click.
+        # Merge instead, so sibling keys survive.
+        try:
+            from agents.runtime.device_registry import merge_settings_file
+            merge_settings_file({"providers": providers})
+        except Exception as e:
+            self.log_signal.emit(f"[Settings] provider list merge failed: {e}")
 
     def _settings_snapshot(self) -> dict:
         """Capture provider-relevant env values for restart-diffing."""

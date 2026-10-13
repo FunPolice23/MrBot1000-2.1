@@ -148,9 +148,16 @@ class PlatformSubmitter:
 
         result = self.safety_guard.check(action)
         if result.action == "flag":
-            # Store approval ID for tracking
+            # Store approval ID for tracking. `get_pending_approvals()` returns
+            # the layer's raw pending dicts, whose "action" value is a
+            # SafetyAction *dataclass*, not a dict — attribute access, not
+            # .get(). Using .get() raised AttributeError here, so the one path
+            # that actually flags a submission crashed instead of queueing it.
+            record.approval_id = ""
             for pending in self.safety_guard.get_pending_approvals():
-                if pending.get("action", {}).get("arguments", {}).get("record_id") == record.record_id:
+                pending_action = pending.get("action")
+                pending_args = getattr(pending_action, "arguments", None)
+                if isinstance(pending_args, dict) and pending_args.get("record_id") == record.record_id:
                     record.approval_id = pending["id"]
                     break
             return {
@@ -169,6 +176,84 @@ class PlatformSubmitter:
         # Allowed
         record.status = "approved"
         return {"ok": True, "record_id": record.record_id, "status": "approved"}
+
+    def submit_if_approved(self, record: SubmissionRecord) -> Dict[str, Any]:
+        """Submit a record the human has actually approved.
+
+        The approval path was terminal before this: ``request_approval``
+        queued the request and returned ``awaiting_approval``, and nothing
+        ever read the decision back — so the operator approved a submission
+        in the Approvals tab and it was never sent (the same shape of defect
+        as ARCH-ENG-083's approved ACTION item).
+
+        The decision is re-read from HumanApprovalQueue, never from a caller
+        argument: the queue is the only component permitted to record a human
+        approval. A record whose approval is still PENDING, or was
+        DENIED/DEFERRED, is NOT submitted. Fail-closed on any read error.
+        """
+        if not record.approval_id:
+            return {
+                "ok": False,
+                "record_id": record.record_id,
+                "error": "No approval was ever requested for this record",
+            }
+        try:
+            from agents.safety.approval import (
+                ApprovalStatus,
+                HumanApprovalQueue,
+            )
+            item = HumanApprovalQueue.instance().find_by_id(record.approval_id)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "record_id": record.record_id,
+                "status": "blocked",
+                "error": f"Approval queue unavailable: {exc}",
+            }
+        if item is None:
+            return {
+                "ok": False,
+                "record_id": record.record_id,
+                "status": "blocked",
+                "error": (
+                    f"Approval {record.approval_id} is not in the queue; "
+                    "cannot confirm a human decision"
+                ),
+            }
+        if item.status == ApprovalStatus.PENDING:
+            return {
+                "ok": False,
+                "record_id": record.record_id,
+                "status": "awaiting_approval",
+                "approval_id": record.approval_id,
+                "error": "Still awaiting human approval",
+            }
+        if item.status != ApprovalStatus.APPROVED:
+            record.status = "rejected"
+            record.error = f"Human decision: {item.status.value}"
+            return {
+                "ok": False,
+                "record_id": record.record_id,
+                "status": "rejected",
+                "error": record.error,
+            }
+        # The human approved. Refuse to send the same record twice: the queue
+        # keeps a decided item APPROVED forever, so without this guard a second
+        # call (a retry button, a re-emitted signal, a future caller) would
+        # execute the irreversible submission again. Reproduced: two calls with
+        # a real adapter registered produced two external submissions.
+        if record.status in ("submitted", "failed") or record.submitted_at:
+            return {
+                "ok": False,
+                "record_id": record.record_id,
+                "status": record.status,
+                "error": (
+                    "This submission was already executed "
+                    f"(status={record.status}); refusing to send it twice"
+                ),
+            }
+        record.status = "approved"
+        return self.submit(record)
 
     def submit(self, record: SubmissionRecord) -> Dict[str, Any]:
         """Submit an approved record via platform adapter."""

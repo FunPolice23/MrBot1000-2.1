@@ -229,6 +229,39 @@ class _ModelLabelAdapter:
             return "Model: —"
 
 
+class _NullWidget:
+    """Null-object standing in for a disabled brain's legacy alias widgets.
+
+    v2.1.53 (ARCH-ENG-053): when a brain is disabled (single-GPU box, CPU
+    unchecked) its row is not rendered, so the legacy sb_*/bb_* aliases have no
+    real widget. Pointing them here makes every downstream setText / setStyleSheet
+    / setEnabled a harmless no-op instead of an AttributeError that aborts the
+    start flow. Any attribute access that isn't a known setter returns a no-op
+    callable, so it tolerates the full range of legacy call patterns.
+    """
+
+    def setText(self, *a, **k):
+        pass
+
+    def setStyleSheet(self, *a, **k):
+        pass
+
+    def setEnabled(self, *a, **k):
+        pass
+
+    def text(self, *a, **k):
+        return ""
+
+    def isEnabled(self, *a, **k):
+        return False
+
+    def __getattr__(self, name):
+        # Any other method/attribute the legacy code might poke -> no-op callable.
+        def _noop(*a, **k):
+            return None
+        return _noop
+
+
 class DualBrainControl(ProviderLifecycleBackend, QWidget):
     """Control panel for dual-brain GPU orchestration."""
 
@@ -240,6 +273,17 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
     # and access violations. They emit this instead; the slot runs on the GUI
     # thread.
     _log_requested = Signal(str)
+
+    # ARCH-ENG-057: >0 while `_apply_runtime` is programmatically filling the
+    # per-device settings controls. Seeding must never be treated as an operator
+    # edit, because each row's valueChanged is wired directly to
+    # `_on_brain_settings_changed` -> `save_policy()`, and firing there persisted
+    # hardcoded constructor defaults over the operator's saved per-device model +
+    # llama.cpp settings. A counter (not a bool) so nested/recursive seeding
+    # paths cannot clear it early. Class-level default so the attribute exists
+    # even on instances built via `__new__` (tests do this to reach methods
+    # without paying for full widget construction).
+    _seeding_settings = 0
     
     # Signals emitted when model changes
     small_brain_model_changed = Signal(str)  # model_name
@@ -286,6 +330,15 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         # Guard against auto-restart loops from probe-triggered combo changes
         self._suppress_model_change_restart = False
 
+        # ARCH-ENG-057: >0 while `_apply_runtime` is programmatically filling the
+        # per-device settings controls. Seeding must never be treated as an
+        # operator edit, because the row's valueChanged is wired directly to
+        # `_on_brain_settings_changed` -> `save_policy()`, and firing there
+        # persisted hardcoded constructor defaults over the operator's saved
+        # per-device settings. A counter (not a bool) so nested/recursive
+        # seeding paths cannot clear it early.
+        self._seeding_settings = 0
+
         # GPU status worker (background thread)
         self.gpu_worker = GPUStatusWorker(interval_ms=2000)
         self.gpu_worker.status_updated.connect(self._on_gpu_status_updated)
@@ -318,6 +371,20 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         # Defer provider status refresh to next event loop cycle so the widget
         # paints first without blocking on HTTP calls to llama-server ports.
         QTimer.singleShot(0, self._refresh_provider_status)
+
+        # v2.1.60 (ARCH-ENG-073): a llama-server can die on its own (OOM, GPU
+        # contention, mmproj mismatch abort) with the app still alive. Without a
+        # periodic re-probe the status row froze at "● Running" and the operator
+        # was misled into thinking the brain was still loaded when its process
+        # was gone (e.g. the big brain on port 1234 dying while the GUI showed
+        # Running). _refresh_provider_status already runs the probe on a
+        # background thread and applies results via a queued signal, so a slow
+        # or dead port never blocks the GUI. Poll every 4s while the panel is
+        # open; cleanup() stops it.
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(4000)
+        self._status_timer.timeout.connect(self._refresh_provider_status)
+        self._status_timer.start()
         
         # Build dynamic provider panels after detection. Provider discovery
         # performs GPU and endpoint probes, so it must not run on the Qt thread.
@@ -977,12 +1044,22 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             if not key:
                 return  # slots 2+ are governed by the device policy only
             value = "true" if now_enabled else "false"
-            os.environ[key] = value
+            # Import FIRST, then write os.environ. `main` runs
+            # `load_dotenv(override=True)` at module level (main.py:201), so a
+            # lazy first import re-reads .env and silently clobbers any
+            # os.environ value set beforehand — the toggle appeared to do
+            # nothing in-process (ARCH-ENG-048). Importing before the write
+            # makes the assignment authoritative.
             try:
                 from main import set_env_values
-                set_env_values({key: value})
             except Exception:
-                pass
+                set_env_values = None
+            os.environ[key] = value
+            if set_env_values is not None:
+                try:
+                    set_env_values({key: value})
+                except Exception:
+                    pass
             self.log_signal.emit(
                 f"[GUI] {key}={value} (device '{dev.label()}' "
                 f"{'enabled' if now_enabled else 'disabled'})"
@@ -1034,6 +1111,13 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                     self.runtime.config(BrainRole.SMALL),
                     self.runtime.config(BrainRole.BIG))
             self._apply_runtime()
+            # v2.1.54 (ARCH-ENG-054): _apply_plan_device_assignment grows/shrinks
+            # runtime.slots() to match enabled devices, but the Provider Control
+            # ROWS are built once and were never rebuilt here — so enabling the
+            # CPU/RAM device updated the runtime to 2 slots while the panel still
+            # showed only the Big brain row (and disabling left a stale row).
+            # Rebuild the rows so the panel always matches the runtime's slots.
+            self._rebuild_provider_rows()
         except Exception:
             pass
 
@@ -1087,6 +1171,7 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             row.start_clicked.connect(self._on_provider_row_start)
             row.stop_clicked.connect(self._on_provider_row_stop)
             row.model_changed.connect(self._on_provider_row_model_changed)
+            row.mtp_changed.connect(self._on_provider_row_mtp_changed)
             self._provider_rows.append(row)
 
         # Fill every row's model dropdown from discovered local .gguf files and
@@ -1114,23 +1199,45 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         BrainControlRow exposes a model dropdown (``model_combo``) rather than a
         label, so we wrap it in a tiny adapter whose ``setText`` selects that
         model in the dropdown — keeping the backend's setText calls working.
+
+        v2.1.53 (ARCH-ENG-053): ALWAYS create every alias, even when a brain is
+        disabled and its row is not rendered (single-GPU box, CPU unchecked).
+        Previously ``len(rows) < 2`` returned early, leaving sb_status/bb_status
+        (and the start/stop buttons, model labels) UNDEFINED — so any backend or
+        GUI code that touched them raised AttributeError and aborted the start
+        flow. Now a missing brain's aliases point at a null-object that swallows
+        setText/setStyleSheet/setEnabled, so status updates for the live brain
+        still work and the disabled brain is a harmless no-op.
         """
         rows = getattr(self, "_provider_rows", [])
-        if len(rows) < 2:
-            return
-        small_row, big_row = rows[1], rows[0]  # slot1=Small, slot0=Big
+        # slot 0 = Big, slot 1 = Small. Find each by slot (rows may be a subset
+        # when a brain is disabled).
+        big_row = next((r for r in rows if getattr(r, "slot", None) == 0), None)
+        small_row = next((r for r in rows if getattr(r, "slot", None) == 1), None)
+
+        def _status(row):
+            return row.status if row is not None else _NullWidget()
+
+        def _label(row):
+            return _ModelLabelAdapter(row) if row is not None else _NullWidget()
+
+        def _btn(row, which):
+            if row is None:
+                return _NullWidget()
+            return row.start_btn if which == "start" else row.stop_btn
+
         # Small Brain legacy aliases
-        self.sb_status = small_row.status
-        self.sb_model_label = _ModelLabelAdapter(small_row)
-        self.sb_start_btn = small_row.start_btn
-        self.sb_stop_btn = small_row.stop_btn
-        self._sb_control_label = small_row.header
+        self.sb_status = _status(small_row)
+        self.sb_model_label = _label(small_row)
+        self.sb_start_btn = _btn(small_row, "start")
+        self.sb_stop_btn = _btn(small_row, "stop")
+        self._sb_control_label = small_row.header if small_row is not None else _NullWidget()
         # Big Brain legacy aliases
-        self.bb_status = big_row.status
-        self.bb_model_label = _ModelLabelAdapter(big_row)
-        self.bb_start_btn = big_row.start_btn
-        self.bb_stop_btn = big_row.stop_btn
-        self._bb_control_label = big_row.header
+        self.bb_status = _status(big_row)
+        self.bb_model_label = _label(big_row)
+        self.bb_start_btn = _btn(big_row, "start")
+        self.bb_stop_btn = _btn(big_row, "stop")
+        self._bb_control_label = big_row.header if big_row is not None else _NullWidget()
 
     def _on_provider_row_start(self, slot: int):
         """Route a row's Start click to the right brain handler by slot."""
@@ -1197,6 +1304,78 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 persist()
             else:
                 self._persist_settings()
+        except Exception:
+            pass
+
+    def _on_provider_row_mtp_changed(self, slot: int, enabled: bool):
+        """A row's MTP toggle changed: set the slot config's spec_type (Phase G).
+
+        Only ever called with enabled=True when the model supports MTP (the row
+        greys the box otherwise), so this simply maps the checkbox onto
+        ``spec_type``. Persists via the device policy + .env like the model
+        choice. Never raises.
+        """
+        try:
+            if self.runtime is None:
+                return
+            cfg = self.runtime.slot_config(slot)
+            if cfg is None:
+                return
+            cfg.spec_type = "draft-mtp" if enabled else ""
+            if enabled and getattr(cfg, "spec_draft_n_max", None) in (None, 0):
+                cfg.spec_draft_n_max = 3  # llama.cpp default
+            # Persist to the device policy so the choice survives restarts.
+            try:
+                from agents.runtime import device_registry as dr
+                if cfg.device_id:
+                    policy = dr.load_policy()
+                    settings = policy.settings.setdefault(cfg.device_id, {})
+                    if enabled:
+                        settings["spec_type"] = "draft-mtp"
+                        settings["spec_draft_n_max"] = cfg.spec_draft_n_max
+                    else:
+                        settings.pop("spec_type", None)
+                        settings.pop("spec_draft_n_max", None)
+                    dr.save_policy(policy)
+            except Exception:
+                pass
+            persist = getattr(self, "_persist_settings_async", None)
+            if persist is not None:
+                persist()
+            else:
+                self._persist_settings()
+        except Exception:
+            pass
+
+    def _show_advanced_settings_help(self):
+        """Show a concise reference for the advanced llama.cpp settings (Phase G).
+
+        Renders the same text as the per-control mouse-hover tooltips so the "?"
+        button and the hovers never disagree.
+        """
+        try:
+            from agents.knowledge.llama_setting_help import LLAMA_SETTING_HELP
+            _TITLES = {
+                "ctx": "Context (Ctx)", "gpu_layers": "GPU Layers",
+                "threads": "Threads", "batch": "Batch", "kv_cache": "KV cache",
+                "split_mode": "Split mode", "temperature": "Temperature",
+                "flash_attn": "FlashAttention", "cache_reuse": "Cache reuse",
+                "context_shift": "Context shift",
+                "ctx_checkpoints": "Context checkpoints",
+                "mtp": "MTP (multi-token prediction)",
+                "spec_draft_n_max": "MTP draft tokens",
+                "mmproj": "Vision projector (mmproj)",
+            }
+            lines = ["Advanced llama.cpp settings — what they do:\n"]
+            for key in ("ctx", "gpu_layers", "threads", "batch", "kv_cache",
+                        "split_mode", "temperature", "flash_attn",
+                        "cache_reuse", "context_shift", "ctx_checkpoints",
+                        "mtp", "spec_draft_n_max", "mmproj"):
+                text = LLAMA_SETTING_HELP.get(key)
+                if text:
+                    lines.append(f"• {_TITLES.get(key, key)}: {text}")
+            QMessageBox.information(self, "Advanced llama.cpp settings",
+                                    "\n\n".join(lines))
         except Exception:
             pass
 
@@ -1323,6 +1502,11 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         persist (off-thread). Slots 0/1 persist via .env; slots 2+ persist to the
         device policy (settings.json → devices.settings). Never raises."""
         try:
+            # ARCH-ENG-057: a programmatic fill (see `_seeding_settings`) is not
+            # an operator edit. Persisting it wrote the row's unbound defaults
+            # over the operator's saved per-device settings.
+            if getattr(self, "_seeding_settings", 0) > 0:
+                return
             if self.runtime is None:
                 return
             rows = getattr(self, "_settings_rows", [])
@@ -1332,10 +1516,14 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             if cfg is None:
                 return
             rows[slot].apply_to(cfg)
-            # Persist per-device settings for slots 2+ (they have no .env keys).
+            # Persist per-device settings. Slots 2+ always need the device
+            # policy (they have no .env keys). A slot 0/1 whose device is the
+            # CPU/RAM pool (or an extra device) ALSO needs it — .env only holds
+            # the GPU role keys, so without this a CPU-pool context/threads edit
+            # applied in-session but silently reverted on restart (ARCH-ENG-049).
             try:
                 from agents.runtime import device_registry as dr
-                if cfg.device_id and slot >= 2:
+                if cfg.device_id and (slot >= 2 or cfg.device_id == "cpu"):
                     policy = dr.load_policy()
                     policy.settings[cfg.device_id] = rows[slot].values()
                     dr.save_policy(policy)
@@ -1395,40 +1583,55 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 big.gpu_label = big.gpu_label or "External provider"
             sb_spin = getattr(self, "sb_ctx_spin", None)
             bb_spin = getattr(self, "bb_ctx_spin", None)
-            if sb_spin is not None:
-                sb_spin.setValue(small.context)
-            if bb_spin is not None:
-                bb_spin.setValue(big.context)
-            # Seed the llama.cpp customization widgets (v2.1).
+            # ARCH-ENG-057: seeding a control is NOT an operator edit, but these
+            # `setValue` calls land on the BrainSettingsRow spins whose
+            # `valueChanged` is wired straight to `_on_brain_settings_changed` ->
+            # `save_policy()`. Firing during seeding persisted the row's
+            # unbound/hardcoded defaults over the operator's saved per-device
+            # model + llama.cpp settings — reproduced by merely constructing the
+            # widget (context/threads/batch/kv/split/temperature all reverted to
+            # the BrainSettingsRow constructor defaults). Hold the guard for the
+            # whole seeding block so no programmatic fill can persist.
+            self._seeding_settings += 1
             try:
-                if getattr(self, "sb_threads_spin", None) is not None:
-                    self.sb_threads_spin.setValue(small.threads)
-                if getattr(self, "bb_threads_spin", None) is not None:
-                    self.bb_threads_spin.setValue(big.threads)
-                if getattr(self, "sb_batch_spin", None) is not None:
-                    self.sb_batch_spin.setValue(small.batch)
-                if getattr(self, "bb_batch_spin", None) is not None:
-                    self.bb_batch_spin.setValue(big.batch)
-                if getattr(self, "sb_split_combo", None) is not None:
-                    self.sb_split_combo.setCurrentText(small.split_mode)
-                if getattr(self, "bb_split_combo", None) is not None:
-                    self.bb_split_combo.setCurrentText(big.split_mode)
-                if getattr(self, "sb_kv_combo", None) is not None:
-                    self.sb_kv_combo.setCurrentText(small.kv_cache)
-                if getattr(self, "bb_kv_combo", None) is not None:
-                    self.bb_kv_combo.setCurrentText(big.kv_cache)
-                if getattr(self, "sb_gpu_layers_spin", None) is not None:
-                    self.sb_gpu_layers_spin.setValue(small.gpu_layers if small.gpu_layers is not None else -1)
-                if getattr(self, "bb_gpu_layers_spin", None) is not None:
-                    self.bb_gpu_layers_spin.setValue(big.gpu_layers if big.gpu_layers is not None else -1)
-                # NOTE (v2.1.38, ARCH-ENG-045): temperature is NOT seeded here.
-                # This method rebuilds the per-device settings rows via
-                # _update_detected_brains_summary() further down, which recreates
-                # every BrainSettingsRow at its hardcoded 0.5 — so any temp seeded
-                # here would be immediately overwritten. Temperature is seeded
-                # inside _update_detected_brains_summary, AFTER the rows are built.
-            except Exception:
-                pass
+                if sb_spin is not None:
+                    sb_spin.setValue(small.context)
+                if bb_spin is not None:
+                    bb_spin.setValue(big.context)
+                # Seed the llama.cpp customization widgets (v2.1).
+                try:
+                    if getattr(self, "sb_threads_spin", None) is not None:
+                        self.sb_threads_spin.setValue(small.threads)
+                    if getattr(self, "bb_threads_spin", None) is not None:
+                        self.bb_threads_spin.setValue(big.threads)
+                    if getattr(self, "sb_batch_spin", None) is not None:
+                        self.sb_batch_spin.setValue(small.batch)
+                    if getattr(self, "bb_batch_spin", None) is not None:
+                        self.bb_batch_spin.setValue(big.batch)
+                    if getattr(self, "sb_split_combo", None) is not None:
+                        self.sb_split_combo.setCurrentText(small.split_mode)
+                    if getattr(self, "bb_split_combo", None) is not None:
+                        self.bb_split_combo.setCurrentText(big.split_mode)
+                    if getattr(self, "sb_kv_combo", None) is not None:
+                        self.sb_kv_combo.setCurrentText(small.kv_cache)
+                    if getattr(self, "bb_kv_combo", None) is not None:
+                        self.bb_kv_combo.setCurrentText(big.kv_cache)
+                    if getattr(self, "sb_gpu_layers_spin", None) is not None:
+                        self.sb_gpu_layers_spin.setValue(
+                            small.gpu_layers if small.gpu_layers is not None else -1)
+                    if getattr(self, "bb_gpu_layers_spin", None) is not None:
+                        self.bb_gpu_layers_spin.setValue(
+                            big.gpu_layers if big.gpu_layers is not None else -1)
+                    # NOTE (v2.1.38, ARCH-ENG-045): temperature is NOT seeded here.
+                    # This method rebuilds the per-device settings rows via
+                    # _update_detected_brains_summary() further down, which recreates
+                    # every BrainSettingsRow at its hardcoded 0.5 — so any temp seeded
+                    # here would be immediately overwritten. Temperature is seeded
+                    # inside _update_detected_brains_summary, AFTER the rows are built.
+                except Exception:
+                    pass
+            finally:
+                self._seeding_settings -= 1
             # Refresh the port labels to match the canonical contract.
             provider_names = {
                 "llamacpp": "llama.cpp",
@@ -1884,26 +2087,110 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             except Exception:
                 pass
 
+    @staticmethod
+    def _mmproj_core(stem: str) -> str:
+        """Reduce a model or projector filename to its shared 'core' identity.
+
+        Strips a leading ``mmproj-`` and any trailing quant/format token
+        (``Q4_K_M``, ``BF16``, ``F16``, ``Q3_K_XL``, ``.Q6_K`` …) so that a
+        model and its projector collapse to the same string, e.g.::
+
+            gemma-4-26B-A4B-it-Q4_K_M      ->  gemma-4-26B-A4B-it
+            mmproj-gemma-4-26B-A4B-it-BF16 ->  gemma-4-26B-A4B-it
+        """
+        import re
+        s = stem
+        if s.lower().startswith("mmproj-"):
+            s = s[len("mmproj-"):]
+        # Repeatedly peel a trailing quant/format token (separated by - or .).
+        while True:
+            m = re.match(
+                r"^(.*?)[._-](?:Q\d[\w.]*|F\d+|BF\d+|IQ\d[\w.]*|QAT|BF16|F16|F32)$",
+                s, re.IGNORECASE)
+            if not m or not m.group(1):
+                return s
+            s = m.group(1)
+
     def _auto_detect_mmproj(self, prefix: str, edit) -> None:
-        """Find an mmproj-*.gguf beside the selected model and fill the field."""
+        """Fill the mmproj field with the projector that matches the model.
+
+        Matches by core identity (see ``_mmproj_core``) — NOT by folder order.
+        If the selected model has no matching projector (text-only, or its
+        vision projector simply isn't installed), the field is left EMPTY and a
+        clear note is logged; we never grab an unrelated model's projector
+        (which llama.cpp rejects at startup, killing the visible console).
+        """
         try:
+            import pathlib
             small = prefix.startswith("SMALL")
             model_path = self._current_model_path(small)
             if not model_path:
                 self._log("⚠️ Select a model first, then Auto-detect mmproj.")
                 return
-            import pathlib
             folder = pathlib.Path(model_path).parent
+            model_stem = pathlib.Path(model_path).stem
+            model_core = self._mmproj_core(model_stem)
+            model_tokens = model_core.split("-")
+
             found = sorted(folder.glob("mmproj*.gguf"))
             if not found:
                 edit.setText("")
                 self._log(f"ℹ️ No mmproj-*.gguf next to {pathlib.Path(model_path).name} "
                           f"(model is text-only or has vision built in).")
                 return
-            edit.setText(str(found[0]))
-            self._log(f"✅ Found projector: {found[0].name}")
+
+            # Score each candidate against the selected model's core identity.
+            # exact == the cores are identical; related == one token list is a
+            # prefix or suffix of the other (handles a -QAT/-it tag on the
+            # projector, or a brand prefix like "Ternary-" on the model).
+            best, best_score = None, 0
+            for cand in found:
+                cand_core = self._mmproj_core(cand.stem)
+                if cand_core == model_core:
+                    score = 2
+                elif self._token_related(model_tokens, cand_core.split("-")):
+                    score = 1
+                else:
+                    continue
+                if score > best_score:
+                    best, best_score = cand, score
+
+            if best is None:
+                edit.setText("")
+                names = ", ".join(c.name for c in found[:3])
+                more = f" (+{len(found) - 3} more)" if len(found) > 3 else ""
+                self._log(f"ℹ️ No projector matches {model_stem} "
+                          f"(found: {names}{more} — none belong to this model). "
+                          f"Left blank; this model runs text-only.")
+                return
+
+            edit.setText(str(best))
+            self._log(f"✅ Projector for {model_stem}: {best.name}")
         except Exception as exc:
             self._log(f"mmproj auto-detect failed: {exc}")
+
+    @staticmethod
+    def _token_prefix(a: list, b: list) -> bool:
+        """True if one token list is a prefix of the other (token-wise)."""
+        n = min(len(a), len(b))
+        if n == 0:
+            return False
+        return [t.lower() for t in a[:n]] == [t.lower() for t in b[:n]]
+
+    @staticmethod
+    def _token_suffix(a: list, b: list) -> bool:
+        """True if one token list is a suffix of the other (token-wise)."""
+        n = min(len(a), len(b))
+        if n == 0:
+            return False
+        return [t.lower() for t in a[-n:]] == [t.lower() for t in b[-n:]]
+
+    @staticmethod
+    def _token_related(a: list, b: list) -> bool:
+        """Model↔projector cores are related if one is a prefix or suffix of
+        the other — the projector name is the model name minus a quant/format
+        tag, possibly with a brand prefix (``Ternary-Bonsai`` vs ``Bonsai``)."""
+        return DualBrainControl._token_prefix(a, b) or DualBrainControl._token_suffix(a, b)
 
     def _llama_flag_values(self, prefix: str, controls: dict) -> dict:
         """Convert one group's controls into env key/value pairs.
@@ -2064,6 +2351,18 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         # unchanged. Rebuilt by _rebuild_provider_rows() on device-policy change.
         self._provider_rows: list = []
         self._build_provider_rows(provider_layout)
+
+        # Phase G (ARCH-ENG-094): a "?" button that explains the advanced
+        # llama.cpp settings (the same text as the per-control mouse-hover tips).
+        help_btn = QPushButton("❓ Advanced settings help")
+        help_btn.setToolTip(
+            "What each advanced llama.cpp setting does and when to change it.")
+        help_btn.setStyleSheet(
+            "QPushButton { background:#333; color:#ffb300; border:1px solid #ffb300;"
+            " border-radius:4px; padding:4px 10px; }"
+            "QPushButton:hover { background:#3a3a3a; }")
+        help_btn.clicked.connect(self._show_advanced_settings_help)
+        provider_layout.addWidget(help_btn, len(self._provider_rows), 0)
 
         layout.addWidget(provider_group)
 
@@ -3033,24 +3332,37 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         else:
             self._on_start_big_brain()
 
+    def _row_for_slot(self, slot: int):
+        """Return the BrainControlRow for *slot*, or None if not rendered.
+
+        v2.1.53 (ARCH-ENG-053): with a brain disabled (e.g. CPU unchecked on a
+        single-GPU box) only the enabled brain's row exists, so the legacy
+        sb_*/bb_* aliases are absent. Callers that update a brain's status must
+        resolve the row by slot and no-op when it isn't rendered, instead of
+        touching a missing alias and raising AttributeError (which aborted the
+        start flow).
+        """
+        for row in getattr(self, "_provider_rows", []) or []:
+            if getattr(row, "slot", None) == slot:
+                return row
+        return None
+
     def _set_loading(self, small: bool, loading: bool, model_path: str):
         """Show/hide loading indicator for a brain."""
         label = "Small Brain" if small else "Big Brain"
-        idx = 0 if small else 1
+        slot = 1 if small else 0
+        idx = 0 if small else 1  # GPU-card detail index (unchanged legacy mapping)
         if loading:
             self._log(f"⏳ {label}: loading {os.path.basename(model_path)} into VRAM...")
-            # Update status to show loading
-            if small:
-                self.sb_status.setText("● Loading...")
-                self.sb_status.setStyleSheet("color: #ffb300; font-weight: bold;")
-                self.sb_start_btn.setEnabled(False)
-                self.sb_stop_btn.setEnabled(False)
-            else:
-                self.bb_status.setText("● Loading...")
-                self.bb_status.setStyleSheet("color: #ffb300; font-weight: bold;")
-                self.bb_start_btn.setEnabled(False)
-                self.bb_stop_btn.setEnabled(False)
-            
+            # Update the brain's row status to show loading. Resolve by slot so a
+            # disabled/missing brain is a no-op instead of an AttributeError.
+            row = self._row_for_slot(slot)
+            if row is not None:
+                row.status.setText("● Loading...")
+                row.status.setStyleSheet("color: #ffb300; font-weight: bold;")
+                row.start_btn.setEnabled(False)
+                row.stop_btn.setEnabled(False)
+
             # Do not parse GGUF metadata here. Large model files can make that
             # operation expensive, and this method runs on the Qt thread.
             # GPUStatusWorker will update actual usage while the server loads.
@@ -3058,12 +3370,10 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             self._set_gpu_detail(idx, "act", "Loading...")
             self._set_gpu_detail(idx, "kv", "Loading...")
         else:
-            if small:
-                self.sb_status.setText("● Checking...")
-                self.sb_status.setStyleSheet("color: #ffb300; font-weight: bold;")
-            else:
-                self.bb_status.setText("● Checking...")
-                self.bb_status.setStyleSheet("color: #ffb300; font-weight: bold;")
+            row = self._row_for_slot(slot)
+            if row is not None:
+                row.status.setText("● Checking...")
+                row.status.setStyleSheet("color: #ffb300; font-weight: bold;")
             # Refresh status on the Qt event loop. A threading.Timer would call
             # QWidget methods from a Python worker thread and can leave the
             # visible state stuck at Loading even after llama-server is ready.
@@ -3251,6 +3561,14 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
     def cleanup(self):
         """Stop and join provider workers before this control is destroyed."""
         self._closing = True
+        # v2.1.60 (ARCH-ENG-073): stop the periodic provider-status poller so it
+        # doesn't fire after teardown (probing dead ports on a destroyed widget).
+        status_timer = getattr(self, "_status_timer", None)
+        if status_timer is not None:
+            try:
+                status_timer.stop()
+            except RuntimeError:
+                pass
         probe_thread = getattr(self, "_provider_probe_thread", None)
         if probe_thread is not None and probe_thread.is_alive():
             probe_thread.join(3000)

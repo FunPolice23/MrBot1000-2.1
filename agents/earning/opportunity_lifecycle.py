@@ -65,13 +65,21 @@ class OpportunityLifecycleTracker:
     """Automated lifecycle tracker with smart transitions and scheduling."""
 
     _ALLOWED_TRANSITIONS = {
-            "discovered": {"researched", "queued", "failed"},
-            "researched": {"queued", "failed"},
-            "queued": {"applied", "rejected", "failed"},
-            "applied": {"in_progress", "rejected", "failed"},
-            "in_progress": {"submitted", "failed"},
-            "submitted": {"paid", "failed"},
+            # `claimed` is the crypto/airdrop route to revenue: a payout that has no
+            # application/submission stage (an on-chain claim) still has to pass
+            # through an explicit stage before `paid` is reachable (ARCH-ENG-062).
+            # The terminal stages (`paid`/`completed`/`failed`/`rejected`) have an
+            # EMPTY set, so no path may be routed THROUGH them — a `failed`
+            # opportunity can never be resurrected to `paid`.
+            "discovered": {"researched", "queued", "applied", "claimed", "completed", "failed"},
+            "researched": {"queued", "applied", "claimed", "completed", "failed"},
+            "queued": {"applied", "claimed", "rejected", "completed", "failed"},
+            "applied": {"in_progress", "submitted", "claimed", "rejected", "completed", "failed"},
+            "in_progress": {"submitted", "completed", "failed"},
+            "submitted": {"paid", "completed", "failed"},
+            "claimed": {"paid", "completed", "failed"},
             "paid": set(),
+            "completed": set(),
             "failed": set(),
             "rejected": set(),
         }
@@ -130,6 +138,11 @@ class OpportunityLifecycleTracker:
             "evidence_ids": list(state.evidence_ids),
             "history": [self._event_to_dict(e) for e in state.history],
             "verification": verification,
+            # ARCH-ENG-061: a refused transition's reason is the operator-visible
+            # signal that a move was rejected. It was set on the state object but
+            # never serialized, so the GUI/report could not show WHY an
+            # opportunity refused to advance.
+            "last_transition_error": state.last_transition_error,
         }
 
     def get_all_states(self) -> List[Dict]:
@@ -355,11 +368,9 @@ class OpportunityLifecycleTracker:
                 state.verification = evidence
                 return state
             state.last_amount = max(state.last_amount, amount)
-            state.status = "paid"
-            state.verification = evidence
-            self._append(state, "paid",
-                         f"Payment verified: {evidence.get('summary','')}",
-                         amount=amount, source="verifier")
+            self._mark_paid(state,
+                            f"Payment verified: {evidence.get('summary','')}",
+                            amount=amount, verification=evidence)
             return state
         # New Evidence path
         if evidence is not None and self._evidence_store is not None:
@@ -383,11 +394,9 @@ class OpportunityLifecycleTracker:
                 state.verification = evidence.to_dict()
                 return state
             state.last_amount = max(state.last_amount, amount)
-            state.status = "paid"
-            state.verification = evidence.to_dict()
-            self._append(state, "paid",
-                         f"Payment verified via {evidence.verification_method} ({evidence.verification_level.name})",
-                         amount=amount, source="verifier")
+            self._mark_paid(state,
+                            f"Payment verified via {evidence.verification_method} ({evidence.verification_level.name})",
+                            amount=amount, verification=evidence.to_dict())
             return state
         # No store + Evidence: there is no EvidenceStore to consult, so the
         # policy gate (`is_transition_eligible`) cannot run. Trusting an
@@ -414,12 +423,10 @@ class OpportunityLifecycleTracker:
                 state.verification = evidence.to_dict()
                 return state
             state.last_amount = max(state.last_amount, amount)
-            state.status = "paid"
-            state.verification = evidence.to_dict()
-            self._append(state, "paid",
-                         (f"Payment verified via {evidence.verification_method} "
-                          f"({evidence.verification_level.name}, no store)"),
-                         amount=amount, source="verifier")
+            self._mark_paid(state,
+                            (f"Payment verified via {evidence.verification_method} "
+                             f"({evidence.verification_level.name}, no store)"),
+                            amount=amount, verification=evidence.to_dict())
             return state
         # Fail closed: an unproven or low-trust payment is NOT a paid lifecycle.
         # `evidence` may legitimately be None here (a caller reported a payout
@@ -465,16 +472,32 @@ class OpportunityLifecycleTracker:
         if is_transition_eligible("SUBMITTED->PAID", all_ev) or \
            is_transition_eligible("CLAIMED->REVENUE_REALIZED", all_ev):
             state = self._ensure(opportunity_id)
-            if state.current_stage in ("submitted", "claimed"):
-                if state.last_amount <= 0.0:
-                    self._append(state, "submitted",
-                                 "Reconciled evidence present but last_amount is not positive; not treated as realized revenue",
-                                 amount=state.last_amount, source="verifier")
-                else:
-                    state.status = "paid"
-                    self._append(state, "paid",
-                                 f"Reconciled to paid via {method} ({reconciler})",
-                                 amount=state.last_amount, source="verifier")
+            # ARCH-ENG-065: book the RECONCILED amount, not the claimed one. The old
+            # code used `state.last_amount`, which `mark_submitted` had set to the
+            # caller-supplied claim — so a $5000 claim settled for $25 booked $5000
+            # of verified revenue while `EconomicAccounting` on the same subject said
+            # $25. Two authorities disagreed by the whole difference. The reconciled
+            # evidence is the external truth; fall back to the claim only when the
+            # evidence itself carries no amount at all.
+            reconciled_amount = float(getattr(reconciled, "amount", 0.0) or 0.0)
+            if reconciled_amount > 0.0:
+                # ARCH-ENG-065: the reconciled amount IS the externally established
+                # payment, so it REPLACES the claim rather than being max'd with it.
+                # `max()` preserved a $5000 claim that had settled for $25.
+                state.last_amount = reconciled_amount
+            else:
+                # The reconciled record carries no amount of its own (e.g. a
+                # completion confirmation) — keep the recorded claim.
+                reconciled_amount = state.last_amount
+            if reconciled_amount <= 0.0:
+                self._append(state, "submitted",
+                             "Reconciled evidence present but no positive amount; not treated as realized revenue",
+                             amount=0.0, source="verifier")
+            else:
+                self._mark_paid(state,
+                                f"Reconciled to paid via {method} ({reconciler})",
+                                amount=reconciled_amount,
+                                verification=reconciled.to_dict())
         return reconciled
 
     def mark_paid(self, opportunity_id: str, amount: float = 0.0, note: str = "") -> OpportunityState:
@@ -494,14 +517,18 @@ class OpportunityLifecycleTracker:
 
     def mark_failed(self, opportunity_id: str, note: str = "") -> OpportunityState:
         state = self._ensure(opportunity_id)
-        state.status = "failed"
-        self._transition(state, "failed", note or "Opportunity failed", source="user")
+        # ARCH-ENG-061: only commit the status when the transition is actually
+        # allowed. Setting it before the gate let `mark_failed` demote a
+        # revenue-booked `paid` opportunity to status="failed" even though the
+        # stage itself was correctly refused.
+        if self._transition(state, "failed", note or "Opportunity failed", source="user"):
+            state.status = "failed"
         return state
 
     def mark_rejected(self, opportunity_id: str, reason: str = "") -> OpportunityState:
         state = self._ensure(opportunity_id)
-        state.status = "rejected"
-        self._transition(state, "rejected", reason or "Opportunity rejected", source="user")
+        if self._transition(state, "rejected", reason or "Opportunity rejected", source="user"):
+            state.status = "rejected"
         return state
 
     def mark_final_outcome(self, opportunity_id: str, *, outcome_state: str,
@@ -529,6 +556,14 @@ class OpportunityLifecycleTracker:
         # (unverified self-report), we record an honest non-win terminal outcome
         # (`completed`) instead of silently writing a "paid"/revenue reputation event.
         effective_state = outcome_state
+        # ARCH-ENG-068: the H-4 guard below correctly refuses to book an unverified
+        # "paid" as revenue, but `revenue` was still passed verbatim to the learning
+        # loop, which treats "completed" as `is_success=True`. The result: an
+        # unverified $5000 claim was recorded as a successful $5000 revenue event
+        # across the category / task-type / strategy priors — the same collapse of
+        # states the guard exists to prevent, one layer down. When the effective
+        # outcome is downgraded, its revenue must be zeroed with it.
+        effective_revenue = revenue
         if outcome_state in ("paid",):
             state = self.mark_paid_verified(opportunity_id, amount=revenue)
             if getattr(state, "status", "") != "paid":
@@ -540,6 +575,7 @@ class OpportunityLifecycleTracker:
                                 note or "paid reported but payment not verified",
                                 source="system")
                 effective_state = "completed"
+                effective_revenue = 0.0
         elif outcome_state == "failed":
             self.mark_failed(opportunity_id, note or "failed")
         elif outcome_state in ("rejected", "rejected_apply", "rejected_pay"):
@@ -547,8 +583,10 @@ class OpportunityLifecycleTracker:
         else:
             # generic terminal transition (e.g. completed/submitted/abandoned)
             state = self._ensure(opportunity_id)
-            state.status = outcome_state
-            self._transition(state, outcome_state, note or outcome_state, source="system")
+            # ARCH-ENG-061: commit the status only if the stage transition was
+            # allowed, otherwise a refused move would still change the status.
+            if self._transition(state, outcome_state, note or outcome_state, source="system"):
+                state.status = outcome_state
 
         # v2.0.36g: record search-strategy economic outcome (if a recorder was wired). The
         # pipeline extracts the strategy:<id> from the opportunity's provenance and updates
@@ -556,7 +594,7 @@ class OpportunityLifecycleTracker:
         if self._outcome_callback is not None:
             try:
                 self._outcome_callback(opportunity_id, effective_state,
-                                       revenue=revenue, cost=cost, effort_hours=effort_hours)
+                                       revenue=effective_revenue, cost=cost, effort_hours=effort_hours)
             except Exception:
                 pass  # recorder failure must never break the lifecycle transition
 
@@ -565,7 +603,7 @@ class OpportunityLifecycleTracker:
         return self._learning_loop.process_outcome(
             opportunity_id, outcome_state=effective_state,
             platform=platform, category=category, task_type=task_type,
-            revenue=revenue, cost=cost, effort_hours=effort_hours,
+            revenue=effective_revenue, cost=cost, effort_hours=effort_hours,
             time_spent_hours=time_spent_hours, strategy_used=strategy_used,
             proposal_variant=proposal_variant, failure_cause=failure_cause,
             success_cause=success_cause, predicted=predicted, evidence_ids=evidence_ids,
@@ -579,16 +617,103 @@ class OpportunityLifecycleTracker:
         return self._states[opportunity_id]
 
     def _transition(self, state: OpportunityState, stage: str, note: str, 
-                    amount: float = 0.0, source: str = "system") -> None:
+                    amount: float = 0.0, source: str = "system") -> bool:
+        """Attempt a stage transition. Returns True iff the stage actually moved.
+
+        ARCH-ENG-061: a stage not in `_ALLOWED_TRANSITIONS` is recorded in the audit
+        trail with `transition_ok=False` but does NOT move `current_stage`. The old
+        code appended unconditionally, so the table was decorative: `in_progress ->
+        queued`, `paid -> failed` (a revenue-booked opportunity demoted) and
+        `discovered -> completed` (a stage not even in the table) all "worked" while
+        reporting `transition_ok=False`. `last_transition_error` is the signal.
+        """
         if stage not in self._ALLOWED_TRANSITIONS.get(state.current_stage, set()):
             state.last_transition_error = f"Invalid transition from {state.current_stage} to {stage}"
-            self._append(state, stage, note, amount=amount, source=source, transition_ok=False)
-            return
+            self._append(state, stage, note, amount=amount, source=source,
+                         transition_ok=False, move_stage=False)
+            return False
 
         state.last_transition_error = ""
         self._append(state, stage, note, amount=amount, source=source, transition_ok=True)
         if source != "system":
             self._notify("transition", state.opportunity_id, state)
+        return True
+
+    def _mark_paid(self, state: OpportunityState, note: str, amount: float,
+                   verification, source: str = "verifier") -> bool:
+        """Flip a state to `paid` THROUGH the state machine (ARCH-ENG-062).
+
+        Every paid branch used to call `self._append(state, "paid", ...)` directly,
+        which bypassed `_ALLOWED_TRANSITIONS` entirely — a single L5 balance-delta
+        record moved `discovered` straight to `paid`, skipping
+        researched/queued/applied/in_progress/submitted, and a `failed` opportunity
+        could be resurrected to `paid`. The state machine must be the single
+        authority on which moves are legal.
+
+        The freelance route reaches `paid` from `submitted`. The crypto/airdrop
+        route (CLAIMED->REVENUE_REALIZED) has no submission stage, so it is routed
+        through the explicit `claimed` stage first. Intermediate stages are walked
+        via the transition graph — a payout verified on an opportunity still at
+        `applied` or `in_progress` advances it through the remaining stages rather
+        than being refused. Terminal stages have an empty successor set, so a
+        `failed` opportunity can never be resurrected to `paid`.
+        """
+        if "paid" not in self._ALLOWED_TRANSITIONS.get(state.current_stage, set()):
+            waypoints = self._route_to(state.current_stage, "paid")
+            if not waypoints:
+                self._append(state, "paid", note, amount=amount, source=source,
+                             transition_ok=False, move_stage=False)
+                return False
+            for stage in waypoints:
+                # Intermediate stages are system-internal routing steps, not
+                # operator/verifier actions, so they must not emit a transition
+                # notification. `paid` itself is excluded — the final transition
+                # below carries the real note and source.
+                if stage == "paid":
+                    continue
+                self._transition(state, stage,
+                                 f"Advanced to {stage} on verified payout",
+                                 amount=amount, source="system")
+        if not self._transition(state, "paid", note, amount=amount, source=source):
+            return False
+        state.status = "paid"
+        state.verification = verification
+        # ARCH-ENG-092: `_transition` -> `_append` -> `_persist` wrote the JSON
+        # snapshot BEFORE these two assignments, so the file on disk held
+        # current_stage='paid' with status='active' and verification=None. A
+        # restart recovered exactly that, `_is_verified_evidence(None)` returned
+        # False, and a real $750 externally-verified payout silently collapsed to
+        # verified_revenue_usd() == 0.0 while still appearing in no unverified
+        # list either — the money vanished from every report. Re-persist now that
+        # the authoritative fields are actually set.
+        self._persist()
+        return True
+
+    def _route_to(self, start: str, target: str) -> List[str]:
+        """Shortest legal stage path `start` -> `target`, excluding `start` itself.
+
+        ARCH-ENG-062: `_mark_paid` originally tried a single hardcoded waypoint, so
+        `paid` was unreachable from `applied` and `in_progress` — a real $750 payout
+        on an in-progress opportunity was refused and booked $0 revenue. Walking the
+        graph keeps the state machine authoritative while still letting a verified
+        payout reach `paid` from wherever the opportunity actually is. Returns []
+        when no path exists (terminal stages have no successors, so `failed` and
+        `rejected` can never be routed to `paid`).
+        """
+        if start == target:
+            return []
+        queue = [(start, [])]
+        seen = {start}
+        while queue:
+            stage, path = queue.pop(0)
+            for nxt in sorted(self._ALLOWED_TRANSITIONS.get(stage, set())):
+                if nxt == target:
+                    return path + [nxt]
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                queue.append((nxt, path + [nxt]))
+        return []
 
     # ── v2.0.36k Group 4 (M-1): persistence ────────────────────────────────
     def _persist(self) -> None:
@@ -644,8 +769,13 @@ class OpportunityLifecycleTracker:
             pass
 
     def _append(self, state: OpportunityState, stage: str, note: str, 
-                amount: float = 0.0, source: str = "system", transition_ok: bool = True) -> None:
-        state.current_stage = stage
+                amount: float = 0.0, source: str = "system", transition_ok: bool = True,
+                move_stage: bool = True) -> None:
+        # ARCH-ENG-061: `move_stage=False` records a REFUSED transition in the audit
+        # trail without moving `current_stage`. A rejected transition must leave the
+        # state machine where it was.
+        if move_stage:
+            state.current_stage = stage
         state.history.append(LifecycleEvent(
             stage=stage, timestamp=time.time(), note=note, 
             amount=amount, source=source, transition_ok=transition_ok
@@ -665,18 +795,25 @@ class OpportunityLifecycleTracker:
         }
 
     def _notify(self, event_type: str, opportunity_id: str, state: OpportunityState):
-        """Notify callback if one was registered."""
-        if self._callback:
-            try:
-                self._callback({
-                    "type": event_type,
-                    "opportunity_id": opportunity_id,
-                    "stage": state.current_stage,
-                    "score": state.score,
-                    "budget": state.budget
-                })
-            except Exception:
-                pass
+        """Notify callback if one was registered.
+
+        Best-effort by contract: `__notify` is reached from every transition, and a
+        missing callback attribute (a tracker built via `__new__` in a test fixture)
+        must never abort a state change.
+        """
+        callback = getattr(self, "_callback", None)
+        if not callback:
+            return
+        try:
+            callback({
+                "type": event_type,
+                "opportunity_id": opportunity_id,
+                "stage": state.current_stage,
+                "score": state.score,
+                "budget": state.budget
+            })
+        except Exception:
+            pass
 
     # ── Export Functions ────────────────────────────────────────────────────
 
@@ -690,10 +827,39 @@ class OpportunityLifecycleTracker:
         for s in self._states.values():
             if s.status != "paid":
                 continue
-            ev = s.verification
-            if ev and ev.get("verified"):
+            if self._is_verified_evidence(s.verification):
                 total += s.last_amount
         return round(total, 2)
+
+    @staticmethod
+    def _is_verified_evidence(ev: Optional[Dict]) -> bool:
+        """True iff a stored verification dict proves an INDEPENDENT payment.
+
+        ARCH-ENG-064: this used to read `ev.get("verified")`, but `Evidence.to_dict()`
+        emits `status` / `verification_level` / `verification_method` and NEVER a
+        `verified` key. The consequence was inverted trust: a genuine L5 on-chain
+        payout reported `verified_revenue_usd() == 0.0` and was listed in
+        `unverified_payouts()`, while a hand-written dict `{"verified": True}`
+        booked its full `expected_usd` as revenue. Trust now follows the same
+        evidence-policy rule the lifecycle gate uses — affirmative status AND
+        verification level >= L3 external source — with the legacy `verified`
+        boolean honoured only when it carries no status/level of its own.
+        """
+        if not ev:
+            return False
+        status = str(ev.get("status", "") or "").upper()
+        if not status:
+            # Legacy dict shape: honour the explicit boolean only.
+            return bool(ev.get("verified"))
+        if status not in ("VERIFIED", "PARTIALLY_VERIFIED"):
+            return False
+        level = ev.get("verification_level")
+        if level is None:
+            return False
+        try:
+            return int(level) >= int(VerificationLevel.L3_EXTERNAL_SOURCE)
+        except (TypeError, ValueError):
+            return False
 
     def unverified_payouts(self) -> List[str]:
         """A2: opportunity ids with a payout attempt that was NOT verified.
@@ -704,8 +870,9 @@ class OpportunityLifecycleTracker:
         """
         out = []
         for s in self._states.values():
-            ev = s.verification
-            if ev is not None and not ev.get("verified"):
+            if s.status != "paid":
+                continue
+            if not self._is_verified_evidence(s.verification):
                 out.append(s.opportunity_id)
         return out
         # ── Export Functions ────────────────────────────────────────────────────

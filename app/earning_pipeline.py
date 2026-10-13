@@ -177,7 +177,18 @@ class EarningPipeline:
         # v2.0.36k: Unified Autonomous Planning Loop
         from agents.services.autonomous_loop import AutonomousLoop
         # v2.1 Phase 3: inject the durable run store so loop results persist.
+        self.run_store = run_store
         self.autonomous_loop = AutonomousLoop(self, run_store=run_store)
+        # v2.1.71 Phase C: strategy feedback (lazy) — aggregates recorded
+        # autonomous-run outcomes per platform so ranking is informed by what
+        # has actually paid. None until first use; safe when run_store/portfolio
+        # are absent (feedback is advisory and simply not applied).
+        self._strategy_feedback = None
+        # v2.1.72 Phase C: SelfImprovementEngine (lazy) — learns platform
+        # reliability, tag success rates, and strategy weights from VERIFIED
+        # opportunity outcomes (evidence-gated). Fed from the same lifecycle
+        # outcome_callback as search-strategy memory. Persisted next to the DB.
+        self._self_improvement = None
         # v2.0.34at: Opportunity Intelligence Engine (lazy; created on first use).
         self._intel_engine = None
         self._last_opportunity_graph = None
@@ -323,16 +334,26 @@ class EarningPipeline:
     def _record_strategy_outcome(self, opportunity_id: str, outcome_state: str, *,
                                  revenue: float = 0.0, cost: float = 0.0,
                                  effort_hours: float = 0.0) -> None:
-        """v2.0.36g: feed a finalized opportunity outcome into Search Strategy Memory.
+        """Feed a finalized opportunity outcome into the learning systems.
 
-        Deterministic: reads the opportunity's stored provenance (set at discovery time as
-        `strategy:<id>`), extracts the search-strategy id, and records the ECONOMIC outcome
-        (useful/accepted/completed/paid + net revenue - effort). The discovery scheduler then
-        ranks exploitation by usefulness and keeps novel searches explorable. No LLM, no network.
+        Two sinks, both deterministic (no LLM, no network):
+        1. Search Strategy Memory (v2.0.36g) — records the economic outcome
+           against the discovery `strategy:<id>` so the scheduler ranks by
+           usefulness. Only when a strategy id is present.
+        2. SelfImprovementEngine (v2.1.72 Phase C) — learns platform
+           reliability, tag success rates, and strategy weights from VERIFIED
+           outcomes (it ignores records without evidence_ids, so unverified
+           outcomes never distort learning). Runs for every finalized outcome.
         """
         if not opportunity_id:
             return
         hist = self.memory.get_opportunity_history(opportunity_id) or {}
+
+        # 2) SelfImprovementEngine — verified-outcome learning (Phase C).
+        self._feed_self_improvement(opportunity_id, outcome_state, hist,
+                                    revenue=revenue, cost=cost,
+                                    effort_hours=effort_hours)
+
         prov = hist.get("provenance", "") or ""
         # provenance may be "src::strategy:<id>" or "strategy:<id>"
         sid = None
@@ -352,6 +373,50 @@ class EarningPipeline:
             accepted=1 if accepted else 0, completed=1 if completed else 0,
             paid=1 if paid else 0, net_revenue=max(0.0, float(revenue) - float(cost)),
             effort_hours=float(effort_hours))
+
+    def _feed_self_improvement(self, opportunity_id: str, outcome_state: str,
+                               hist: dict, *, revenue: float, cost: float,
+                               effort_hours: float) -> None:
+        """Record a finalized outcome into the SelfImprovementEngine (Phase C).
+
+        The engine only learns from VERIFIED outcomes (it requires
+        `verified` and non-empty `evidence_ids`), so this passes whatever
+        evidence the lifecycle attached; unverified outcomes are ignored by the
+        engine, never fabricating a learning signal. Never raises.
+        """
+        engine = self.self_improvement
+        if engine is None:
+            return
+        try:
+            from agents.autonomy.self_improvement import OutcomeRecord, Outcome
+            os_ = (outcome_state or "").lower()
+            success = os_ in ("completed", "paid")
+            # Evidence: the lifecycle links paid/verified evidence ids to the
+            # opportunity; only a paid/verified outcome carries them, which is
+            # exactly the engine's gate.
+            evidence_ids = []
+            try:
+                evidence_ids = self.memory.get_outcome_evidence(opportunity_id) or []
+            except Exception:
+                evidence_ids = []
+            verified = bool(os_ == "paid" and evidence_ids)
+            record = OutcomeRecord(
+                opportunity_id=opportunity_id,
+                strategy=str(hist.get("strategy", "") or ""),
+                platform=str(hist.get("platform", "") or ""),
+                outcome=Outcome.SUCCESS.value if success else Outcome.FAILURE.value,
+                revenue=float(revenue or 0.0),
+                cost=float(cost or 0.0),
+                effort_hours=float(effort_hours or 0.0),
+                risk_level=str(hist.get("risk_level", "unknown") or "unknown"),
+                success_probability=float(hist.get("success_probability", 0.0) or 0.0),
+                tags=list(hist.get("tags", []) or []),
+                verified=verified,
+                evidence_ids=list(evidence_ids),
+            )
+            engine.record_outcome(record)
+        except Exception as exc:
+            self._log(f"[SelfImprovement] outcome feed skipped: {exc}")
 
     @staticmethod
     def _adapt_to_legacy(o) -> "Opportunity":
@@ -661,8 +726,60 @@ class EarningPipeline:
             evaluated,
             evidence_store=self.evidence_store,
             log_fn=self._log,
+            strategy_feedback=self.strategy_feedback,
         )
         return evaluated
+
+    @property
+    def strategy_feedback(self):
+        """Lazy StrategyFeedback: run outcomes -> per-platform stats (Phase C).
+
+        The platform resolver reads the portfolio entry's platform for a run's
+        opportunity_id. Returns None when there is no run store or portfolio, so
+        ranking simply skips the advisory adjustment.
+        """
+        if self._strategy_feedback is not None:
+            return self._strategy_feedback
+        if self.run_store is None or self.portfolio is None:
+            return None
+        try:
+            from agents.earning.strategy_feedback import StrategyFeedback
+
+            def _resolve(opportunity_id: str) -> str:
+                try:
+                    entry = self.portfolio.get(opportunity_id)
+                    return getattr(entry, "platform", "") or ""
+                except Exception:
+                    return ""
+
+            self._strategy_feedback = StrategyFeedback(
+                self.run_store, _resolve)
+        except Exception as exc:
+            self._log(f"[Feedback] strategy feedback unavailable: {exc}")
+            return None
+        return self._strategy_feedback
+
+    @property
+    def self_improvement(self):
+        """Lazy SelfImprovementEngine: learns from VERIFIED outcomes (Phase C).
+
+        Adjusts platform reliability, tag success rates, and strategy weights
+        only from outcomes that carry evidence (the engine itself ignores
+        unverified records). Persisted to self_improvement_state.json next to
+        the DB so learning survives restarts. None if the engine can't load.
+        """
+        if self._self_improvement is not None:
+            return self._self_improvement
+        try:
+            from agents.autonomy.self_improvement import SelfImprovementEngine
+            state_path = os.path.join(
+                os.path.dirname(os.path.abspath(self.db_path)),
+                "self_improvement_state.json")
+            self._self_improvement = SelfImprovementEngine(state_path=state_path)
+        except Exception as exc:
+            self._log(f"[SelfImprovement] engine unavailable: {exc}")
+            return None
+        return self._self_improvement
 
     def _sync_to_portfolio(self, opp: Opportunity) -> None:
         """Create/update a PortfolioEntry from an evaluated opportunity (deterministic)."""
