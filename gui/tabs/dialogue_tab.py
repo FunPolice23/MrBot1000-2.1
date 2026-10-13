@@ -46,6 +46,18 @@ from agents.core.comms import EventBus
 # having to replicate the instance bookkeeping attributes.
 
 
+class _WorkerCancelled(Exception):
+    """Raised inside a DialogueWorker's stream callback to abort a blocking
+    provider read the instant cancel() is called (ARCH-ENG-102).
+
+    A worker blocked in a slow CPU-model HTTP read cannot be stopped by the
+    cooperative ``_cancelled`` flag alone (it is only checked between ops), so
+    it survives teardown and the QThread is destroyed while running ->
+    Qt6Core 0xc0000409. Raising out of the per-chunk callback propagates through
+    the streaming generator and unblocks run() immediately.
+    """
+
+
 def _decision_signature(text):
     """Compact normalized semantic signature of a persona turn.
 
@@ -1223,9 +1235,14 @@ class DialogueTab(QWidget):
         self._pending_images = []
         if getattr(self, "_image_label", None) is not None:
             self._image_label.setText("")
+        # Resolve the active speaker's runtime slot (0=Big, 1=Small, 2+=extra)
+        # for the device-aware GPU tok/s display (ARCH-ENG-101).
+        _spk = self._speaker_for(self.current_speaker)
+        _slot = int(getattr(_spk, "slot", 0) or 0) if _spk is not None else 0
         worker = DialogueWorker(brain, context, [],
                                      self.current_speaker, system_prompt,
-                                     generation_id=generation_id, images=images)
+                                     generation_id=generation_id, images=images,
+                                     slot=_slot, parent=self)
         self.worker = worker
         if self.live_running and not manual:
             self._live_workers[self.current_speaker] = worker
@@ -1237,6 +1254,7 @@ class DialogueTab(QWidget):
             self._progress_throttler = make_throttler(flush_ms=80)
             self._progress_throttler.connect(self._on_dialogue_progress)
         worker.progress.connect(self._progress_throttler.emit)
+        worker.gpu_progress.connect(self._on_gpu_progress)
         worker.tool_activity.connect(self._on_tool_activity)
         worker.finished.connect(
             lambda response, speaker, generation=generation_id:
@@ -1455,6 +1473,18 @@ class DialogueTab(QWidget):
             self.progress_bar.hide()
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setFormat("Ready")
+        # Clear the GPU-window tok/s bar once no generation is in flight
+        # (ARCH-ENG-101). In Live mode several workers run; only reset when the
+        # last one finished so a mid-session turn doesn't blank a live bar.
+        if not getattr(self, "_live_workers", {}):
+            gpu = self._gpu_window()
+            if gpu is not None and hasattr(gpu, "clear_gpu_progress"):
+                _spk = self._speaker_for(canonical_speaker)
+                _slot = int(getattr(_spk, "slot", 0) or 0) if _spk is not None else 0
+                try:
+                    gpu.clear_gpu_progress(_slot)
+                except Exception:
+                    pass
         if getattr(self, "_goal_restart_pending", False):
             self._goal_restart_pending = False
             if not self.live_running or not getattr(self, "_live_workers", {}):
@@ -1912,10 +1942,62 @@ class DialogueTab(QWidget):
         if not latest:
             return
         speaker, text, running = latest
-        if speaker and text:
+        # Live tok/s in the Dialogue progress bar (ARCH-ENG-101): accumulate
+        # streamed chars per speaker since the first token and derive tok/s.
+        # Keyed by speaker so a Live session with several personas tracks each.
+        if speaker and text and running:
+            import time as _t
+            state = getattr(self, "_stream_state", None)
+            if state is None:
+                state = self._stream_state = {}
+            st = state.get(speaker)
+            now = _t.time()
+            if st is None:
+                st = state[speaker] = {"chars": 0, "t0": now}
+            st["chars"] += len(str(text))
+            elapsed = max(1e-6, now - st["t0"])
+            tok = max(1, st["chars"] // 4)
+            tps = tok / elapsed
+            self.progress_bar.setFormat(
+                f"Generating {speaker}'s response… ● {tps:.1f} tok/s · ~{tok} tok")
+        elif speaker and running:
             self.progress_bar.setFormat(f"Generating {speaker}'s response...")
+        if not running and speaker:
+            # Turn ended for this speaker — drop its accumulator.
+            state = getattr(self, "_stream_state", None)
+            if state is not None:
+                state.pop(speaker, None)
         self.progress_bar.setRange(0, 0 if running else 1)
         self.progress_bar.hide() if not running else self.progress_bar.show()
+
+    def _gpu_window(self):
+        """Return the Providers & GPU control (DualBrainControl) or None.
+
+        Reached via the MainWindow parent, which stores it as
+        ``providers_gpu_tab``. Defensive: returns None when there is no parent
+        or the attribute is absent (e.g. ``__new__``-built tests), so callers
+        never raise on a half-constructed tab.
+        """
+        try:
+            owner = self.parent()
+        except Exception:
+            return None
+        if owner is None:
+            return None
+        return getattr(owner, "providers_gpu_tab", None)
+
+    def _on_gpu_progress(self, slot: int, tok_count: int, elapsed_s: float):
+        """Route live tok/s to the Providers & GPU window (device-aware).
+
+        v2.1.80 (ARCH-ENG-101): the worker emits (slot, tok_count, elapsed) from
+        the stream; forward to the GPU window's progress bar for that device.
+        """
+        gpu = self._gpu_window()
+        if gpu is not None and hasattr(gpu, "update_gpu_progress"):
+            try:
+                gpu.update_gpu_progress(int(slot), int(tok_count), float(elapsed_s))
+            except Exception:
+                pass
 
     def on_model_changed(self, role: str = ""):
         """Stop the active generation before adapters switch model endpoints."""
@@ -2582,11 +2664,12 @@ class DialogueWorker(QThread):
     finished = Signal(str, str)  # response, speaker
     progress = Signal(str, str, bool)  # speaker, text, running
     tool_activity = Signal(str, dict)  # speaker, tool_event
+    gpu_progress = Signal(int, int, float)  # slot, tok_count, elapsed_s (ARCH-ENG-101)
 
     def __init__(self, brain, context, history, speaker, system_prompt=None,
                  anti_repetition=True, max_retries=2, generation_id=0,
-                 images=None):
-        super().__init__()
+                 images=None, slot=0, parent=None):
+        super().__init__(parent)
         self.brain = brain
         self.context = context
         self.history = history
@@ -2595,12 +2678,20 @@ class DialogueWorker(QThread):
         self.anti_repetition = anti_repetition
         self.max_retries = max_retries
         self.generation_id = generation_id
+        # Runtime slot (0=Big, 1=Small, 2+=extra) for the device-aware GPU
+        # tok/s display. Resolved by the tab from the speaker registry.
+        self.slot = int(slot)
         # Optional vision payload: list of image URLs / data-URLs / local paths
         # for vision-capable models. Ignored by text-only models.
         self.images = list(images or [])
         self._cancelled = False
         self._emitted_tool_calls = set()
         self.max_tokens = self._resolve_max_tokens(brain)
+        # Live tok/s accounting (ARCH-ENG-101): accumulate streamed chars and
+        # wall time from the first token, emit estimated tok/s to the GPU window.
+        self._stream_chars = 0
+        self._stream_t0 = None
+        self._last_gpu_emit = 0.0
 
     @staticmethod
     def _resolve_max_tokens(brain) -> int:
@@ -2752,9 +2843,30 @@ class DialogueWorker(QThread):
 
             def on_stream(chunk):
                 if self._cancelled:
-                    return
+                    # Abort the blocking provider read so cancel() has teeth:
+                    # raising out of the per-chunk callback propagates through
+                    # the streaming generator and unblocks run() immediately
+                    # (ARCH-ENG-102). Without this, a worker blocked in a slow
+                    # CPU-model HTTP read survives teardown and the QThread is
+                    # destroyed while running -> Qt6Core 0xc0000409 crash.
+                    raise _WorkerCancelled()
                 if chunk:
                     self.progress.emit(self.speaker, str(chunk), True)
+                    # Live tok/s accounting (ARCH-ENG-101): chars since first
+                    # token + wall time; emit ~4x/sec to the GPU window.
+                    try:
+                        import time as _t
+                        if self._stream_t0 is None:
+                            self._stream_t0 = _t.time()
+                        self._stream_chars += len(str(chunk))
+                        now = _t.time()
+                        if now - self._last_gpu_emit >= 0.25:
+                            self._last_gpu_emit = now
+                            elapsed = now - self._stream_t0
+                            tok = max(1, self._stream_chars // 4)
+                            self.gpu_progress.emit(self.slot, tok, elapsed)
+                    except Exception:
+                        pass
 
             def on_tool(tool_event):
                 # Emit each verified tool call/result once so the tab can render
@@ -2836,6 +2948,11 @@ class DialogueWorker(QThread):
             response = response or "(empty)"
             self.progress.emit(self.speaker, response, False)
             self.finished.emit(response, self.speaker)
+        except _WorkerCancelled:
+            # Cancelled mid-read (ARCH-ENG-102): exit quietly. Emitting an
+            # error here would feed a bogus "Error:" turn into the transcript
+            # and could re-arm a Live continuation after teardown.
+            return
         except Exception as e:
             error_response = f"Error: {str(e)}"
             self.progress.emit(self.speaker, error_response, False)
@@ -2989,6 +3106,60 @@ class DialogueWorker(QThread):
             "tool_call:",
         )
         if any(phrase in lower for phrase in narrated_tool_phrases):
+            return True
+
+        # ── Narrated read/verify intent WITHOUT an actual tool call ───────────
+        # ARCH-ENG-104: a persona announcing it will read/verify/check a page
+        # but routing nothing through the tool channel is a stall, not progress
+        # (the small-model "I need to verify... let me read the page" loop). The
+        # real tool chain executes a [TOOL] line and returns evidence; a turn
+        # that only NARRATES the intent produces no evidence and repeats. Reject
+        # it so the retry re-prompts for a concrete decision or a real tool call.
+        # Guarded by the absence of an executed tool marker so a turn that DID
+        # call a tool (and is reporting the result in past tense) still passes.
+        narrated_read_intent = (
+            "let me read",
+            "let me check",
+            "let me verify",
+            "let me pull",
+            "let me look",
+            "i'll read",
+            "i will read",
+            "i'll verify",
+            "i will verify",
+            "i'll check",
+            "i will check",
+            "i need to verify",
+            "i need to read",
+            "i need to check",
+            "i'm going to read",
+            "i am going to read",
+            "i'm going to check",
+            "i am going to check",
+            "i'm going to verify",
+            "i am going to verify",
+        )
+        has_executed_tool = ("[tool]" in lower or "[tool result]" in lower
+                             or "tool result:" in lower or "search results" in lower
+                             or "retrieved at:" in lower)
+        # Only a PURE narrated-verify stall is rejected: a turn that states a
+        # read/verify intent but ALSO carries a concrete decision, commitment,
+        # or approval ask is real progress ("I will check the gig, then outline
+        # a plan — I need your approval"). Reject only when there is no such
+        # concrete marker, so the small-model "I need to verify... let me read"
+        # loop (intent and nothing else) is caught while legit plans pass.
+        has_concrete_progress = any(m in lower for m in (
+            "i'm committing", "i am committing", "i'm locking", "i am locking",
+            "i'm going with", "i am going with", "i'll proceed", "i will proceed",
+            "approve or reject", "your approval", "need your approval",
+            "i need your approval", "do i proceed", "should i proceed",
+            "here's my plan", "here is my plan", "my plan is", "the plan is",
+            "i'll draft", "i will draft", "i'll submit", "i will submit",
+            "i'll start", "i will start", "let's proceed", "lets proceed",
+            "i recommend",
+        ))
+        if (not has_executed_tool and not has_concrete_progress
+                and any(phrase in lower for phrase in narrated_read_intent)):
             return True
 
         # ── Pseudo-tool / fake tool-request syntax ────────────────────────────

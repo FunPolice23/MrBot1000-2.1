@@ -242,11 +242,42 @@ class ChatTab(QWidget):
         self.input.clear()
         self.send_btn.setEnabled(False)
         self.send_btn.setText("...")
-        
+
+        # Time the primary (Small Brain) call so we can show a post-hoc tok/s in
+        # the Providers & GPU window on completion (ARCH-ENG-101). The Chat tab
+        # is intentionally non-streaming, so this is a completion-time estimate.
+        import time as _t
+        self._chat_t0 = _t.time()
+
         # Run inference in background thread
         self.worker = InferenceWorker(self.small_brain, msg, self.conversation_history)
         self.worker.finished.connect(self._on_small_brain_response)
         self.worker.start()
+
+    def _gpu_window(self):
+        """Return the Providers & GPU control (DualBrainControl) or None."""
+        try:
+            owner = self.parent()
+        except Exception:
+            return None
+        return getattr(owner, "providers_gpu_tab", None) if owner is not None else None
+
+    def _report_chat_tps(self, response: str, slot: int):
+        """Push a post-hoc tok/s for a completed Chat turn to the GPU window."""
+        gpu = self._gpu_window()
+        if gpu is None or not hasattr(gpu, "update_gpu_progress"):
+            return
+        t0 = getattr(self, "_chat_t0", None)
+        if not t0:
+            return
+        import time as _t
+        elapsed = max(1e-6, _t.time() - t0)
+        tok = max(1, len(response or "") // 4)
+        try:
+            gpu.update_gpu_progress(int(slot), tok, elapsed)
+            gpu.clear_gpu_progress(int(slot))
+        except Exception:
+            pass
     
     def _on_small_brain_response(self, response: str):
         """Handle Small Brain response (runs in GUI thread)."""
@@ -267,6 +298,11 @@ class ChatTab(QWidget):
         
         # Display clean response
         self.append_message(NAVIGATOR.current_name, clean_response, "#03dac6")
+
+        # Report post-hoc tok/s for this Small-Brain turn to the GPU window
+        # (slot 1) — the Chat tab is non-streaming, so this is a completion
+        # estimate (ARCH-ENG-101).
+        self._report_chat_tps(clean_response, 1)
         
         # Update history
         self.conversation_history.append({"role": "user", "content": self.worker.user_msg})

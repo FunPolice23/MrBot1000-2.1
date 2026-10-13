@@ -18,10 +18,26 @@ function never raises and never fabricates a capability.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 # Substrings that mark an MTP / next-token-prediction head in the tensor names.
 _MTP_MARKERS = ("nextn", "mtp", "shared_head", "eh_proj")
+
+# ARCH-ENG-098: detect_mtp parses the GGUF header (hundreds of thousands of
+# tensor/KV skips on a 9B+ model). The GUI status tick used to call it every
+# ~4s on the GUI thread, freezing the whole app for seconds. Cache by
+# (abspath, mtime_ns, size) so a given file is parsed at most once until it
+# actually changes on disk. Callers get a copy so they can't mutate the cache.
+_MTP_CACHE: Dict[tuple, Dict[str, Any]] = {}
+
+
+def _cache_key(model_path: str):
+    try:
+        st = os.stat(model_path)
+        return (os.path.abspath(model_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (os.path.abspath(model_path), None, None)
 
 
 def detect_mtp(model_path: str) -> Dict[str, Any]:
@@ -38,6 +54,10 @@ def detect_mtp(model_path: str) -> Dict[str, Any]:
     if not model_path:
         result["reason"] = "no model selected"
         return result
+    key = _cache_key(model_path)
+    cached = _MTP_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
     try:
         from agents.providers.gguf_meta import read_tensor_names
         names = read_tensor_names(model_path)
@@ -54,6 +74,7 @@ def detect_mtp(model_path: str) -> Dict[str, Any]:
         result["reason"] = "model carries an MTP (multi-token) head"
     else:
         result["reason"] = "model has no MTP head — MTP unavailable"
+    _MTP_CACHE[key] = dict(result)
     return result
 
 

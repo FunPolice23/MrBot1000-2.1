@@ -665,11 +665,18 @@ class AgentDB:
         else:
             stats["uptime_hours"] = 0
         
-        # Get DB size
+        # Get DB size. PRAGMA database_list returns the on-disk path in the
+        # "file" column; "name" is just the logical alias ("main"), which
+        # os.path.getsize cannot resolve — that bug silently forced 0.
         try:
             import os
-            db_path = self._execute("PRAGMA database_list").fetchone()["name"]
-            stats["db_size_mb"] = round(os.path.getsize(db_path) / (1024 * 1024), 2)
+            _dbrow = self._execute("PRAGMA database_list").fetchone()
+            _dbpath = (_dbrow["file"] if _dbrow and _dbrow["file"]
+                       else getattr(self, "db_path", ""))
+            if _dbpath and os.path.exists(_dbpath):
+                stats["db_size_mb"] = round(os.path.getsize(_dbpath) / (1024 * 1024), 2)
+            else:
+                stats["db_size_mb"] = 0
         except Exception:
             stats["db_size_mb"] = 0
         

@@ -151,6 +151,7 @@ from agents.safety.handlers import (
     _tool_workshop_list, _tool_workshop_read, _tool_workshop_write,
     _tool_workshop_mkdir, _tool_workshop_storage, _tool_workshop_search,
     _tool_workshop_proposal, _tool_workshop_account, _tool_workshop_payment,
+    _tool_record_payment, _tool_social_post,
     _tool_file_read, _tool_file_write, _tool_file_list, _tool_run_command,
     _tool_query_db,
 )

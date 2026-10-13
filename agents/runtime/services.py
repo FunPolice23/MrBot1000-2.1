@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
-import importlib.util
 import json
 import queue
 import re
@@ -221,67 +219,8 @@ class EmbeddingCache:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  WorkerRegistry  — dynamic agent loader
-# ─────────────────────────────────────────────────────────────────────────────
-class WorkerRegistry:
-    """
-    Discover and load WorkerAgent subclasses from the agents/ folder.
-
-    Any .py file in agents/ that defines a class inheriting from WorkerAgent
-    (or duck-typing it — having an `llm` method) will be registered.
-
-    Usage::
-
-        registry = WorkerRegistry("/path/to/agents")
-        registry.scan()
-        names = registry.list_workers()          # ["AnalystWorker", ...]
-        cls   = registry.get("AnalystWorker")
-        inst  = cls(api_key, log_signal, db=db)
-    """
-
-    def __init__(self, agents_dir: str = None):
-        self._dir = Path(agents_dir or Path(__file__).parent)
-        self._workers: Dict[str, type] = {}
-
-    def scan(self) -> List[str]:
-        """Scan agents/ folder and load all valid worker classes."""
-        found = []
-        SKIP = {"__init__", "library", "base_worker"}
-        for py in sorted(self._dir.glob("*.py")):
-            stem = py.stem
-            if stem in SKIP or stem.startswith("_"):
-                continue
-            try:
-                spec = importlib.util.spec_from_file_location(
-                    f"agents.{stem}", py)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                for name in dir(mod):
-                    obj = getattr(mod, name)
-                    if (isinstance(obj, type)
-                            and name not in ("WorkerAgent",)
-                            and hasattr(obj, "llm")
-                            and name not in self._workers):
-                        self._workers[name] = obj
-                        found.append(name)
-            except Exception as e:
-                pass   # silently skip broken modules
-        return found
-
-    def list_workers(self) -> List[str]:
-        return list(self._workers.keys())
-
-    def get(self, name: str) -> Optional[type]:
-        return self._workers.get(name)
-
-    def register(self, name: str, cls: type):
-        """Manually register a worker class."""
-        self._workers[name] = cls
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  Convenience helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-__all__=["TaskQueue", "AgentLogger", "FileWatcher", "EmbeddingCache", "WorkerRegistry"]
+__all__=["TaskQueue", "AgentLogger", "FileWatcher", "EmbeddingCache"]

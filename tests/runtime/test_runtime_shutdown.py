@@ -14,31 +14,21 @@ class TestMainWindowShutdown(unittest.TestCase):
     def setUp(self):
         self.app = QApplication.instance() or QApplication([])
 
-    def test_shutdown_stops_threads_and_closes_db(self):
+    def test_shutdown_closes_db_and_ollama(self):
+        # v2.1.77: legacy ManagerThread/SummarizerThread removed. shutdown() now
+        # tears down the DB + Ollama executors + tab background threads; there
+        # are no manager/summarizer worker threads to stop.
         window = MainWindow.__new__(MainWindow)
         window._shutting_down = False
         window._shutdown_ollama = MagicMock()
-
-        manager = MagicMock()
-        manager.isRunning.return_value = True
-        summarizer = MagicMock()
-        summarizer.isRunning.return_value = True
+        window._stop_tab_background_threads = MagicMock()
         db = MagicMock()
-
-        window.manager = manager
-        window.summarizer = summarizer
         window.db = db
 
         window.shutdown()
 
-        manager.stop.assert_called_once_with()
-        summarizer.stop.assert_called_once_with()
-        # Graceful wait only — shutdown must never terminate() a thread that may
-        # be blocked in socket I/O (that corrupts the process).
-        manager.wait.assert_called_once_with(5000)
-        summarizer.wait.assert_called_once_with(5000)
-        manager.terminate.assert_not_called()
-        summarizer.terminate.assert_not_called()
+        window._shutdown_ollama.assert_called_once_with()
+        window._stop_tab_background_threads.assert_called_once_with()
         db.close.assert_called_once_with()
 
 

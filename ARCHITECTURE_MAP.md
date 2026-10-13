@@ -1,5 +1,12 @@
 # MrBot1000 architecture map
 
+> **Update (v2.1.77):** the legacy central-Manager architecture (`ManagerThread`,
+> `SummarizerThread`, and the `manager_*` runtime helpers) has been **fully removed**.
+> The N-device peer council (Dialogue) + Chat tab are the decision/chat authority;
+> `EarningPipeline`/`AutonomousLoop` drive earning. Historical "Phase 9 manager
+> orchestration" sections below are a record of past work, not current architecture.
+> See [`docs/LEGACY_AUDIT.md`](LEGACY_AUDIT.md) for the removal record.
+
 ## Executive assessment
 
 MrBot1000 is feature-rich and has strong safety, evidence, and recovery
@@ -36,9 +43,10 @@ main.py
   │         │    └─ AutonomousLoop
   │         ├─ OpportunityPortfolio
   │         └─ AutonomousRunStore
-  ├─ WorkerAgent / provider registry
-  ├─ ManagerThread
-  └─ SummarizerThread
+  └─ WorkerAgent / provider registry
+     └─ N-device brains (Dialogue peer council + Chat tab) are the
+        decision/chat authority (legacy ManagerThread/SummarizerThread
+        removed — see docs/LEGACY_AUDIT.md)
 ```
 
 The GUI currently remains the largest composition boundary. It knows about

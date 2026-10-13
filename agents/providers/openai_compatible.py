@@ -257,13 +257,18 @@ def _stream_timeout_seconds() -> float:
         return 120.0
 
 
-def _build_provider_timeout(openai_module, *, read: float):
+def _build_provider_timeout(openai_module, *, read: float, connect: float = None):
     """Build an openai.Timeout with a short connect and a long read.
 
     Falls back to a plain float when the module has no ``Timeout`` (older SDKs
     and the fakes used in tests), so the caller always gets something usable.
+
+    ``connect`` overrides the env-derived connect timeout when a caller (e.g.
+    the local CPU brain) needs a longer window than the cloud default
+    (ARCH-ENG-107).
     """
-    connect = _connect_timeout_seconds()
+    if connect is None:
+        connect = _connect_timeout_seconds()
     timeout_cls = getattr(openai_module, "Timeout", None)
     if timeout_cls is None:
         return float(read)

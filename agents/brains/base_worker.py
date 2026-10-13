@@ -81,12 +81,12 @@ BACKUP_DIRNAME = ".mrbot_backups"
 # refuses to overwrite any of these basenames so a bad LLM rewrite can never
 # break the running app. For intentional dev edits, use an external editor.
 PROTECTED_SOURCE_FILES = {
-    "main.py", "manager.py", "ui.py", "theme_config.py", "library.py",
+    "main.py", "ui.py", "theme_config.py", "library.py",
     "database.py", "action_pipeline.py", "earning_pipeline.py",
     "startup_validation.py", "test_earning_pipeline.py",
     "__init__.py", "base_worker.py", "coder.py", "analyst_worker.py",
-    "job_search_worker.py", "fiverr_client.py", "upwork_client.py",
-    "chat_router.py", "summarizer.py", "shared_context.py",
+    "fiverr_client.py", "upwork_client.py",
+    "chat_router.py", "shared_context.py",
     "document_scanner.py", "task_workspace.py", "earning_discoverer.py",
     "opportunity_lifecycle.py", "wallet_manager.py", "content_generator.py",
     "workflow_planner.py", "social_earning_platform.py", "microtask_client.py",
@@ -98,9 +98,6 @@ PROTECTED_SOURCE_FILES = {
 _CODEBASE_INDEX_SKIP_DIRS = WRITE_EXCLUSION_DIRS | {
     ".github", "references", "skills", "scripts", "tests", "docs",
 }
-
-# Registry of worker classes by name (populated by manager registration).
-WORKER_REGISTRY = {}
 
 
 from agents.brains.worker_provider import normalize_keep_alive as _normalize_keep_alive
@@ -122,10 +119,10 @@ FILENAME_BLOCKLIST = {
 # Stored as BASENAMES only — safe_write_file matches by Path(filename).name so
 # "./coder.py", "agents/coder.py", and absolute paths are all caught.
 PROTECTED_SOURCE_FILES = {
-    "main.py", "manager.py", "action_pipeline.py", "database.py", "library.py",
+    "main.py", "action_pipeline.py", "database.py", "library.py",
     "ui.py", "theme_config.py", "startup_validation.py", "earning_pipeline.py",
     "earning_memory.py", "test_earning_pipeline.py",
-    "coder.py", "base_worker.py", "job_search_worker.py", "analyst_worker.py",
+    "coder.py", "base_worker.py", "analyst_worker.py",
     "__init__.py",
 }
 

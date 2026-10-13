@@ -12,7 +12,6 @@ _EXPORTS = {
     "AirdropScanner": ("earning.airdrop_scanner", "AirdropScanner"),
     "AirdropOpportunity": ("earning.airdrop_scanner", "AirdropOpportunity"),
     "WorkerAgent": ("brains.base_worker", "WorkerAgent"),
-    "JobSearchWorker": ("earning.job_search_worker", "JobSearchWorker"),
     "SharedContext": ("brains.shared_context", "SharedContext"),
     "SocialEarningPlatform": ("earning.social_earning_platform", "SocialEarningPlatform"),
     "FactLedger": ("cognition.fact_ledger", "FactLedger"),
@@ -46,7 +45,6 @@ def __getattr__(name):
 
 __all__ = [
     'WorkerAgent',
-    'JobSearchWorker',
     'SharedContext',
     'AirdropScanner',
     'AirdropOpportunity',

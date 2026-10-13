@@ -48,7 +48,7 @@ class TestSqlToolSafety(unittest.TestCase):
 
     def test_safety_gate_blocks_invalid_query_before_allowing_it(self):
         from agents.safety.gate import SafetyDecision, SafetyGate
-        with patch("agents.safety.tool_safety.resolve_project_path", return_value=self.db_path):
+        with patch("agents.safety.policy.resolve_project_path", return_value=self.db_path):
             allowed, reason, decision = SafetyGate().check(
                 "query_database", {"sql": "UPDATE facts SET value='bad'"})
         self.assertFalse(allowed)

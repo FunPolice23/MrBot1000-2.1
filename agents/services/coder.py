@@ -210,8 +210,3 @@ class CoderWorker(WorkerAgent):
             return {"success": True, "notes": "Refactoring applied"}
         return {"success": False, "notes": "Write failed"}
 
-
-# Register this worker automatically
-def register_worker(registry):
-    from agents.brains.base_worker import WORKER_REGISTRY
-    WORKER_REGISTRY["Coder"] = CoderWorker

@@ -1,3 +1,235 @@
+## [2.1.86] - 2026-10-13 - Fix CPU-brain "could not reach" + Web Browser replay + requirements
+
+### Fixed
+- **ARCH-ENG-107: CPU/RAM brain logged "could not reach its model" while it was
+  alive and generating.** Root cause: the local **connect timeout was 8s**, but a
+  CPU-hosted brain mid-prompt-eval (a 3-4k-token Dialogue context takes 30s+ at
+  ~125 tok/s on CPU, single request slot) cannot accept a new TCP connection
+  inside 8s — so the NEXT turn's connect timed out and the Dialogue logged a
+  false "could not reach" + retried, even though the server log showed it
+  generating at 12 t/s. Fix: raised the default local connect timeout to 30s
+  (big + small brain) and pass it through `_build_provider_timeout` (new
+  optional `connect` kwarg). A stopped server still fails fast (refused
+  instantly); only a BUSY server is slow to accept. Env-tunable via
+  `LOCAL_LLM_CONNECT_TIMEOUT_SECONDS`. (The CPU perf itself — 64k ctx, 3 threads
+  — is a separate config matter.)
+- **Web Browser tab stayed blank** when agents browsed before the tab was opened.
+  The tab is lazy-built on first show, so its nav-bus connection didn't exist yet
+  when the agents' `web_read`/`web_search` fired — the pages were lost. Fix: the
+  nav bus now keeps a 50-entry ring buffer of recent navigations; the tab drains
+  it on connect, replaying the activity log and loading the most recent URL into
+  the view.
+- **requirements.txt was missing 3 imported runtime deps** (ARCH-ENG-108):
+  `openai` (the brains' HTTP client — a fresh install would ImportError),
+  `psutil` (hardware detection), and `playwright` (web-browser escalation,
+  optional). Pinned to the installed versions. Verified every pin now matches.
+
+## [2.1.85] - 2026-10-13 - Fix GPU tok/s blank + DB Stats size/tokens
+
+### Fixed
+- **ARCH-ENG-106: GPU Status "Generation" tok/s line stayed blank ("— tok/s").**
+  The live tok/s is driven by `stream_progress`, but `chat_completion` only
+  invoked it for `content` deltas — NOT the `reasoning_content` channel. A
+  reasoning-heavy model (especially the CPU Small Brain) spends most of its time
+  emitting `reasoning_content` before any visible `content` streams, so no
+  `gpu_progress` fired through the entire thinking phase and the bar stayed
+  empty. Fix: also drive `stream_progress` on `reasoning_content` so tok/s tracks
+  TOTAL generation. (Verified the whole chain — worker `gpu_progress` →
+  `_on_gpu_progress` → `_gpu_window()` → `update_gpu_progress` → label — works;
+  the progress handler only updates the bar, never leaks reasoning into the
+  visible bubble.) Gate: dialogue 320 passed / 3 skipped.
+- **DB Stats: DB size showed 0.** `get_llm_stats` read the DB path from
+  `PRAGMA database_list`'s `"name"` column — but that's the logical alias
+  (`"main"`), not the file path (which is in `"file"`). `os.path.getsize("main")`
+  raised `FileNotFoundError`, silently caught → `db_size_mb = 0`. Fixed to read
+  `"file"` (with a `self.db_path` fallback). Now reports the real size (1.04 MB).
+  (Avg tok/s + prompt/completion tokens populate on NEW calls — the recording
+  fix landed in ARCH-ENG-099/103; the existing 535 rows predate it.)
+
+## [2.1.84] - 2026-10-13 - Web Browser tab = agents' live browsing surface
+
+### Added
+- **ARCH-ENG-105: the Web Browser tab now renders the AGENTS' web activity with
+  real page loading.** A `QWebEngineView` (embedded Chromium) loads each URL the
+  personas fetch, so the operator watches what they browse — not just `[TOOL]`
+  text lines. New `gui/widgets/web_nav_bus.py` carries agent→tab navigation on a
+  queued Qt signal (GUI-thread-safe; the agent tools run on a worker thread).
+  `handlers._tool_web_read` / `_tool_web_search` announce the URL (read) or top
+  result (search); the tab loads it in the view and appends a timestamped line
+  to an activity log. The agents' data still comes from `web_eyes` text
+  extraction — this tab is the visual mirror. A manual URL bar remains for the
+  operator. Falls back to text-only if QtWebEngine is unavailable.
+  (Note: the tool-call display in Dialogue was already wired — it was hidden
+  only because tools were dead, fixed in ARCH-ENG-103.)
+  Gate: safety + gui smoke 106 passed; agent→tab bridge verified end-to-end.
+
+## [2.1.83] - 2026-10-13 - Reject narrated-verify stalls in Dialogue
+
+### Fixed
+- **ARCH-ENG-104: Jacob's "I need to verify... let me read the page" loop.**
+  The small model produced textually-distinct but semantically-identical
+  narrated-verify turns that slipped past the text (95% similarity) and
+  semantic (normalized full-text signature) duplicate detectors, so the agent
+  spun forever announcing verification it never performed. `_is_bad_dialogue_response`
+  now rejects a turn that narrates a read/verify/check intent **without** an
+  executed tool marker **and** without a concrete progress marker (commitment,
+  approval ask, plan) — so a pure "let me read the page" stall is caught while a
+  legit "I will check X, then outline a plan — I need your approval" turn
+  passes. Regression test: `tests/dialogue/test_narrated_read_intent_guard.py`
+  (5 tests). Gate: dialogue 315 passed / 3 skipped.
+  (Root enabler was ARCH-ENG-103 — the tool chain now actually works, so a
+  verify intent can be executed instead of narrated.)
+
+## [2.1.82] - 2026-10-13 - Fix broken tool chain (missing handler imports)
+
+### Fixed
+- **ARCH-ENG-103: every Dialogue tool call failed with "safety module's
+  missing an attribute."** `agents/safety/dispatch.py` builds its handler map
+  referencing `runtime._tool_record_payment` and `runtime._tool_social_post`,
+  but `agents/safety/calling.py` never imported them (both exist in
+  `handlers.py`). Building the map raised `AttributeError` on the first missing
+  name, so `execute_tool` failed for **all** tools — web_search, web_read,
+  everything. The personas saw `web_search/web_read returned status=error`,
+  reported "the tool chain's busted," and looped on narrated-but-never-executed
+  "I need to verify…" intents. Fix: import `_tool_record_payment` and
+  `_tool_social_post` in `calling.py`. Verified: `execute_tool("web_search")`
+  now returns real results; all 19 dispatch handlers resolve; safety suite
+  93 passed.
+
+## [2.1.81] - 2026-10-13 - Fix app crash on Dialogue teardown (QThread destroyed while running)
+
+### Fixed
+- **ARCH-ENG-102: `python.exe` fast-fail crash (Qt6Core.dll 0xc0000409) that
+  killed all responses.** Windows Event Log showed the app aborting at a
+  constant fault offset across launches; the Qt message log showed
+  `QThread: Destroyed while thread is still running` at each crash. Root cause:
+  `DialogueWorker` was created **parentless**, and `cancel()` only set a
+  cooperative flag checked *between* operations — a worker blocked inside
+  `brain.chat()` (a multi-minute HTTP read on the slow CPU Small Brain) never
+  saw it, survived window-close teardown, and the QThread was destroyed while
+  its thread still ran. The shutdown sweep `_stop_orphan_tab_threads` uses
+  `findChildren(QThread)`, which cannot see a parentless worker.
+  Fix (two layers): (1) `DialogueWorker` is now **parented to the tab**, so the
+  sweep finds, disconnects and `wait()`s on it; (2) `on_stream` raises a new
+  `_WorkerCancelled` the instant `cancel()` is set, which propagates out of the
+  streaming generator and unblocks `run()` immediately; `run()` swallows it
+  cleanly (no bogus error turn). Regression test:
+  `tests/dialogue/test_worker_cancellation_abort.py` (3 tests).
+  Gate: dialogue + gui 478 passed / 6 skipped.
+
+## [2.1.80] - 2026-10-13 - tok/s wiring, DB-stats tokens, Web Browser tab
+
+### Fixed
+- **ARCH-ENG-099: DB Stats showed no token usage.** Live DB had 535 `llm_calls`
+  rows with every token column = 0 (471 errors). Root cause: the
+  `worker_llm_mixin.py` path (trigger=`llm`) logged calls with only
+  chars/latency — `prompt_tokens`/`completion_tokens`/`tokens_per_second`
+  defaulted to 0. It now estimates tokens (chars//4) + tps (tokens/elapsed) like
+  the big/small brain paths, so DB Stats populates. Verified: a logged call
+  yields 1000 prompt / 200 completion tokens, 600 tps.
+
+### Added
+- Web Browser tab (replaces "Browse Root") — exposes `WebController.read_page`
+  (robust requests→Playwright escalation, robots.txt-aware) behind a URL bar,
+  off-thread fetch, rendered output + status, and "open in system browser".
+- GPU Status + Dialogue/Chat live tok/s display (device-aware, not
+  persona-name-based) — see below.
+
+## [2.1.79] - 2026-10-13 - Fix GUI freeze after model load (MTP probe on GUI thread)
+
+### Fixed
+- **ARCH-ENG-098: whole-GUI freeze / severe lag once models are loaded.** The
+  Phase-G MTP feature (`_refresh_mtp_availability` → `detect_mtp` →
+  `read_tensor_names`) parsed the selected model's GGUF header — hundreds of
+  thousands of tensor/KV skips on a 9B+ model — **on the GUI thread**, and the
+  provider status tick re-invoked it every ~4s via `setText → _ModelLabelAdapter
+  → set_model → _refresh_mtp_availability`. Caught live with py-spy: 100% of
+  sampled GUI-thread time was in `gguf_meta._skip_val`. Two fixes:
+  1. `BrainControlRow.set_model` returns early when the target index is already
+     current, so a steady status tick costs nothing (no MTP re-probe).
+  2. `detect_mtp` caches per (abspath, mtime_ns, size) — a model file is parsed
+     at most once until it changes on disk; callers get a copy.
+  Verified: cached re-call ~0.1 ms vs a multi-second first parse; providers +
+  GUI smoke 70 passed / 1 skipped.
+
+### Added
+- `tools/profile_lag.py` — read-only py-spy lag profiler (attaches to the running
+  app, dumps hot functions + every thread's stack) used to diagnose this class of
+  GUI freeze.
+
+## [2.1.78] - 2026-10-13 - Remove legacy central-Manager + Summarizer architecture (N-device brains are the authority)
+
+### Removed
+Full removal of the pre-N-brain "central CEO Manager + worker team" architecture,
+which the N-device peer council (Dialogue) + Chat tab + EarningPipeline already
+superseded. See `docs/LEGACY_AUDIT.md` for the complete record.
+
+- **Legacy 2D-office UI + ThoughtPanel** (`app/ui.py` 1431L → 88L): removed
+  `QuadThoughtPanel`, `ThoughtChannel`, `ManagerWindow`/`AgentWindow`/`CommsWindow`/
+  `SummaryWindow`, `AgentsTab`, `AgentSprite`, `Particle`, and the channel color
+  palette. The Chat tab (`ThinkingBox`) and Dialogue tab (thought-graph "🧠 Thoughts"
+  button) already show reasoning; System/startup messages flow to Live Logs. Kept the
+  theme helpers (`ui_style`/`restyle_ui`/`set_ui_theme`/`set_effects`/`TH`). Removed
+  the "View → Thought Panel / Manager/Agent/Comms/Summary Window" menu + all
+  `thought_panel.route(...)` call sites + orphaned handlers (`_on_job_found`,
+  `_on_comms`, `_on_manager_thought`, `_on_agent_thought`, `_on_summary_ready`,
+  `_show_*_win`, `_toggle_thought_panel`, `_show_thoughts`).
+- **`AgentCollaboration`** (`app/action_pipeline.py`) — dead classifier with
+  JobSearch/Manager/Coder/Analyst/Summarizer capability buckets; zero callers.
+
+### Removed (residual polish, 5a2e14d follow-up)
+- **Orphaned signal handlers** in main.py (`_on_summarizer_status`,
+  `_on_summarizer_paused`, `_on_worker_assigned`, `_on_chat_reply`, `_on_agent_status`,
+  `_toggle_summarizer_pause`, `_summarizer_human_send`, `_on_strategy_change`,
+  `_on_summarizer_chat_reply`) — no live emitters after the Manager/Summarizer removal.
+- **Inert "Performance & Cache" Settings spins** — Heartbeat Interval, Idle LLM
+  cooldown, Startup Delay, Research Cache TTL (manager-heartbeat legacy, no consumer).
+  Kept `max_file_spin` (live — feeds `worker.max_file_size`). Removed the dead
+  `agents_tab.heartbeat_label` update in `save_settings`.
+
+- **`JobSearchWorker`** (`agents/earning/job_search_worker.py`, 522L) — removed. It was
+  superseded by the `EarningPipeline`/`discoverer.py`/`social_earning_platform.py`
+  discovery path and had no live importer (only its own test). Orphaned `job_search.db`
+  deleted; dropped from the `query_db` allowlist (`STORE_AUTHORITIES` + tool schema) and
+  both `PROTECTED_SOURCE_FILES` sets. Also cleaned stale `manager.py`/`summarizer.py`
+  entries from those protection sets (deleted in the prior pass).
+
+- **`ManagerThread`** (`app/manager.py`) + **`SummarizerThread`** +
+  **`SummarizerDB`** (`agents/services/summarizer.py`) — deleted, along with all
+  their wiring in `main.py`/GUI (construction, heartbeat, JobSearch/Analyst/Coder
+  worker registration, ~15 Qt signal connects, shutdown thread-stop loop) and the
+  dead operator hooks that fed the retired loop (task box, pause toggles,
+  type-to-chat, heartbeat spinner, research re-scan / self-improve buttons → now
+  log "use the Dialogue tab").
+- **Orphaned `manager_*` runtime helpers** (`agents/runtime/manager_metrics.py`,
+  `manager_queues.py`, `manager_routing.py`, `manager_scheduler.py`,
+  `manager_shutdown.py`, `manager_workers.py`) — zero live importers after the
+  Manager deletion; removed with their `runtime/__init__.py` exports.
+- **`ConversationMemory` / `SpeechPatternBank`** (`agents/dialogue/conversation_memory.py`)
+  — orphaned once the summarizer was gone; personas are contract-defined, so these
+  learned-style helpers had no consumer. Removed (re-introduce as a fresh
+  Dialogue-fed feature if per-persona voice is ever wanted).
+- **Memory & Stream tab** + SummarizerDB panels (Stream Health read retired-loop
+  telemetry; the Memory panel's only writer was the retired manager).
+- **Dead `WORKER_REGISTRY`**, the `WorkerRegistry` dynamic loader, and compat shims
+  `agents/services/agent_runtime.py` + `agents/safety/tool_safety.py`.
+- Dead EventBus `USER_REQUEST→chat` publish in `_human_send` (no subscriber remained).
+
+### Kept (verified live, not duplicate)
+`EarningPipeline` (earning engine + OPPORTUNITY_UPDATE events to the GUI via
+`QtEventBridge`), the `EventBus` (opportunity/evidence/notification events),
+`AgentRuntime` (Dialogue), `WorkerAgent` (Ollama helpers), and `JobSearchWorker`
+(has a passing test). `save_settings` still applies Ollama model overrides +
+provider-registry refresh to the live `WorkerAgent`.
+
+### Tests
+Rewrote/removed the suites that tested the deleted classes (`test_manager_queue_limits`,
+`test_runtime_warnings`, manager/summarizer classes in `test_comms_integration`,
+`TestRuntimeStats`/`TestRoleMemory` in `test_section_e`, `TestProposalModelRole` in
+`test_section_d`, `test_runtime_shutdown`, `test_main`). Full codebase map regenerated.
+
+---
+
 ## [2.1.77] - 2026-10-12 - Silent safe exit + unknown-architecture pre-launch warning (ARCH-ENG-096/097)
 
 ### Fixed

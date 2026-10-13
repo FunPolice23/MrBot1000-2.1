@@ -139,97 +139,6 @@ class TestNumGpuFor(unittest.TestCase):
             self._clear()
 
 
-class TestRuntimeStats(unittest.TestCase):
-    """Section E G5: steady-stream telemetry + adaptive cadence (pure logic)."""
-
-    def test_record_and_snapshot(self):
-        from app.manager import RuntimeStats
-        rs = RuntimeStats()
-        self.assertEqual(rs.snapshot()["cycles"], 0)
-        rs.record_cycle(12.5, ok=True, kind="job")
-        rs.record_cycle(3.0, ok=True, kind="chat")
-        rs.record_cycle(5.0, ok=False, kind="heartbeat")
-        snap = rs.snapshot()
-        self.assertEqual(snap["cycles"], 3)
-        self.assertEqual(snap["jobs_processed"], 1)
-        self.assertEqual(snap["error_streak"], 1)
-        self.assertIsInstance(snap["throughput_per_min"], float)
-
-    def test_adaptive_sleep(self):
-        from app.manager import RuntimeStats
-
-        rs = RuntimeStats()
-
-        def adaptive_sleep(pending):
-            limit = int(os.getenv("STREAM_ERROR_STREAK_LIMIT", "5"))
-            fast = 0.3
-            idle = 1.0
-            cap = 10.0
-            if rs.error_streak >= limit:
-                return min(cap, fast * (2 ** min(rs.error_streak - limit, 5)))
-            return fast if pending else idle
-
-        self.assertEqual(adaptive_sleep(False), 1.0)   # idle
-        self.assertEqual(adaptive_sleep(True), 0.3)    # pending work -> fast
-        for _ in range(6):
-            rs.record_cycle(0.0, ok=False)             # streak=6 >= limit
-        v = adaptive_sleep(False)
-        self.assertTrue(0.3 <= v <= 10.0)
-        rs.record_cycle(0.0, ok=False)
-        self.assertGreaterEqual(adaptive_sleep(False), v)
-
-
-class TestRoleMemory(unittest.TestCase):
-    """Section E G6: per-role memory + long-term notes (SummarizerDB)."""
-
-    def setUp(self):
-        import tempfile
-        self._path = os.path.join(tempfile.gettempdir(), "hermes-e6-test.db")
-        if os.path.exists(self._path):
-            os.remove(self._path)
-        import agents.services.summarizer as S
-        self.db = S.SummarizerDB(self._path)
-
-    def tearDown(self):
-        try:
-            self.db._conn.close()
-        except Exception:
-            pass
-        if os.path.exists(self._path):
-            os.remove(self._path)
-
-    def test_role_isolation(self):
-        self.db.add_role_memory("chat", "hi")
-        self.db.add_role_memory("main", "decision")
-        self.assertEqual(len(self.db.get_role_memory("chat")), 1)
-        self.assertEqual(len(self.db.get_role_memory("main")), 1)
-        self.assertTrue(all(r["role"] == "chat" for r in self.db.get_role_memory("chat")))
-
-    def test_summary_compaction(self):
-        for i in range(12):
-            self.db.add_role_memory("main", f"x{i}")
-        summ = self.db.summarize_role_memory("main", keep=8)
-        self.assertIsNotNone(summ)
-        self.assertEqual(
-            self.db._execute(
-                "SELECT COUNT(*) FROM role_memory WHERE role='main' AND kind='exchange'"
-            ).fetchone()[0], 8)
-        self.assertEqual(
-            self.db._execute(
-                "SELECT COUNT(*) FROM role_memory WHERE role='main' AND kind='summary'"
-            ).fetchone()[0], 1)
-
-    def test_clear_and_notes(self):
-        self.db.add_role_memory("chat", "a")
-        self.db.clear_role_memory("chat")
-        self.assertEqual(
-            self.db._execute("SELECT COUNT(*) FROM role_memory WHERE role='chat'").fetchone()[0], 0)
-        self.db.add_note("prefs", "concise")
-        self.assertEqual(len(self.db.get_notes("prefs")), 1)
-        self.db.clear_notes("prefs")
-        self.assertEqual(self.db._execute("SELECT COUNT(*) FROM longterm_notes").fetchone()[0], 0)
-
-
 @unittest.skipUnless(
     os.environ.get("QT_QPA_PLATFORM") or _PYQT_AVAILABLE,
     "PySide6 GUI test (set QT_QPA_PLATFORM=offscreen to run)")
@@ -311,9 +220,9 @@ class TestGuiTabs(unittest.TestCase):
         # Count must equal the ungated tabs plus the enabled gated tabs
         # (live_trading gates two tabs).
         ungated = ["Management", "Providers & GPU", "Model Library", "Safety & Tools",
-                   "Chat", "Dialogue", "Approvals", "Browse Root", "Payments",
-                   "Earnings", "Insights", "Opportunities", "Analytics", "Reputation",
-                   "Data Explorer", "Settings", "Live Logs", "DB Stats"]
+                   "Chat", "Dialogue", "Approvals", "Registration", "Web Browser",
+                   "Payments", "Earnings", "Insights", "Opportunities", "Analytics",
+                   "Reputation", "Data Explorer", "Settings", "Live Logs", "DB Stats"]
         expected = len(ungated) + sum(1 for f in gated.values() if feature_enabled(f))
         self.assertEqual(self.mw.tabs.count(), expected)
 
@@ -342,8 +251,7 @@ class TestGuiTabs(unittest.TestCase):
         for attr in ("sb_ctx_spin", "bb_ctx_spin", "start_all_btn", "stop_all_btn"):
             self.assertTrue(hasattr(provider_tab, attr), f"missing provider control {attr}")
         self.assertIsNotNone(provider_tab.findChild(QGroupBox, "quickActionsGroup"))
-        for attr in ("model_info_browser", "max_tokens_spin", "memory_view",
-                     "stream_health_label"):
+        for attr in ("model_info_browser", "max_tokens_spin"):
             self.assertTrue(hasattr(self.mw, attr), f"missing {attr}")
 
     def test_refresh_db_stats_guarded_when_lazy(self):

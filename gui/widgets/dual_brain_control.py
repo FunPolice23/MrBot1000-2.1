@@ -2947,9 +2947,14 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             label.setStyleSheet(f"color: {color}; font-size: 10px; font-weight: bold; padding-top: 4px;")
             label.setText(text)
 
-    def clear_gpu_progress(self, speaker: str):
-        """Reset the generation progress bar after generation completes."""
-        idx = 0 if speaker == "Edward Hurst" else 1
+    def clear_gpu_progress(self, slot: int = 0):
+        """Reset the generation progress bar after generation completes.
+
+        v2.1.80 (ARCH-ENG-101): ``slot`` is the runtime slot index (0=Big,
+        1=Small, 2+=extra device), NOT a persona name — the N-brain roster has
+        no fixed Edward/Jacob pair, so callers resolve the active device's slot.
+        """
+        idx = int(slot)
         bar = getattr(self, f"gpu{idx}_progress", None)
         speed_label = getattr(self, f"gpu{idx}_tok_speed", None)
         if bar is not None:
@@ -2959,9 +2964,14 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         if speed_label is not None:
             speed_label.setText("— tok/s  |  — tok generated  |  — elapsed")
 
-    def update_gpu_progress(self, speaker: str, tok_count: int, elapsed_s: float):
-        """Update the live generation progress bar from the dialogue."""
-        idx = 0 if speaker == "Edward Hurst" else 1
+    def update_gpu_progress(self, slot: int, tok_count: int, elapsed_s: float):
+        """Update the live generation progress bar for a device slot.
+
+        v2.1.80 (ARCH-ENG-101): device/slot-keyed. ``slot`` 0=Big, 1=Small,
+        2+=extra. ``tok_count``/``elapsed_s`` come from the streaming brain
+        (accumulated chars//4 and wall time since first token).
+        """
+        idx = int(slot)
         bar = getattr(self, f"gpu{idx}_progress", None)
         speed_label = getattr(self, f"gpu{idx}_tok_speed", None)
         if bar is None:
@@ -2970,7 +2980,8 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         bar.setRange(0, 0)
         bar.setFormat(f"● {tps:.1f} tok/s")
         if speed_label is not None:
-            speed_label.setText(f"{tps:.1f} tok/s  |  ~{tok_count} tok  |  {elapsed_s:.1f}s")
+            speed_label.setText(
+                f"{tps:.1f} tok/s  |  ~{tok_count} tok  |  {elapsed_s:.1f}s")
 
     def _get_context_for_gpu(self, idx):
         """Get the configured context size for a GPU."""

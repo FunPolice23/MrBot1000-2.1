@@ -80,7 +80,7 @@ class ProgramKnowledge:
     ARCHITECTURE = """
     SYSTEM ARCHITECTURE:
     - GUI: PySide6 desktop application with tabbed interface
-    - Data: SQLite databases (agent.db, earning.db, job_search.db)
+    - Data: SQLite databases (agent.db, earning.db)
     - AI: Dual-brain setup (Ollama + LM Studio)
     - Discovery: RSS feeds, Reddit, web scraping, platform APIs
     - Execution: Playwright browser automation, API clients

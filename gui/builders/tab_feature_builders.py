@@ -10,23 +10,17 @@ from datetime import datetime
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileSystemModel, QFormLayout,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QPlainTextEdit, QPushButton, QMessageBox,
     QScrollArea, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem,
-    QTextEdit, QTreeView, QVBoxLayout, QWidget, QAbstractItemView,
+    QTextEdit, QVBoxLayout, QWidget, QAbstractItemView,
 )
 
 from gui.builders.tab_workers import DataExplorerWorker, LivePortfolioWorker, SocialDiscoveryWorker, MoltbookFeedWorker
-from app.ui import AgentSprite, AgentsTab
 
 
 class FeatureTabBuildersMixin:
-    def create_agents_tab(self):
-        # v2.1 fix: main.py's "Agents" tab spec points here, which was only the
-        # sprite setup stub and returned None -> the Agents tab rendered empty.
-        # Delegate to the full builder so the real AgentsTab (chat + roster) shows.
-        return self.create_agents_tab_original()
 
     def create_chat_tab(self):
         """Create the Chat tab (Human ↔ Small Brain)."""
@@ -271,43 +265,6 @@ class FeatureTabBuildersMixin:
             pass
         return self.collaboration_tab
 
-    def create_agents_tab_original(self):
-        # Create sprites
-        self.agent_sprite = AgentSprite(label="Worker")
-        self.summarizer_sprite = AgentSprite(label="Summarizer")
-        self.summarizer_sprite.set_state("idle")
-
-        # Connect summarizer signals to main window methods
-        self.summarizer.status_changed.connect(self._on_summarizer_status)
-        self.summarizer.paused_changed.connect(self._on_summarizer_paused)
-
-        # Create the tab widget with all new window callbacks
-        tab = AgentsTab(
-            self,
-            worker_sprite=self.agent_sprite,
-            summarizer_sprite=self.summarizer_sprite,
-            worker_status_signal=self.manager.agent_status,
-            summarizer_status_signal=self.summarizer.status_changed,
-            show_thoughts_cb=self._show_thoughts,
-            toggle_worker_pause_cb=self._toggle_pause,
-            toggle_summarizer_pause_cb=self._toggle_summarizer_pause,
-            heartbeat_interval=self.manager.HEARTBEAT_INTERVAL,
-            on_send=self._human_send,
-            on_strategy_change=self._on_strategy_change,
-            show_manager_win_cb=self._show_manager_win,
-            show_agent_win_cb=self._show_agent_win,
-            show_comms_win_cb=self._show_comms_win,
-            show_summary_win_cb=self._show_summary_win,
-        )
-        self.agents_tab = tab
-
-        # Wire pipeline to summarizer for spelling assist
-        if hasattr(self, "pipeline"):
-            self.pipeline.set_summarizer(self.summarizer.worker)
-
-        return tab
-
-
     def create_management_tab(self):
         """Management Control Center — administrative-only edition.
         
@@ -326,52 +283,8 @@ class FeatureTabBuildersMixin:
         self.management_tab.request_review_proposal.connect(self._on_management_review_proposal)
         self.management_tab.request_submit_proposal.connect(self._on_management_submit_proposal)
         self.management_tab.request_verify_paid.connect(self._on_management_verify_paid)
-        self._attach_memory_stream_panel(self.management_tab)
-        
+
         return self.management_tab
-
-    def _attach_memory_stream_panel(self, management_tab):
-        """Keep useful legacy telemetry in Management without a separate tab."""
-        stream_group = QGroupBox("Stream Health")
-        stream_layout = QVBoxLayout(stream_group)
-        self.stream_health_label = QLabel("Starting...")
-        self.stream_health_label.setWordWrap(True)
-        stream_layout.addWidget(self.stream_health_label)
-
-        memory_group = QGroupBox("Memory (chat + CEO / long-term)")
-        memory_layout = QVBoxLayout(memory_group)
-        self.memory_view = QTextEdit()
-        self.memory_view.setReadOnly(True)
-        self.memory_view.setMinimumHeight(120)
-        memory_layout.addWidget(self.memory_view)
-        buttons = QHBoxLayout()
-        self.memory_chat_clear_btn = QPushButton("Clear Chat memory")
-        self.memory_main_clear_btn = QPushButton("Clear CEO memory")
-        self.memory_notes_clear_btn = QPushButton("Clear long-term notes")
-        self.memory_refresh_btn = QPushButton("Refresh")
-        self.memory_chat_clear_btn.clicked.connect(lambda: self._clear_memory("chat"))
-        self.memory_main_clear_btn.clicked.connect(lambda: self._clear_memory("main"))
-        self.memory_notes_clear_btn.clicked.connect(lambda: self._clear_memory("notes"))
-        self.memory_refresh_btn.clicked.connect(self._refresh_memory_panel)
-        for button in (self.memory_chat_clear_btn, self.memory_main_clear_btn,
-                       self.memory_notes_clear_btn, self.memory_refresh_btn):
-            buttons.addWidget(button)
-        memory_layout.addLayout(buttons)
-
-        layout = management_tab.layout()
-        insert_at = max(0, layout.count() - 1)
-        layout.insertWidget(insert_at, stream_group)
-        layout.insertWidget(insert_at + 1, memory_group)
-        self._stream_timer = QTimer(self)
-        self._stream_timer.setInterval(5000)
-        self._stream_timer.timeout.connect(self._refresh_stream_health)
-        self._stream_timer.start()
-        self._memory_timer = QTimer(self)
-        self._memory_timer.setInterval(10000)
-        self._memory_timer.timeout.connect(self._refresh_memory_panel)
-        self._memory_timer.start()
-        QTimer.singleShot(50, self._refresh_stream_health)
-        QTimer.singleShot(50, self._refresh_memory_panel)
 
     def _on_management_review_proposal(self, job_id: str, job_desc: str, draft: str):
         """Handle review proposal request from Management tab."""
@@ -396,86 +309,247 @@ class FeatureTabBuildersMixin:
         self._verify_and_mark_paid()
 
 
-    def create_memory_stream_tab(self):
-        """v2.0.34ag (A3): 'Memory & Stream' tab — relocated from Management so the
-        Management tab's core controls get room. Contains the Stream Health (G5) panel
-        + the per-role Memory panel (F7). Widget names and timers are kept identical
-        (self.stream_health_label, self.memory_view, self._stream_timer,
-        self._memory_timer) so _refresh_stream_health / _refresh_memory_panel /
-        _clear_memory keep working unmodified."""
+    def create_file_browser_tab(self):
+        """Web Browser tab — the AGENTS' live web-browsing surface.
+
+        v2.1.84 (ARCH-ENG-105): this is where the personas' web activity renders
+        with REAL page loading (a QWebEngineView), not just text. When an agent
+        runs web_read/web_search, the URL loads here so the operator can watch
+        what it fetches. A manual URL bar remains for the operator. The agents'
+        data still comes from web_eyes text extraction; this tab is the visual
+        mirror. Navigation arrives on the GUI thread via gui.widgets.web_nav_bus.
+        """
+        from PySide6.QtCore import QThread
+
+        # Real page rendering (embedded Chromium). Falls back to text-only if
+        # QtWebEngine is unavailable.
+        web_view = None
+        try:
+            from PySide6.QtWebEngineWidgets import QWebEngineView
+            from PySide6.QtCore import QUrl
+            web_view = QWebEngineView()
+            web_view.setMinimumHeight(320)
+        except Exception:
+            web_view = None
+
+        class _WebReadWorker(QThread):
+            done = Signal(dict)
+
+            def __init__(self, url: str):
+                super().__init__()
+                self._url = url
+
+            def run(self):
+                try:
+                    from agents.integrations.browser import WebController
+                    result = WebController().read_page(self._url)
+                    if not isinstance(result, dict):
+                        result = {"ok": False, "error": "unexpected reader result"}
+                except Exception as exc:  # network/deps — never crash the GUI
+                    result = {"ok": False, "error": str(exc)}
+                self.done.emit(result)
+
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(14)
-        title = QLabel("Memory & Stream")
-        title.setStyleSheet(f"font-size:20px;font-weight:bold;color:{self._t('accent')};")
-        self._themeable.append((title, "accent", "font-size:20px;font-weight:bold;"))
-        lay.addWidget(title)
 
-        # Stream Health (G5)
-        streamg = QGroupBox("Stream Health")
-        streaml = QFormLayout(streamg)
-        streaml.setContentsMargins(12, 12, 12, 12)
-        streaml.setVerticalSpacing(6)
-        self.stream_health_label = QLabel("Starting…")
-        self.stream_health_label.setStyleSheet(f"font-size:11px;color:{self._t('muted')};")
-        self._themeable.append((self.stream_health_label, "muted", "font-size:11px;"))
-        streaml.addRow(self.stream_health_label)
-        lay.addWidget(streamg)
-        self._stream_timer = QTimer(self)
-        # PERF: 5s interval (was 2s) — stream health changes slowly, no need for 2s
-        self._stream_timer.setInterval(5000)
-        self._stream_timer.timeout.connect(self._refresh_stream_health)
-        self._stream_timer.start()
+        header = QLabel("🌐 Web Browser")
+        header.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        header.setAlignment(Qt.AlignCenter)
+        header.setStyleSheet("color: #bb86fc; padding: 6px;")
+        lay.addWidget(header)
+        note = QLabel(
+            "Live view of the agents' web browsing. When a persona runs "
+            "web_read/web_search, the page loads here in real time. You can also "
+            "open a URL yourself below. Robots.txt / human-open-only hosts are "
+            "respected by the agents; use Open in system browser for pages that "
+            "need login or interaction.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;")
+        self._themeable.append((note, "caption", "font-size:10px;"))
+        lay.addWidget(note)
 
-        # Memory panel (F7)
-        memg = QGroupBox("Memory (chat + CEO / long-term)")
-        meml = QVBoxLayout(memg)
-        meml.setContentsMargins(12, 12, 12, 12)
-        meml.setSpacing(6)
-        self.memory_view = QTextEdit()
-        self.memory_view.setReadOnly(True)
-        self.memory_view.setMinimumHeight(120)
-        meml.addWidget(self.memory_view, stretch=1)
-        mem_btn_row = QHBoxLayout()
-        self.memory_chat_clear_btn = QPushButton("Clear Chat memory")
-        self.memory_main_clear_btn = QPushButton("Clear CEO memory")
-        self.memory_notes_clear_btn = QPushButton("Clear long-term notes")
-        self.memory_refresh_btn = QPushButton("Refresh")
-        self.memory_chat_clear_btn.clicked.connect(lambda: self._clear_memory("chat"))
-        self.memory_main_clear_btn.clicked.connect(lambda: self._clear_memory("main"))
-        self.memory_notes_clear_btn.clicked.connect(lambda: self._clear_memory("notes"))
-        self.memory_refresh_btn.clicked.connect(self._refresh_memory_panel)
-        for b in (self.memory_chat_clear_btn, self.memory_main_clear_btn,
-                  self.memory_notes_clear_btn, self.memory_refresh_btn):
-            mem_btn_row.addWidget(b)
-        meml.addLayout(mem_btn_row)
-        lay.addWidget(memg)
-        self._memory_timer = QTimer(self)
-        # PERF: 10s interval (was 5s) — memory panel is not time-critical
-        self._memory_timer.setInterval(10000)
-        self._memory_timer.timeout.connect(self._refresh_memory_panel)
-        self._memory_timer.start()
+        # URL bar + actions
+        bar = QHBoxLayout()
+        self.web_url_edit = QLineEdit()
+        self.web_url_edit.setPlaceholderText("https://example.com/page")
+        self.web_url_edit.returnPressed.connect(lambda: self._web_browser_read(w))
+        bar.addWidget(self.web_url_edit)
+        read_btn = QPushButton("📖 Open page")
+        read_btn.clicked.connect(lambda: self._web_browser_read(w))
+        bar.addWidget(read_btn)
+        open_btn = QPushButton("↗ Open in system browser")
+        open_btn.clicked.connect(self._web_browser_open_external)
+        bar.addWidget(open_btn)
+        lay.addLayout(bar)
 
-        # v2.0.34ao: no trailing addStretch() — the memory panel (stretch=1) now
-        # fills the available height so the tab isn't ~60% empty dead space.
-        # v2.0.34ak: populate shortly after build (deferred so tab paints first)
-        QTimer.singleShot(50, self._refresh_stream_health)
-        QTimer.singleShot(50, self._refresh_memory_panel)
+        self.web_status_label = QLabel(
+            "Watching for agent web activity…")
+        self.web_status_label.setWordWrap(True)
+        self.web_status_label.setStyleSheet(f"color:{self._t('caption')};font-size:10px;")
+        self._themeable.append((self.web_status_label, "caption", "font-size:10px;"))
+        lay.addWidget(self.web_status_label)
+
+        # Real rendered page (or a text-only placeholder if no WebEngine).
+        if web_view is not None:
+            lay.addWidget(web_view, stretch=3)
+        else:
+            fallback = QLabel(
+                "Visual page rendering unavailable (QtWebEngine not installed). "
+                "Showing extracted text only.")
+            fallback.setWordWrap(True)
+            fallback.setStyleSheet(f"color:{self._t('caption')};")
+            lay.addWidget(fallback)
+
+        # Activity log — every agent web action, newest last.
+        self.web_activity_log = QPlainTextEdit()
+        self.web_activity_log.setReadOnly(True)
+        self.web_activity_log.setMaximumBlockCount(500)
+        self.web_activity_log.setFixedHeight(110)
+        lay.addWidget(self.web_activity_log, stretch=1)
+
+        self.web_output = QTextEdit()
+        self.web_output.setReadOnly(True)
+        self.web_output.setMaximumHeight(140)
+        lay.addWidget(self.web_output)
+
+        # Off-thread fetch for the operator's manual reads; keep the worker.
+        self._web_worker = None
+
+        def _load_url(url: str, context: str):
+            """Load *url* into the view + log it (GUI thread only)."""
+            if not url:
+                return
+            self.web_url_edit.setText(url)
+            if web_view is not None:
+                try:
+                    web_view.setUrl(QUrl(url))
+                except Exception:
+                    pass
+            _log_line(f"▶ {context}: {url}")
+
+        def _log_line(text: str):
+            try:
+                from datetime import datetime
+                ts = datetime.now().strftime("%H:%M:%S")
+                self.web_activity_log.appendPlainText(f"[{ts}] {text}")
+            except Exception:
+                pass
+
+        def _on_nav(url: str, context: str):
+            self.web_status_label.setText(f"🌐 {context}: {url}")
+            _load_url(url, context)
+
+        def _on_activity(record: dict):
+            kind = record.get("kind", "")
+            if kind == "search":
+                q = record.get("query", "")
+                _log_line(f"🔎 agent searched: {q}")
+                for r in record.get("results", [])[:5]:
+                    _log_line(f"    • {r.get('title','')} — {r.get('url','')}")
+            elif kind == "read":
+                _log_line(f"📄 agent read: {record.get('url','')}")
+
+        # Connect the agent→tab nav bus (GUI thread). QueuedConnection so an
+        # emit from a worker thread (the agent tool) is delivered here safely.
+        try:
+            from PySide6.QtCore import Qt as _Qt
+            from gui.widgets.web_nav_bus import (
+                web_nav_bus, recent_navigations)
+            bus = web_nav_bus()
+            bus.navigate.connect(_on_nav, _Qt.ConnectionType.QueuedConnection)
+            bus.activity.connect(_on_activity, _Qt.ConnectionType.QueuedConnection)
+            self._web_nav_bus = bus  # keep a ref alive
+            # Replay recent activity: this tab is lazy-built on first show, so
+            # the agents may have browsed before it existed (ARCH-ENG-105).
+            for entry in recent_navigations():
+                try:
+                    if entry[0] == "nav":
+                        _log_line(f"▶ {entry[2]}: {entry[1]}")
+                    elif entry[0] == "activity":
+                        rec = entry[1]
+                        if rec.get("kind") == "search":
+                            _log_line(f"🔎 agent searched: {rec.get('query','')}")
+                        elif rec.get("kind") == "read":
+                            _log_line(f"📄 agent read: {rec.get('url','')}")
+                except Exception:
+                    pass
+            # Load the most recent navigated URL into the view.
+            _last_url = ""
+            for entry in reversed(recent_navigations()):
+                if entry[0] == "nav":
+                    _last_url = entry[1]
+                    break
+            if _last_url and web_view is not None:
+                try:
+                    web_view.setUrl(QUrl(_last_url))
+                    self.web_status_label.setText(f"🌐 last agent page: {_last_url}")
+                except Exception:
+                    pass
+        except Exception:
+            self._web_nav_bus = None
+
+        def _on_done(result):
+            self._web_worker = None
+            read_btn.setEnabled(True)
+            url = result.get("url", self.web_url_edit.text().strip())
+            if result.get("human_open_only"):
+                self.web_status_label.setText(
+                    f"🔒 {url} — blocked by robots.txt / human-open-only. "
+                    "Use Open in system browser.")
+                self.web_output.setPlainText(
+                    result.get("error") or "This host only allows human access.")
+                return
+            if not result.get("ok"):
+                self.web_status_label.setText(
+                    f"⚠️ Could not read {url}: {result.get('error', 'unknown error')}")
+                self.web_output.setPlainText(
+                    result.get("text") or result.get("error", ""))
+                return
+            title = result.get("title") or url
+            text = result.get("text") or result.get("content") or ""
+            self.web_status_label.setText(
+                f"✅ {title} — {len(text):,} chars"
+                + (" (via headless browser)" if result.get("escalated") else ""))
+            self.web_output.setPlainText(text if text else "(no extractable text)")
+
+        def _read():
+            url = self.web_url_edit.text().strip()
+            if not url:
+                self.web_status_label.setText("Enter a URL first.")
+                return
+            if not (url.startswith("http://") or url.startswith("https://")):
+                url = "https://" + url
+                self.web_url_edit.setText(url)
+            # Show it immediately in the view, then fetch text off-thread.
+            _load_url(url, "operator")
+            read_btn.setEnabled(False)
+            self.web_status_label.setText(f"⏳ Reading {url} ...")
+            self.web_output.setPlainText("")
+            worker = _WebReadWorker(url)
+            worker.done.connect(_on_done)
+            worker.finished.connect(worker.deleteLater)
+            self._web_worker = worker
+            worker.start()
+
+        # Stash the read trigger so the button lambdas above can call it.
+        w._web_browser_read = _read
         return w
 
+    def _web_browser_read(self, tab):
+        """Trigger the Web Browser tab's read (bound per-tab via ``_web_browser_read``)."""
+        fn = getattr(tab, "_web_browser_read", None)
+        if callable(fn):
+            fn()
 
-    def create_file_browser_tab(self):
-        w   = QWidget()
-        lay = QVBoxLayout(w)
-        lay.addWidget(QLabel(f"Root (sandboxed): {self.root_folder}"))
-        model = QFileSystemModel()
-        model.setRootPath(self.root_folder)
-        tree = QTreeView()
-        tree.setModel(model)
-        tree.setRootIndex(model.index(self.root_folder))
-        lay.addWidget(tree)
-        return w
+    def _web_browser_open_external(self):
+        """Open the current URL in the user's default system browser."""
+        import webbrowser
+        url = getattr(self, "web_url_edit", None)
+        url = url.text().strip() if url is not None else ""
+        if url and not (url.startswith("http://") or url.startswith("https://")):
+            url = "https://" + url
+        if url:
+            webbrowser.open(url)
 
 
     def create_payments_tab(self):
@@ -1938,50 +2012,6 @@ class FeatureTabBuildersMixin:
         perfl = QFormLayout(perfg)
         perfl.setContentsMargins(12, 12, 12, 12)
         perfl.setVerticalSpacing(8)
-        self.polling_spin = QSpinBox()
-        self.polling_spin.setRange(10, 3600)
-        self.polling_spin.setValue(self.manager.HEARTBEAT_INTERVAL)
-        self.polling_spin.setSuffix(" s")
-        perfl.addRow("Heartbeat Interval:", self.polling_spin)
-        heartbeat_note = QLabel("How often the manager thinks/acts when idle. Discovery runs every 5 heartbeats independently. When work is queued, it's processed immediately without an LLM call — the LLM is only needed when deciding strategy, not for routine dispatch.")
-        heartbeat_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
-        self._themeable.append((heartbeat_note, "caption", "font-size:10px;padding-top:3px;"))
-        heartbeat_note.setWordWrap(True)
-        perfl.addRow(heartbeat_note)
-
-        self.idle_cooldown_spin = QSpinBox()
-        self.idle_cooldown_spin.setRange(60, 3600)
-        self.idle_cooldown_spin.setValue(int(os.getenv("IDLE_HEARTBEAT_COOLDOWN", 600)))
-        self.idle_cooldown_spin.setSuffix(" s")
-        perfl.addRow("Idle LLM cooldown:", self.idle_cooldown_spin)
-        idle_note = QLabel("LLM heartbeat only fires when idle for this long. Queued work is processed immediately without the LLM. Higher = fewer LLM calls when no work is pending.")
-        idle_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
-        self._themeable.append((idle_note, "caption", "font-size:10px;padding-top:3px;"))
-        idle_note.setWordWrap(True)
-        perfl.addRow(idle_note)
-
-        self.startup_spin = QSpinBox()
-        self.startup_spin.setRange(0, 60)
-        self.startup_spin.setValue(int(os.getenv("STARTUP_DELAY_SECS", 5)))
-        self.startup_spin.setSuffix(" s")
-        perfl.addRow("Startup Delay:", self.startup_spin)
-        startup_note = QLabel("Delay before agents start. Useful if you need to start Ollama first.")
-        startup_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
-        self._themeable.append((startup_note, "caption", "font-size:10px;padding-top:3px;"))
-        startup_note.setWordWrap(True)
-        perfl.addRow(startup_note)
-
-        self.research_cache_ttl_spin = QSpinBox()
-        self.research_cache_ttl_spin.setRange(0, 3600)
-        self.research_cache_ttl_spin.setValue(int(os.getenv("RESEARCH_CACHE_TTL", 120)))
-        self.research_cache_ttl_spin.setSuffix(" s")
-        perfl.addRow("Research Cache TTL:", self.research_cache_ttl_spin)
-        cache_note = QLabel("How long file scans are cached. Lower = fresher data but slower scans.")
-        cache_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
-        self._themeable.append((cache_note, "caption", "font-size:10px;padding-top:3px;"))
-        cache_note.setWordWrap(True)
-        perfl.addRow(cache_note)
-
         self.max_file_spin = QSpinBox()
         self.max_file_spin.setRange(1, 500)
         self.max_file_spin.setValue(int(os.getenv("MAX_FILE_SIZE_MB", 10)))

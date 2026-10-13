@@ -1,4 +1,4 @@
-from agents.services.agent_runtime import (
+from agents.runtime.agent import (
     AgentDescriptor,
     AgentEventKind,
     AgentRuntime,

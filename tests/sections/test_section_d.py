@@ -27,61 +27,6 @@ class FakeWorker:
         return "Draft proposal text."
 
 
-class TestProposalModelRole(unittest.TestCase):
-    """D1: proposal drafting model role follows PROPOSAL_MODEL_ROLE env."""
-
-    def _make_manager(self):
-        # Import lazily so the env is read at call time.
-        from app import manager
-        m = manager.ManagerThread.__new__(manager.ManagerThread)
-        m.worker = FakeWorker()
-        return m
-
-    def test_default_role_is_chat(self):
-        from tests.sections.test_section_d import FakeWorker
-        m = self._make_manager()
-        with patch.object(m, "worker", FakeWorker()):
-            # ensure default env
-            os.environ.pop("PROPOSAL_MODEL_ROLE", None)
-            out = type(m)._prepare_proposal_text(m, "Write a python gig proposal")
-            self.assertEqual(m.worker.last_chat, True)
-            self.assertTrue(out)
-
-    def test_role_main_routes_to_main(self):
-        from tests.sections.test_section_d import FakeWorker
-        m = self._make_manager()
-        with patch.object(m, "worker", FakeWorker()):
-            os.environ["PROPOSAL_MODEL_ROLE"] = "main"
-            try:
-                out = type(m)._prepare_proposal_text(m, "task")
-                self.assertEqual(m.worker.last_chat, False)
-                self.assertTrue(out)
-            finally:
-                del os.environ["PROPOSAL_MODEL_ROLE"]
-
-    def test_role_chat_explicit(self):
-        from tests.sections.test_section_d import FakeWorker
-        m = self._make_manager()
-        with patch.object(m, "worker", FakeWorker()):
-            os.environ["PROPOSAL_MODEL_ROLE"] = "chat"
-            try:
-                type(m)._prepare_proposal_text(m, "task")
-                self.assertEqual(m.worker.last_chat, True)
-            finally:
-                del os.environ["PROPOSAL_MODEL_ROLE"]
-
-    def test_unknown_role_falls_back_to_chat(self):
-        from tests.sections.test_section_d import FakeWorker
-        m = self._make_manager()
-        with patch.object(m, "worker", FakeWorker()):
-            os.environ["PROPOSAL_MODEL_ROLE"] = "bogus"
-            try:
-                type(m)._prepare_proposal_text(m, "task")
-                self.assertEqual(m.worker.last_chat, True)
-            finally:
-                del os.environ["PROPOSAL_MODEL_ROLE"]
-
-
 class FakeLearningMemory:
     """Minimal EarningMemory stand-in for proposal-intro A/B tracking."""
     def __init__(self):

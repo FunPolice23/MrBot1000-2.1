@@ -199,6 +199,18 @@ def chat_with_tools(
                 _delta_reasoning = getattr(delta, "reasoning_content", None) if delta is not None else None
                 if isinstance(_delta_reasoning, str) and _delta_reasoning:
                     reasoning_parts.append(_delta_reasoning)
+                    # ARCH-ENG-106: also drive stream_progress on the reasoning
+                    # channel so the live tok/s bar tracks TOTAL generation
+                    # (thinking + answer). A reasoning-heavy model (esp. the CPU
+                    # small brain) spends most of its time in reasoning_content
+                    # before any visible content streams; without this the GPU
+                    # Status tok/s line stayed blank ("— tok/s") through the
+                    # entire thinking phase.
+                    if stream_progress is not None:
+                        try:
+                            stream_progress(_delta_reasoning)
+                        except Exception:
+                            pass
                     continue
                 # Fall back to a complete message object (non-streaming shape).
                 message = getattr(choice0, "message", None)

@@ -16,10 +16,7 @@ USAGE:
     Opens the MrBot1000 desktop application with full agent orchestration
 
 KEY COMPONENTS:
-    - MainWindow: Main application window with 8 tabs
-    - ManagerThread: Background agent coordinator
-    - SummarizerThread: Chat interface handler
-    - AgentsTab: Chat display + live info in the Agents tab (UnifiedChatWidget retired)
+    - MainWindow: Main application window with tabbed interface
     - ActionPipeline: Safe file modification with validation
 
 SECURITY:
@@ -168,7 +165,6 @@ from PySide6.QtWidgets import (
 )
 
 from agents.brains.base_worker import ROOT_FOLDER, WorkerAgent
-from agents.services.summarizer import SummarizerThread
 
 # Phase 6: unified event logger, notification service, human-approval queue,
 # alerting rule engine, and heartbeat system (credit-based survival tiers).
@@ -183,10 +179,8 @@ from agents.core.alerting import (
     llm_spend_threshold_rule, survival_tier_change_rule,
     safety_block_rule, pending_approval_aging_rule,
 )
-from agents.autonomy.heartbeat import HeartbeatSystem, CreditMonitor, SurvivalTier
 from app.database import AgentDB
 from gui.builders.tab_builders import TabBuildersMixin
-from app.manager import ManagerThread
 
 # Theme system — single source of truth lives in theme_config.py
 # (preset definitions + env-driven "Custom" theme via MRBOT_THEME_*).
@@ -195,7 +189,6 @@ from app.theme_config import (
     THEME_PRESETS,
     resolve_theme_definition,
 )
-from app.ui import QuadThoughtPanel
 
 try:
     load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
@@ -499,11 +492,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             source="main",
         )
 
-        # Heartbeat system — credit-based survival tiers. Uses the earning
-        # pipeline's credit getter if available, else a simple default.
-        # NOTE: interval is set after manager is created below.
-        self.heartbeat_system = None
-
         ollama_chat  = os.getenv("OLLAMA_CHAT_MODEL", "").strip() or None
         ollama_main  = os.getenv("OLLAMA_MAIN_MODEL", "").strip() or os.getenv("OLLAMA_MODEL", "").strip() or None
         self.log_signal.emit(f"[Startup] OLLAMA_CHAT_MODEL from env: {ollama_chat}")
@@ -512,17 +500,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self.worker  = WorkerAgent(api_key, self.log_signal, db=self.db,
                                    chat_ollama_model=ollama_chat,
                                    primary_ollama_model=ollama_main)
-        self.manager = ManagerThread(api_key, self.worker, db=self.db,
-                                   earning_pipeline=self.earning_pipeline)
-        self.summarizer = SummarizerThread(self.worker, db=self.db, manager=self.manager)
-        self.manager.set_summarizer(self.summarizer)  # Connect summarizer to manager
 
-        # ── Phase 6: heartbeat + bridges (after manager exists) ─────────────
-        self.heartbeat_system = HeartbeatSystem(
-            interval=self.manager.HEARTBEAT_INTERVAL,
-            credit_getter=lambda: getattr(self.earning_pipeline, 'credits', 500.0)
-            if self.earning_pipeline else lambda: 500.0,
-        )
+        # ── Phase 6: heartbeat + bridges ────────────────────────────────────
+        # (legacy ManagerThread/SummarizerThread removed — N-device peer council
+        #  in Dialogue is the decision authority; see docs/LEGACY_AUDIT.md)
 
         # Bridge: approval queue → notification service
         self.approval_queue.on_change = self._on_approval_queue_change
@@ -541,48 +522,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.log_signal.emit(f"[Startup] Provider hot-reload unavailable: {e}")
             self.provider_hot_reload = None
 
-        # Register specialized workers with the CEO manager
-        try:
-            from agents.earning.job_search_worker import JobSearchWorker
-            self.job_worker = JobSearchWorker(api_key, self.log_signal, db=self.db)
-            self.job_worker.set_new_jobs_callback(self.manager.on_new_jobs)
-            self.manager.register_worker("JobSearch", self.job_worker, "job search")
-        except Exception:
-            self.job_worker = None
-            # Not fatal — just means no job search worker
-        try:
-            from agents.services.analyst_worker import AnalystWorker
-            self.analyst_worker = AnalystWorker(api_key, self.log_signal, db=self.db)
-            self.manager.register_worker("Analyst", self.analyst_worker, "code analysis")
-        except Exception:
-            self.analyst_worker = None
-        try:
-            from agents.services.coder import CoderWorker
-            self.coder_worker = CoderWorker(api_key, self.log_signal, db=self.db)
-            self.manager.register_worker("Coder", self.coder_worker, "code refactoring")
-        except Exception:
-            self.coder_worker = None
-            # Not fatal — Coder ACTIONs fall back to base worker (Bug D fixed)
+        # (legacy worker registration + Manager/Summarizer signal wiring removed —
+        #  N-device peer council in Dialogue is the decision authority)
 
-        self.summarizer.chat_reply.connect(self._on_summarizer_chat_reply)
-
-        self.manager.manager_thought.connect(self._on_manager_thought)
-        self.manager.agent_thought.connect(self._on_agent_thought)
-        self.manager.comms.connect(self._on_comms)
-        self.summarizer.summary_ready.connect(self._on_summary_ready)
-
-        self.manager.log.connect(self._safe_log)
-        self.manager.chat_reply.connect(self._on_chat_reply)
-        self.manager.agent_status.connect(self._on_agent_status)
         self.log_signal.connect(self._safe_log)
-
-        # New CEO signals
-        self.manager.worker_assigned.connect(self._on_worker_assigned)
-        self.manager.job_found.connect(self._on_job_found)
-
-        self.manager.manager_thought.connect(self.summarizer.add_manager_thought)
-        self.manager.agent_thought.connect(self.summarizer.add_agent_thought)
-        self.manager.comms.connect(self.summarizer.add_comms_thought)
 
         # Kick off provider/GPU detection on a BACKGROUND thread before the UI
         # builds. The eager Providers & GPU tab build calls get_gpus()/…
@@ -601,8 +544,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self.create_ui()
         self.apply_theme("Dark")
 
-        self.summarizer.start()
-        self.manager.start()
+        # (legacy summarizer/manager thread start removed)
 
         # P4 (comms redesign): bridge the EventBus into the GUI thread so the
         # dashboard observes OPPORTUNITY/EVIDENCE/NOTIFICATION events without
@@ -627,18 +569,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         fm.addAction("Exit").triggered.connect(self.close)
 
         view_menu = menubar.addMenu("View")
-        view_menu.addAction("Show Thought Panel").triggered.connect(
-            self._show_thoughts)
-        view_menu.addSeparator()
-        self.show_thoughts_action = view_menu.addAction("Hide Thought Panel")
-        self.show_thoughts_action.setCheckable(True)
-        self.show_thoughts_action.toggled.connect(self._toggle_thought_panel)
-
-        view_menu.addAction("🟣 Manager Window").triggered.connect(self._show_manager_win)
-        view_menu.addAction("🟢 Agent Window").triggered.connect(self._show_agent_win)
-        view_menu.addAction("🟡 Comms Window").triggered.connect(self._show_comms_win)
-        view_menu.addAction("📊 Summary Window").triggered.connect(self._show_summary_win)
-
         view_menu.addSeparator()
         window_mode_menu = view_menu.addMenu("Window Mode")
         self._window_mode_actions = {}
@@ -665,9 +595,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             else:
                 act.triggered.connect(lambda _, tn=t: self.apply_theme(tn))
 
-        self.thought_panel = QuadThoughtPanel(self)
-        self.thought_panel.hide()
-
         # v2.0.34ag (A5): status_label is created here (top-level) so it exists
         # before the lazy Management tab is built; create_management_tab reuses it.
         self.status_label = QLabel("Agent status: Not registered")
@@ -675,18 +602,12 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         if api_key:
             self.status_label.setText("Agent status: Registered ✓")
 
-        for t in self.db.get_thoughts(limit=100):
-            self.thought_panel.route(t["source"], f"[history] {t['text']}")
-        self.thought_panel.route("System",
-                                 f"Agent started. Root: {ROOT_FOLDER}")
         # v2.0.21 P1#1: verify runtime deps at boot so a missing package (e.g.
         # feedparser in a different Python env) shows a clear warning instead of
         # silently killing discovery mid-run.
         self._check_dependencies()
         # v2.0.21 P1#3: surface model-config issues at startup (no crash).
-        # Runs here (after thought_panel exists) so warnings can be routed.
         self._validate_model_config(ollama_main, ollama_chat)
-        self.thought_panel.route("System", "Research folder: not set")
 
         self._db_stats_start_timer = QTimer(self)
         self._db_stats_start_timer.setSingleShot(True)
@@ -700,7 +621,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         disabled (e.g. feedparser -> Reddit/LinkedIn discovery off)."""
         req_path = os.path.join(ROOT_FOLDER, "requirements.txt")
         if not os.path.exists(req_path):
-            self.thought_panel.route("System", "[Startup] WARN: requirements.txt not found")
+            self.log_signal.emit("[Startup] WARN: requirements.txt not found")
             return
         missing = []
         # distribution-name -> import-name (they differ for some packages)
@@ -738,10 +659,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 msg += (" | CORE packages missing — you are likely running the "
                         "wrong Python. Launch with the venv interpreter, e.g. "
                         "venv/Scripts/python.exe main.py")
-            self.thought_panel.route("System", msg)
+            self.log_signal.emit(msg)
             print(msg)
         else:
-            self.thought_panel.route("System", "[Startup] Dependencies OK")
+            self.log_signal.emit("[Startup] Dependencies OK")
 
     # ── v2.0.21 P1#3: startup model-config validation ────────────────────────
     def _validate_model_config(self, main_model: str | None, chat_model: str | None):
@@ -749,13 +670,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         Never crashes — purely advisory so the operator can fix config."""
         def warn(msg):
             full = f"[Startup] MODEL WARN: {msg}"
-            # Defensive: thought_panel may not exist if called early.
-            panel = getattr(self, "thought_panel", None)
-            if panel is not None:
-                try:
-                    panel.route("System", full)
-                except Exception:
-                    pass
+            self.log_signal.emit(full)
             print(full)
 
         if not main_model:
@@ -804,44 +719,10 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             OllamaAdapter.shutdown_executor()
         except Exception:
             pass
-        for worker in (getattr(self, "manager", None), getattr(self, "summarizer", None)):
-            if worker is None:
-                continue
-            try:
-                worker.stop()
-                # Disconnect BEFORE waiting. The manager may be mid-stream on a
-                # provider call with a long read timeout, so it can still be
-                # running when we return; any signal it emits afterwards would
-                # be delivered to widgets that are about to be destroyed, which
-                # aborts the interpreter with an access violation.
-                self._disconnect_worker_signals(worker)
-                # Graceful wait only, and short: this runs on the GUI thread, so
-                # a long wait is a visible freeze on close. Calling
-                # QThread.terminate() is NOT an option — killing a thread blocked
-                # in socket I/O corrupts the process. Signals are already
-                # disconnected above, so a thread that outlives the wait is
-                # harmless and is reaped at process exit.
-                if not worker.wait(5000):
-                    _log_shutdown_warning(worker)
-            except Exception:
-                pass
-        try:
-            job_worker = getattr(self, "job_worker", None)
-            if job_worker is not None and hasattr(job_worker, "close"):
-                job_worker.close()
-        except Exception:
-            pass
+        # (legacy manager/summarizer thread-stop loop removed)
         try:
             if getattr(self, "db", None) is not None:
                 self.db.close()
-        except Exception:
-            pass
-
-        # Stop Phase 6 services
-        try:
-            heartbeat = getattr(self, "heartbeat_system", None)
-            if heartbeat and hasattr(heartbeat, "stop"):
-                heartbeat.stop()
         except Exception:
             pass
 
@@ -1034,50 +915,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                     self.log_signal.emit(f"[Ollama] failed to unload {model}: {e}")
         except Exception:
             pass
-
-    # --- Summarizer signal handlers ---
-    def _on_summarizer_status(self, status: str, task: str):
-        # Update sprite only; the tab's own connection handles labels
-        state_map = {
-            "Idle": "idle",
-            "Summarizing": "thinking",
-            "Paused": "idle",
-        }
-        sprite_state = state_map.get(status, "idle")
-        self.summarizer_sprite.set_state(sprite_state)
-
-    def _on_summarizer_paused(self, paused: bool):
-        # Update pause button in the tab
-        if hasattr(self, 'agents_tab'):
-            self.agents_tab.set_summarizer_pause_button_state(paused)
-
-    # --- Manager thought handlers ---
-    def _on_worker_assigned(self, worker_name: str, task: str):
-        pass
-
-    def _on_job_found(self, jobs_json: str):
-        try:
-            import json
-            jobs = json.loads(jobs_json)
-            count = len(jobs)
-            self._safe_log(f"🔍 {count} new gig(s) queued from JobSearch")
-        except Exception:
-            pass
-
-    def _on_comms(self, direction: str, text: str):
-        self.thought_panel.route("Comms", text, direction)
-
-    def _on_chat_reply(self, trigger: str, text: str, thinking: str = ""):
-            # Filter out heartbeat and task messages from chat window
-            # These should go to notifications/subtle status, not chat
-            if trigger.startswith("Heartbeat:") or trigger.startswith("Task:"):
-                # Heartbeat/task decisions - update status, don't clutter chat
-                if hasattr(self, 'agent_status_label'):
-                    self.agent_status_label.setText(f"Action: {trigger}")
-                return
-        
-            if hasattr(self, "agents_tab") and hasattr(self.agents_tab, "append_reply"):
-                self.agents_tab.append_reply("Manager", f"[{trigger}] {text}", thinking)
 
     # ── EventBus bridge (P4 comms redesign) ──────────────────────────────────
     def _on_bus_event(self, msg):
@@ -1313,24 +1150,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.log_signal.emit("[Provider] Configuration updated - changes applied")
         except Exception as e:
             self.log_signal.emit(f"[Provider] Error applying config changes: {e}")
-
-    def _on_manager_thought(self, text: str):
-        self.thought_panel.route("Manager", text)
-        self.log_signal.emit(f"[Manager] thought: {text}")
-
-    def _on_agent_status(self, status: str, task: str):
-        # Update management tab status label
-        if hasattr(self, 'agent_status_label'):
-            self.agent_status_label.setText(f"Status: {status} — {task}")
-        # Update heartbeat label in the agents tab
-        if hasattr(self, 'agents_tab'):
-            self.agents_tab.last_heartbeat_label.setText(
-                f"Last heartbeat: {datetime.now().strftime('%H:%M:%S')}")
-        self.log_signal.emit(f"[Manager] agent status: {status} — {task}")
-
-    def _on_agent_thought(self, text: str):
-        self.thought_panel.route("Agent", text)
-        self.log_signal.emit(f"[Agent] thought: {text}")
 
     def _safe_log(self, msg: str):
         # v2.0.34an: always buffer, even if log_edit isn't built yet (Live Logs is a
@@ -1580,15 +1399,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         if hasattr(self, "log_table"):
             self.log_table.setRowCount(0)
 
-    def _toggle_thought_panel(self, checked):
-        if checked:
-            self.thought_panel.hide()
-            self.show_thoughts_action.setText("Show Thought Panel")
-        else:
-            self.thought_panel.show()
-            self.thought_panel.raise_()
-            self.show_thoughts_action.setText("Hide Thought Panel")
-
     def create_ui(self):
         # Centered title header at the top of the program
         container = QWidget()
@@ -1628,7 +1438,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                     ("Dialogue",       self.create_dialogue_tab),
                     ("Approvals",      self.create_approval_tab),
                     ("Registration",   self.create_registration_tab),
-                    ("Browse Root",    self.create_file_browser_tab),
+                    ("Web Browser",   self.create_file_browser_tab),
                     ("Payments",       self.create_payments_tab),
                     ("Earnings",       self.create_earnings_tab),
                     ("Insights",       self.create_insights_tab),
@@ -1831,45 +1641,14 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self._management_build_deferred = True
             QTimer.singleShot(0, lambda: self._ensure_tab_built(0))
 
-    def _toggle_summarizer_pause(self, checked):
-        self.summarizer.set_paused(checked)
-
-    def _show_thoughts(self):
-        self.thought_panel.show()
-        self.thought_panel.raise_()
-        self.show_thoughts_action.setChecked(False)
-
     def _toggle_pause(self, checked):
-        self.manager.set_paused(checked)
-        # Update the button in the tab
-        if hasattr(self, 'agents_tab'):
-            self.agents_tab.set_pause_button_state(checked)
-            # Update heartbeat label text
-            if checked:
-                self.agents_tab.heartbeat_label.setText("Heartbeat: PAUSED")
-            else:
-                self.agents_tab.heartbeat_label.setText(
-                    f"Heartbeat every {self.manager.HEARTBEAT_INTERVAL}s")
-        self.thought_panel.route(
-            "System", "Heartbeat paused" if checked else "Heartbeat resumed")
+        # legacy manager heartbeat removed — no-op (control removed in Management tab)
+        pass
 
     def _human_send(self, text: str):
-        # v2.0.22b + P2 comms redesign: route chat through the EventBus as a
-        # structured USER_REQUEST (destination "chat" = Chat interface/Summarizer
-        # thread). The Summarizer forwards task/command intents back to the
-        # Manager as a structured TASK_REQUEST — no arbitrary prompt loops.
-        # Falls back to the direct queue path if the bus/summarizer is unavailable.
-        try:
-            from agents.core.comms import EventBus, Message, MessageType
-            bus = EventBus.instance()
-            bus.publish(Message(MessageType.USER_REQUEST, "gui", "chat",
-                                payload={"text": text}))
-        except Exception:
-            if getattr(self, "summarizer", None) is not None:
-                self.summarizer.send_human_message(text)
-            else:
-                self.manager.send_human_message(text)
-        self.thought_panel.route("Comms", text, "Human→M")
+        # Legacy AgentsTab send-box callback (control removed). The Chat tab /
+        # N-device Dialogue is the chat authority.
+        pass
 
     # ── A2: Verify-then-mark-paid ──────────────────────────────────────────────
     def _build_payout_verifier(self):
@@ -2105,82 +1884,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         mins = int((seconds % 3600) / 60)
         return f"{hours}h {mins}m ago"
 
-    def _refresh_stream_health(self):
-        """v2.0.34ac (G5): render live steady-stream telemetry into the Management tab."""
-        try:
-            mgr = getattr(self, "manager", None)
-            if mgr is None or not hasattr(mgr, "get_runtime_stats"):
-                return
-            s = mgr.get_runtime_stats()
-            healthy = s.get("healthy", True)
-            color = "#00ff88" if healthy else "#ff5555"
-            lines = [
-                f"Status: <b style='color:{color}'>{'HEALTHY' if healthy else 'DEGRADED'}</b>"
-                + (" (paused)" if s.get("paused") else ""),
-                f"Cycles: {s.get('cycles', 0)} · "
-                f"Jobs: {s.get('jobs_processed', 0)} · "
-                f"Chats: {s.get('chats_handled', 0)} · "
-                f"Tasks: {s.get('tasks_handled', 0)}",
-                f"Throughput: {s.get('throughput_per_min', 0)} work/min · "
-                f"last cycle: {s.get('last_cycle_ms', 0)} ms",
-                f"Queued → tasks: {s.get('pending_tasks', 0)} · "
-                f"chat: {s.get('pending_chat', 0)} · "
-                f"jobs: {s.get('pending_jobs', 0)}",
-                f"Errors: {s.get('errors', 0)} (streak {s.get('error_streak', 0)}) · "
-                f"last ok {self._format_ago(s.get('last_success_ago_s', 0))}",
-            ]
-            self.stream_health_label.setText("<br>".join(lines))
-        except Exception:
-            pass  # never break the GUI timer
-
-    def _memory_db(self):
-        """Return the SummarizerDB behind the manager's memory, or None."""
-        mgr = getattr(self, "manager", None)
-        summ = getattr(mgr, "_summarizer", None)
-        # SummarizerThread stores its DB as `summ_db` (not `db`).
-        db = getattr(summ, "summ_db", None) or getattr(summ, "db", None)
-        return db if hasattr(db, "get_role_memory") else None
-
-    def _refresh_memory_panel(self):
-        """v2.0.34ad (F7): render per-role memory + long-term notes into the panel."""
-        try:
-            db = self._memory_db()
-            if db is None:
-                self.memory_view.setPlainText("(memory store unavailable)")
-                return
-            parts = []
-            for role in ("chat", "main"):
-                rows = db.get_role_memory(role, limit=10)
-                if rows:
-                    head = "CHAT memory:" if role == "chat" else "CEO memory:"
-                    parts.append(head)
-                    for r in rows[-6:]:
-                        parts.append(f"  - {r['text'][:160]}")
-            notes = db.get_notes(limit=10)
-            if notes:
-                parts.append("Long-term notes:")
-                for n in notes[-6:]:
-                    parts.append(f"  [{n['topic']}] {n['text'][:160]}")
-            self.memory_view.setPlainText("\n".join(parts) if parts else "(empty)")
-        except Exception:
-            pass  # never break the GUI timer
-
-    def _clear_memory(self, what: str):
-        """v2.0.34ad (F7): clear chat/CEO memory or long-term notes on operator click."""
-        try:
-            db = self._memory_db()
-            if db is None:
-                return
-            if what == "chat":
-                db.clear_role_memory("chat")
-            elif what == "main":
-                db.clear_role_memory("main")
-            elif what == "notes":
-                db.clear_notes()
-            self._refresh_memory_panel()
-        except Exception:
-            pass
-
     def _apply_llm_budget(self, text: str):
         """A4: apply the daily LLM budget cap live (no restart)."""
         try:
@@ -2208,21 +1911,16 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.worker.research_folder = folder
             self.research_folder_label.setText(f"Research folder: {folder}")
             self.log_signal.emit(f"Research folder set: {folder}")
-            self.thought_panel.route(
-                "System", f"Research folder set: {folder}")
-            self.manager.invalidate_cache()
-            self.manager._reviewed_files.clear()
 
     def force_safe_improve(self):
-        self.manager.queue_task(
-            "Self-improvement: review codebase and propose one concrete upgrade")
-        self.log_signal.emit("Self-improvement task queued")
+        # legacy manager queue removed — route intent to the N-device Dialogue
+        self.log_signal.emit(
+            "Self-improvement: use the Dialogue tab to direct the peer council")
 
     def force_research_rescan(self):
-        self.manager.invalidate_cache()
-        self.manager.queue_task(
-            "Research re-scan: review all files and summarize key findings")
-        self.log_signal.emit("Research re-scan queued")
+        # legacy manager queue removed — route intent to the N-device Dialogue
+        self.log_signal.emit(
+            "Research re-scan: use the Dialogue tab to direct the peer council")
 
     def clear_file_cache(self):
         reply = QMessageBox.question(
@@ -2271,12 +1969,8 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             stats = db.get_llm_stats()
             props = db.count_proposals()
             disc = {}
-            if getattr(self.manager, "earning_pipeline", None) is not None:
-                try:
-                    disc = self.manager.get_discovery_summary()
-                except Exception:
-                    disc = {}
-            
+            # (legacy manager.get_discovery_summary() removed)
+
             # Update stat cards
             self.db_stat_calls.value_label.setText(str(stats.get("total_calls", 0)))
             self.db_stat_errors.value_label.setText(str(stats.get("errors", 0)))
@@ -2447,7 +2141,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 try:
                     data = response.json()
                     self.worker.api_key  = data["api_key"]
-                    self.manager.api_key = data["api_key"]
                     self.log_signal.emit("Registration SUCCESS")
                     self.status_label.setText("Agent status: Registered ✓")
                 except Exception as e:
@@ -3197,34 +2890,20 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                         threading.Thread(target=_unload, args=(old,), daemon=True).start()
         if new_chat and new_chat != old_chat:
             self.worker._chat_ollama_model_override = new_chat
-            if hasattr(self.manager, "_chat_ollama_model_override"):
-                self.manager._chat_ollama_model_override = new_chat
-            if hasattr(self.summarizer, "_chat_ollama_model_override"):
-                self.summarizer._chat_ollama_model_override = new_chat
             self.log_signal.emit(f"[Ollama] chat model now live: {new_chat}")
         if new_main and new_main != old_main:
             self.worker._ollama_model_override = new_main
-            if hasattr(self.manager, "_ollama_model_override"):
-                self.manager._ollama_model_override = new_main
-            if hasattr(self.summarizer, "_ollama_model_override"):
-                self.summarizer._ollama_model_override = new_main
             self.log_signal.emit(f"[Ollama] main model now live: {new_main}")
         # Make cloud/local provider model changes live without a restart: rebuild
         # the cached provider registry from the just-written .env on next llm() call.
-        for obj in (self.worker, self.manager, self.summarizer):
+        for obj in (self.worker,):
             if hasattr(obj, "invalidate_provider_registry"):
                 obj.invalidate_provider_registry()
         self.log_signal.emit("[Models] provider registry refreshed — changes apply on next call (no restart)")
 
         # Update live objects
         self.worker.max_file_size = self.max_file_spin.value() * 1024 * 1024
-        self.manager.HEARTBEAT_INTERVAL = self.polling_spin.value()
-        self.manager._research_cache_ttl = self.research_cache_ttl_spin.value()
-        # v2.0.36k: idle-directed heartbeat cooldown (LLM only when truly idle)
-        try:
-            self.manager._idle_heartbeat_cooldown = int(self.idle_cooldown_spin.value())
-        except Exception:
-            pass
+        # (legacy manager HEARTBEAT_INTERVAL / research-cache-ttl / idle-cooldown removed)
         # v2.0.36w: save LLM parameters
         try:
             values["MAX_TOKENS"] = str(self.max_tokens_spin.value())
@@ -3252,9 +2931,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.worker._top_p = float(self.top_p_spin.value())
         except Exception:
             pass
-        if hasattr(self, "agents_tab"):
-            self.agents_tab.heartbeat_label.setText(
-                f"Heartbeat every {self.polling_spin.value()}s")
         self.log_signal.emit("Settings saved")
 
         # v2.0.25: persist the provider list to settings.json (provider-agnostic,
@@ -3417,10 +3093,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             f"[Pipeline] {status} score={result.score:.2f} "
             f"| {action.proposer} → {action.action_type} "
             f"| {result.summary}")
-        if hasattr(self, "thought_panel"):
-            self.thought_panel.route(
-                "System",
-                f"Pipeline {status}: {action.description} | {result.summary}")
 
     def _on_pipeline_executed(self, action, result):
         status = "✓" if result.success else "✗"
@@ -3432,10 +3104,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self.log_signal.emit(
             f"[Pipeline] REJECTED {action.action_type} "
             f"by {action.proposer}: {reason}")
-        if hasattr(self, "thought_panel"):
-            self.thought_panel.route(
-                "System",
-                f"⚠ Rejected: {action.description} | {reason}")
 
     def _validate_clipboard_code(self):
         """Quick-validate whatever code is in the clipboard."""
@@ -3785,46 +3453,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         if fx_override is not None:
             return fx_override.effective(), style_hints_qss, apply_antialiasing
         return EffectSettings.from_env().effective(), style_hints_qss, apply_antialiasing
-
-    def _summarizer_human_send(self, text: str):
-        self.summarizer.send_human_message(text)
-
-    def _on_summarizer_chat_reply(self, label: str, text: str, thinking: str = ""):
-        """Handle chat reply from summarizer - update tab display."""
-        try:
-            # Use the agents tab's built-in chat display (same as Manager thoughts)
-            if hasattr(self, 'agents_tab') and hasattr(self.agents_tab, 'append_reply'):
-                self.agents_tab.append_reply(label, text, thinking)
-                # Switch to the Agents tab (index 1) using the real QTabWidget.
-                if getattr(self, "tabs", None) is not None:
-                    self.tabs.setCurrentIndex(1)
-        except Exception as e:
-            self.log_signal.emit(f"Chat display error: {e}")
-
-    def _on_strategy_change(self, strategy: str):
-        self.summarizer.set_strategy(strategy)
-
-    def _on_summary_ready(self, text: str):
-        if hasattr(self, "thought_panel"):
-            self.thought_panel.route_summary(text)
-
-
-
-    def _show_manager_win(self):
-        self.thought_panel._win("Manager").show()
-        self.thought_panel._win("Manager").raise_()
-
-    def _show_agent_win(self):
-        self.thought_panel._win("Agent").show()
-        self.thought_panel._win("Agent").raise_()
-
-    def _show_comms_win(self):
-        self.thought_panel._win("Comms").show()
-        self.thought_panel._win("Comms").raise_()
-
-    def _show_summary_win(self):
-        self.thought_panel._win("Summary").show()
-        self.thought_panel._win("Summary").raise_()
 
 
 if __name__ == "__main__":

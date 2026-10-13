@@ -58,12 +58,6 @@ STORE_AUTHORITIES: tuple[StoreAuthority, ...] = (
         classification="subsystem",
     ),
     StoreAuthority(
-        "job_search",
-        "job_search.db",
-        "Job-search subsystem state; not authoritative for earning lifecycle or accounting",
-        classification="subsystem",
-    ),
-    StoreAuthority(
         "dual_brain",
         "dual_brain.db",
         "Dual-brain/UI runtime state and cached coordination data",

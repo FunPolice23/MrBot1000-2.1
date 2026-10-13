@@ -7,13 +7,10 @@ Provides:
   - ChainOfThought      : structured multi-step reasoning helper
   - PromptBuilder       : fluent prompt construction
   - ResponseParser      : parse structured fields from LLM output
-  - ConversationMemory  : rolling conversation context with token budget
-  - SpeechPatternBank   : learn and replay user/agent speech styles
   - TaskQueue           : priority task queue with dedup
   - AgentLogger         : structured event logger (wraps DB if present)
   - FileWatcher         : lightweight polling-based file change detector
   - EmbeddingCache      : simple keyword-based semantic similarity cache
-  - WorkerRegistry      : central registry for dynamically loaded workers
 """
 
 from __future__ import annotations
@@ -130,11 +127,8 @@ def retry_llm(max_attempts: int = 3, backoff: float = 1.5, exceptions=(Exception
 from agents.knowledge.prompt_utils import ChainOfThought, PromptBuilder, ResponseParser
 
 
-from agents.dialogue.conversation_memory import ConversationMemory, SpeechPatternBank
-
-
 from agents.runtime.services import (
-    AgentLogger, EmbeddingCache, FileWatcher, TaskQueue, WorkerRegistry,
+    AgentLogger, EmbeddingCache, FileWatcher, TaskQueue,
 )
 
 

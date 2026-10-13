@@ -226,7 +226,15 @@ class BrainControlRow(QWidget):
 
     def set_model(self, model_name: str) -> None:
         """Select ``model_name`` (full path or basename) in the dropdown if
-        present; otherwise leave the current selection untouched."""
+        present; otherwise leave the current selection untouched.
+
+        v2.1.79 (ARCH-ENG-098): the status tick calls this every ~4s with the
+        same model. Re-selecting an already-selected index re-runs the MTP
+        probe, which parses the GGUF header on the GUI thread — a multi-second
+        freeze on a 9B+ model. Skip the whole block (including the MTP refresh)
+        when the target index is already current, so a steady state costs
+        nothing.
+        """
         if not model_name:
             return
         sel_norm = _norm(model_name)
@@ -237,6 +245,8 @@ class BrainControlRow(QWidget):
                 continue
             d = str(data)
             if _norm(d) == sel_norm or _norm(os.path.basename(d)) == sel_base:
+                if self.model_combo.currentIndex() == i:
+                    return  # already selected — no MTP re-probe, no freeze
                 self.model_combo.blockSignals(True)
                 try:
                     self.model_combo.setCurrentIndex(i)

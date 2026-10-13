@@ -65,12 +65,24 @@ class SmallBrainAdapter:
         # with no error shown to the operator. CONNECT stays short so a stopped
         # llama-server (or a wrong port) fails fast instead of pinning the
         # caller — and the manager thread — for the whole generation budget.
+        #
+        # v2.1.86 (ARCH-ENG-107): the CONNECT timeout was 8s, but a CPU-hosted
+        # brain mid-prompt-eval (a 3-4k-token Dialogue context takes 30s+ at
+        # ~125 tok/s on CPU, single request slot) cannot accept a new TCP
+        # connection inside 8s — so the NEXT turn's connect timed out and the
+        # Dialogue logged "could not reach its model" even though the server was
+        # alive and generating. A stopped server still fails fast on connect
+        # (refused instantly); only a BUSY server is slow to accept. 30s covers
+        # a CPU model's prompt-eval window without meaningfully delaying a truly
+        # dead-endpoint failure. Tunable via LOCAL_LLM_CONNECT_TIMEOUT_SECONDS.
         read_timeout = max(5.0, float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "600")))
-        connect_timeout = max(2.0, float(os.getenv("LOCAL_LLM_CONNECT_TIMEOUT_SECONDS", "8")))
+        connect_timeout = max(2.0, float(
+            os.getenv("LOCAL_LLM_CONNECT_TIMEOUT_SECONDS", "30")))
         from agents.providers.openai_compatible import _build_provider_timeout
         return openai.OpenAI(
             api_key="local", base_url=self.base_url,
-            timeout=_build_provider_timeout(openai, read=read_timeout),
+            timeout=_build_provider_timeout(openai, read=read_timeout,
+                                            connect=connect_timeout),
         )
 
     def _dialogue_protocol(self) -> dict:

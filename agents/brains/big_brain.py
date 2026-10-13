@@ -85,12 +85,20 @@ class BigBrainAdapter:
         # with no error shown to the operator. CONNECT stays short so a stopped
         # llama-server (or a wrong port) fails fast instead of pinning the
         # caller — and the manager thread — for the whole generation budget.
+        #
+        # v2.1.86 (ARCH-ENG-107): raised the default connect window to 30s (was
+        # 8s) and pass it through — a busy brain mid-generation cannot accept a
+        # new TCP connection inside 8s, so the next turn falsely logged "could
+        # not reach its model". A stopped server still fails fast (refused
+        # instantly); only a BUSY server is slow to accept.
         read_timeout = max(5.0, float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "600")))
-        connect_timeout = max(2.0, float(os.getenv("LOCAL_LLM_CONNECT_TIMEOUT_SECONDS", "8")))
+        connect_timeout = max(2.0, float(
+            os.getenv("LOCAL_LLM_CONNECT_TIMEOUT_SECONDS", "30")))
         from agents.providers.openai_compatible import _build_provider_timeout
         return openai.OpenAI(
             api_key="local", base_url=self.base_url,
-            timeout=_build_provider_timeout(openai, read=read_timeout),
+            timeout=_build_provider_timeout(openai, read=read_timeout,
+                                            connect=connect_timeout),
         )
 
     def _dialogue_protocol(self) -> dict:

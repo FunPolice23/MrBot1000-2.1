@@ -171,15 +171,28 @@ class WorkerLLMMixin:
                         # fall through to retry (next provider / attempt)
                         continue
                     # Persist the call so the DB Stats tab can show it (2.0.20e).
+                    # v2.1.80 (ARCH-ENG-099): record real token + tps estimates
+                    # (chars//4, tokens/elapsed) like the big/small brain paths,
+                    # so DB Stats shows token usage instead of all-zero columns.
                     # Guarded: logging must never break the LLM result.
                     try:
                         if self.db is not None:
+                            _p_chars = len(system) + len(user)
+                            _r_chars = len(resp or "")
+                            _p_tok = max(1, _p_chars // 4)
+                            _c_tok = max(1, _r_chars // 4)
+                            _elapsed_s = dt_ms / 1000.0
+                            _tps = ((_p_tok + _c_tok) / _elapsed_s
+                                    if _elapsed_s > 0 else 0.0)
                             self.db.log_llm_call(
                                 model=model, provider=name,
                                 trigger=getattr(self, "last_trigger", "llm"),
-                                prompt_chars=len(system) + len(user),
-                                response_chars=len(resp or ""),
-                                latency_ms=dt_ms, error=None)
+                                prompt_chars=_p_chars,
+                                response_chars=_r_chars,
+                                latency_ms=dt_ms, error=None,
+                                prompt_tokens=_p_tok,
+                                completion_tokens=_c_tok,
+                                tokens_per_second=round(_tps, 2))
                     except Exception as _log_err:
                         self.log_signal.emit(f"[LLM] stats log skipped: {_log_err}")
                     self.last_provider = name

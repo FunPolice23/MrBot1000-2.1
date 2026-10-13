@@ -1,8 +1,12 @@
-# MrBot1000 v2.1.48 — Multi-Brain AI-Powered Earning Agent
+# MrBot1000 v2.1.77 — Multi-Brain AI-Powered Earning Agent
 
 A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. It is local-first: the default brain runtime runs on your machine across every detected GPU and the CPU/RAM pool, while optional cloud providers are explicitly configured by the operator.
 
-## Highlights (through v2.1.48)
+> **New here?** See [`docs/codemap/`](docs/codemap/README.md) for a full
+> function-level map of every file, and [`docs/LEGACY_AUDIT.md`](docs/LEGACY_AUDIT.md)
+> for the status of the retired central-Manager architecture.
+
+## Highlights (through v2.1.77)
 
 - **Device-centric N-brain runtime** (`agents/runtime/device_registry.py` + `agents/runtime/dual_brain.py`): one source of truth for device→slot→role→endpoint/model. The runtime detects every GPU and the CPU/RAM pool and assigns each an ordered slot — slot 0/1 are the classic Big/Small brains (back-compat), slots 2+ are extra devices (e.g. a CPU/RAM brain). Per-device enable/role/model/settings persist in `settings.json`. The active local or cloud provider is selected from Settings.
 - **Shared-skills peer council Dialogue** (`agents/cognition/speaker_registry.py`): every enabled brain runs the same earning-agent skillset, differing only by a customizable per-device name (Edward Hurst, Jacob Stanley, Chris Borrows, …). Each brain independently reads the shared transcript — human + teammates + tool results — and decides whether to answer the human, react to a teammate, or push the goal. Names are editable in the Management tab (`BIG_BRAIN_NAME`/`SMALL_BRAIN_NAME`/`BRAIN_SLOT{n}_NAME`).
@@ -154,7 +158,7 @@ Safe mode can also be toggled from the Management tab at runtime.
 - Tracks earnings and payouts locally in SQLite with **Unified Economic Accounting** (verified vs unverified revenue, LLM cost, gas, net profit, ROI, net hourly rate)
 - Runs a self-audit engine that identifies improvement opportunities across 14 categories without mutating safety constraints
 - Supports llama.cpp, Ollama, LM Studio, vLLM, KoboldCpp, and supported cloud providers through the Settings and Providers & GPU surfaces. The interface adapts to whichever enabled provider is active; if none is enabled, it reports that no provider is in use.
-- Maintains per-role memory (chat + CEO) that survives restarts
+- Maintains per-brain conversation memory (via the Dialogue/N-device MemoryDatabase) that survives restarts
 - Dynamically schedules discovery sources based on historical performance (exploration/exploitation balance)
 
 ### Live Portfolio and Trading
@@ -324,7 +328,7 @@ recommended trim sequence, see [ARCHITECTURE_MAP.md](ARCHITECTURE_MAP.md).
 - **Self-Audit Engine** (v2.0.36j-T4): 14 audit categories, structured findings with confidence + expected benefit/risk, no security mutations
 - **Dynamic Discovery Scheduler** (v2.0.36f): history-driven source/category/strategy selection, exploration/exploitation balance, backoff, provenance tagging
 - **Opportunity Portfolio** (v2.0.36h): 16-state WorkStatus, persistent sqlite-backed queue, configurable QueuePolicy + CapacityConfig overcommit gates, lifecycle-authoritative transitions
-- **Per-role memory** (v2.0.34ad): chat + CEO memory stores that persist across restarts, with compact-on-write to stay bounded
+- **Per-brain conversation memory**: the Dialogue/N-device `MemoryDatabase` persists conversation turns across restarts (the legacy chat/CEO `SummarizerDB` role-memory was removed with the Manager/Summarizer cleanup)
 - **Submission ramp** (v2.0.34aq): win-rate-gated auto-submission that only unlocks after sufficient verified submissions; cold-start safe
 - **Proposal A/B templates** (v2.0.34v): rotated intro variants that learn from outcomes
 - **Win-rate guard** (v2.0.34aq): auto-decline platforms below configured success threshold; cold-start safe
@@ -346,10 +350,10 @@ agents/                  Agent layer, grouped by domain:
   discovery/             discovery engine, scheduler, sources, port
   knowledge/             proposal_*, program_knowledge, help_catalog, prompting
   core/                  comms, event_logger, alerting, composition_root, persistence, ...
-  services/              autonomous_loop, summarizer, self_audit, workshop, code_patch, ...
+  services/              autonomous_loop, self_audit, workshop, code_patch, ...
   autonomy/ integrations/ polish/   autonomous-loop, external integrations, output polish
   safety/                instructions (gate), trust (boundary), guard, tool safety
-  runtime/               dual_brain, device_registry, manager_metrics, services registry
+  runtime/               dual_brain, device_registry, services registry
   providers/             anthropic, ollama, openai_compatible, context_table
   platforms/             human-gated PlatformAdapter skeleton (fiverr/upwork/github/...)
 gui/                     Desktop UI, grouped:
@@ -373,7 +377,6 @@ dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 | File | Purpose |
 |------|---------|
 | `main.py` | Application entry point, window setup, lazy tab loading, settings, and version display |
-| `app/manager.py` | Manager orchestration, intent routing, heartbeat, approvals, memory, and service coordination |
 | `agents/runtime/dual_brain.py` | Canonical brain provider, endpoint, device, slot, and model configuration |
 | `agents/runtime/device_registry.py` | Device-centric detection + slot assignment (GPU + CPU/RAM pool), per-device policy |
 | `agents/cognition/speaker_registry.py` | N-brain speaker roster, per-device names, team brief, ping-pong order |
@@ -403,7 +406,7 @@ dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 | `app/action_pipeline.py` | Proposal validation and controlled execution safeguards |
 | `app/database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
 | `app/theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
-| `app/version.py` | Public application version source (`2.1.48`) |
+| `app/version.py` | Public application version source (`2.1.77`) |
 | `Agent.md` / `README.md` / `CHANGELOG.md` | Runtime contract, current system overview, and release history |
 | `tests/` | Focused regression and subsystem tests |
 | `tools/github_publish/` | Personal publish-mirror tooling (git-ignored; syncs a sanitized copy to GitHub) |
@@ -440,7 +443,7 @@ Key settings:
 - `PIPELINE_ALLOW_SELF_IMPROVE` — Enable/disable auto code updates
 - `LLM_DAILY_BUDGET_USD` — Daily cloud-LLM spend cap (0 = off)
 - `WINRATE_DECLINE_BELOW` — Auto-decline platform if win-rate below this %
-- `MEMORY_ENABLED` — Per-role memory (chat + CEO)
+- `MEMORY_ENABLED` — Per-brain conversation memory (Dialogue/N-device MemoryDatabase)
 - `THINKING_ENABLED` — Thinking/reasoning block for supported models
 - `ALLOW_WEB_DISCOVERY` — Enable web search discovery (human-review gated)
 - Per-provider: `<PROVIDER>_API_KEY`, `<PROVIDER>_BASE_URL`, `<PROVIDER>_MODEL`, `<PROVIDER>_MAIN_ENABLED`, `<PROVIDER>_CHAT_ENABLED`
@@ -478,8 +481,13 @@ it is not a separate visible tab.
 |------|----------|----------------|
 | Big Brain | Edward Hurst, Driver | Planning, opportunity sizing, coding, deep research, negotiation, and review |
 | Small Brain | Jacob Stanley, Navigator | Human chat, triage, risk assessment, source verification, and detail checking |
-| Manager services | Deterministic application layer | Routes intents, coordinates workers, enforces approvals, persists state, and runs heartbeat workflows |
 | Specialized workers | Discovery, analysis, coding, platform, and accounting services | Perform bounded tasks through validated tools and human-gated execution |
+
+> **Legacy removed (v2.1.77):** the old central "CEO Manager" (`ManagerThread`) +
+> `SummarizerThread` + their worker-dispatch loop have been **fully removed**. The
+> N-device peer council in Dialogue + the Chat tab are the decision/chat authority;
+> `EarningPipeline`/`AutonomousLoop` drive earning. See
+> [`docs/LEGACY_AUDIT.md`](docs/LEGACY_AUDIT.md) for the full removal record.
 
 ## Security
 
@@ -497,7 +505,10 @@ it is not a separate visible tab.
 
 - **Agent.md** — Runtime contract for any model interacting with the system
 - **README.md** (this file) — Current system overview, tab inventory, and configuration guide
-- **CHANGELOG.md** — Full change history (current release v2.1.48)
+- **CHANGELOG.md** — Full change history (current release v2.1.77)
+- **docs/codemap/** — Full function-level codebase map (every file, every function)
+- **docs/LEGACY_AUDIT.md** — Status of the retired central-Manager / worker-team architecture
+- **ARCHITECTURE_MAP.md** — Subsystem map, dependency assessment, consolidation plan
 
 ## Requirements
 

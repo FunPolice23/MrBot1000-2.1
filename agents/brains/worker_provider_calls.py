@@ -126,8 +126,8 @@ class WorkerProviderCallsMixin:
             # emitted only thinking (answer empty), fall back to the thinking so
             # callers still receive coherent text instead of an empty string —
             # but the budget fix above makes answer-empty rare. Emitting raw
-            # thinking as "the answer" is exactly what produced the
-            # "ACTION[JobSearch]: ? No wait per instruction…" garbage decisions.
+            # thinking as "the answer" produces malformed "ACTION[...]" garbage
+            # instead of a real reply.
             if answer:
                 return answer
             if thinking:

@@ -147,3 +147,6 @@ _lead_prompt_short.txt
 
 # Temporary scratch
 tmp/
+
+# Personal codebase-map generator (local tooling, not for the mirror)
+tools/gen_codemap.py

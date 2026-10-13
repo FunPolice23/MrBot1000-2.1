@@ -199,7 +199,7 @@ def get_all_tools() -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         "sql": {"type": "string", "description": "SELECT-only SQL query"},
-                        "db": {"type": "string", "description": "Store name: agent (default) | earning | memory | portfolio | autonomous_runs | goals | job_search | dual_brain"},
+                        "db": {"type": "string", "description": "Store name: agent (default) | earning | memory | portfolio | autonomous_runs | goals | dual_brain"},
                         "limit": {"type": "integer", "description": "Max rows (default 50, max 500)"}
                     },
                     "required": ["sql"]

@@ -1,12 +1,12 @@
 import unittest
 from pathlib import Path
 
-from agents.safety.tool_safety import command_argv, resolve_command_cwd, resolve_project_path
+from agents.safety.policy import command_argv, resolve_command_cwd, resolve_project_path
 
 
 class TestToolSafety(unittest.TestCase):
     def test_relative_paths_stay_inside_project(self):
-        resolved = resolve_project_path("agents/safety/tool_safety.py")
+        resolved = resolve_project_path("agents/safety/policy.py")
         self.assertTrue(resolved.is_file())
         self.assertEqual(resolved, resolve_project_path(str(resolved)))
 

@@ -40,10 +40,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QAbstractItemView
 
-from app.ui import (  # GUI sprite + Agents tab widget used by create_agents_tab
-    AgentSprite,
-    AgentsTab,
-)
 from gui.builders.tab_lifecycle import TabLifecycleMixin
 
 

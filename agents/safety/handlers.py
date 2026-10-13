@@ -12,12 +12,48 @@ from agents.safety.calling import (
 )
 
 
+def _announce_agent_web(url: str, context: str, extra: dict | None = None) -> None:
+    """Mirror an agent web action into the Web Browser tab (ARCH-ENG-105).
+
+    Best-effort and never raises: if the GUI nav bus / Qt is unavailable (e.g.
+    headless tests) this is a no-op and the agent's text path is unaffected.
+    """
+    try:
+        from gui.widgets.web_nav_bus import (
+            announce_web_navigation, announce_web_activity)
+        if url:
+            announce_web_navigation(url, context)
+        if extra:
+            announce_web_activity(extra)
+    except Exception:
+        pass
+
+
 def _tool_web_search(args: Dict[str, Any]) -> str:
     """Search the web."""
     try:
         from agents.integrations.web_eyes import get_web_eyes
         eyes = get_web_eyes()
-        results = eyes.search(args["query"], int(args.get("limit", 5)))
+        query = args.get("query", "")
+        results = eyes.search(query, int(args.get("limit", 5)))
+        # Surface the search in the Web Browser tab: navigate to the top hit
+        # (if any) and log the query + result URLs.
+        top_url = ""
+        try:
+            for r in results:
+                u = (r or {}).get("url") or ""
+                if u.startswith("http"):
+                    top_url = u
+                    break
+        except Exception:
+            pass
+        _announce_agent_web(top_url, "agent web_search", {
+            "kind": "search", "query": query,
+            "results": [
+                {"title": (r or {}).get("title", ""), "url": (r or {}).get("url", "")}
+                for r in (results or [])[:5]
+            ],
+        })
         return eyes.format_search_results(results)
     except Exception as e:
         return f"[Search error: {e}]"
@@ -67,6 +103,8 @@ def _tool_web_read(args: Dict[str, Any]) -> str:
             }, indent=2)
         from agents.integrations.web_eyes import get_web_eyes
         eyes = get_web_eyes()
+        # Surface the read in the Web Browser tab (real page load) — ARCH-ENG-105.
+        _announce_agent_web(url, "agent web_read", {"kind": "read", "url": url})
         page = eyes.read_page(url)
         return eyes.format_page_summary(page)
     except Exception as e:
@@ -434,7 +472,7 @@ def _tool_query_db(args: Dict[str, Any]) -> str:
     """Run a read-only SQL query against an allowlisted store (default agent.db).
 
     Phase D (ARCH-ENG-083): optional ``db`` arg names a canonical store
-    (agent|earning|memory|portfolio|autonomous_runs|goals|job_search|dual_brain);
+    (agent|earning|memory|portfolio|autonomous_runs|goals|dual_brain);
     unknown names are rejected and the query is always SELECT-only
     (execute_readonly_query + the gate's SQL validation).
     """
