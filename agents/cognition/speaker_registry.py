@@ -236,9 +236,12 @@ def build_team_brief(speakers: List[Speaker], self_speaker: Optional[Speaker],
         "thoughts and any tool-call results. Read them, then add YOUR OWN "
         "perspective — agree, refine, push back, or call your own tool. Do not "
         "just echo them; do not wait for permission. Speak as "
-        f"{self_speaker.name} in first person. Converge on ONE concrete next "
-        "action; if you have no new evidence, say so plainly (UNKNOWN/BLOCKED) "
-        "instead of inventing agreement."
+        f"{self_speaker.name} in first person. "
+        "When the OPPORTUNITY BOARD is present, do NOT just pick the first row: "
+        "name the full ranked list, argue the candidates best->worst with your "
+        "reasoning, then converge on ONE concrete next action. If you have no "
+        "new evidence, say so plainly (UNKNOWN/BLOCKED) instead of inventing "
+        "agreement."
     )
     return "\n".join(lines) + "\n\n"
 

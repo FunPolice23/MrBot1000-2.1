@@ -20,6 +20,113 @@ except ImportError:  # pragma: no cover - optional dependency fallback
     BeautifulSoup = None
 
 
+# A `$` figure a listing STATES as the payout IT offers. ARCH-ENG-123/123b.
+#
+# The Reddit producers previously wrote a hardcoded `min_amount=1.0`, which
+# invented a $1 payout for every post that stated no amount — and because
+# `validate_opportunity` sets `payment_present = advertised_amount > 0`, the
+# invented dollar is what made an unpayable listing structurally VALID and let
+# it flow into ranking, intelligence scoring and the autonomous loop.
+#
+# The first cut of the fix replaced that with a bare first-`$` regex, and the
+# reviewer caught that this REOPENED the ARCH-ENG-120 defect in a new place:
+# r/CryptoCurrency reads crypto news, where the first `$` is usually a coin's
+# market price. Measured on that first cut:
+#     "BTC is at $67,500 today. Join the airdrop, gas only." -> 67500.0
+#     "Startup kit costs $250 to join. No wage stated."      -> 250.0  (a COST)
+#     "We raised $250,000,000 for victims"                   -> 2.5e8
+# all of which cross the `payment > 100.0` financial-exposure threshold in
+# autonomous_loop._stage_request_approval as if a stranger had offered a prize.
+#
+# So a figure is booked ONLY when the text attributes it to a payout, and only
+# within a plausible magnitude — the same rule ARCH-ENG-120 imposed on the
+# airdrop scanner, in the vocabulary of job prose instead of crypto news.
+_STATED_USD_RE = re.compile(r"\$\s*([\d,]+(?:\.\d{1,2})?)")
+
+# The figure prices something OTHER than this listing's payout.
+_PRICE_CONTEXT_CUES = (
+    "at $", "holds at", "hold at", "trades at", "trade at", "trading at",
+    "traded at", "price of", "priced at", "prices at", "sits at", "sitting at",
+    "market cap", "down to", "up to $", "above", "below", "near $", "from $",
+    "rises to", "rose to", "climbs to", "climbed to", "surges to", "surged to",
+    "falls to", "fell to", "drops to", "dropped to", "slips to", "slipped to",
+    "snapshot", "per token", "/token", "in volume", "did $",
+)
+# The figure is money the WORKER pays, or money moving for some other reason.
+_COST_CONTEXT_CUES = (
+    "costs", "cost ", "costing", "entry fee", "fee is", "fees are", "fee of",
+    "you pay", "we charge", "charges", "deposit of", "gas", "spend", "spent",
+    "spending", "raised", "raise ", "funding round", "reimbursement",
+    "coupon", "voucher", "discount", "sale price", "listed at", "worth of",
+)
+# A coin named as the subject means the figure prices the coin.
+_MARKET_SUBJECT_RE = re.compile(
+    r"\b(btc|bitcoin|eth|ethereum|sol|solana|doge|ada|xrp|market|coin|token price)s?\b"
+)
+# The text attributes the figure to what this listing pays. Checked both
+# BEFORE the figure and in a short window AFTER it, because job prose puts the
+# cue on either side ("pays $1,500" / "$25 reward for the survey").
+_PAYOUT_CUES = (
+    "pay", "pays", "paying", "paid", "payment", "budget", "rate", "salary",
+    "compensation", "compensat", "wage", "reward", "bounty", "prize", "stipend",
+    "honorarium", "worth", "valued at", "value of", "earn", "earning", "income",
+    "up to", "from $", "starting at", "offering", "offer", "we are paying",
+    "hourly", "per hour", "per article", "per post", "per task", "per week",
+    "fixed price", "on merge", "for this", "for the best", "for completing",
+    "/hr", "/hour", "/wk", "/week", "/mo", "/month", "/yr", "/year", "p/a",
+)
+# How far back from the `$` a cue may sit, and how far forward.
+_CUE_WINDOW_CHARS = 45
+_FORWARD_WINDOW_CHARS = 32
+# A market subject must be this close to the figure to mean "the figure prices
+# the coin"; a payout verb in between ("ETH stakers claim $500") keeps it a
+# payout. Mirrors airdrop_scanner.COIN_ADJACENCY_CHARS.
+_COIN_ADJACENCY_CHARS = 20
+# Plausible magnitude for a payout a Reddit post would state. Same ceiling the
+# sibling GitHub-bounty producer uses (`MAX_BOUNTY_USD`) so the two do not
+# disagree about what an implausible figure is; the floor rejects sub-dollar
+# noise like "$0.50".
+_MIN_STATED_USD = 1.0
+_MAX_STATED_USD = 100_000.0
+
+
+def _stated_usd(text: str) -> float:
+    """USD figure the listing attributes to its own payout, else 0.0.
+
+    0.0 means UNKNOWN — never a guess. Per the financial-truth rule used by
+    v2.1.68/93/94: an amount a listing never attributed to a payout is unknown,
+    and a producer that cannot establish one must emit 0.0 rather than a
+    default. The magnitude window is the last line of defence: even a
+    well-attributed figure outside it is treated as a mis-parse, not a prize.
+    """
+    text = text or ""
+    for match in _STATED_USD_RE.finditer(text):
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if not (_MIN_STATED_USD <= value <= _MAX_STATED_USD):
+            continue  # implausible as a posted payout; treat as a mis-parse
+        before = text[max(0, match.start() - _CUE_WINDOW_CHARS):match.start()].lower()
+        near = before[-25:]
+        after = text[match.end():match.end() + _FORWARD_WINDOW_CHARS].lower()
+        if any(cue in near for cue in _PRICE_CONTEXT_CUES):
+            continue  # the figure quotes a price
+        if any(cue in near for cue in _COST_CONTEXT_CUES):
+            continue  # the figure is money the worker pays
+        for coin in _MARKET_SUBJECT_RE.finditer(before):
+            gap = before[coin.end():]
+            if (len(gap) <= _COIN_ADJACENCY_CHARS
+                    and not any(cue in gap for cue in _PAYOUT_CUES)):
+                break  # "...Bitcoin $95,000" prices the coin
+        else:
+            if any(cue in before for cue in _PAYOUT_CUES):
+                return value
+            if any(cue in after for cue in _PAYOUT_CUES):
+                return value
+    return 0.0
+
+
 @dataclass
 class EarningOpportunity:
     """A generic earning opportunity discovered from the web."""
@@ -124,18 +231,39 @@ class EarningDiscoverer:
             if data is None:
                 data = self._reddit_rss("https://www.reddit.com/r/WorkOnline/.rss")
             if data is not None:
-                for post in data.get("data", {}).get("children", []):
-                    post_data = post.get("data", {})
-                    title = post_data.get("title", "").lower()
-                    if any(kw in title for kw in ["earn", "make money", "gig", "freelance", "cash"]):
-                        opps.append(EarningOpportunity(
-                            id=f"reddit_{post_data.get('id')}",
-                            title=post_data.get("title", "Work Opportunity"),
-                            description=post_data.get("selftext", "")[:500],
-                            platform="Reddit r/WorkOnline",
-                            url=post_data.get("url", ""), payment_type="usd",
-                            min_amount=1.0, required_action="apply",
-                        ))
+             for post in data.get("data", {}).get("children", []):
+                 post_data = post.get("data", {})
+                 title = post_data.get("title", "")
+                 if any(kw in title.lower() for kw in ["earn", "make money", "gig", "freelance", "cash"]):
+                     # Parse a real amount from the post; 0.0 = not stated,
+                     # NEVER a default.
+                     #
+                     # ARCH-ENG-123: this was a hardcoded `min_amount=1.0` on
+                     # both Reddit paths — a fabricated $1 payout on listings
+                     # that stated no amount at all. Measured end-to-end
+                     # through DynamicSource._discover on a post with no `$`
+                     # anywhere: `min_amount=1.0` ->
+                     # canonical advertised_amount=1.0,
+                     # estimated_net_value=1.0, and
+                     # `validate_opportunity -> status=valid, reasons=[]`
+                     # because `payment_present = advertised_amount > 0`. The
+                     # invented $1 is what made an unpayable listing
+                     # structurally VALID, so it flowed on into ranking, the
+                     # opportunity-intelligence score, and the autonomous
+                     # loop's economics/financial-exposure stages. Same
+                     # financial-truth violation as ARCH-ENG-118/119 (v2.1.93)
+                     # and the LinkedIn/WeWorkRemotely fix (v2.1.68) — that
+                     # one pair of Reddit producers was left behind, and
+                     # "dynamic" is in the default source rotation.
+                     opps.append(EarningOpportunity(
+                         id=f"reddit_{post_data.get('id')}",
+                         title=title or "Work Opportunity",
+                         description=post_data.get("selftext", "")[:500],
+                         platform="Reddit r/WorkOnline",
+                         url=post_data.get("url", ""), payment_type="usd",
+                         min_amount=_stated_usd(f"{title} {post_data.get('selftext', '')}"),
+                         required_action="apply",
+                     ))
 
             crypto_url = ("https://www.reddit.com/r/CryptoCurrency/new/.json"
                           f"?limit=100&page={self.page}")
@@ -145,15 +273,20 @@ class EarningDiscoverer:
             if data is not None:
                 for post in data.get("data", {}).get("children", []):
                     post_data = post.get("data", {})
-                    title = post_data.get("title", "").lower()
-                    if any(kw in title for kw in ["airdrop", "faucet", "reward", "earn", "free"]):
+                    title = post_data.get("title", "")
+                    if any(kw in title.lower() for kw in ["airdrop", "faucet", "reward", "earn", "free"]):
+                        # Same rule as r/WorkOnline above: the amount a crypto
+                        # post actually states, or 0.0. The hardcoded 1.0 here
+                        # invented a $1 payout (and, for a post quoting a coin's
+                        # market price, made a PRICE into a payout).
                         opps.append(EarningOpportunity(
                             id=f"cryptoreddit_{post_data.get('id')}",
-                            title=post_data.get("title", "Crypto Reward"),
+                            title=title or "Crypto Reward",
                             description=post_data.get("selftext", "")[:500],
                             platform="Reddit r/CryptoCurrency",
                             url=post_data.get("url", ""), payment_type="crypto",
-                            min_amount=1.0, required_action="claim", risk_level="medium",
+                            min_amount=_stated_usd(f"{title} {post_data.get('selftext', '')}"),
+                            required_action="claim", risk_level="medium",
                         ))
         except Exception as e:
             print(f"  Reddit error: {e}")
@@ -280,12 +413,24 @@ class EarningDiscoverer:
 
                 body = (issue.get("body", "") or "")[:300]
 
-                match = re.search(r'\$(\d+(?:\.\d+)?)', body + title)
-                bounty = float(match.group(1)) if match else 10.0
+                match = re.search(r'\$([\d,]+(?:\.\d{1,2})?)', body + title)
+                bounty = 0.0
+                if match:
+                    try:
+                        bounty = float(match.group(1).replace(",", ""))
+                    except ValueError:
+                        bounty = 0.0
                 # Guard against absurd parses ("$239398281948585883* bounty"):
-                # treat an implausible figure as unknown rather than a real prize.
+                # treat an implausible figure as UNKNOWN, never as a real prize.
+                #
+                # ARCH-ENG-119: both fallbacks here wrote a hardcoded `10.0`.
+                # The comment says "unknown" but the code asserted a $10 prize
+                # the issue never offered — the same financial-truth violation
+                # as ARCH-ENG-118, on the path that feeds the canonical bounty
+                # board (advertised_amount/estimated_net_value, and therefore
+                # validation, ranking, and the autonomous loop's economics).
                 if not (1.0 <= bounty <= self.MAX_BOUNTY_USD):
-                    bounty = 10.0
+                    bounty = 0.0
 
                 seen_titles.add(title_key)
                 per_repo[repo_name] = per_repo.get(repo_name, 0) + 1

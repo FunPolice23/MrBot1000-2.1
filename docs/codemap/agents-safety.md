@@ -243,8 +243,10 @@
 - `_tool_file_read(args: Dict[str, Any]) -> str` (L221) — Read a file.
 - `_tool_file_write(args: Dict[str, Any], authorization=...) -> str` (L232) — Write a file.
 - `_tool_file_list(args: Dict[str, Any]) -> str` (L247) — List directory.
-- `set_lifecycle_tracker(tracker) -> None` (L265) — Inject the OpportunityLifecycleTracker for the record_payment tool.
-- `_tool_record_payment(args: Dict[str, Any], authorization=...) -> str` (L271) — Record a verified payment against an opportunity (HIGH_TRUST).
+- `set_lifecycle_tracker(tracker) -> None` (L304) — Inject the OpportunityLifecycleTracker for the record_payment tool.
+- `_evidence_meets_l3(ev) -> bool` (L310) — ARCH-ENG-121: true only for a real `Evidence` carrying its own affirmative status AND verification_level >= L3_EXTERNAL_SOURCE. A dict (including a serialized `Evidence.to_dict()`) is refused because it is agent-supplied.
+- `_evidence_detail(ev) -> str` — Never-raising description of supplied evidence for refusal messages.
+- `_tool_record_payment(args: Dict[str, Any], authorization=...) -> str` (L371) — Record a verified payment against an opportunity (HIGH_TRUST). ARCH-ENG-121: fails closed unless `evidence_ref` resolves in the authoritative EvidenceStore to a stored record meeting the L3 floor for THIS opportunity. An approval authorizes the action, not the amount or its verification.
 - `set_social_writer(writer) -> None` (L331) — Inject a callable(post_payload) -> result for confirmed write endpoints.
 - `_tool_social_post(args: Dict[str, Any], authorization=...) -> str` (L341) — Post content to a social/agent network (HIGH-TRUST, approval-gated).
 - `_tool_run_command(args: Dict[str, Any], authorization=...) -> str` (L386) — Run a shell command.

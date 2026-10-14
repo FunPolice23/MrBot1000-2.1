@@ -41,6 +41,7 @@ class BigBrainAdapter:
         _cfg = DualBrainRuntime.from_env().config(BrainRole.BIG)
         legacy_url = os.getenv("BIG_BRAIN_URL") if _cfg.provider == "llamacpp" else ""
         self.base_url = base_url or legacy_url or _cfg.endpoint
+        self.provider = _cfg.provider
         self.device = _cfg.device
         self.context_length = _cfg.context
         
@@ -95,8 +96,14 @@ class BigBrainAdapter:
         connect_timeout = max(2.0, float(
             os.getenv("LOCAL_LLM_CONNECT_TIMEOUT_SECONDS", "30")))
         from agents.providers.openai_compatible import _build_provider_timeout
+        from agents.runtime.provider_keys import resolve_provider_api_key
+        # Phase 1: local providers keep the "local" sentinel (unchanged); cloud
+        # providers resolve a real key from the encrypted vault /
+        # PROVIDER_API_KEY_* / BIG_API_KEY, or "" (fail-closed) so a paid
+        # endpoint is never sent the "local" sentinel.
+        api_key = resolve_provider_api_key(getattr(self, "provider", "llamacpp"), "BIG")
         return openai.OpenAI(
-            api_key="local", base_url=self.base_url,
+            api_key=api_key, base_url=self.base_url,
             timeout=_build_provider_timeout(openai, read=read_timeout,
                                             connect=connect_timeout),
         )
@@ -158,32 +165,45 @@ class BigBrainAdapter:
     def _hardware_line(self) -> str:
         """One line describing the device this brain runs on (N-brain).
 
-        Prefers the live device registry (source of truth for detected hardware)
-        so the prompt reflects the ACTUAL card, never a hardcoded name; falls
-        back to the runtime config's gpu_label. Empty string when unknown.
+        The device registry is the source of truth. A label is only asserted to
+        the model when detection actually CONFIRMED a device — the prompt must
+        never state hardware as fact on the strength of a config default.
+
+        ARCH-ENG-115: this used to fall back to ``cfg.gpu_label`` when detection
+        came back empty. That default is the literal placeholder
+        ``"GPU 0 (detected hardware)"`` (``ROLE_DEFAULTS``), so whenever
+        ``nvidia-smi`` returned nothing — a transient driver hiccup, or the
+        subprocess timing out under load — the brain was told it runs on a
+        specific GPU that had not been detected at all. The prompt asserted
+        unverified hardware to the model, and it also made
+        ``tests/runtime/test_brain_prompt_hardware.py`` flaky: detection
+        intermittently yields CPU-only, the prompt still claims "GPU 0", and the
+        test's "names a real detected device" assertion fails ~50% of runs.
+
+        Now: no confirmed device -> no hardware claim. Omitting the section is
+        strictly better than stating a false one.
         """
         try:
             from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
             from agents.runtime import device_registry as dr
             cfg = DualBrainRuntime.from_env().config(BrainRole.BIG)
-            label = (cfg.gpu_label or "").strip()
             try:
                 devices = dr.detect_devices(include_cpu=True)
+                dev = None
                 if cfg.device_id:
                     dev = next((d for d in devices if d.id == cfg.device_id), None)
-                    if dev is not None:
-                        label = dev.label()
                 elif cfg.gpu_layers == 0:
-                    cpu = next((d for d in devices if d.is_cpu), None)
-                    if cpu is not None:
-                        label = cpu.label()
+                    dev = next((d for d in devices if d.is_cpu), None)
                 elif 0 <= cfg.device < 64:
-                    gpu = next((d for d in devices
+                    dev = next((d for d in devices
                                 if d.is_gpu and d.index == cfg.device), None)
-                    if gpu is not None:
-                        label = gpu.label()
+                if dev is None:
+                    # Detection did not confirm this brain's device. Say nothing
+                    # rather than repeat an unverified placeholder as fact.
+                    return ""
+                label = dev.label()
             except Exception:
-                pass
+                return ""
             if not label:
                 return ""
             return (f"You run on {label}. You are the larger-capacity brain; "

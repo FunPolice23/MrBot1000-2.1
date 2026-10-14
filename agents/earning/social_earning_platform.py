@@ -143,9 +143,33 @@ class SocialEarningPlatform:
                               for x in ['pay', '$', 'usd', 'budget', 'rate']):
                         continue
                     
-                    # Estimate payment
-                    dollar_match = re.search(r'\$(\d+)', title + desc)
-                    pay_amount = float(dollar_match.group(1)) if dollar_match else 50.0
+                    # Parse a real amount from the listing ("$50", "$1,500",
+                    # "$80,000 - $95,000"); 0 = not stated, NEVER a default.
+                    #
+                    # ARCH-ENG-118: this fell back to a hardcoded `50.0` whenever
+                    # no `$` figure appeared, and the regex `\$(\d+)` truncated
+                    # "$1,500" to "1". Measured: a listing stating no amount at
+                    # all was emitted with min_amount=50.0, and a $1,500 project
+                    # was emitted with min_amount=1.0. Both are fabricated
+                    # revenue at the producer — the same financial-truth
+                    # violation fixed for LinkedIn (v2.1.68) and WeWorkRemotely,
+                    # which use the comma-aware regex below. Reddit is the only
+                    # social source that actually returns entries (LinkedIn's
+                    # public feed is empty, forums and Twitter fail closed), so
+                    # this was the live fabrication site.
+                    #
+                    # The fabricated 50.0 was also what made an unpayable
+                    # listing structurally VALID: `validate_opportunity` sets
+                    # `payment_present = advertised_amount > 0`, so a post that
+                    # stated no pay passed validation with no reasons and flowed
+                    # into ranking, scoring, and the autonomous loop's economics.
+                    dollar_match = re.search(r"\$\s*([\d,]+)(?:\.\d{2})?", title + desc)
+                    pay_amount = 0.0
+                    if dollar_match:
+                        try:
+                            pay_amount = float(dollar_match.group(1).replace(",", ""))
+                        except ValueError:
+                            pay_amount = 0.0
                     
                     opps.append(SocialOpportunity(
                         # Stable id: `hash()` is salted per process, so the same

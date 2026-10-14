@@ -11,9 +11,49 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agents.safety.policy import command_argv, resolve_command_cwd, resolve_project_path
+from agents.safety.handlers import _is_secret_file
 
 # Project root
 PROJECT_ROOT = resolve_project_path(".")
+
+# ARCH-ENG-133: `read_file`/`write_file`/`run_command` here are reached through
+# the Big Brain tool loop, where SafetyGate classifies `read_file` as an ALIAS of
+# `file_read` (READONLY => ALLOWED) and dispatches to execute_tool — i.e. to the
+# handlers in THIS module, not to the hardened `_tool_file_read` in handlers.py.
+# The private readers below therefore have to re-apply the same two layers the
+# hardened path applies, using the SAME authority (`_is_secret_file`) so there is
+# one blocklist, not two that can drift:
+#   1. SECRET FILES are refused outright (the value IS the whole file).
+#   2. every other file's content passes through `redact_secrets`, so a secret
+#      pasted into a readable file (README, notes) is scrubbed before it enters
+#      model context.
+# `write_file`/`run_command` are already NEEDS_APPROVAL in the gate; refusing a
+# secret path here as well is defence in depth and returns a refusal string
+# (never raises) so the model gets a usable tool result.
+
+_SECRET_READ_REFUSAL = (
+    " is a credential/key store and is never returned to the model. "
+    "Read .env.example for the key names, and ask the operator for any "
+    "value."
+)
+
+
+def _redact(text: str) -> str:
+    """Layer 2: scrub secret-shaped substrings before model context."""
+    from agents.integrations.wallet_crypto import redact_secrets
+    return redact_secrets(text)
+
+
+def _is_secret_path(path: str) -> bool:
+    """True when the resolved path names a credential/key store."""
+    try:
+        return _is_secret_file(resolve_project_path(path, allow_missing=True))
+    except (ValueError, OSError):
+        # Outside the workspace (or unresolvable): treat the NAME as the signal.
+        try:
+            return _is_secret_file(Path(str(path)))
+        except Exception:
+            return False
 
 
 def _read_file(path: str) -> str:
@@ -23,7 +63,9 @@ def _read_file(path: str) -> str:
         return f"[File not found: {path}]"
     except ValueError as e:
         return f"[Read error: {e}]"
-    return p.read_text(encoding="utf-8", errors="replace")
+    if _is_secret_file(p):
+        return f"[Read refused: {path}{_SECRET_READ_REFUSAL}]"
+    return _redact(p.read_text(encoding="utf-8", errors="replace"))
 
 
 def _write_file(path: str, content: str) -> str:
@@ -31,6 +73,12 @@ def _write_file(path: str, content: str) -> str:
         p = resolve_project_path(path, allow_missing=True)
     except ValueError as e:
         return f"[Write error: {e}]"
+    if _is_secret_file(p):
+        return (
+            f"[Write refused: {path} is a credential/key store and is never "
+            "written by the model. Edit it only via explicit operator action; "
+            "read .env.example for the key names.]"
+        )
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"[Wrote {p}]"
@@ -45,8 +93,24 @@ def _list_dir(path: str) -> List[str]:
 
 
 def _run_command(cmd: str, cwd: Optional[str] = None) -> str:
+    # ARCH-ENG-133 defence in depth: the gate already queues run_command for
+    # approval, but a command that NAMES a secret store (type .env, cat
+    # wallet.key, ...) must never execute even behind an approval — the file
+    # contents would land in model context either way. Refusal string, no raise.
     try:
         argv = command_argv(cmd)
+    except ValueError as e:
+        # Same message the pre-fix code produced for unparseable commands.
+        return f"[Command error: {e}]"
+    for token in argv:
+        name = Path(token).name
+        if name and _is_secret_file(Path(name)):
+            return (
+                f"[Command refused: the command names a credential/key store "
+                f"('{token}'). Read .env.example for the key names and ask the "
+                "operator for any value.]"
+            )
+    try:
         safe_cwd = resolve_command_cwd(cwd)
         result = subprocess.run(
             argv,
@@ -197,9 +261,15 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
                 lines.append(f"- {item.get('title','')}: {item.get('url','')}")
             return "\n".join(lines) if lines else "[No results]"
         elif name == "analyze_document":
-            content = _read_file(arguments["path"])
+            # ARCH-ENG-133: analyze_document reads through the same private
+            # reader, so a secret path would be dumped into model context inside
+            # the analysis block. Refuse before reading anything.
+            doc_path = arguments["path"]
+            if _is_secret_path(doc_path):
+                return f"[Analysis refused: {doc_path}{_SECRET_READ_REFUSAL}]"
+            content = _read_file(doc_path)
             # Simple analysis - return first 2000 chars as summary
-            return f"[Analysis of {arguments['path']}]\n\n{content[:2000]}..."
+            return f"[Analysis of {doc_path}]\n\n{content[:2000]}..."
         elif name == "query_database":
             from agents.safety.sql import execute_readonly_query
             db_path = str(PROJECT_ROOT / "agent.db")

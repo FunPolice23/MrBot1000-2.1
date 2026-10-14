@@ -63,10 +63,30 @@ PROVIDER_OLLAMA = "ollama"
 PROVIDER_LMSTUDIO = "lmstudio"
 PROVIDER_VLLM = "vllm"
 PROVIDER_KOBOLDCPP = "koboldcpp"
-SUPPORTED_PROVIDERS = {
+
+# Cloud providers (all OpenAI-compatible). A real API key is resolved at
+# client-build time via provider_keys.resolve_provider_api_key (encrypted vault
+# -> PROVIDER_API_KEY_<PROVIDER> env -> <ROLE>_API_KEY env -> fail-closed ""); it
+# is never stored in config. Each maps to a default OpenAI-compatible base URL,
+# overridable with <PROVIDER>_BASE_URL (e.g. OPENAI_BASE_URL) or the per-role
+# BIG_BRAIN_URL / SMALL_BRAIN_URL.
+PROVIDER_OPENAI = "openai"
+PROVIDER_NVIDIA_NIM = "nvidia_nim"
+PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_GROQ = "groq"
+PROVIDER_TOGETHER = "together"
+CLOUD_PROVIDER_DEFAULT_ENDPOINTS = {
+    PROVIDER_OPENAI: "https://api.openai.com/v1",
+    PROVIDER_NVIDIA_NIM: "https://integrate.api.nvidia.com/v1",
+    PROVIDER_OPENROUTER: "https://openrouter.ai/api/v1",
+    PROVIDER_GROQ: "https://api.groq.com/openai/v1",
+    PROVIDER_TOGETHER: "https://api.together.xyz/v1",
+}
+LOCAL_PROVIDERS = {
     PROVIDER_LLAMACPP, PROVIDER_OLLAMA, PROVIDER_LMSTUDIO, PROVIDER_VLLM,
     PROVIDER_KOBOLDCPP,
 }
+SUPPORTED_PROVIDERS = LOCAL_PROVIDERS | set(CLOUD_PROVIDER_DEFAULT_ENDPOINTS)
 
 # llama-server binary (v2.1 fix). The WindowsApps `llama.exe` (MSVC 0.3.0 build)
 # has NO CUDA kernel for sm_75 (GTX 1660 Super), so `--device CUDA1` crashes on
@@ -668,6 +688,12 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
     elif provider == PROVIDER_KOBOLDCPP:
         provider_endpoint = e.get("KOBOLDCPP_BASE_URL", "").strip().rstrip("/")
         endpoint_default = provider_endpoint or "http://127.0.0.1:5001/v1"
+    elif provider in CLOUD_PROVIDER_DEFAULT_ENDPOINTS:
+        # Cloud: default OpenAI-compatible endpoint, overridable with
+        # <PROVIDER>_BASE_URL (e.g. OPENAI_BASE_URL). The API key is resolved
+        # separately at client-build time (provider_keys), never stored here.
+        provider_endpoint = e.get(f"{provider.upper()}_BASE_URL", "").strip().rstrip("/")
+        endpoint_default = provider_endpoint or CLOUD_PROVIDER_DEFAULT_ENDPOINTS[provider]
     gpu_raw = _g("GPU_LAYERS", "")
     gpu_layers: Optional[int] = None
     if gpu_raw:

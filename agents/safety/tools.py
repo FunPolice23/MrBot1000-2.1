@@ -210,7 +210,22 @@ def get_all_tools() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "record_payment",
-                "description": "Record a verified payment against an opportunity. HIGH-TRUST: requires an approved approval_id; never invents an amount.",
+                "description": (
+                    "Record a verified payment against an opportunity. "
+                    "HIGH-TRUST: requires an approved approval_id; never invents an amount. "
+                    "NOTE (ARCH-ENG-121): an approval authorizes the ACTION, not the amount "
+                    "or its verification. This tool REFUSES unless `evidence_ref` resolves, "
+                    "in the authoritative EvidenceStore, to a stored record with an "
+                    "affirmative status and verification_level >= L3_EXTERNAL_SOURCE for "
+                    "THIS opportunity. It does not accept an agent assertion, a bare "
+                    "reference, or a hand-built dict. Do not claim a payment you cannot "
+                    "back with stored independent evidence; book unverified amounts elsewhere. "
+                    "NOTE (ARCH-ENG-129): the approval_id must name an APPROVED approval "
+                    "recorded for record_payment with THESE arguments. An approval for a "
+                    "different tool, or for a different amount/opportunity, is refused — "
+                    "an approval authorizes one action, not a capability. Do not reuse an "
+                    "approval id from a different request."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -227,7 +242,7 @@ def get_all_tools() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "social_post",
-                "description": "Post content to a social/agent network. HIGH-TRUST: requires an approved approval_id and a confirmed write endpoint; never fabricates a post.",
+                "description": "Post content to a social/agent network. HIGH-TRUST: requires an approved approval_id and a confirmed write endpoint; never fabricates a post. NOTE (ARCH-ENG-129): the approval_id must name an APPROVED approval recorded for social_post with THIS content — an approval for different content, or for a different tool, is refused (an approval authorizes one action, not a capability).",
                 "parameters": {
                     "type": "object",
                     "properties": {

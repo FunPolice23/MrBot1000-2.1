@@ -30,13 +30,40 @@ def evaluate_opportunity(
             except (TypeError, ValueError):
                 return float(default)
 
+        def to_unit(value: Any, default: float) -> float:
+            """A 0..1 score, accepting the model answering on a 0..10 scale.
+
+            ARCH-ENG-124: the prompt below asks for every axis on a 0-10 scale,
+            but every consumer of `skill_match` and `effort` treats them as 0..1
+            (`SemanticEstimate.skill_fit`/`difficulty`, `min(1.0, ...)` clamps,
+            the `/(effort_score + 0.1)` ranking divisor, and the engine's
+            `p_complete = 1 - 0.6*difficulty`). Measured before this
+            normalization: a model answering honestly with skill_match=7.0
+            saturated `p_acceptance` to 1.000 and effort=5.0 drove
+            `p_completion` to its 0.01 floor, collapsing a $2,500 opportunity to
+            `marginal` — the model's own scale was silently breaking the
+            probability model in BOTH directions. Dividing by 10 when the value
+            exceeds 1.0 makes a 0..10 answer mean what the code expects while
+            leaving an already-0..1 answer untouched.
+
+            `risk` is deliberately NOT normalized: its thresholds (>=7 high,
+            >=4 medium) are written for the 0-10 scale the prompt asks for.
+            """
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                return float(default)
+            if v > 1.0:
+                v = v / 10.0
+            return max(0.0, min(1.0, v))
+
         return {
             "profit": to_float(raw_scores.get("profit", 0.0), 0.0),
-            "effort": to_float(raw_scores.get("effort", 0.5), 0.5),
+            "effort": to_unit(raw_scores.get("effort", 0.5), 0.5),
             "risk": to_float(raw_scores.get("risk", 5.0), 5.0),
             "urgency": to_float(raw_scores.get("urgency", 0.0), 0.0),
-            "skill_match": to_float(raw_scores.get("skill_match", 0.5), 0.5),
-            "scam_prob": to_float(raw_scores.get("scam_prob", 0.0), 0.0),
+            "skill_match": to_unit(raw_scores.get("skill_match", 0.5), 0.5),
+            "scam_prob": to_unit(raw_scores.get("scam_prob", 0.0), 0.0),
         }
 
     def extract_scores(content: str):
@@ -118,6 +145,19 @@ def evaluate_opportunity(
         )
         opportunity.urgency = scores.get("urgency", 0.0)
         opportunity.status = "evaluated"
+        # ARCH-ENG-126: the model's scam assessment was COMPUTED and then
+        # DISCARDED. `normalize_scores` produced `scam_prob`, and the only use
+        # of it was `if scam_prob > 0.7: risk_level = "high"` — a coarse 0.7
+        # cliff that threw the number away. `opportunity.scam_prob` was never
+        # assigned (verified: `hasattr(o, "scam_prob")` was False after a
+        # successful evaluation), so `intelligence.evaluate_intelligence` —
+        # which reads exactly that attribute — always saw 0.0 and reported
+        # `reasons["scam_risk"] = "low"` for an opportunity the model had
+        # scored 0.95. The engine's `scam >= 0.6 -> unsafe` gate was therefore
+        # unreachable from the LLM path; only the risk_level cliff survived,
+        # and it set "high" which the engine treats as unsafe for an unrelated
+        # reason (`risk_levels_unsafe`), masking the missing signal.
+        opportunity.scam_prob = scores.get("scam_prob", 0.0)
         if scores.get("scam_prob", 0.0) > 0.7:
             opportunity.risk_level = "high"
     except Exception as exc:

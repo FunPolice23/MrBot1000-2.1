@@ -246,10 +246,22 @@ class OpportunityIntelligenceEngine:
         sufficiency["payment_amount_known"] = advertised > 0 or opportunity.estimated_net_value > 0
 
         # --- Factor 6: estimated net payment ---
+        # ARCH-ENG-122: gross is not net. When the listing never stated a net
+        # figure the advertised gross is the best available estimate, but it must
+        # NOT be reported as if the net were known — fees/haircuts are real and
+        # unmodelled, so `estimated_net_payment` silently carried a gross number
+        # under a net label into EV, and the sufficiency record claimed a net was
+        # supplied. `net_payment_known` is now reported separately so a caller
+        # can tell "net stated" from "gross substituted", and confidence is
+        # reduced accordingly below.
         net = opportunity.estimated_net_value
-        if net <= 0:
+        net_stated = net > 0
+        if not net_stated:
             net = advertised  # fallback to advertised if net unknown
+        sufficiency["net_payment_known"] = net_stated
         reasons["estimated_net_payment"] = round(net, 2)
+        if not net_stated and net > 0:
+            reasons["estimated_net_payment_basis"] = "advertised_gross (net not stated)"
         reasons["payment"] = _level(min(1.0, net / 100.0))  # relative band
 
         # --- Factor 7: payment reliability ---
@@ -293,9 +305,23 @@ class OpportunityIntelligenceEngine:
             (opportunity.deadline - time.time()) / 3600.0, 1) if opportunity.deadline else None
 
         # --- Factor 12: scam risk ---
+        # ARCH-ENG-127: a semantic estimate must not be able to LOWER a
+        # producer's scam assessment. `est.scam_risk` REPLACED
+        # `opportunity.scam_risk` outright, so an LLM answering "scam_prob: 0"
+        # on an opportunity a deterministic producer had screened at 0.9 moved
+        # the verdict from `unsafe` to `attractive` — measured, end to end,
+        # through the real engine: producer 0.9 + no estimate -> high/unsafe;
+        # producer 0.9 + estimate 0.0 -> low/attractive. The `unsafe` branch is
+        # the only thing standing between this agent and a scam listing, and it
+        # was overridable by the least trustworthy input in the system.
+        #
+        # Same asymmetry the skill_fit path already had (see
+        # `test_llm_estimate_never_directly_sets_verdict`): an estimate may
+        # RAISE a risk, never lower it. The engine's job is to combine, and a
+        # risk signal can only ever add.
         scam = opportunity.scam_risk
         if est.scam_risk is not None:
-            scam = est.scam_risk
+            scam = max(scam, est.scam_risk)
         reasons["scam_risk"] = _level(scam)
         sufficiency["scam_provided"] = est.scam_risk is not None
 
@@ -376,6 +402,11 @@ class OpportunityIntelligenceEngine:
         hist_conf = min(plat_conf, cat_conf, tt_conf) if (plat_n or cat_n or tt_n) else cfg.neutral_confidence
         missing = sum(1 for k in ("payment_amount_known", "effort_known", "skill_fit_provided")
                       if not sufficiency.get(k))
+        # ARCH-ENG-122: a net figure substituted with the advertised gross is a
+        # weaker input than a stated net (fees/haircuts are unmodelled), so it
+        # lowers confidence without changing the verdict policy above.
+        if net > 0 and not net_stated:
+            missing += 1
         conf = max(0.05, hist_conf - 0.1 * missing)
         if cold_start:
             conf = min(conf, cfg.neutral_confidence)

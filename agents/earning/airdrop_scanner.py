@@ -191,12 +191,120 @@ class AirdropScanner:
         lower = text.lower()
         return any(keyword in lower for keyword in self.AIRDROP_KEYWORDS)
 
+    # ------------------------------------------------------------------
+    # Value attribution (ARCH-ENG-120)
+    #
+    # A `$` figure in crypto news is as often a coin's market price as a
+    # payout: "Bitcoin holds at $95,000 as airdrop season begins" booked the
+    # first `$` in the headline as a $95,000 airdrop, which flowed on to
+    # advertised_amount / expected_net_revenue and a fabricated "attractive"
+    # verdict in opportunity_intelligence. Per the golden rule an amount a
+    # listing never attributed to the payout is unknown (0.0), never a guess,
+    # so a figure is only booked when the surrounding text ties it to the
+    # airdrop/reward. "airdrop worth $500" and "valued at $1,200" still parse;
+    # a bare price quote yields 0.0.
+    VALUE_INTENT_CUES = (
+        "worth", "valued at", "value of", "reward", "allocation", "allocated",
+        "allocating", "distribut", "payout", "prize", "giveaway", "bonus",
+        "claim", "drop of", "totaling", "totalling", "amounting to",
+        "paying out", "pays out", "grant",
+    )
+    WEAK_VALUE_CUES = ("up to",)
+    # Cues that may sit AFTER the figure ("$2,500 reward for testnet users").
+    # Deliberately narrower than VALUE_INTENT_CUES: verbs like "claim"/"grant"
+    # must not match forward, or "pay $95,000 to claim your airdrop" — a DEMAND
+    # for money — would book the fee as a payout. Only nouns naming the thing
+    # being distributed are safe here.
+    FORWARD_VALUE_CUES = (
+        "reward", "giveaway", "bonus", "prize", "allocation", "payout",
+        "distribution", "bounty", "per wallet", "in total",
+    )
+    FORWARD_WINDOW_CHARS = 30
+    # An appositive attribution: "Airdrop live now — $1,000 for eligible
+    # wallets" names the drop immediately before the figure with no value verb.
+    # The window is TIGHT (not VALUE_WINDOW_CHARS) so it cannot reach back
+    # across a clause into unrelated market commentary, and the price-context
+    # and market-subject guards above have already rejected those shapes.
+    SUBJECT_WINDOW_CHARS = 25
+    # Market-price language. Price context must sit next to the figure; a
+    # payout phrase further back is still a payout ("trades at $95,000 — the
+    # airdrop is worth $500").
+    PRICE_CONTEXT_CUES = (
+        "holds at", "hold at", "trades at", "trade at", "trading at",
+        "traded at", "price of", "priced at", "prices at", "sits at",
+        "sitting at", "market cap", "down to", "down $", "up $", "above",
+        "below", "near", "from $", "rises to", "rose to", "climbs to",
+        "climbed to", "surges to", "surged to", "falls to", "fell to",
+        "drops to", "dropped to", "slips to", "slipped to",
+        "per token",
+    )
+    # A coin named as the subject is not a payout. ARCH-ENG-120 review: the
+    # first version of this guard read `not any(PAYOUT_NOUNS in before)`, but 7
+    # words sit in BOTH VALUE_INTENT_CUES and PAYOUT_NOUNS (reward, allocation,
+    # bonus, claim, giveaway, payout, prize), so any headline containing one
+    # disabled the guard and "Airdrop allocation — Bitcoin $95,000 snapshot"
+    # booked the BTC price as a $95,000 payout. The escape clause is therefore
+    # REMOVED: instead the coin must be ADJACENT to the figure, so a genuine
+    # attribution ("ETH stakers claim $500") still parses while a coin sitting
+    # next to a bare figure means the coin is what is being priced.
+    MARKET_SUBJECT_RE = re.compile(
+        r"\b(btc|bitcoin|eth|ethereum|sol|solana|doge|ada|xrp|market|coin)s?\b"
+    )
+    PAYOUT_NOUNS = (
+        "airdrop", "reward", "drop", "claim", "allocation", "giveaway",
+        "bonus", "retroactive", "payout", "prize", "distribution", "staking",
+    )
+    VALUE_WINDOW_CHARS = 70  # how far back from the `$` a cue may sit
+    PRICE_WINDOW_CHARS = 35  # price language must sit next to the `$`
+    # A coin ticker within this many chars of the figure, with NO value cue
+    # between it and the figure, means the figure prices the coin.
+    COIN_ADJACENCY_CHARS = 20
+
+    @classmethod
+    def _extract_stated_value_usd(cls, combined_text: str) -> float:
+        """USD figure the text attributes to the airdrop, else 0.0 (unknown)."""
+        text = combined_text or ""
+        for match in re.finditer(r"\$([\d,]+(?:\.\d{1,2})?)", text):
+            before = text[max(0, match.start() - cls.VALUE_WINDOW_CHARS):
+                          match.start()].lower()
+            near = before[-cls.PRICE_WINDOW_CHARS:]
+            if any(cue in near for cue in cls.PRICE_CONTEXT_CUES):
+                continue  # the figure is a quote of a coin, not a payout
+            coin_hit = None
+            for coin in cls.MARKET_SUBJECT_RE.finditer(before):
+                gap = before[coin.end():]
+                if (len(gap) <= cls.COIN_ADJACENCY_CHARS
+                        and not any(cue in gap for cue in cls.VALUE_INTENT_CUES)
+                        and not any(cue in gap for cue in cls.WEAK_VALUE_CUES)):
+                    coin_hit = coin
+                    break
+            if coin_hit is not None:
+                # "...Bitcoin $95,000" / "SOL at $212" — the figure is the coin's
+                # price. An attribution verb between the coin and the figure
+                # ("ETH stakers claim $500") keeps the gap cue-filled and passes.
+                continue
+            if any(cue in before for cue in cls.VALUE_INTENT_CUES):
+                return float(match.group(1).replace(",", ""))
+            if any(cue in near for cue in cls.WEAK_VALUE_CUES):
+                return float(match.group(1).replace(",", ""))
+            after = text[match.end():
+                         match.end() + cls.FORWARD_WINDOW_CHARS].lower()
+            if any(cue in after for cue in cls.FORWARD_VALUE_CUES):
+                return float(match.group(1).replace(",", ""))
+            subject_window = before[-cls.SUBJECT_WINDOW_CHARS:]
+            if (any(noun in subject_window for noun in cls.PAYOUT_NOUNS)
+                    and not cls.MARKET_SUBJECT_RE.search(subject_window)):
+                # "Airdrop live now — $1,000" names the drop right before the
+                # figure. A coin ticker in the SAME window means the coin is
+                # the subject ("airdrop Bitcoin $95,000"), so this is refused.
+                return float(match.group(1).replace(",", ""))
+        return 0.0
+
     def _parse_entry(self, entry: dict, combined_text: str) -> Optional[AirdropOpportunity]:
         """Convert a feed entry into a structured opportunity."""
         title = entry.get("title", "")
         link = entry.get("link", entry.get("url", ""))
         token_match = re.search(r"\$([A-Z]{2,10})", combined_text)
-        value_match = re.search(r"\$([\d,]+(?:\.\d{1,2})?)", combined_text)
         deadline_match = re.search(
             r"(?:deadline|ends?|expires?|before)\s*[:\s]*(.+?)(?:\.|$|\n)",
             combined_text,
@@ -210,9 +318,7 @@ class AirdropScanner:
             title=title[:200],
             description=combined_text[:500],
             token_symbol=token_match.group(1) if token_match else "",
-            estimated_value_usd=(
-                float(value_match.group(1).replace(",", "")) if value_match else 0.0
-            ),
+            estimated_value_usd=self._extract_stated_value_usd(combined_text),
             risk_level=self._assess_risk(combined_text, link),
             deadline=deadline_match.group(1).strip() if deadline_match else "",
             url=link,

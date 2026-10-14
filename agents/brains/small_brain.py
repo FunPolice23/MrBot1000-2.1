@@ -30,6 +30,7 @@ class SmallBrainAdapter:
         _cfg = DualBrainRuntime.from_env().config(BrainRole.SMALL)
         legacy_url = os.getenv("SMALL_BRAIN_URL") if _cfg.provider == "llamacpp" else ""
         self.base_url = base_url or legacy_url or _cfg.endpoint
+        self.provider = _cfg.provider
         self.device = _cfg.device
         self.context_length = _cfg.context
         self.decision_support_only = _cfg.decision_support_only
@@ -79,8 +80,14 @@ class SmallBrainAdapter:
         connect_timeout = max(2.0, float(
             os.getenv("LOCAL_LLM_CONNECT_TIMEOUT_SECONDS", "30")))
         from agents.providers.openai_compatible import _build_provider_timeout
+        from agents.runtime.provider_keys import resolve_provider_api_key
+        # Phase 1: local providers keep the "local" sentinel (unchanged); cloud
+        # providers resolve a real key from the encrypted vault /
+        # PROVIDER_API_KEY_* / SMALL_API_KEY, or "" (fail-closed) so a paid
+        # endpoint is never sent the "local" sentinel.
+        api_key = resolve_provider_api_key(getattr(self, "provider", "llamacpp"), "SMALL")
         return openai.OpenAI(
-            api_key="local", base_url=self.base_url,
+            api_key=api_key, base_url=self.base_url,
             timeout=_build_provider_timeout(openai, read=read_timeout,
                                             connect=connect_timeout),
         )
@@ -139,33 +146,33 @@ class SmallBrainAdapter:
     def _hardware_line(self) -> str:
         """One line describing the device this brain runs on (N-brain).
 
-        Prefers the live device registry (source of truth for detected hardware)
-        so the prompt reflects the ACTUAL card, never a hardcoded name; falls
-        back to the runtime config's gpu_label. Empty string when unknown.
+        The device registry is the source of truth, and a label is asserted to
+        the model only when detection CONFIRMED a device. Same rule as
+        ``BigBrainAdapter._hardware_line`` (ARCH-ENG-115): the config's
+        ``gpu_label`` default is a placeholder (``"CPU / System RAM"`` for this
+        role), so falling back to it when detection came back empty told the
+        brain it runs on hardware that was never verified.
         """
         try:
             from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
             from agents.runtime import device_registry as dr
             cfg = DualBrainRuntime.from_env().config(BrainRole.SMALL)
-            label = (cfg.gpu_label or "").strip()
             # Resolve the live device label from the registry when possible.
             try:
                 devices = dr.detect_devices(include_cpu=True)
+                dev = None
                 if cfg.device_id:
                     dev = next((d for d in devices if d.id == cfg.device_id), None)
-                    if dev is not None:
-                        label = dev.label()
                 elif cfg.gpu_layers == 0:
-                    cpu = next((d for d in devices if d.is_cpu), None)
-                    if cpu is not None:
-                        label = cpu.label()
+                    dev = next((d for d in devices if d.is_cpu), None)
                 elif 0 <= cfg.device < 64:
-                    gpu = next((d for d in devices
+                    dev = next((d for d in devices
                                 if d.is_gpu and d.index == cfg.device), None)
-                    if gpu is not None:
-                        label = gpu.label()
+                if dev is None:
+                    return ""
+                label = dev.label()
             except Exception:
-                pass
+                return ""
             if not label:
                 return ""
             return (f"You run on {label}. You are the fast, lower-capacity brain; "

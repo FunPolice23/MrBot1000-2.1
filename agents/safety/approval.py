@@ -221,13 +221,33 @@ class HumanApprovalQueue:
                         requested_by: str = "system",
                         details: Dict[str, Any] = None,
                         payload: Dict[str, Any] = None) -> ApprovalItem:
+        """Queue a PAYMENT approval for ``record_payment``.
+
+        ARCH-ENG-129: the approved AMOUNT is part of the approval's scope. An
+        operator who reviews "pay $5.00" has authorized $5.00 and nothing else,
+        so the amount travels in ``details["arguments"]`` alongside the tool
+        name and is enforced by ``assert_approval_covers``. Passing no amount
+        records no authorized amount, and the HIGH-TRUST tool then refuses any
+        positive one — fail-closed, because an approval that never stated a
+        figure cannot authorize booking one.
+        """
+        scope_args: Dict[str, Any] = {"amount": float(amount or 0.0)}
+        if currency:
+            scope_args["currency"] = currency
         item = ApprovalItem(
             kind=ApprovalKind.PAYMENT,
             title=title,
             description=description,
             requested_by=requested_by,
-            details={"amount": amount, "currency": currency, **(details or {})},
-            payload=payload or {},
+            # Scope always lives in `details`: `approval_scope` reads `payload`
+            # first and falls back to `details`, and a caller-supplied payload
+            # is preserved verbatim (it may carry redaction-sensitive fields
+            # that other consumers assert on).
+            details={"tool": "record_payment", "arguments": scope_args,
+                     "amount": amount, "currency": currency,
+                     **(details or {})},
+            payload=payload if payload is not None else {
+                "tool": "record_payment", "arguments": scope_args},
         )
         return self.enqueue(item)
 
@@ -459,6 +479,116 @@ class HumanApprovalQueue:
         return None
 
 
+# ── Approval scope binding (ARCH-ENG-129) ────────────────────────────────────
+#
+# An approval authorizes ONE action, not a capability. Before ARCH-ENG-129 the
+# only thing a HIGH-TRUST tool checked was `item.status == APPROVED` — the
+# item's `kind`, `details` and `payload` were never read. Reproduced on the
+# real code by executing it:
+#
+#   * a human-approved **$5.00** payment approval booked **$1,000,000.00** of
+#     verified revenue, because `amount` was a raw tool argument;
+#   * a human-approved **file_write** approval (path `scratch.txt`) was
+#     replayed as the `approval_id` for **record_payment**, which then booked
+#     $777 — approval ids are model-visible, so one id could be spent against
+#     any mutating tool;
+#   * a human-approved social post of `'Hello team'` published
+#     `'BUY THIS NOW <link>'`, because `content` was a raw tool argument.
+#
+# The fix is a single predicate every HIGH-TRUST tool calls before it mutates:
+# the approval must name THIS tool and, where the human saw arguments, THOSE
+# arguments. Fail-closed: an item that records no scope at all authorizes
+# nothing.
+
+
+def approval_scope(item: "ApprovalItem") -> Dict[str, Any]:
+    """The (tool, arguments) pair the human actually approved, or {} if none.
+
+    Producers record scope in two shapes, both accepted:
+      * ``details``/``payload`` with ``tool`` + ``arguments`` keys — used by
+        ``dispatch.execute_tool``, ``chat_completion`` and ``big_brain``;
+      * ``enqueue_payment`` / ``enqueue_gate`` / ``enqueue_submission`` and
+        the registration/safety-guard producers, which record only free-form
+        ``details``. Those carry NO tool name and therefore authorize nothing
+        under ``assert_approval_covers`` (see below).
+    """
+    for source in (getattr(item, "payload", None), getattr(item, "details", None)):
+        if isinstance(source, dict):
+            tool = source.get("tool")
+            args = source.get("arguments")
+            if isinstance(tool, str) and tool.strip():
+                return {"tool": tool.strip(),
+                        "arguments": args if isinstance(args, dict) else {}}
+    return {}
+
+
+def assert_approval_covers(item: "ApprovalItem", tool: str,
+                           arguments: Dict[str, Any]) -> Optional[str]:
+    """None when `item` authorizes exactly `tool(**arguments)`; else a refusal.
+
+    The approval must have been recorded as an APPROVED decision for THIS tool.
+    When the producer recorded the arguments the human reviewed, those
+    arguments must match the call — a different amount, a different path or
+    different content is a DIFFERENT action and needs its own approval.
+
+    Numbers compare with a small tolerance (JSON round-trips `25.0` as `25`),
+    everything else compares exactly. Keys the approval did not record are not
+    policed: producers legitimately record a subset (e.g. ``big_brain`` adds a
+    ``reason``), and an unrecorded key cannot have been shown to the human, so
+    requiring it would make the tool unusable.
+    """
+    if item is None:
+        return "approval not found"
+    if item.status != ApprovalStatus.APPROVED:
+        return (f"approval {item.id} is {item.status.value}, not approved")
+    scope = approval_scope(item)
+    recorded_tool = scope.get("tool", "")
+    if not recorded_tool:
+        return (
+            f"approval {item.id} records no tool scope, so it authorizes no "
+            f"action; {tool} was not executed"
+        )
+    if recorded_tool != tool:
+        return (
+            f"approval {item.id} authorizes {recorded_tool!r}, not {tool!r}; "
+            f"{tool} was not executed"
+        )
+    recorded_args = scope.get("arguments") or {}
+    for key, want in recorded_args.items():
+        # `approval_id` is the handle by which the caller REFERS to this
+        # approval, not an argument the human reviewed as part of the action.
+        # It is also re-stamped by ``main._execute_approved_action`` with the
+        # id the operator actually approved, so comparing it would refuse
+        # every honest call. The binding it provides is redundant: the tool
+        # name and the reviewed arguments are what identify the action.
+        if key == "approval_id":
+            continue
+        got = (arguments or {}).get(key)
+        if not _approval_args_match(want, got):
+            return (
+                f"approval {item.id} authorized {tool} with {key}="
+                f"{want!r}, but the call passed {got!r}; {tool} was not "
+                f"executed (an approval authorizes one action, not a "
+                f"capability)"
+            )
+    return None
+
+
+def _approval_args_match(want: Any, got: Any) -> bool:
+    """Compare an approved argument value against the value being executed."""
+    if isinstance(want, bool) or isinstance(got, bool):
+        return want is got
+    if isinstance(want, (int, float)) and isinstance(got, (int, float)):
+        return abs(float(want) - float(got)) <= 1e-6
+    if isinstance(want, dict) and isinstance(got, dict):
+        return all(k in got and _approval_args_match(v, got[k])
+                   for k, v in want.items())
+    if isinstance(want, (list, tuple)) and isinstance(got, (list, tuple)):
+        return (len(want) == len(got)
+                and all(_approval_args_match(a, b) for a, b in zip(want, got)))
+    return want == got
+
+
 # ── module-level convenience ───────────────────────────────────────────────────
 
 def enqueue_approval(kind: ApprovalKind, title: str, description: str,
@@ -480,4 +610,6 @@ __all__ = [
     "ApprovalItem",
     "HumanApprovalQueue",
     "enqueue_approval",
+    "approval_scope",
+    "assert_approval_covers",
 ]

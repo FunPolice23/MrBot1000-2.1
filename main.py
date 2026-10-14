@@ -97,14 +97,27 @@ except Exception:
 # ── CLI flags ──────────────────────────────────────────────────────────────
 # -sm / --safe-mode is a convenience alias for MRBOT_SAFE_MODE=true.
 # It exercises the workflow without making real file changes.
+#
+# ARCH-ENG-114: this parser must only consume argv when main.py is the
+# ENTRYPOINT. It used to run unconditionally at import, and `parse_known_args`
+# happily ate flags belonging to whatever host process imported the module:
+# pytest's `-s` (no capture) parses as the short-option cluster `-s` + `m`,
+# which argparse expands to `-sm`, so `python -m pytest -s` silently turned
+# MRBOT_SAFE_MODE on for the entire test session. Every ActionPipeline built
+# afterwards then skipped its file writes, and 3 tests in
+# tests/safety/test_safe_mode_pipeline.py failed purely because the operator
+# (or CI) added `-s` to the pytest command line.
+#
+# Guard on __main__: only the real entrypoint parses argv.
 import argparse
 
 _parser = argparse.ArgumentParser(description="MrBot1000 desktop application", add_help=True)
 _parser.add_argument("-sm", "--safe-mode", action="store_true",
                      help="Run in safe mode (alias for MRBOT_SAFE_MODE=true)")
-_args, _unknown = _parser.parse_known_args()
-if _args.safe_mode:
-    os.environ["MRBOT_SAFE_MODE"] = "true"
+if __name__ == "__main__":
+    _args, _unknown = _parser.parse_known_args()
+    if _args.safe_mode:
+        os.environ["MRBOT_SAFE_MODE"] = "true"
 
 import html
 import tempfile
@@ -1038,6 +1051,16 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         arguments = payload.get("arguments")
         if not tool or not isinstance(arguments, dict):
             return
+        # ARCH-ENG-129: stamp THIS approval's id into the arguments. The model
+        # cannot know an approval id before the item exists, so the queued
+        # arguments carry either no `approval_id` or a placeholder — and the
+        # HIGH-TRUST tools then refuse a call that a human genuinely approved.
+        # Re-stamping here makes the executed call provably the one the
+        # operator approved (same id the queue recorded), and it is the only
+        # place an id could legitimately enter the call.
+        arguments = dict(arguments)
+        if item_id:
+            arguments["approval_id"] = item_id
         from agents.safety.dispatch import execute_tool
         try:
             result = execute_tool(tool, arguments, approved=True)
@@ -1420,7 +1443,11 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         try:
             from app.version import __version__
         except Exception:
-            __version__ = "2.1.31"  # last-resort literal; version.py has no deps
+            # Last-resort literal. app/version.py has no dependencies, so this
+            # should be unreachable; if it ever fires, the title would silently
+            # claim an old release. Keep it in step with app/version.py — the
+            # single authority — and prefer fixing the import over bumping this.
+            __version__ = "2.1.99"
         title_lbl = QLabel(f"MrBot1000 v{__version__}")
         title_lbl.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         title_lbl.setStyleSheet(

@@ -862,11 +862,20 @@ class EarningPipeline:
             
             filtered.append(opp)
 
-        # Sort by value * skill_match / (effort + 0.1)
+        # Sort by value * skill_match / effort.
+        #
+        # ARCH-ENG-124: the divisor was `effort_score + 0.1`. `effort_score` is a
+        # 0..1 SCORE (lower = easier), so +0.1 made the easiest opportunity rank
+        # 10x higher than the hardest purely from the floor: measured with
+        # net=$2,500 and skill_match=0.7, effort 0.1 -> 8,750.0 while 0.5 ->
+        # 2,916.7, a 3x swing with no change in value or skill. `_apply_memory_boost`
+        # compounds it (`max(0.1, score*0.7)` -> 0.035+0.1 floor). `+1.0` bounds
+        # the whole 0..1 range to a 2x spread, which is what a difficulty
+        # *modifier* should do; the ordering (easier ranks higher) is unchanged.
         filtered.sort(
             key=lambda o: (
                 o.estimated_usd_value * o.skill_match
-            ) / (o.effort_score + 0.1),
+            ) / (o.effort_score + 1.0),
             reverse=True,
         )
 

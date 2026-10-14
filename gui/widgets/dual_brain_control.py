@@ -588,21 +588,41 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         """
         if getattr(self, "_provider_rows", None):
             return  # rows self-wire via slot-keyed signals
-        if hasattr(self, "sb_start_btn"):
-            self.sb_start_btn.clicked.connect(self._on_start_small_brain)
-        if hasattr(self, "sb_stop_btn"):
-            self.sb_stop_btn.clicked.connect(self._on_stop_small_brain)
-        if hasattr(self, "bb_start_btn"):
-            self.bb_start_btn.clicked.connect(self._on_start_big_brain)
-        if hasattr(self, "bb_stop_btn"):
-            self.bb_stop_btn.clicked.connect(self._on_stop_big_brain)
+        # ARCH-ENG-128: a disabled brain's row is not rendered, so its legacy
+        # alias is a _NullWidget. _NullWidget.__getattr__ answers EVERY name
+        # (returning a no-op function), so `hasattr(self, "sb_start_btn")` is
+        # always True and `sb_start_btn.clicked` resolves to that no-op
+        # FUNCTION — calling `.connect` on it raises
+        # "AttributeError: 'function' object has no attribute 'connect'".
+        # Skip null-object aliases; only a REAL button has a .clicked.connect.
+        def _real_btn(w):
+            return w if (w is not None and not isinstance(w, _NullWidget)) else None
+        for _attr, _handler in (
+            ("sb_start_btn", self._on_start_small_brain),
+            ("sb_stop_btn", self._on_stop_small_brain),
+            ("bb_start_btn", self._on_start_big_brain),
+            ("bb_stop_btn", self._on_stop_big_brain),
+        ):
+            _b = _real_btn(getattr(self, _attr, None))
+            if _b is not None:
+                _b.clicked.connect(_handler)
 
     def _wire_refresh_buttons(self):
-        """Wire up refresh/model buttons after class body is fully defined."""
-        if hasattr(self, "sb_refresh_models_btn"):
-            self.sb_refresh_models_btn.clicked.connect(self._refresh_small_brain_models)
-        if hasattr(self, "bb_refresh_models_btn"):
-            self.bb_refresh_models_btn.clicked.connect(self._refresh_big_brain_models)
+        """Wire up refresh/model buttons after class body is fully defined.
+
+        ARCH-ENG-128: same null-object guard as _wire_start_stop_buttons — a
+        _NullWidget alias answers every attribute with a no-op function, so
+        `.clicked.connect` would raise. Only real buttons are wired.
+        """
+        def _real_btn(w):
+            return w if (w is not None and not isinstance(w, _NullWidget)) else None
+        for _attr, _handler in (
+            ("sb_refresh_models_btn", self._refresh_small_brain_models),
+            ("bb_refresh_models_btn", self._refresh_big_brain_models),
+        ):
+            _b = _real_btn(getattr(self, _attr, None))
+            if _b is not None:
+                _b.clicked.connect(_handler)
 
     def _apply_hardware_preset(self):
         """Apply the selected preset to the chosen hardware target."""
@@ -948,6 +968,20 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             v.addWidget(hint)
 
             devices = dr.detect_devices(include_cpu=True)
+            # B1: surface a lost-GPU / detection diagnostic in the device panel
+            # AND the Live Log, so a dropped GPU is explained (with a reboot
+            # hint) instead of silently missing from the list.
+            detect_error = getattr(dr, "_LAST_DETECT_ERROR", "") or ""
+            if detect_error:
+                warn = QLabel("⚠️ " + detect_error)
+                warn.setWordWrap(True)
+                warn.setStyleSheet(
+                    "color: #ffb300; font-size: 11px; padding: 4px;")
+                v.addWidget(warn)
+                try:
+                    self._log("⚠️ GPU detection: " + detect_error)
+                except Exception:
+                    pass
             policy = dr.load_policy()
             self._device_rows = {}
             if not devices:

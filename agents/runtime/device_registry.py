@@ -45,6 +45,17 @@ CPU_MIN_CORES = 4
 
 SETTINGS_FILE = "settings.json"
 
+# Why the last `nvidia-smi` probe could not run, or "" when it ran cleanly.
+# Lets a caller distinguish "this box has no GPUs" from "we could not ask" —
+# the two must never be conflated (ARCH-ENG-116).
+_LAST_DETECT_ERROR = ""
+
+# Substrings nvidia-smi prints when a GPU has dropped out of the driver
+# (TDR reset / driver crash). A lost GPU is NOT "no GPUs": the healthy
+# card(s) are still detected and usable, so this records a reboot hint
+# rather than swallowing the GPU (B1).
+_GPU_LOST_SIGNALS = ("gpu is lost", "unable to determine the device handle")
+
 
 # ── Detected device ──────────────────────────────────────────────────────────
 @dataclass
@@ -311,26 +322,115 @@ def _detect_cpu() -> ComputeDevice:
                          memory_gb=round(ram_gb, 1), cores=cores)
 
 
+def _run_nvidia_smi(query: str) -> str:
+    """Run `nvidia-smi --query-gpu=<query>` and return its stdout.
+
+    ARCH-ENG-116: `subprocess.run(..., capture_output=True)` pipes the child's
+    stdout through a freshly created OS handle. On Windows that handle must be
+    made inheritable via `DuplicateHandle`, which FAILS (WinError 50 / errno 22
+    "The request is not supported") when the parent's own stdout is a pipe that
+    a capture layer has reconfigured — exactly what pytest's `--capture=fd`
+    does. The spawn then raises before nvidia-smi ever runs.
+
+    Measured: `_detect_gpus()` under `pytest --capture=fd` raises
+    `OSError(22, 'The request is not supported', None, 50, None)` on every
+    attempt, so GPU detection returned ZERO devices and every caller believed
+    the box had no GPUs at all. With `--capture=sys` or `-s` the same code
+    returns both cards.
+
+    Writing to a real temp FILE instead of an inherited pipe sidesteps the
+    stdout duplication, and passing DEVNULL for BOTH stdin and stderr means
+    nothing has to be inherited at all — the child opens the path itself.
+    Measured: this succeeds under `pytest --capture=fd`, where the previous
+    `capture_output=True` form raised WinError 50 on every attempt.
+
+    Note the failing handle was STDIN, not stdout: `_get_handles` duplicates
+    whichever of the three standard streams it is given, and leaving stdin
+    implicit made it inherit the capture pipe. So all three are named
+    explicitly here.
+    """
+    import subprocess
+    import tempfile
+
+    argv = ["nvidia-smi", f"--query-gpu={query}",
+            "--format=csv,noheader,nounits"]
+    flags = 0
+    try:
+        flags = subprocess.CREATE_NO_WINDOW
+    except AttributeError:
+        flags = 0
+
+    handle = None
+    path = None
+    try:
+        fd, path = tempfile.mkstemp(prefix="mrb_smi_", suffix=".csv")
+        handle = os.fdopen(fd, "w+", encoding="utf-8", errors="replace")
+        subprocess.run(argv,
+                       stdin=subprocess.DEVNULL,
+                       stdout=handle,
+                       stderr=subprocess.DEVNULL,
+                       timeout=5, creationflags=flags, check=False)
+        handle.flush()
+        handle.seek(0)
+        return handle.read()
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        if path:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 def _detect_gpus() -> List[ComputeDevice]:
     """Detect GPUs with stable UUIDs via nvidia-smi; fall back to the provider
     manager's probe (index-only) when the UUID query is unavailable."""
     devices: List[ComputeDevice] = []
+    global _LAST_DETECT_ERROR
+    _LAST_DETECT_ERROR = ""
+    lost_hint = False
     # Preferred: nvidia-smi with uuid for a stable identity. compute_cap is
     # nice-to-have; some drivers lack it, so try with it first and retry without
     # rather than dropping GPU detection entirely.
-    import subprocess
     for query in (
         "index,name,memory.total,uuid,compute_cap",
         "index,name,memory.total,uuid",
     ):
         try:
-            out = subprocess.run(
-                ["nvidia-smi", f"--query-gpu={query}",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW).stdout
-        except Exception:
+            out = _run_nvidia_smi(query)
+        except Exception as exc:
+            # ARCH-ENG-116: this used to `continue` silently, so a subprocess
+            # that could not even be spawned (pytest's fd capture on Windows
+            # makes `DuplicateHandle` fail with WinError 50; a locked driver
+            # does the same) was indistinguishable from "this query form is
+            # unsupported". GPU detection then reported ZERO GPUs and every
+            # caller believed the box had none: `tests/gui/test_gui_smoke.py::`
+            # test_management_tab_builds` failed with 1 persona field instead of
+            # 3, and the brain prompt's hardware line was dropped entirely.
+            # Record the reason so the caller can tell "no GPUs" from "could
+            # not ask", and retry the next query form regardless.
+            if not lost_hint:
+                _LAST_DETECT_ERROR = f"nvidia-smi spawn failed: {exc!r}"
             continue
+        # B1: a lost GPU (TDR reset / driver crash) prints "GPU is lost" or
+        # "Unable to determine the device handle" in the query output. That is
+        # NOT "no GPUs" — the healthy card(s) are still listed and usable — so
+        # record a reboot hint instead of silently dropping the GPU, and keep
+        # parsing the healthy lines below.
+        low_out = out.lower()
+        if any(sig in low_out for sig in _GPU_LOST_SIGNALS):
+            _LAST_DETECT_ERROR = (
+                "nvidia-smi reported a lost GPU (\"GPU is lost\" / "
+                "\"Unable to determine the device handle\"): a GPU has dropped "
+                "out of the driver, usually after a TDR reset or driver crash. "
+                "Reboot the machine to recover the lost GPU(s); the healthy "
+                "GPU(s) below are still detected and usable."
+            )
+            lost_hint = True
         parsed: List[ComputeDevice] = []
         for line in out.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
@@ -351,15 +451,23 @@ def _detect_gpus() -> List[ComputeDevice]:
         if parsed:
             return parsed
     # Fallback: provider manager (no UUID -> id by index).
+    #
+    # ARCH-ENG-116: `detect=False` returns the provider manager's CACHED GPU
+    # list, which is empty until something has probed. This fallback only runs
+    # when nvidia-smi already failed, so nothing had probed — the call returned
+    # [] every single time and the "fallback" was dead code. GPU detection then
+    # silently reported ZERO GPUs and every caller believed the box had none.
+    # `detect=True` forces the probe; verified to return both cards on this box.
     try:
         from agents.providers.provider_manager import ProviderManager
-        for g in ProviderManager.instance().get_gpus(detect=False):
+        for g in ProviderManager.instance().get_gpus(detect=True):
             devices.append(ComputeDevice(
                 id=f"gpu{g.index}", kind="gpu", index=g.index, name=g.name,
                 memory_gb=round((g.memory_total_mb or 0) / 1024.0, 1),
                 compute_capability=g.compute_capability or ""))
-    except Exception:
-        pass
+    except Exception as exc:
+        if not lost_hint:
+            _LAST_DETECT_ERROR = f"provider-manager fallback failed: {exc!r}"
     return devices
 
 

@@ -1,3 +1,978 @@
+## [2.1.99] - 2026-10-14 - The model-context boundary leaked credentials through four more doors (ARCH-ENG-133/134/135/136)
+
+v2.1.98 hardened exactly one function, `_tool_file_read`. This cycle audited the
+*consumers* of that fix rather than the fix, and found four more paths that
+return file content to the model with no guard — including one CRITICAL.
+
+Every claim below was reproduced by executing the real dispatcher or the real
+function. Nothing is inferred from reading.
+
+Full engineering record: `docs/ARCH_ENG_133_136_MODEL_CONTEXT_LEAKS.md`.
+
+### The lesson
+
+**A security invariant hardened in one function is not hardened.** v2.1.98's own
+write-up recorded the right insight — "the vault's contract was defeated by a
+tool that never touches the vault" — but the fix still treated the boundary as
+one function instead of one invariant. Four sibling paths were missed, and the
+next cycle found the same class of defect somewhere else. Every path crossing the
+same trust boundary has to be enumerated.
+
+### ARCH-ENG-133 (HIGH) — `legacy_tools` had a second, ungated file reader
+
+`agents/safety/legacy_tools.py` has its own private `_read_file()`. The Big Brain
+tool loop (`agents/brains/big_brain.py:240`) classifies names with `SafetyGate`,
+which maps the alias `read_file` -> `file_read` = READONLY = ALLOWED, then
+dispatches to `legacy_tools.execute_tool` — **not** to the hardened
+`_tool_file_read`.
+
+```
+execute_tool('read_file', {'path':'.env'})       -> 13,418 chars of .env
+execute_tool('read_file', {'path':'wallet.key'}) -> 'dE23Hpd6...EKXMc='  (raw Fernet key)
+```
+
+Fixed by reusing the single authority (`_is_secret_file`, imported from
+`handlers`; verified no circular import) plus `redact_secrets`. `_write_file`,
+`_run_command` and `analyze_document` also refuse secret paths. Gate decisions
+verified unchanged: `read_file` ALLOWED, `write_file`/`run_command`
+NEEDS_APPROVAL, `analyze_document` still BLOCKED-as-unknown.
+
+Known limit, recorded: `run_command` refuses a command that *names* a secret
+file, but `python -c "print(open('.env').read())"` would still exfiltrate it into
+command output. Closing that needs output-level scanning and belongs with the
+approval layer.
+
+### ARCH-ENG-134 (CRITICAL) — `workshop_read` read the whole workshop tree raw
+
+`workshop_read` is READONLY/auto-allowed, and the workshop root
+(`D:\ai_workshop`, `MRBOT_WORKSHOP_ROOT`) is **outside `PROJECT_ROOT`**, so
+`resolve_project_path`/`_is_secret_file` never applied. `Workshop.read_file`
+does a bare `open(path).read()`. The workshop's own `accounts/accounts.json`
+stores a plaintext `password`.
+
+```
+workshop_read '.env'                    -> 'OPENAI_API_KEY=sk-ZZZ...'
+workshop_read 'wallet.key'              -> 'RAWFERNETKEYMATERIAL=='
+workshop_read 'accounts/accounts.json'  -> {"Upwork": {..., "password": "P@ssw0rd-abcdef"}}
+workshop_read 'notes.md'                -> an unredacted sk-proj- key in prose
+```
+
+Fixed with the same two layers via a new `_is_workshop_secret_path()`. The
+workshop-only names (`accounts.json`, `payments.json`, `payment_methods.json`)
+are deliberately a **separate** frozenset, not merged into `_SECRET_FILE_NAMES`:
+they are credential-bearing only inside the workshop's own schema, and merging
+would widen `file_read` for files that do not exist in the project tree.
+
+Sibling tools verified clean by execution, no change made: `workshop_list`
+(name/size/mtime), `workshop_storage` (byte counts), `workshop_search`
+(filename + marker, never the matched text), `workshop_write` (approval queued).
+
+### ARCH-ENG-135 (HIGH) — `redact_secrets` did not match this deployment's keys
+
+The pattern set covered only wallet key material. The live `.env` holds ~264 keys
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `UPWORK_CLIENT_SECRET`,
+`UPWORK_REFRESH_TOKEN`, ...) and **none** of those shapes matched. Executed
+pre-fix, all six cases `redacted=False`:
+
+```
+OPENAI_API_KEY=sk-proj-AAAA...    password: P@ssw0rd-abcdef
+token: ghp_HHHH...                Authorization: Bearer eyJhbG...
+AWS_ACCESS_KEY_ID=AKIA...        api_key = "aGVsbG8..."
+```
+
+So the v2.1.98 "redact other content" layer was ineffective against the exact
+secrets this deployment stores, and every consumer inherited the gap.
+
+Added value-shaped patterns (`sk-`, `gh[pousr]_`, `AKIA`, `xox[baprs]-`, PEM
+blocks) and label-shaped patterns that replace only the VALUE and keep the LABEL,
+so the model still learns *which* key is missing. Single marker
+`[REDACTED-SECRET]`, idempotent, `contains_secret` extended to agree.
+
+### ARCH-ENG-136 (HIGH) — the wallet's crown jewels survived anyway
+
+Found by the Architect's independent adversarial review of 135, not by the
+implementer's own tests. The pre-existing *bare-marker* rule matched the WORD
+`mnemonic` and replaced the **label**, leaving the value readable:
+
+```
+in : mnemonic: abandon ability able about above absent
+out: [REDACTED-SECRET]: abandon ability able about above absent
+```
+
+A seed phrase IS the wallet. Same for `seed_phrase`, `private_key`,
+`WALLET_ENC_KEY`.
+
+**A second leak surfaced while fixing the first:** a BIP39 phrase is
+SPACE-SEPARATED WORDS, so the labelled rule's `\S{6,}` captured only the first
+word — 11 of 12 words still readable. Added `_SEED_PHRASE_RE` for the whole list.
+
+Two revisions were tried and **rejected by execution**; the rejections are
+recorded in the code because they are the design rationale:
+
+1. matching a bare word list with no label matched ordinary English prose
+   ("3+ lowercase words" is also the shape of a sentence);
+2. allowing `is/are/was` as the separator matched
+   `The mnemonic is stored encrypted and never logged verbatim.`
+
+`redact_secrets` runs on every file the model reads, so over-redaction would gut
+the module and push callers to bypass it. The label plus `:`/`=` is mandatory.
+
+Residual risk, recorded honestly and pinned by a test: a phrase with no label, or
+after `is`, is not caught.
+
+### Verification
+
+- `tests/safety`: **213 passed, 86 subtests passed** (baseline 128 at cycle
+  start). Full suite: **2006 passed, 5 skipped, 175 subtests passed** (global
+  Python 3.14, working tree).
+- New: `test_arch_eng_133_legacy_tools_secrets.py` (19),
+  `test_arch_eng_134_workshop_read_secrets.py` (18),
+  `test_arch_eng_135_redact_secrets_patterns.py` (25),
+  `test_arch_eng_136_wallet_label_redaction.py` (23).
+- Every suite carries a **behaviour-targeted negative control**: unwire the
+  guard, prove the leak returns, restore it. 136 also pins the load-bearing rule
+  ordering. No existing test was changed — nothing asserted the old leaky
+  behaviour.
+- **Fresh-clone gate** (`git clone` + full suite) caught 2 ARCH-ENG-133 tests
+  that passed in the working tree but failed in a clone: both depended on the
+  gitignored real `.env`. Both classes now own their fixture (setUp writes a
+  marker `.env` only when absent, tearDown removes only what the test created),
+  which also stops them reading the operator's live `.env`. Clone re-run clean
+  (208 passed / 5 skipped in `tests/safety`); real `.env` verified unchanged.
+  This is why the gate is never skipped — the working tree and the clone differ
+  by exactly the gitignored files.
+- Version bumped in `app/version.py` (authority), the `main.py` fallback
+  literal, and `README.md`; `test_arch_eng_117_version_authority` passes.
+- Pre-existing clone-context failures in `tests/tools/test_github_publish_sync.py`
+  and `tests/engineering/test_arch_eng_113_env_fallback_bypass.py` reproduce
+  identically on the pre-cycle parent commit — not regressions from this work.
+
+### Open findings carried forward
+
+- **HIGH — `web_read`/`web_check` have no SSRF guard.** Executed against a
+  loopback server: an internal token was returned into model context and
+  `web_check` reported "Online (200)". `InstructionGate._is_safe_fetch_url`
+  already exists and blocks loopback/private/link-local — it is simply not
+  applied on this path, and redirects are followed without re-validation.
+- **HIGH — `WorkerFilesystemMixin.research_all` blocklist misses realistic
+  credential filenames** (`credentials.yml`, `secrets.yaml`,
+  `service-account.json`, `api_keys.yml`, `tokens.json`, `id_ed25519` all pass),
+  and the text flows into the shared-context research snapshot and back into the
+  prompt. Reproduced with a real PEM key.
+- **HIGH — `chat_router.build_runtime_context` inlines `.yaml`/`.json` file text
+  into the prompt unredacted.** `.env`/`*.key` are correctly excluded, but
+  `credentials.yaml` is not.
+- **MEDIUM — approval items persist raw model-supplied `arguments` to plaintext
+  `~/.mrbot1000/approvals.json`** and the GUI renders them verbatim. The fix must
+  redact for *display* only — `assert_approval_covers` must keep comparing the
+  unredacted in-memory arguments, or the v2.1.97 scope binding weakens.
+- **LOW — `run_command` output is not scanned** (see ARCH-ENG-133 known limit).
+- **LOW — `RealCryptoOperator.confirm_and_send` takes `private_key` as a plain
+  argument.** Unreachable in the wired path; carried since ARCH-ENG-132.
+
+### Verified sound, no change made
+
+`query_db` exposes no credential-bearing columns (all 7 stores enumerated and
+swept); the instruction-provenance gate fails closed with a single human-only
+allowlist writer; no integration client logs a request/response body, header or
+API key; `event_logger` writes no tool arguments or credentials.
+
+## [2.1.98] - 2026-10-14 - file_read no longer hands the credential stores to the model (ARCH-ENG-132)
+
+The v2.1.97 cycle recorded three open findings; this closes the HIGH one.
+
+`file_read` is classified READONLY and auto-allowed by the gate, and
+`resolve_project_path` confines reads to `PROJECT_ROOT` — which *contains the
+secret stores*. The credential vault's contract ("values are never returned to
+a model") was defeated by a tool that never touches the vault. Reproduced by
+EXECUTION against the pre-fix handler:
+
+```
+execute_tool('file_read', {'path':'.env'})                    -> 13,418 chars, 264 credential lines
+execute_tool('file_read', {'path':'wallet.key'})              -> the raw Fernet wallet encryption key
+execute_tool('file_read', {'path':'data/platform_vault.json'}) -> the encrypted platform vault
+execute_tool('file_read', {'path':'data/platform_vault.key'}) -> the vault's own key
+```
+
+All four reachable by a plain model tool call with zero approval, feeding
+straight into model context.
+
+### Fixed
+
+- **ARCH-ENG-132 (HIGH): `_tool_file_read` returns credential stores.**
+  Two layers now guard the boundary in `agents/safety/handlers.py`:
+  1. **Secret files are refused outright** — the value *is* the whole file, so
+     redaction is meaningless. `_is_secret_file` blocks `.env` (at any
+     directory depth, but NOT `.env.example`/`.template`/`.sample`, which hold
+     placeholders the agent needs to discover key names), `*.key`, `*.pem`,
+     `*.p12`, `*.pfx`, `*.keystore`, `wallet.key`, `platform_vault.key`,
+     `platform_vault.json`, `wallets.json`, `credentials.json`,
+     `secrets.json`, `.netrc`, `.npmrc`. The refusal names the reason and
+     points the model at `.env.example` + the operator.
+  2. **Every other file's content passes through `redact_secrets`** (the
+     existing `agents/integrations/wallet_crypto.py` primitive) before it
+     returns — so a credential pasted into a readable README/notes file is
+     scrubbed rather than read.
+
+  `redact_secrets` also matches 64-hex strings (git SHAs / content hashes), so
+  a long hash in a text file is redacted — a deliberate fail-safe: a false
+  redaction costs the model a hash; a false pass costs the operator a
+  credential. Short hashes (e.g. `3f8a2b1c`) are unaffected.
+
+### Tests
+
+`tests/safety/test_arch_eng_132_file_read_secrets.py` — 30 tests: the four
+live secret stores refused, the name-classifier's allow/block lists (incl.
+`.env.example` allowed, `.env.local` blocked), a pasted secret redacted in a
+readable file, clean prose untouched, and a **behavior-targeted negative
+control** — monkeypatching `_is_secret_file` to always-False re-leaks `.env`
+(>1000 chars), proving the guard is what stops it, and restoring it re-refuses.
+
+Full suite: **1921 passed, 5 skipped, 138 subtests passed**.
+
+### Not fixed this cycle (carried forward)
+
+- **MEDIUM — `.env` is in git history** (~9 commits). Historical values were
+  placeholders, so no live secret leaked, but rotate any key ever committed and
+  `git filter-repo` if the public mirror pulled those refs.
+- **LOW — `RealCryptoOperator.confirm_and_send` takes `private_key` as a plain
+  argument.** Unreachable in the wired path (`try_real_payment` hard-returns
+  `{"ok": False}`; only `propose_payment` is called from the GUI); also
+  `__init__(safety_guard=None)` makes `propose_payment` silently return
+  `status: "simulated"`.
+
+## [2.1.97] - 2026-10-14 - An approval authorizes ONE action, not a capability (ARCH-ENG-129)
+
+`record_payment` and `social_post` are the project's two HIGH-TRUST mutating
+tools. Both took an `approval_id` and checked exactly one thing about it:
+`item.status == APPROVED`. The item's `kind`, `details` and `payload` were
+never read — so `amount` and `content` were raw agent tool arguments sitting
+next to a gate that did not know what the human had reviewed.
+
+Every defect below was reproduced by EXECUTING the real handlers before the
+fix (not inferred from reading). Measured output:
+
+```
+human approved $5.00 for opp-XYZ
+record_payment -> PAID amount=$1000000.00 behind approval 95133307...
+  tracker booked: [('opp-XYZ', 1000000.0)]
+
+human approved file_write(scratch.txt)
+record_payment -> PAID amount=$777.00 behind approval 8da670ce...
+  tracker booked: [('opp-XYZ', 777.0)]
+
+human approved social_post content='Hello team'
+social_post -> posted to moltbook ... {'ok': True}
+  actually posted: [{'content': 'BUY THIS NOW http://x', ...}]
+```
+
+### Fixed
+
+- **ARCH-ENG-129 (HIGH): the approved AMOUNT was not the amount booked.**
+  `handlers.py:_tool_record_payment` read `amount = float(args.get("amount"))`
+  — a raw tool argument — and compared nothing to the approval. `enqueue_payment`
+  has recorded the approved amount in `details["amount"]` since the queue was
+  written; nothing ever read it. A human who reviewed "pay $5.00" could have
+  $1,000,000.00 booked as **verified revenue**, which then flows into
+  `OpportunityLifecycleTracker.verified_revenue_usd()`.
+
+- **ARCH-ENG-130 (HIGH): any APPROVED item authorized any mutating tool.**
+  No scope binding at all. Approval ids are model-visible — `dispatch.py`,
+  `chat_completion.py` and `big_brain.py` all return `request_id=<id>` into the
+  transcript — so a model could harvest ONE approved id and spend it against
+  any mutating tool. Reproduced: a human-approved `file_write`
+  (`path: scratch.txt`) replayed as the `approval_id` for `record_payment`
+  booked $777.
+
+- **ARCH-ENG-131 (HIGH): `social_post` published content other than what was
+  approved.** `content` came straight from `args`; the approved content was
+  never compared. Outbound public content behind a gate that does not read
+  what the human saw is not a gate. Live whenever `MOLTBOOK_API_KEY` is set.
+
+**The fix is one predicate** — `agents.safety.approval.assert_approval_covers
+(item, tool, arguments)` — called by both HIGH-TRUST tools before they mutate:
+
+- the approval must name **this tool** (`details["tool"]` or `payload["tool"]`);
+- where the producer recorded the arguments the human reviewed, those
+  arguments must **match** the call (a different amount, path, network or
+  content is a DIFFERENT action needing its own approval);
+- an item that records **no** tool scope authorizes **nothing** — fail closed.
+  `enqueue_submission` / `enqueue_gate` and the registration and safety-guard
+  producers record only free-form `details`, and the human never saw a tool.
+
+Supporting changes:
+
+- **`enqueue_payment` now records scope.** The approved amount travels in
+  `details["arguments"]`/`payload["arguments"]` alongside `tool:
+  "record_payment"`, so what the operator reviewed is what the tool enforces.
+  The legacy `details["amount"]`/`["currency"]` keys are preserved (existing
+  consumers read them), and a caller-supplied `payload` is kept verbatim.
+- **`main._execute_approved_action` stamps the approved id into the call.**
+  The model cannot know an approval id before the item exists, so the queued
+  arguments carry no `approval_id` — and the tools would then refuse a call a
+  human genuinely approved. The id is stamped on a copy of the arguments
+  immediately before dispatch, making the executed call provably the one the
+  operator approved. Without this the fix would have been a silent
+  approval-loop regression wearing a security badge.
+- **`assert_approval_covers` does not compare `approval_id` against itself** —
+  it is the handle by which the caller refers to the approval, and the stamp
+  site above legitimately rewrites it.
+- **The Social Activity tab's Moltbook post now captures the draft.** The
+  button previously enqueued an approval with no content at all, so there was
+  nothing for a scope binding to check. It now has a submolt field and a post
+  body, both recorded in the approval item, and refuses an empty draft.
+- **Both tool descriptions** in `agents/safety/tools.py` state the binding, so
+  the model stops reusing an approval id across requests.
+
+### Tests
+
+`tests/engineering/test_arch_eng_129_approval_scope_binding.py` — 29 tests.
+Discrimination proven by restoring the pre-fix handler with the scope helper
+still present: **9 fail**, and they are exactly the amount-scope, tool-scope
+and content-scope cases. The remaining 20 cover the predicate's own semantics
+(payload-over-details precedence, nested values, bool-vs-number, unrecorded
+keys not policed, status checked before scope) and the stamp site.
+
+`tests/safety/test_record_payment_gate.py` and
+`tests/safety/test_social_post_gate.py` fixtures updated: they enqueued
+**unscoped** approvals and asserted the tools ran behind them, i.e. they
+encoded the defect. They now enqueue scoped approvals with the amount/content
+under test, plus new cases for a different amount, a different content, an
+approval for another tool, and an unscoped approval.
+
+`tests/engineering/test_arch_eng_121_record_payment_evidence_floor.py` fixture
+gained an `amount=` parameter for the same reason; each call site now approves
+the amount it books.
+
+**Version-authority note:** `app/version.py` is the single authority, and
+`main.py` carries a last-resort fallback literal in its window title.
+`tests/engineering/test_arch_eng_117_version_authority.py` parses `main.py` and
+fails if that literal disagrees — the full suite caught it during this cycle
+(`1 failed, 1890 passed`), and both were bumped to 2.1.97 together. Bumping the
+version without the fallback is a one-test suite failure.
+
+### Not changed (verified sound)
+
+- The L3 evidence floor (ARCH-ENG-121) is untouched and still runs *after* the
+  scope check — an approval authorizes an action, not a verification.
+- `record_payment` still refuses a non-positive amount and still requires an
+  `evidence_ref` that resolves to a stored L3 record for THIS opportunity.
+- `social_post` still refuses when no confirmed writer is wired, never
+  fabricating a post.
+- `HumanApprovalQueue.find_by_id`'s restored-decision refusal, the
+  consumed-once ledger in `_execute_approved_action`, and the SQL read-only
+  validator are unaffected.
+
+## [2.1.96] - 2026-10-14 - Wiring crash when no brain slot renders (ARCH-ENG-128)
+
+A single-line defect that took down the whole Providers & GPU tab in one
+specific configuration: `hasattr()` cannot be used to test for a widget whose
+class answers every attribute name.
+
+### Fixed
+
+- **ARCH-ENG-128: `_wire_start_stop_buttons` / `_wire_refresh_buttons` crashed
+  with `AttributeError: 'function' object has no attribute 'connect'`.**
+
+  `_NullWidget` (v2.1.53, ARCH-ENG-053) is the null-object that stands in for a
+  disabled brain's legacy aliases. Its `__getattr__` returns a no-op callable
+  for ANY attribute name, so `hasattr(self, "sb_start_btn")` is **always True**
+  — it can never detect a missing widget — and `self.sb_start_btn.clicked`
+  resolves to that no-op *function*, which has no `.connect`.
+
+  The crash needs `_provider_rows` to be empty when the deferred
+  `_wire_all_signals()` timer fires, because the method's only guard was
+  `if getattr(self, "_provider_rows", None): return`. That is precisely the
+  "no brain slot renders at all" configuration: every slot disabled, both role
+  brains off and no CPU fallback. Verified on baseline:
+
+  ```
+  _provider_rows len = 0
+  sb_start_btn is _NullWidget = True
+    -> self.sb_start_btn.clicked.connect(...)
+  E   AttributeError: 'function' object has no attribute 'connect'
+  ```
+
+  Both wiring methods now skip null-object aliases and wire only real buttons.
+
+  **Honest note on severity:** this is a startup crash in a
+  both-brains-disabled configuration, not a data-integrity or
+  financial-truth defect. It aborts the tab's wiring, so the operator gets a
+  panel whose start/stop buttons are dead rather than a wrong number.
+
+- **`_wire_settings_signals` was checked for the same hazard and is NOT
+  affected.** It uses the same `hasattr` pattern, but
+  `_alias_legacy_settings_attrs()` *returns early* when fewer than two settings
+  rows exist, leaving those attributes genuinely absent rather than pointed at
+  `_NullWidget`. Measured in the same 0-row configuration:
+
+  ```
+  sb_ctx_spin -> QSpinBox; sb_temp_spin -> QDoubleSpinBox
+  sb_model_combo / bb_model_combo -> <ABSENT>
+  ```
+
+  `hasattr()` is honest there, so no change was made. Recorded so the next
+  reader does not "fix" working code.
+
+### Tests
+
+`tests/gui/test_null_widget_button_wiring.py` — 4 tests, 3 of which fail on
+baseline and pass after the fix. Includes an end-to-end precondition test that
+builds a real runtime with every slot disabled and asserts `_provider_rows` is
+empty before running the production wiring path, rather than hand-setting the
+alias.
+
+| Test | Baseline | After |
+|---|---|---|
+| `test_wire_start_stop_buttons_tolerates_null_widget_alias` | failed | passed |
+| `test_wire_refresh_buttons_tolerates_null_widget_alias` | failed | passed |
+| `test_all_slots_disabled_reaches_the_crash_precondition` | failed | passed |
+| `test_null_widget_clicked_is_a_function_not_a_signal` | passed | passed |
+
+Full GUI suite: 168 passed, 1 skipped — no regressions.
+
+## [2.1.95] - 2026-10-14 - Score-as-hours, discarded scam signal, and a gate an LLM could clear (ARCH-ENG-123/124/125/126/127)
+
+A follow-up audit of the same discovery -> opportunity -> accounting path
+v2.1.94 just cleaned found five more defects in the same family: a default, a
+fallback, or an unexamined shape doing the work of evidence. Two fabricated
+numbers; two discarded a real one; one let the least trustworthy input in the
+system clear a safety gate.
+
+### Fixed
+
+- **ARCH-ENG-123: the last two Reddit producers invented a $1 payout.**
+  `_discover_reddit` wrote a hardcoded `min_amount=1.0` on both the
+  r/WorkOnline and r/CryptoCurrency paths. Measured end-to-end through
+  `DynamicSource._discover` on a post containing no `$` anywhere:
+
+  ```
+  min_amount=1.0
+    -> canonical advertised_amount=1.0, estimated_net_value=1.0
+    -> validate_opportunity -> status=valid, reasons=[]
+  ```
+
+  The invented dollar is what made an unpayable listing structurally VALID,
+  because `validate_opportunity` sets `payment_present =
+  advertised_amount > 0`. It then flowed into ranking, the
+  opportunity-intelligence score, and the autonomous loop's economics and
+  financial-exposure stages. This is the same violation v2.1.93 fixed for the
+  other Reddit/GitHub producers and v2.1.68 for LinkedIn/WeWorkRemotely - that
+  one pair was left behind, and `"dynamic"` is in the default source rotation.
+
+  `_stated_usd()` now books a figure only when the text attributes it to a
+  payout, within a plausible magnitude (`1.0 <= v <= 100_000`, the same ceiling
+  the sibling GitHub producer uses). The same listing now reports
+  `advertised_amount=0.0`, `status=invalid`,
+  `reasons=['missing payment information (amount=0)']`.
+
+  **The reviewer caught that the first cut of this fix reopened ARCH-ENG-120.**
+  A bare first-`$` regex has no attribution check, and r/CryptoCurrency reads
+  crypto news where the first `$` is usually a market price:
+
+  ```
+  "BTC is at $67,500 today. Join the airdrop, gas only."  -> 67500.0
+  "Startup kit costs $250 to join. No wage stated."       ->  250.0  (a COST)
+  "We raised $250,000,000 for victims"                    -> 2.5e8
+  "Reimbursement up to $239398281948585883"               -> 2.4e17
+  ```
+
+  Every one of those crosses the `payment > 100.0` financial-exposure threshold
+  in `autonomous_loop._stage_request_approval`. `_stated_usd` now applies the
+  ARCH-ENG-120 attribution rule in job-prose vocabulary - price-context cues,
+  cost cues, and a coin-adjacency guard all refuse - and the full 28-case
+  must-book/must-refuse corpus ships as regression tests (13 must-book, 15
+  must-refuse, 28/28 correct).
+
+- **ARCH-ENG-124: a 0..1 effort SCORE was consumed as HOURS.**
+  `intelligence.evaluate_intelligence` passed `effort_score` straight into
+  `SemanticEstimate.effort_hours`, so the engine divided expected value by a
+  difficulty rating. Measured end-to-end on a $2,500 GitHub bounty:
+
+  ```
+  effort_score=0.1 -> effort_hours=0.1 -> expected_hourly_value = $1,403.09/h
+                                                           verdict = attractive
+  ```
+
+  That number reaches `got.OpportunityGraph._utility` (`0.1 * hourly` in the
+  ranking) and the operator. Hours are now passed ONLY when the opportunity
+  actually states them; a score still feeds `difficulty`, which is
+  score-shaped, so the signal is preserved. `effort_score=0.1` now yields
+  `effort_hours=0.0`, `expected_hourly_value=0.0`.
+
+  The same change found the LLM scoring contract was internally inconsistent:
+  `evaluation.py` asks the model for every axis on a **0-10** scale, while every
+  consumer of `skill_match`/`effort` treats them as **0..1**. Measured, a model
+  answering honestly with `skill_match=7.0` saturated `p_acceptance` to 1.000
+  and `effort=5.0` drove `p_completion` to its 0.01 floor, collapsing a $2,500
+  opportunity from `attractive` to `marginal` - the model's own scale was
+  breaking the probability model in BOTH directions. A `to_unit()` helper
+  divides by 10 when a value exceeds 1.0 and clamps to 0..1. `risk` is
+  deliberately NOT normalized: its `>=7`/`>=4` thresholds are written for the
+  0-10 scale the prompt asks for.
+
+  Finally the ranking divisor `(effort_score + 0.1)` turned the 0..1 range into
+  a 10x multiplier - measured, net $2,500 / skill 0.7 ranked 8,750.0 at effort
+  0.1 versus 2,916.7 at 0.5, a 3x swing from difficulty alone, compounded by
+  `_apply_memory_boost`. Now `+1.0`, bounding the whole range to 2x. This is a
+  re-weighting, not an order-preserving tweak: 2,186 of the sampled pairs
+  change relative order, which is the point - a low-value, low-skill
+  opportunity can no longer outrank a high-value, high-skill one purely from
+  the floor.
+
+- **ARCH-ENG-126: the model's scam assessment was computed and then thrown
+  away.** `normalize_scores` produced `scam_prob`, and its only use was a
+  coarse `if scam_prob > 0.7: risk_level = "high"` cliff. `opportunity.scam_prob`
+  was never assigned - verified, `hasattr(o, "scam_prob")` was False after a
+  successful evaluation - so `evaluate_intelligence`, which reads exactly that
+  attribute, always saw 0.0 and reported `reasons["scam_risk"] = "low"` for an
+  opportunity the model had scored 0.95. The engine's `scam >= 0.6 -> unsafe`
+  gate was unreachable from the LLM path. Now assigned.
+
+- **ARCH-ENG-127: a semantic estimate could CLEAR a producer's scam gate.**
+  Factor 12 did `scam = est.scam_risk`, replacing the producer's value
+  outright. Measured end-to-end through the real engine:
+
+  ```
+  producer scam_risk=0.9, no estimate      -> scam high    verdict unsafe
+  producer scam_risk=0.9, estimate 0.0     -> scam low     verdict attractive
+  ```
+
+  An LLM answering `scam_prob: 0` on an opportunity a deterministic producer had
+  screened at 0.9 moved the verdict from `unsafe` to `attractive`. That branch
+  is the only thing standing between this agent and a scam listing, and it was
+  overridable by the least trustworthy input in the system. Now
+  `scam = max(scam, est.scam_risk)` - the same asymmetry the `skill_fit` path
+  already had: an estimate may RAISE a risk, never lower it.
+
+- **ARCH-ENG-125: a liquidity pool's TVL was booked as a payout.**
+  `DefiSource` computed `advertised_amount = tvl_usd * (apy_percent/100) * 0.01`
+  and wrote it into BOTH `advertised_amount` and `estimated_net_value`. TVL is
+  the size of a liquidity pool, not a payout anyone offers this agent, and the
+  `0.01` factor has no derivation anywhere in the repo. Counterfactual, a $1B
+  pool at 3.4% APY yields $340,000 - crossing the financial-exposure threshold
+  as if a stranger had offered a $340k prize. Now 0.0/0.0.
+
+### Recorded, not fixed (pre-existing, no production impact today)
+
+- `canonical_to_legacy` does not copy `scam_risk`, and the legacy `Opportunity`
+  dataclass has no `scam_prob` field, so a producer's screened value (e.g.
+  DefiSource's 0.4) round-trips to 0.0 and ARCH-ENG-127's `max()` is a no-op on
+  the live pipeline path. The fix has teeth when the engine is driven directly
+  (which is what the test does). Closing the adapter gap is the follow-up.
+- `sufficiency["scam_provided"]` reports `True` for an opportunity with no
+  `scam_prob` attribute at all, because `intelligence.py` passes `0.0` rather
+  than `None`. Reporting inaccuracy only; it does not enter the `missing`
+  confidence set.
+
+### Tests
+
+New file `tests/engineering/test_arch_eng_123_124_125.py` (32 tests), measured
+against the pre-fix sources restored from HEAD in a separate clone:
+
+| assignment | before fix | after fix |
+|---|---|---|
+| ARCH-ENG-123 | 5 failed | 32 passed |
+| ARCH-ENG-124 | 4 failed | 32 passed |
+| ARCH-ENG-125 | 1 failed | 32 passed |
+| ARCH-ENG-126/127 | 4 failed | 32 passed |
+
+The reviewer's two findings are pinned as their own negative controls: the
+28-case attribution corpus fails against a bare first-`$` regex (the first cut
+of the fix), and `test_real_pipeline_divisor_is_bounded` fails against the
+`+0.1` divisor - the earlier version of that test re-derived the formula inline
+and would have stayed green on a revert.
+
+Full suite: **1854 passed, 5 skipped, 138 subtests passed**.
+
+
+## [2.1.94] - 2026-10-14 - Three financial-truth defects: unattributed `$`, evidence-floor bypass, gross-as-net (ARCH-ENG-120/121/122)
+
+A repo-wide audit for financial-truth violations found three live defects. Two
+booked money that was never verified; the third reported a gross figure under a
+net label. All three are the same failure mode as v2.1.68 and v2.1.93 — a
+default, a fallback, or an unexamined shape doing the work of evidence.
+
+### Fixed
+
+- **ARCH-ENG-120: the first `$` in a crypto headline became the airdrop payout.**
+  `AirdropScanner._parse_entry` took the first dollar figure anywhere in the
+  headline+body with no check that it described the airdrop.
+
+  ```python
+  value_match = re.search(r"\$([\d,]+(?:\.\d{1,2})?)", combined_text)
+  estimated_value_usd=(float(value_match.group(1)...) if value_match else 0.0)
+  ```
+
+  Measured before the fix, end-to-end through `AirdropSource._discover`:
+
+  ```
+  input:  "Bitcoin holds at $95,000 as airdrop season begins"
+  _parse_entry  -> estimated_value_usd = 95000.0
+  AirdropSource -> advertised_amount=$95,000, estimated_net_value=$95,000
+  intelligence  -> expected_value = $3,446.52, verdict = "attractive"
+  ```
+
+  A BTC market price booked as an airdrop payout, and the EV gate called it
+  attractive. This was the **live default discovery path**: `AirdropSource` is
+  in `all_builtin_sources()` with `is_enabled()` true, and the
+  `feature_enabled("airdrop_claiming")` flag guards only the legacy
+  `_discover_source` path, which has no callers.
+
+  `_extract_stated_value_usd` now books a figure only when the text attributes
+  it to the airdrop, and yields `0.0` (unknown) otherwise — a value cue, a
+  forward cue, or the drop named as the adjacent subject, with market-price
+  language and a coin ticker adjacent to the figure both refusing.
+
+  **The reviewer caught that the first version of this fix still reopened the
+  defect** — 7 words sit in both the value-cue and payout-noun tables
+  (`reward`, `allocation`, `bonus`, `claim`, `giveaway`, `payout`, `prize`), so
+  the original "no payout noun before the figure" escape clause was disabled by
+  any of them and `"Airdrop allocation — Bitcoin $95,000 snapshot"` booked
+  `$95,000`. The escape clause was removed in favour of requiring the coin to be
+  *adjacent* with no attribution verb between it and the `$`. All 13 re-open
+  headlines are now pinned as regression tests.
+
+- **ARCH-ENG-121: `record_payment` booked an agent-asserted amount as VERIFIED
+  revenue.** The handler built a hand-written evidence dict with no `status` and
+  no `verification_level`, so `_is_verified_evidence` took its legacy
+  `if not status: return bool(ev.get("verified"))` branch:
+
+  ```python
+  evidence={"verified": True, "method": "manual",
+            "reference": evidence_ref or "agent-recorded", ...}
+  ```
+
+  Measured: `mark_paid_verified(amount=7500.0, evidence=<that dict>)` →
+  `verified_revenue_usd() == 7500.0`, `_is_verified_evidence == True`. Every
+  other paid path enforces the L3 floor; this one did not. An approval
+  authorizes an **ACTION**, not an AMOUNT and not a VERIFICATION, and `amount`
+  came straight from the tool arguments.
+
+  Now fails closed. The evidence-floor check was **not** implemented by
+  synthesizing a conforming status/level — that would launder an unverified
+  claim by relabelling it. `evidence_ref` is resolved against the authoritative
+  `EvidenceStore`, and only a stored record carrying its own affirmative status
+  and `verification_level >= L3_EXTERNAL_SOURCE` for *this* opportunity books.
+  An unknown id, a below-floor record, a record for another opportunity, and a
+  hand-built dict (including a serialized `Evidence.to_dict()`) all refuse.
+
+  `tests/safety/test_record_payment_gate.py::test_records_behind_approved_approval`
+  **asserted the defect** — it passed a bare `evidence_ref` and asserted the
+  hand-written dict reached the tracker. Updated to supply a genuine L3 record,
+  with a new companion test pinning that a bare ref refuses.
+
+  The reviewer also found the first cut made the tool **structurally
+  unreachable** (tool arguments are JSON, so an `Evidence` object can never be
+  passed in), which would have turned the fix into a guaranteed refusal loop
+  while the tool description promised otherwise. Store resolution closes that
+  gap without reopening the laundering path.
+
+- **ARCH-ENG-122: gross was reported as net.** `opportunity_intelligence` fell
+  back to `advertised_amount` whenever `estimated_net_value` was unset, then
+  wrote it into `reasons["estimated_net_payment"]` — a *net*-labelled field —
+  and reported the amount as known. Gross is not net: platform fees and haircuts
+  are real and unmodelled. Now records `net_payment_known` and an
+  `estimated_net_payment_basis`, and reduces confidence, without changing verdict
+  routing.
+
+### Also fixed
+
+- `_evidence_detail` documented itself as never-raising but raised `ValueError`
+  on a malformed `verification_level`, so a garbage `evidence` argument surfaced
+  as a tool crash instead of the refusal the caller needs.
+- `docs/codemap/agents-safety.md` cited stale line numbers for
+  `set_lifecycle_tracker` / `_tool_record_payment`; corrected, and the new
+  evidence-floor helpers documented.
+
+### Tests
+
+Three new files (ARCH-ENG-120: 25 tests + subtests; 121: 21 tests; 122: 6 tests)
+plus the updated gate test. Measured discrimination, each run against the
+original code restored from HEAD and then with the fix applied:
+
+| assignment | before fix | after fix |
+|---|---|---|
+| ARCH-ENG-120 | 9 failed / 7 passed | 25 passed |
+| ARCH-ENG-121 | 6 failed / 8 passed | 21 passed |
+| ARCH-ENG-122 | 5 failed / 3 passed | 6 passed |
+
+ARCH-ENG-120's corpus covers both directions — a BTC price must not book, and a
+genuine "airdrop worth $500" must still parse — plus the reviewer's over-
+rejection cases (`"$2,500 reward for testnet participants"`, `"Airdrop live now
+— $1,000"`), which a backward-only cue window silently dropped.
+
+Full suite: **1821 passed, 5 skipped, 138 subtests passed** (the single failure
+during the run was the version-authority guard correctly demanding this entry).
+
+### Recorded, not fixed (no production caller)
+
+- `export_analytics_report` (`opportunity_lifecycle.py`) sums `last_amount`
+  across ALL stages with no paid/verified filter, so two merely-*submitted*
+  opportunities report as $10,799 of value. Reached only from
+  `initialize_lifecycle_export`, which has no caller.
+- `payout_verifier` + `mark_paid_verified` book the caller's *claim* rather than
+  the measured `observed_usd` delta, and the 0.9 tolerance makes them diverge by
+  design with nothing reconciling them. The triggering `verify_crypto` call in
+  `main.py` passes no snapshots, so it currently always returns `verified=False`.
+- `economic_accounting` uses a frozen `_DEFAULT_RATES` FX table (`eth: 3500.0`,
+  `btc: 65000.0`) for VERIFIED payments — a 2021-vintage price applied to 2026
+  revenue. Latent: no current producer records non-stablecoin `Evidence`.
+- `gas_estimator` returns `$0.00` for every chain except ethereum/solana, so the
+  skip-gate never fires elsewhere. Documented placeholder, env-overridable.
+- `discoverer.py` still sets `min_amount=1.0` on Reddit posts with no stated pay
+  — the same class fixed for the other two Reddit/GitHub producers in v2.1.93,
+  in a different file.
+- ARCH-ENG-122's new branch is defensive-only: every production producer sets
+  `estimated_net_value` from the same field as `advertised_amount`, so
+  `advertised > 0 && net == 0` has no production site today.
+
+
+
+Two discovery producers invented revenue for listings that never stated an
+amount, and wrote the invented figure into the fields the rest of the system
+treats as fact. Both were the same financial-truth violation that was already
+fixed for LinkedIn and WeWorkRemotely in v2.1.68 — those two were caught, this
+pair was not.
+
+### Fixed
+
+- **ARCH-ENG-118: `_scan_reddit_jobs` fabricated `$50` when a listing stated
+  no amount, and truncated `$1,500` to `$1`.**
+
+  ```python
+  pay_amount = float(dollar_match.group(1)) if dollar_match else 50.0   # before
+  ```
+
+  Two separate defects on one line. The `else 50.0` invented a payout the
+  listing never offered, and the regex `\$(\d+)` has no comma handling, so
+  `"$1,500"` parsed as `1`.
+
+  Measured before the fix: `"[HIRING] Virtual assistant / We pay weekly.
+  Remote."` (no amount anywhere) emitted `min_amount=50.0,
+  estimated_value=50.0`; `"Budget is $1,500 total"` emitted `min_amount=1.0`.
+  Both values flow through `SocialSource._discover` into the canonical
+  `advertised_amount` / `estimated_net_value`.
+
+  **Why the fabricated `50.0` mattered beyond being wrong.** It is what made an
+  unpayable listing structurally VALID. `validate_opportunity` sets
+  `payment_present = advertised_amount > 0`, so a post offering nothing passed
+  validation with `status="valid"` and `reasons=[]` — then flowed into ranking,
+  the opportunity-intelligence score, and the autonomous loop's economics and
+  financial-exposure stages. A default value was doing the work of evidence.
+  With the fix that same listing is `advertised_amount=0.0`,
+  `payment_present=False`, `reasons=["missing payment information (amount=0)"]`.
+
+  Reddit is the only social source that actually returns entries — LinkedIn's
+  public jobs feed is empty, and the forum/Twitter scanners fail closed — so
+  this was the live fabrication site, not a dormant branch.
+
+  Now uses the same comma-aware parse as the v2.1.68 scanners
+  (`\$\s*([\d,]+)(?:\.\d{2})?`); no match → `0.0` (unknown).
+
+- **ARCH-ENG-119: `_discover_github_bounties` fabricated `$10` on both
+  fallbacks, under a comment saying the opposite.**
+
+  ```python
+  # treat an implausible figure as unknown rather than a real prize.
+  if not (1.0 <= bounty <= MAX_BOUNTY_USD):
+      bounty = 10.0        # <- asserted a prize, did not treat it as unknown
+  ```
+
+  The absurd-parse guard existed precisely to stop garbage figures becoming
+  prizes, then wrote a hardcoded `$10` — inventing the payout it was written to
+  reject. The `else 10.0` on the no-match path did the same. Both now yield
+  `0.0`, and the regex gained comma handling (`"$2,500 on merge"` parsed as
+  `25` before).
+
+### Not changed (recorded finding)
+
+- `AirdropScanner._evaluate_opportunity` still contains the same pattern
+  (`value = 50.0` / `value = 10.0`). It has **no production caller**: both the
+  discovery source and the earning pipeline call `scan_feeds()`, which routes
+  through `_parse_entry` and already yields `0.0` for an unstated amount.
+  `_evaluate_opportunity` is reached only from the legacy `scan()` entry point.
+  Left alone deliberately — no evidence it runs, and editing unreached code
+  cannot be verified. Recorded as a finding for when `scan()` is wired or
+  retired.
+
+### Tests
+
+`tests/engineering/test_arch_eng_118_119_no_fabricated_payout.py` (10 tests) —
+a listing stating no amount emits 0; `$1,500` is not truncated to `1`; real
+amounts still parse; an unpayable listing no longer passes validation; and each
+producer is structurally pinned by AST so a hardcoded positive float fallback
+cannot be reintroduced without failing the suite. No network: `feedparser` and
+the GitHub API response are mocked.
+
+Discrimination: **8 of 10 failed with the fix stashed, 10 pass with it
+applied.** The 2 that still pass are the "real amount still parses" cases,
+which are correct under both the old and new code — they exist to prove the fix
+did not break the happy path.
+
+Bumped `__version__` to 2.1.93.
+
+## [2.1.92] - 2026-10-13 - Silent hardware/config corruption under test capture (ARCH-ENG-113/114/115/116/117)
+
+Four defects found by driving the suite as the operator would (`pytest -s`,
+default fd capture) rather than the way that happened to pass. All four made
+the system state something it had not verified: operator config rewritten, safe
+mode silently enabled, hardware asserted as fact, and a two-GPU box reported as
+having no GPUs at all.
+
+Every fix is discrimination-tested in both directions — the new tests fail with
+the fix stashed and pass with it applied.
+
+### Fixed
+
+- **ARCH-ENG-113: an explicit `path=` let a `.env` write escape
+  `MRBOT_ENV_PATH` test isolation and rewrite the operator's LIVE `.env`.**
+
+  `set_env_values(values, path=...)` lets a caller name the target directly. Two
+  GUI persistence paths used that to retry a failed write against a hardcoded
+  `<repo>/.env`:
+
+  - `gui/widgets/dual_brain_control.py` (`_persist_settings`)
+  - `gui/workers/provider_lifecycle_backend.py` (`_write_env_values`)
+
+  The old guard only refused when `MRBOT_ENV_PATH` was **unset**. Under pytest
+  the override **is** set, so the retry was permitted — and the explicit path
+  pointed at the operator's live credentials file. Reproduced end-to-end: one
+  transient failure on the isolated write rewrote the live `.env`, normalising
+  every CRLF to LF and flipping a provider toggle. The session guard in
+  `tests/conftest.py` caught it as "the test suite modified .env".
+
+  `_env_write_refusal` now takes the resolved target and refuses it under pytest
+  whenever it resolves to the repository's own `.env`, however it was spelled
+  (absolute, relative, or via `..`). An explicit *isolated* path still writes,
+  so the legitimate production fallback (CWD != repo root) is untouched outside
+  pytest. Verified: production behaviour unchanged, and the guard is test-only.
+
+- **ARCH-ENG-114: `main.py` parsed the HOST process's argv at import, so
+  `pytest -s` silently enabled safe mode for the whole session.**
+
+  `main.py` defines `-sm` / `--safe-mode` and called `parse_known_args()`
+  unconditionally at module scope. `parse_known_args` is deliberately
+  permissive: pytest's `-s` (no capture) parses as the short-option cluster
+  `-s` + `m`, which argparse expands to `-sm`. Measured:
+  `parse_known_args(['-s'])` → `safe_mode=True`.
+
+  So adding `-s` to the pytest command line set `MRBOT_SAFE_MODE=true`
+  process-wide. `ActionPipeline.__init__` reads that env var, so every pipeline
+  built afterwards skipped its file writes, and 3 tests in
+  `tests/safety/test_safe_mode_pipeline.py` failed — in a file that passes 5/5
+  alone, purely because of the command line.
+
+  The parse is now guarded by `if __name__ == "__main__"`, so only the real
+  entrypoint consumes argv. `python main.py -sm` still works (verified).
+
+- **ARCH-ENG-115: a brain prompt asserted hardware that detection never
+  confirmed.**
+
+  `BigBrainAdapter._hardware_line` / `SmallBrainAdapter._hardware_line` fell
+  back to `cfg.gpu_label` when the device registry came back empty. That default
+  is a literal placeholder — `ROLE_DEFAULTS[BIG]["gpu_label"]` is the string
+  `"GPU 0 (detected hardware)"`. So whenever `nvidia-smi` returned nothing, the
+  brain was told, as fact, that it runs on a specific GPU that had never been
+  detected.
+
+  Measured: with detection stubbed to CPU-only, the old code produced
+  `"You run on GPU 0 (detected hardware)."` while the only detected device was
+  the CPU pool. This is an evidence-integrity bug in the same family as the
+  project's financial-truth rules — an inferred or defaulted value presented as
+  observed fact. It also made `test_brain_prompt_hardware.py` flaky (~50% of
+  runs).
+
+  Now: no confirmed device → no hardware section at all. Omitting is strictly
+  better than asserting a false one.
+
+- **ARCH-ENG-116: GPU detection reported ZERO GPUs on a two-GPU box, and the
+  documented fallback was dead code.**
+
+  Two compounding defects in `_detect_gpus`:
+
+  1. `subprocess.run(..., capture_output=True)` must duplicate whichever
+     standard streams it is given so the child can inherit them. On Windows
+     that `DuplicateHandle` fails with WinError 50 when the parent's own stdout
+     is a pipe a capture layer has reconfigured — exactly what pytest's default
+     `--capture=fd` does. The failing handle was **stdin**, not stdout:
+     `_get_handles` duplicates every stream it is handed, and leaving stdin
+     implicit made it inherit the capture pipe. A bare
+     `except Exception: continue` swallowed it, making a spawn failure
+     indistinguishable from "this query form is unsupported".
+
+  2. The ProviderManager fallback called `get_gpus(detect=False)`, which
+     returns the manager's **cached** list — empty until something has probed.
+     The fallback only runs when nvidia-smi already failed, so nothing had
+     probed: it returned `[]` every time.
+
+  Measured before the fix: `_detect_gpus()` under `--capture=fd` raised
+  `OSError(22, ..., 50, None)` and returned 0 GPUs, while `--capture=sys` / `-s`
+  returned both cards. Every caller then saw a GPU-less box —
+  `test_management_tab_builds` got 1 persona field instead of 3, and the brain
+  prompts dropped their hardware section.
+
+  `_run_nvidia_smi` now names all three std streams explicitly (stdout to a
+  real temp file, stdin and stderr to DEVNULL) so nothing has to be inherited,
+  and the fallback forces a probe with `detect=True`. A new
+  `_LAST_DETECT_ERROR` records why a probe could not run, so a caller can tell
+  "this box has no GPUs" from "we could not ask".
+
+### Tests
+
+- `tests/engineering/test_arch_eng_113_env_fallback_bypass.py` (6 tests) —
+  the hardcoded repo-.env fallback is refused under pytest in every spelling;
+  an explicit isolated path still writes; rule 1 survives rule 2; production
+  outside pytest is unaffected. Self-healing: restores the live `.env` if an
+  attempt ever succeeds, so detecting the regression cannot itself corrupt
+  operator config.
+- `tests/engineering/test_arch_eng_114_argv_collision.py` (6 tests) — the
+  `-s` → `-sm` collision is pinned; importing main.py under a pytest argv sets
+  nothing; `python main.py -sm` still enables safe mode; the parse is
+  structurally guarded on `__main__`.
+- `tests/engineering/test_arch_eng_115_hardware_placeholder.py` (5 tests) —
+  the `"GPU 0 (detected hardware)"` placeholder never reaches a prompt under any
+  detection result; a confirmed device is still named; a broken registry
+  degrades to "no claim"; neither adapter reads `gpu_label` again (checked on
+  parsed code, so the explanatory comment does not trip it).
+- `tests/engineering/test_arch_eng_116_gpu_detection_capture.py` (6 tests) —
+  the nvidia-smi probe works under pytest's fd capture and never raises a handle
+  error; all three std streams are named explicitly; a failed probe leaves a
+  diagnostic; the fallback forces a probe; the CPU pool still appears.
+- `tests/engineering/test_arch_eng_117_version_authority.py` (4 tests) —
+  `app/version.py`, `main.py`'s fallback literal, `README.md`'s documented
+  authority, and the top CHANGELOG entry must all agree.
+
+### Also fixed this cycle
+
+- **ARCH-ENG-117: `main.py` carried a version literal sixty-one releases stale.**
+
+  `app/version.py` is the single authority. `main.py` also held a last-resort
+  literal `"2.1.31"`, and `README.md`'s file-map documented the authority as
+  `2.1.86`. The drift went unnoticed because the literal only executes when the
+  import fails — i.e. in a broken install, the one moment the operator is trying
+  to work out what they are running, where it then reports a confidently wrong
+  version.
+
+  Literal brought in step and README updated. Discrimination: 2 failed with the
+  old values restored, 4 passed after.
+
+### Verification
+
+Full suite on the authoritative interpreter (global Python 3.14):
+
+- `1763 passed, 5 skipped, 106 subtests passed` — zero failures.
+- Re-run with `-s` (the operator flag that exposed ARCH-ENG-113/114):
+  `1759 passed` — identical (count differs only by the 4 ARCH-ENG-117 tests
+  added after that run).
+- `.env` byte-identical before and after the whole run (the ARCH-ENG-113 guard
+  from `tests/conftest.py` also holds).
+- Discrimination proven per fix: with each fix stashed its tests fail (ARCH-ENG-113:
+  2 failed + 1 error; 114: 3 failed; 115: 5 failed; 116: 2 failed), and pass
+  once restored.
+
+Bumped `__version__` to 2.1.92.
+
 ## [2.1.91] - 2026-10-13 - Test-order pollution root-caused and fixed (ARCH-ENG-112)
 
 Two pre-existing, environment-dependent test failures fixed in one cycle. Both

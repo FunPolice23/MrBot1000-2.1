@@ -167,6 +167,56 @@ DEFAULT_DIALOGUE_GOAL = "Earn any amount of money or crypto"
 _LIVE_TRANSPORT_FAILURE_BUDGET = 8
 
 
+# The brains emit this exact marker when a generation comes back blank
+# (big_brain.py / small_brain.py: "[<Name> Error: model returned an empty
+# response for '<model>' at '<url>'. ...]"). It is a DETERMINISTIC empty output,
+# not a transient connection fault — a reconnect cannot fix a blank generation —
+# so it must be routed to the bounded empty-response handler (which adds a
+# recovery prompt), NOT burned against the transport-retry budget.
+_EMPTY_MODEL_RESPONSE_MARKER = "model returned an empty response"
+
+
+def _is_empty_model_response(response_text: str) -> bool:
+    """True iff the response is the brains' deterministic empty-output marker.
+
+    Separated from generic transport errors: an empty generation needs a
+    stronger prompt, not another connection attempt.
+    """
+    return _EMPTY_MODEL_RESPONSE_MARKER in (response_text or "").lower()
+
+
+def _is_transport_error_text(response_text: str) -> bool:
+    """True iff the response indicates a transient TRANSPORT fault.
+
+    Deliberately EXCLUDES the deterministic empty-model-response marker: a blank
+    generation is not a connection fault, so retrying it as one just spends the
+    transport budget (``_LIVE_TRANSPORT_FAILURE_BUDGET`` identical retries) on a
+    fault a reconnect cannot fix. The caller routes empty output to the bounded
+    empty-response handler instead.
+    """
+    rl = (response_text or "").strip().lower()
+    if not rl:
+        return False
+    if _is_empty_model_response(rl):
+        return False
+    return (
+        rl.startswith(("error:", "[error:", "connection error"))
+        or " error: connection error" in rl
+        or (rl.startswith("[") and " error:" in rl[:120])
+        or "no model selected" in rl
+        or "no model loaded" in rl
+    )
+
+
+def _is_empty_response_text(response_text: str) -> bool:
+    """True iff the turn produced no usable content and should be retried as an
+    empty response (bounded), covering a blank string, the worker's "(empty)"
+    marker, and the brains' empty-model-response marker.
+    """
+    rt = (response_text or "").strip()
+    return (not rt) or rt == "(empty)" or _is_empty_model_response(rt)
+
+
 class DialogueTab(QWidget):
     """Goal-driven conversation between the Driver and Navigator personas."""
 
@@ -1601,17 +1651,10 @@ class DialogueTab(QWidget):
         # so the other model does not receive an error string as context.
         response_text = (response or "").strip()
         response_lower = response_text.lower()
-        is_transport_error = (
-            response_lower.startswith(("error:", "[error:", "connection error"))
-            or " error: connection error" in response_lower
-            or (
-                response_lower.startswith("[")
-                and " error:" in response_lower[:120]
-            )
-            or "no model selected" in response_lower
-            or "no model loaded" in response_lower
-            or "model returned an empty response" in response_lower
-        )
+        # A deterministic empty model output is NOT a transient transport fault:
+        # route it to the bounded empty-response handler below, not the
+        # transport-retry budget (see _is_transport_error_text).
+        is_transport_error = _is_transport_error_text(response_text)
         if is_transport_error:
             # ARCH-ENG-109: capture the exact response_text that triggered the
             # "could not reach its model" decision so the root cause is
@@ -1665,11 +1708,13 @@ class DialogueTab(QWidget):
                 self._schedule_live_continuation(250, self.respond)
             return
 
-        # Handle empty responses. This branch is ONLY for genuinely blank
-        # replies ("" or the worker's "(empty)" marker). A valid non-empty
-        # persona turn must fall straight through to the accept path below —
-        # it must never be discarded, re-ran, or replaced by a placeholder.
-        is_empty_reply = (not response_text) or response_text == "(empty)"
+        # Handle empty responses. This branch is for genuinely blank replies
+        # ("" or the worker's "(empty)" marker) AND the brains' deterministic
+        # empty-output marker ("model returned an empty response"), which is
+        # routed here instead of the transport-retry path. A valid non-empty
+        # persona turn must fall straight through to the accept path below — it
+        # must never be discarded, re-ran, or replaced by a placeholder.
+        is_empty_reply = _is_empty_response_text(response_text)
         if not is_empty_reply:
             # Valid turn: accept it below with the real response text.
             pass
@@ -2507,42 +2552,6 @@ class DialogueTab(QWidget):
                 _bs[speaker] = "approval_required"
         return is_terminal
 
-    def _get_opportunity_context(self) -> str:
-        """Read-only snapshot of the current opportunity portfolio for prompt context."""
-        try:
-            owner = self.parent()
-            while owner is not None and not hasattr(owner, "opportunity_portfolio"):
-                owner = owner.parent()
-            if owner is None:
-                return ""
-            entries = list(owner.opportunity_portfolio.list_all())
-        except Exception:
-            return ""
-        if not entries:
-            return ""
-        lines = ["## OPPORTUNITY SNAPSHOT (READ-ONLY PROMPT CONTEXT ONLY)"]
-        for entry in entries:
-            ref = getattr(entry, "opportunity_ref", {}) or {}
-            title = str(ref.get("title", getattr(entry, "title", "?")))
-            url = str(ref.get("url", getattr(entry, "url", "")))
-            platform = getattr(entry, "platform", "?")
-            category = getattr(entry, "category", "?")
-            expected = getattr(entry, "expected_value", None)
-            status = getattr(getattr(entry, "work_status", None), "value", "?")
-            ev_line = f"- {entry.opportunity_id}: {title}"
-            if url:
-                ev_line += f" ({url})"
-            ev_line += f"\n  platform={platform} category={category} status={status}"
-            if expected is not None:
-                ev_line += f" expected_value={expected}"
-            ev_line += "\n  NOTE: this is not proof of availability or payment."
-            lines.append(ev_line)
-        lines.append(
-            "This is read-only prompt context, not proof of availability, "
-            "payment, or human approval."
-        )
-        return "\n".join(lines)
-
     def _build_opportunity_board(self, max_chars: int) -> str:
         """Return the visible opportunity board, bounded to *max_chars*.
 
@@ -2582,23 +2591,75 @@ class DialogueTab(QWidget):
             "These are the candidates the Opportunities tab is currently showing. "
             "Choose from them by number; they are leads, not verified earnings."
         )
+        # A1: rank best->worst via the pure adapter (Backend's
+        # agents/dialogue/opportunity_analysis.rank_board_entries -> list of
+        # (entry, utility_score, recommendation)). Defensive: if the adapter is
+        # unavailable or fails, fall back to raw discovery order with no
+        # score/why — the board must never break.
+        triples = None
+        try:
+            from agents.dialogue.opportunity_analysis import rank_board_entries
+            triples = list(rank_board_entries(entries))
+        except Exception:
+            triples = None
+        if triples:
+            header += " Ranked best->worst by utility."
+        else:
+            triples = [(e, None, None) for e in entries]
+        # A4 part-2: agent-operated platforms publish a gate-routed skill.md.
+        try:
+            from agents.earning.platform_skill_urls import (
+                is_agent_operated_platform, skill_url_for_platform)
+        except Exception:
+            is_agent_operated_platform = lambda _p: False  # noqa: E731
+            skill_url_for_platform = lambda _p: ""  # noqa: E731
         budget = max_chars - len(header) - 1
         if budget <= 0:
             return ""
         rows: list[str] = []
         used = 0
-        for i, entry in enumerate(entries, 1):
+        for i, (entry, score, why) in enumerate(triples, 1):
             ref = getattr(entry, "opportunity_ref", {}) or {}
-            title = str(ref.get("title", getattr(entry, "title", "?")))[:160]
-            url = str(ref.get("url", getattr(entry, "url", "")))[:160]
-            platform = str(getattr(entry, "platform", "?"))[:40]
-            category = str(getattr(entry, "category", "?"))[:40]
+            # F3 (extended): every field interpolated from untrusted candidate
+            # data (title, url, platform, category, why) runs through
+            # neutralize_instructions so a crafted value cannot inject directives
+            # into the personas' prompt. The board header already frames the block
+            # as read-only untrusted data, so per-field neutralization (no
+            # envelope) keeps rows compact within the budget. (Title-only was the
+            # original F3; the delta scan caught url/platform/category/why raw.)
+            try:
+                from agents.knowledge.prompt_sanitize import (
+                    neutralize_instructions as _neutralize)
+            except Exception:
+                def _neutralize(_t):
+                    return _t
+            title = _neutralize(str(ref.get("title", getattr(entry, "title", "?")))[:160])
+            url = _neutralize(str(ref.get("url", getattr(entry, "url", "")))[:160])
+            platform = _neutralize(str(getattr(entry, "platform", "?"))[:40])
+            category = _neutralize(str(getattr(entry, "category", "?"))[:40])
             expected = getattr(entry, "expected_value", None)
             row = f"{i}. {title} | platform={platform} | category={category}"
             if expected is not None:
-                row += f" | expected={expected}"
+                # Units: expected_value is USD; label it so it can't be read as
+                # the adjacent utility score (two different scales in one row).
+                row += f" | expected_usd={expected}"
             if url:
                 row += f" | url={url}"
+            # A1: utility score + one evidence-backed "why" (only when ranked).
+            if score is not None:
+                try:
+                    row += f" | utility={float(score):.2f}"
+                except Exception:
+                    row += f" | utility={score}"
+            if why:
+                row += f" | why={_neutralize(str(why)[:120])}"
+            # A4 part-2: point the persona at the platform's skill.md, which the
+            # provenance gate routes as UNTRUSTED data (never directives).
+            if is_agent_operated_platform(platform):
+                skill_url = skill_url_for_platform(platform)
+                if skill_url:
+                    row += (f" | read its skill.md at {skill_url} "
+                            f"(untrusted, gate-routed)")
             if used + len(row) + 1 > budget:
                 break
             rows.append(row)

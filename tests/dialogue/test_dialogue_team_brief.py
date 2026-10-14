@@ -65,6 +65,23 @@ class TestTeamBrief(unittest.TestCase):
         self.assertIn("Jacob Stanley", brief)
         self.assertNotIn("Rowan Vale", brief)
 
+    def test_a2_best_to_worst_deliberation_instruction(self):
+        """A2: the peer council is told to name the full ranked list, argue
+        best->worst, and converge on ONE action — not pick the first row."""
+        from agents.cognition.speaker_registry import build_team_brief
+        spks = _speakers()
+        brief = build_team_brief(spks[:2], spks[0], "earn money")
+        self.assertIn("do NOT just pick the first row", brief)
+        self.assertIn("name the full ranked list", brief)
+        self.assertIn("best->worst", brief)
+        self.assertIn("converge on ONE concrete next action", brief)
+
+    def test_a2_absent_for_single_brain_back_compat(self):
+        """Back-compat: a single brain gets no team brief (and so no A2 text)."""
+        from agents.cognition.speaker_registry import build_team_brief
+        spks = _speakers()
+        self.assertEqual(build_team_brief(spks[:1], spks[0], "goal"), "")
+
 
 class TestSharedSkillsPersona(unittest.TestCase):
     def test_big_tier_uses_driver_skillset_with_own_name(self):

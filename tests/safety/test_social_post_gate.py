@@ -27,8 +27,24 @@ class TestSocialPostGate(unittest.TestCase):
     def tearDown(self):
         H.set_social_writer(None)
 
-    def _approval(self, *, approve=True):
-        item = self.queue.enqueue_submission("social post", "post to moltbook")
+    def _approval(self, *, approve=True, content="hi"):
+        """Enqueue a scoped social_post approval (ARCH-ENG-129).
+
+        The approval names the tool AND the content. Before the scope binding
+        the queued item carried no scope, and `social_post` checked only
+        `status == APPROVED` — a human who approved 'Hello team' had
+        'BUY THIS NOW <link>' published (reproduced by execution).
+        """
+        from agents.safety.approval import ApprovalItem, ApprovalKind
+        item = self.queue.enqueue(ApprovalItem(
+            kind=ApprovalKind.ACTION,
+            title="social post",
+            description="post to moltbook",
+            details={"tool": "social_post",
+                     "arguments": {"network": "moltbook", "content": content}},
+            payload={"tool": "social_post",
+                     "arguments": {"network": "moltbook", "content": content}},
+        ))
         if approve:
             self.queue.approve(item.id, notes="ok")
         return item.id
@@ -67,13 +83,66 @@ class TestSocialPostGate(unittest.TestCase):
             return "post-id-123"
 
         H.set_social_writer(writer)
-        aid = self._approval(approve=True)
+        aid = self._approval(approve=True, content="hello world")
         out = self._call({"network": "moltbook", "content": "hello world",
                           "approval_id": aid})
         self.assertIn("posted to moltbook", out)
         self.assertIn("post-id-123", out)
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0]["content"], "hello world")
+
+    def test_different_content_than_approved_is_refused(self):
+        """ARCH-ENG-129: the approval authorizes the CONTENT the human saw.
+
+        Reproduced on the real code before the fix: an approval recorded for
+        'Hello team' published 'BUY THIS NOW <link>' — outbound public content
+        behind a gate that never read what the human reviewed.
+        """
+        seen = []
+        H.set_social_writer(lambda p: seen.append(p) or {"ok": True})
+        aid = self._approval(approve=True, content="Hello team")
+        out = self._call({"network": "moltbook", "content": "BUY THIS NOW http://x",
+                          "approval_id": aid})
+        self.assertIn("refused", out)
+        self.assertEqual(seen, [])
+
+    def test_approval_for_another_tool_is_refused(self):
+        """ARCH-ENG-129: an approval authorizes ONE tool, not a capability.
+
+        Reproduced on the real code before the fix: a human-approved
+        ``file_write`` approval was replayed as the ``approval_id`` for
+        ``record_payment``, which booked $777 of verified revenue.
+        """
+        from agents.safety.approval import ApprovalItem, ApprovalKind
+        item = self.queue.enqueue(ApprovalItem(
+            kind=ApprovalKind.ACTION, title="Chat tool request: file_write",
+            description="write scratch.txt", requested_by="dialogue",
+            details={"tool": "file_write",
+                     "arguments": {"path": "scratch.txt", "content": "x"}},
+            payload={"tool": "file_write",
+                     "arguments": {"path": "scratch.txt", "content": "x"}},
+        ))
+        self.queue.approve(item.id, notes="ok")
+        out = self._call({"network": "moltbook", "content": "hi",
+                          "approval_id": item.id})
+        self.assertIn("refused", out)
+        self.assertIn("file_write", out)
+
+    def test_unscoped_approval_authorizes_nothing(self):
+        """ARCH-ENG-129: fail closed on an item that records no scope.
+
+        ``enqueue_submission`` (the legacy GUI/agent path) records only a
+        title and description. It names no tool, so it cannot authorize a
+        HIGH-TRUST action — the human never saw one.
+        """
+        aid = self._approval(approve=True)
+        # Strip the scope the fixture recorded, simulating a legacy producer.
+        item = self.queue.find_by_id(aid)
+        item.details = {"note": "legacy free-form producer"}
+        item.payload = {}
+        out = self._call({"network": "moltbook", "content": "hi",
+                          "approval_id": aid})
+        self.assertIn("refused", out)
 
 
 if __name__ == "__main__":

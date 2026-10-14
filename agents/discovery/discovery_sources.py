@@ -200,16 +200,45 @@ class DefiSource(BaseOpportunitySource):
             url = getattr(opp, "url", "") or ""
             risk = results.get(opp.id)
             risk_level = getattr(risk, "risk_level", None) if risk else opp.risk_level
+            # ARCH-ENG-125: no payout is known here, so none is booked.
+            #
+            # This used to compute
+            #     advertised_amount = tvl_usd * (apy_percent/100) * 0.01
+            # and write the result into BOTH advertised_amount and
+            # estimated_net_value. TVL is the SIZE OF A LIQUIDITY POOL, not a
+            # payout anyone offers this agent, and the `0.01` factor has no
+            # derivation anywhere in the repo — it is a fabricated 1% of a
+            # fabricated annual yield. Counterfactual, measured: a $1B pool at
+            # 3.4% APY yields advertised_amount = $340,000, which crosses the
+            # `payment > 100.0` financial-exposure threshold in
+            # autonomous_loop._stage_request_approval as if a stranger had
+            # offered a $340k prize.
+            #
+            # It is 0.0 today only because `tvl_usd` has ZERO producers in the
+            # entire repo (`grep -rn "tvl_usd\s*="` finds no assignment) — the
+            # scanner's only implemented branch is Lido, which sets apy_percent
+            # and never TVL. Verified by execution: driving the real
+            # DeFiScanner with a real Lido payload
+            # ({eth:3.4, steth:3.2, matic:4.1}) produced
+            # advertised_amount=0.0 for all 3 entries. So this is LATENT, not
+            # live — but it is exactly the ARCH-ENG-120 shape (an unattributed
+            # figure booked as a payout) waiting on the first protocol branch
+            # that populates TVL. Deleting the formula now costs nothing
+            # observable and removes the landmine.
+            #
+            # A yield FARMING position is a real earning strategy, but its value
+            # depends on capital this agent does not have, so it cannot be
+            # expressed as a listed payout. If that changes, the payout must
+            # come from a stated figure (deposit * rate * term the agent can
+            # actually fund), never from TVL.
             out.append(Opportunity(
                 opportunity_id=f"defi_{opp.id}", source=self.name, platform=opp.protocol,
                 title=f"{opp.protocol} {opp.type} — {opp.token_symbol}",
                 description=f"{opp.protocol} {opp.type} with {opp.apy_percent}% APY",
                 category="crypto_reward", payment_type="crypto",
                 currency=getattr(opp, "token_symbol", "") or "TOKEN",
-                advertised_amount=float(getattr(opp, "tvl_usd", 0.0) or 0.0)
-                * (getattr(opp, "apy_percent", 0.0) / 100) * 0.01,
-                estimated_net_value=float(getattr(opp, "tvl_usd", 0.0) or 0.0)
-                * (getattr(opp, "apy_percent", 0.0) / 100) * 0.01,
+                advertised_amount=0.0,   # no payout stated by any protocol API
+                estimated_net_value=0.0,
                 risk_level=risk_level or "medium", scam_risk=0.4,
                 source_reliability=0.4, external_id=str(opp.id), external_url=url,
                 provenance=f"{self.name}::{url}",

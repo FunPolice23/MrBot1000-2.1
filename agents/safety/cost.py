@@ -14,13 +14,36 @@ from typing import Optional
 
 
 def is_local_provider(name: str) -> bool:
-    """A provider is free/local (never skipped by the budget guard) iff it is Ollama.
+    """A provider is free/local (never skipped by the budget guard) iff it runs
+    on the user's own hardware and bills nothing.
 
-    Ollama runs locally on the user's hardware. Everything else (openai, anthropic,
-    openrouter, groq, ...) bills per token and is "billable".
+    Recognises, in addition to the legacy ``ollama``/``local*`` spellings:
+      * the local dual-brain adapter names ``big-brain`` / ``small-brain``
+        (any ``-brain`` adapter runs on-machine), and
+      * the canonical on-machine set (``provider_keys.LOCAL_PROVIDERS``:
+        llamacpp, ollama, lmstudio, vllm, koboldcpp).
+
+    Misclassifying a local brain as billable inverts the guard's intent: when
+    the daily cap is hit it would skip the FREE brain and fall back to a paid
+    cloud provider — spending real money the budget exists to prevent.
     """
-    n = (name or "").lower()
-    return "ollama" in n or n.startswith("local")
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if "brain" in n:
+        return True
+    if n.startswith("local") or "ollama" in n:
+        return True
+    try:
+        from agents.runtime.provider_keys import LOCAL_PROVIDERS
+        # Spelling-robust: lm-studio / lmstudio / "lm studio" are the same
+        # on-machine provider; normalise hyphens/spaces before the set check.
+        squashed = n.replace("-", "").replace("_", "").replace(" ", "")
+        if n in LOCAL_PROVIDERS or squashed in LOCAL_PROVIDERS:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 class CostGuard:

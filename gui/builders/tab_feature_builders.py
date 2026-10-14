@@ -1116,10 +1116,31 @@ class FeatureTabBuildersMixin:
         mb_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         mb_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         mb_lay.addWidget(mb_table)
+
+        # ARCH-ENG-129: the draft the operator reviews. The post body and
+        # submolt are captured here and recorded in the approval item, so the
+        # approval names the exact content social_post may publish.
+        mb_draft = QHBoxLayout()
+        mb_draft.addWidget(QLabel("Submolt:"))
+        mb_submolt = QLineEdit()
+        mb_submolt.setPlaceholderText("general")
+        mb_submolt.setMaximumWidth(160)
+        mb_draft.addWidget(mb_submolt)
+        mb_draft.addStretch(1)
+        mb_lay.addLayout(mb_draft)
+        mb_body = QPlainTextEdit()
+        mb_body.setPlaceholderText(
+            "Write the post to publish. Approving it in the Approvals tab "
+            "authorizes exactly this text — nothing else.")
+        mb_body.setMaximumHeight(120)
+        mb_lay.addWidget(mb_body)
+
         widget.layout().insertWidget(4, mb_box)
         holder["mb_table"] = mb_table
         holder["mb_load"] = mb_load
         holder["mb_post"] = mb_post
+        holder["mb_body"] = mb_body
+        holder["mb_submolt"] = mb_submolt
 
         def mb_feed_finished(result):
             mb_load.setEnabled(True)
@@ -1150,15 +1171,41 @@ class FeatureTabBuildersMixin:
 
         def mb_start_post():
             # Route through the approval queue first. social_post only fires
-            # once the item is APPROVED — a pending draft is never a sent post.
+            # once the item is APPROVED — a pending post is never a sent post.
+            #
+            # ARCH-ENG-129: the approval records the tool AND the content, so
+            # the operator approves the exact post that will be published.
+            # Before this the queued item carried no scope at all, and
+            # `social_post` only checked `status == APPROVED` — a human who
+            # reviewed one draft could have any other content published
+            # (reproduced by executing it). An approval authorizes one action.
             try:
-                from agents.safety.approval import HumanApprovalQueue
-                item = HumanApprovalQueue.instance().enqueue_submission(
-                    "Post to Moltbook",
-                    "Draft a post/response for the Moltbook social network. "
-                    "Approve to let the agent publish it via the social_post "
-                    "tool; the post will still require Moltbook's verification "
-                    "challenge to become visible.")
+                from agents.safety.approval import (
+                    ApprovalItem, ApprovalKind, HumanApprovalQueue,
+                )
+                body = (mb_body.toPlainText() or "").strip()
+                submolt = (mb_submolt.text() or "").strip() or "general"
+                if not body:
+                    holder["widget"]._feature_status.setText(
+                        "Write the post body first — an empty post cannot be "
+                        "approved or published.")
+                    return
+                item = HumanApprovalQueue.instance().enqueue(ApprovalItem(
+                    kind=ApprovalKind.SUBMISSION,
+                    title=f"Post to Moltbook /m/{submolt}",
+                    description=(
+                        "Publish this post to the Moltbook social network via "
+                        "the social_post tool. The post will still require "
+                        "Moltbook's verification challenge to become visible."),
+                    requested_by="social_activity_tab",
+                    details={"tool": "social_post",
+                             "arguments": {"network": "moltbook",
+                                           "content": body},
+                             "submolt": submolt},
+                    payload={"tool": "social_post",
+                             "arguments": {"network": "moltbook",
+                                           "content": body}},
+                ))
                 holder["widget"]._feature_status.setText(
                     f"Moltbook post queued for approval (id {item.id}); "
                     "it posts only after you approve it.")
