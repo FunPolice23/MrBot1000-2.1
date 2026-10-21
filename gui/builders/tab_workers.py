@@ -128,8 +128,10 @@ class MoltbookFeedWorker(QThread):
 
     Builds a read-only MoltbookPoster over requests and returns normalized
     rows (submolt / title / author / preview / id) so the Social Activity tab
-    can render them without blocking. Needs only MOLTBOOK_API_KEY (reads are
-    not approval-gated); emits ok=False with a reason when the key is absent.
+    can render them without blocking. Reads are public on Moltbook
+    (ARCH-ENG-320) — no registration or per-agent credential is needed; only
+    WRITES are credentialed + approval-gated. Emits ok=False with a reason on
+    network or API errors.
     """
 
     finished = Signal(dict)
@@ -141,11 +143,9 @@ class MoltbookFeedWorker(QThread):
 
     def run(self):
         try:
-            import os
-            if not os.getenv("MOLTBOOK_API_KEY", "").strip():
-                self.finished.emit({"ok": False,
-                                    "error": "MOLTBOOK_API_KEY not set"})
-                return
+            # ARCH-ENG-320: Moltbook's read API is public — the feed loads
+            # without any registration or per-agent credential. Writes still
+            # need both the credential and the approval path; reads never did.
             import requests
             from agents.earning.moltbook_agent import MoltbookPoster
             poster = MoltbookPoster(http_client=requests)

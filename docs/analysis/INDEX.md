@@ -27,7 +27,7 @@ per-script status below names the ids that touched each file.
 | Script | Lines | Status |
 |---|---:|---|
 | `__init__.py` | 19 | **done** (R-01) |
-| `main.py` | 3,735 | **done** (11a U-01 fixed 284 — quarantine review moved to Safety tab, dead review methods removed; G-05 live-order approval handler 283; Z-01 evidence reconciliation handler 287; U-03/U-04 removed 250/251; AF-03 wired 272; AB-01 surface retired 275) |
+| `main.py` | 3,735 | **done** (11a U-01 fixed 284 — quarantine review moved to Safety tab, dead review methods removed; G-05 live-order approval handler 283; Z-01 evidence reconciliation handler 287; U-03/U-04 removed 250/251; AF-03 wired 272; AB-01 surface retired 275; 319 log view rebuild + filtered-view mapping) |
 | `run_lead_routine.py` | 688 | **done** (11q, document-shaped, R-02 confirmed; AI-01 fixed 264) |
 | **subtotal** | **4,442** | |
 
@@ -50,8 +50,7 @@ per-script status below names the ids that touched each file.
 |---|---:|---|
 | `agents/brains/__init__.py` | 1 | **done** (clean) |
 | `agents/brains/base_worker.py` | 345 | **done** (B-01/B-02 fixed 288 — trust-boundary modules added to `PROTECTED_SOURCE_FILES`) |
-| `agents/brains/big_brain.py` | 707 | **done** (11o, 0 dead of 17, verified sound; 317 dialogue turns record `direct_dialogue`) |
-| `agents/brains/brain_got.py` | 383 | **done** |
+| `agents/brains/big_brain.py` | 707 | **done** (11o, 0 dead of 17, verified sound; 317 dialogue turns record `direct_dialogue`) || `agents/brains/brain_got.py` | 383 | **done** |
 | `agents/brains/shared_context.py` | 354 | **done** |
 | `agents/brains/small_brain.py` | 605 | **done** (B-04; 317 dialogue turns record `direct_dialogue`) |
 | `agents/brains/worker_budget.py` | 48 | **done** |
@@ -122,7 +121,7 @@ per-script status below names the ids that touched each file.
 | `agents/discovery/discovery_engine.py` | 112 | **done** (live via port) |
 | `agents/discovery/discovery_port.py` | 58 | **done** (F-05) |
 | `agents/discovery/discovery_scheduler.py` | 388 | **done** (F-01 fixed 282 - `tick()` returns `found`, cycle consumes it; F-02 resolved by the same tick wiring) |
-| `agents/discovery/discovery_sources.py` | 473 | **done** (F-04; W-02 fixed 286 — live `is_enabled()` gates on social/airdrop/DeFi sources) |
+| `agents/discovery/discovery_sources.py` | 473 | **done** (F-04; W-02 fixed 286 — live `is_enabled()` gates on social/airdrop/DeFi sources; 320 moltbook search runs keyless) |
 | `agents/discovery/discovery_strategies.py` | 203 | **done** (F-02) |
 | `agents/discovery/scrape_resilience.py` | 179 | **done** (verified sound) |
 | `agents/discovery/web_discovery.py` | 176 | **done** (live, opt-in) |
@@ -156,7 +155,7 @@ per-script status below names the ids that touched each file.
 | `agents/earning/intelligence.py` | 69 | **done** (10g-pt1, live) |
 | `agents/earning/live_trading.py` | 615 | **done** (10h; G-05 fixed 283; AO-02 folded in; G-06 fixed 289; G-07 fixed 295 - explicit fraction/percent units) |
 | `agents/earning/microtask_earner.py` | 220 | **done** (10h, live) |
-| `agents/earning/moltbook_agent.py` | 400 | **done** (10h, live) |
+| `agents/earning/moltbook_agent.py` | 400 | **done** (10h, live; 320 reads are public, key gates writes only) |
 | `agents/earning/opportunity_adapters.py` | 60 | **done** (10g-pt1, live) |
 | `agents/earning/opportunity_intelligence.py` | 455 | **done** (10h, live) |
 | `agents/earning/opportunity_lifecycle.py` | 1,067 | **done** (11f, 6 dead of 37; Z-01 fixed 287 — `reconcile_evidence` wired to Management tab; Z-03 removed 256) |
@@ -302,7 +301,7 @@ per-script status below names the ids that touched each file.
 | `agents/safety/gate.py` | 168 | **done** |
 | `agents/safety/gates.py` | 257 | **done** |
 | `agents/safety/guard.py` | 782 | **done** (11k, 7 dead of 43, AE-02; AE-01/AE-03/AE-04 removed 257-259) |
-| `agents/safety/handlers.py` | 992 | **done** (11g, 0 dead of 30, verified sound; AA-01 convention pinned 268) |
+| `agents/safety/handlers.py` | 992 | **done** (11g, 0 dead of 30, verified sound; AA-01 convention pinned 268; 321 social_read handler) |
 | `agents/safety/instructions.py` | 214 | **done** (verified sound) |
 | `agents/safety/learning.py` | 21 | **done** (N-02, DEAD) |
 | `agents/safety/legacy_tools.py` | 336 | **done** (N-01) |
@@ -310,7 +309,7 @@ per-script status below names the ids that touched each file.
 | `agents/safety/provider_rate_limiter.py` | 207 | **done** |
 | `agents/safety/response.py` | 289 | **done** |
 | `agents/safety/sql.py` | 53 | **done** |
-| `agents/safety/tools.py` | 301 | **done** (N-01 fixed 292 — sole public `get_all_tools` registry) |
+| `agents/safety/tools.py` | 301 | **done** (N-01 fixed 292 — sole public `get_all_tools` registry; 321 social_read schema names moltbook) |
 | `agents/safety/trust.py` | 89 | **done** |
 | `agents/safety/workspace.py` | 284 | **done** (H-01 fixed 299 - QualityController gate) |
 | **subtotal** | **5,920** | |
@@ -343,9 +342,9 @@ per-script status below names the ids that touched each file.
 | `gui/builders/__init__.py` | 1 | **done** (clean) |
 | `gui/builders/refresh_coordinator.py` | 78 | **done** (10r-pt1) |
 | `gui/builders/tab_builders.py` | 53 | **done** (facade) |
-| `gui/builders/tab_feature_builders.py` | 3,898 | **done** (10r/10s, R-01, R-03, AW-02 fixed 238, AW-01 fixed 242; AW-03 split 278; AB-01 retired 275; G-05 order form 283; D-01 crypto surface 281; Z-01 reconcile signal 287; U-01 quarantine gate 284; R-02 error collector 305; P-02 dashboard 306) |
+| `gui/builders/tab_feature_builders.py` | 3,898 | **done** (10r/10s, R-01, R-03, AW-02 fixed 238, AW-01 fixed 242; AW-03 split 278; AB-01 retired 275; G-05 order form 283; D-01 crypto surface 281; Z-01 reconcile signal 287; U-01 quarantine gate 284; R-02 error collector 305; P-02 dashboard 306; 318 FX import scoped per section; 319 logs shell replays on show) |
 | `gui/builders/tab_lifecycle.py` | 138 | **done** (10r-pt1) |
-| `gui/builders/tab_workers.py` | 132 | **done** (10r-pt1; G-05 `LiveOrderProposalWorker` 283) |
+| `gui/builders/tab_workers.py` | 132 | **done** (10r-pt1; G-05 `LiveOrderProposalWorker` 283; 320 feed worker reads without a key) |
 | `gui/panels/__init__.py` | 1 | **done** (clean) |
 | `gui/panels/approval_panel.py` | 285 | **done** (10r-pt1) |
 | `gui/panels/dialogue_log.py` | 25 | **done** (Q-03) |

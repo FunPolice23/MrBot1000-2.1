@@ -1,4 +1,4 @@
-# MrBot1000 v2.1.132 — Multi-Brain AI-Powered Earning Agent
+# MrBot1000 v2.1.135 — Multi-Brain AI-Powered Earning Agent
 
 A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. It is local-first: the default brain runtime runs on your machine across every detected GPU and the CPU/RAM pool, while optional cloud providers are explicitly configured by the operator.
 
@@ -423,7 +423,7 @@ dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 | `app/action_pipeline.py` | Proposal validation and controlled execution safeguards |
 | `app/database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
 | `app/theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
-| `app/version.py` | Public application version source (`2.1.132`) |
+| `app/version.py` | Public application version source (`2.1.135`) |
 | `Agent.md` / `README.md` / `CHANGELOG.md` | Runtime contract, current system overview, and release history |
 | `tests/` | Focused regression and subsystem tests |
 | `tools/github_publish/` | Personal publish-mirror tooling (git-ignored; syncs a sanitized copy to GitHub) |

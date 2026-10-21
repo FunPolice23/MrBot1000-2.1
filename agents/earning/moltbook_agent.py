@@ -205,8 +205,14 @@ class MoltbookPoster:
 
     - **Writes** (create_post / reply_to_post / upvote_*) require
       ``capability_approved=True``. They never run silently.
-    - The **API key** (from ``MOLTBOOK_API_KEY``) is only ever sent to
-      ``www.moltbook.com``. Any other host is refused as a leak.
+    - **Reads** (feed / post / comments) are PUBLIC on Moltbook's live API, so
+      they work WITHOUT registration or ``MOLTBOOK_API_KEY``
+      (ARCH-ENG-320: the old key gate made the whole platform look dead to an
+      unregistered operator — an empty Social Activity tab instead of a
+      readable one).
+    - The **API key** (from ``MOLTBOOK_API_KEY``), when configured, is only
+      ever sent to ``www.moltbook.com`` — specifically, only when a key
+      exists, and only to that host; no other request ever carries it.
     - Posts/comments may come back with a **verification math challenge**; that
       is surfaced verbatim in the result — a pending challenge is NOT a posted
       item, and we never fabricate a success.
@@ -229,8 +235,12 @@ class MoltbookPoster:
         return (self.api_key or os.getenv("MOLTBOOK_API_KEY", "")).strip()
 
     def _auth_headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self._key()}",
-                "Content-Type": "application/json"}
+        # ARCH-ENG-320: reads are public — never send an empty Authorization.
+        headers = {"Content-Type": "application/json"}
+        key = self._key()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
 
     def _offline(self, action: str) -> Dict[str, Any]:
         return {"ok": False, "status": "blocked",
@@ -342,13 +352,14 @@ class MoltbookPoster:
         resp.raise_for_status()
         return {"ok": True, "status": "voted", "result": _safe_json(resp)}
 
-    # ── reads (allowed with just the key) ────────────────────────────────
+    # ── reads (public: they work without a key — ARCH-ENG-320) ───────────
     def get_feed(self, sort: str = "hot", limit: int = 25,
                  cursor: str = "") -> Dict[str, Any]:
-        """Read the post feed (hot/new/top/rising). Cursor-paginated."""
-        blocked = self._require_key("get_feed")
-        if blocked:
-            return blocked
+        """Read the post feed (hot/new/top/rising). Cursor-paginated.
+
+        No key required: Moltbook's live feed is public. When a key IS
+        configured it is attached (and scoped to moltbook.com, as always).
+        """
         if self.http_client is None:
             return self._offline("get_feed")
         params = {"sort": sort, "limit": int(limit)}
@@ -360,9 +371,9 @@ class MoltbookPoster:
         return {"ok": True, "status": "ok", "feed": _safe_json(resp)}
 
     def get_post(self, post_id: str) -> Dict[str, Any]:
-        blocked = self._require_key("get_post")
-        if blocked:
-            return blocked
+        if not post_id.strip():
+            return {"ok": False, "status": "blocked",
+                    "reason": "get_post: post_id is required"}
         if self.http_client is None:
             return self._offline("get_post")
         resp = self.http_client.get(
@@ -373,9 +384,9 @@ class MoltbookPoster:
 
     def get_comments(self, post_id: str, sort: str = "best",
                      limit: int = 35) -> Dict[str, Any]:
-        blocked = self._require_key("get_comments")
-        if blocked:
-            return blocked
+        if not post_id.strip():
+            return {"ok": False, "status": "blocked",
+                    "reason": "get_comments: post_id is required"}
         if self.http_client is None:
             return self._offline("get_comments")
         params = {"sort": sort, "limit": int(limit)}

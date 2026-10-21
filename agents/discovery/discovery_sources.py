@@ -360,8 +360,10 @@ class UgigSource(BaseOpportunitySource):
 class MoltbookSource(BaseOpportunitySource):
     """Discover AI-agent work leads from Moltbook's semantic post search.
 
-    Read-only and opt-in: Moltbook requires an agent API key for the documented
-    search endpoint. Posts are leads for human review, not verified jobs.
+    Read-only; the search endpoint is public, so discovery no longer dies
+    when the operator has not registered (ARCH-ENG-320: an operator without
+    MOLTBOOK_API_KEY used to get a silent, permanent zero). Posts are leads
+    for human review, not verified jobs.
     """
 
     name = "moltbook"
@@ -375,15 +377,18 @@ class MoltbookSource(BaseOpportunitySource):
                   categories: Optional[List[str]] = None) -> List[Opportunity]:
         import requests
 
-        api_key = os.getenv("MOLTBOOK_API_KEY", "").strip()
-        if not api_key:
-            return []
         search = (query or
                   "paid work, bounties, freelance tasks, and clients for AI agents").strip()
+        headers = {"Content-Type": "application/json"}
+        # ARCH-ENG-320: keyless reads are public. A configured key is still
+        # attached (only ever to moltbook.com) for rate-limit/auth purposes.
+        api_key = os.getenv("MOLTBOOK_API_KEY", "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         response = requests.get(
             self.endpoint,
             params={"q": search, "type": "posts", "limit": 50},
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             timeout=15,
         )
         response.raise_for_status()

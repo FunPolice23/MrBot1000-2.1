@@ -1301,31 +1301,55 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self._log_buffer = []
         self._append_log(msg)
 
-    def _replay_log_buffer(self):
-        """Push all buffered log entries into the (now built) log_table widget.
+    def _current_log_filters(self):
+        """ARCH-ENG-319: live appends, replays and filter rebuilds must agree
+        on what is displayed, or the table (a view) and the buffer disagree.
+        All three roads now read the filters from this one accessor."""
+        filter_text = (self.log_filter.text().lower()
+                       if getattr(self, "log_filter", None) is not None else "")
+        severity_filter = (self.log_severity_combo.currentText()
+                           if getattr(self, "log_severity_combo", None) is not None
+                           else "All")
+        category_filter = (self.log_category_combo.currentText()
+                           if getattr(self, "log_category_combo", None) is not None
+                           else "All")
+        return filter_text, severity_filter, category_filter
 
-        Called once when the Live Logs tab is first constructed. Re-applies the
-        current filter so the replay matches what the user is looking at.
-        """
+    def _entry_passes_filters(self, e):
+        filter_text, severity_filter, category_filter = self._current_log_filters()
+        if severity_filter != "All" and e.get("severity") != severity_filter:
+            return False
+        if category_filter != "All" and e.get("category") != category_filter:
+            return False
+        if filter_text and filter_text not in e.get("msg", "").lower():
+            return False
+        return True
+
+    def _replay_log_view(self):
+        """Rebuild the visible table from the buffer under the current filters
+        and record exactly which buffered entries the rows map to."""
         if not hasattr(self, "log_table") or self.log_table is None:
             return
         self.log_table.setRowCount(0)
-        filter_text = (self.log_filter.text().lower()
-                       if hasattr(self, "log_filter") and self.log_filter is not None else "")
-        severity_filter = (self.log_severity_combo.currentText()
-                          if hasattr(self, "log_severity_combo") and self.log_severity_combo is not None else "All")
-        category_filter = (self.log_category_combo.currentText()
-                          if hasattr(self, "log_category_combo") and self.log_category_combo is not None else "All")
+        self._view_entries = []
         for e in self._log_buffer:
-            if severity_filter != "All" and e.get("severity") != severity_filter:
-                continue
-            if category_filter != "All" and e.get("category") != category_filter:
-                continue
-            if filter_text and filter_text not in e.get("msg", "").lower():
-                continue
-            self._append_log_to_table(e)
+            self._append_log_to_table(e)  # applies the filters itself
         if getattr(self, "auto_scroll_logs", None) and self.auto_scroll_logs.isChecked():
             self.log_table.scrollToBottom()
+
+    def _replay_log_buffer(self):
+        """Rebuild the (now shown) log table from the authoritative buffer.
+
+        ARCH-ENG-319: this used to run at build time, while the freshly built
+        widget was still hidden, so every row was "deferred" by the hidden-tab
+        guard and the operator opened an empty Live Logs tab until they poked
+        the filter. The deferred model is kept (buffer stays authoritative,
+        hidden tabs stay untouched); the rebuild is now triggered by the shell
+        widget's showEvent, so every view opens complete.
+        """
+        if not hasattr(self, "log_table") or self.log_table is None:
+            return
+        self._replay_log_view()
 
     def _append_log_to_table(self, entry):
         """Append a single log entry to the log table widget.
@@ -1342,9 +1366,18 @@ class MainWindow(TabBuildersMixin, QMainWindow):
 
         Now: nothing touches the widget while the tab is hidden. That is safe
         because every entry is already appended to `self._log_buffer` by
-        `_log_emit`, and both `_replay_log_buffer` (on tab build) and
+        `_log_emit`, and both `_replay_log_buffer` (on tab build/show) and
         `_do_apply_log_filter` (on filter change) rebuild the table from that
         buffer. Nothing is lost by deferring the widget work.
+
+        ARCH-ENG-319: the table is a filtered VIEW of the buffer. This method
+        is the only thing that ever adds a row, so it now also (a) applies the
+        current filters for LIVE appends — previously a new line that did not
+        match the active filter still landed on the table, polluting a
+        filtered view — and (b) records the entry in `self._view_entries`,
+        the row↔entry mapping the details panel reads. `_show_log_details`
+        previously indexed `self._log_buffer[row]`, which only agreed with
+        the table when no filter was active.
 
         `resizeRowToContents` is kept for the visible case, where wrapped
         details genuinely need the row height, but it now runs only for rows
@@ -1354,6 +1387,11 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             return
         if not self.log_table.isVisible():
             return        # deferred: the buffer is authoritative, the table is a view
+        if not self._entry_passes_filters(entry):
+            return        # filtered out: stays in the buffer, not on the view
+        if not hasattr(self, "_view_entries"):
+            self._view_entries = []
+        self._view_entries.append(entry)
         row = self.log_table.rowCount()
         self.log_table.insertRow(row)
         
@@ -1410,9 +1448,15 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.log_details.clear()
             return
         row = selected[0].row()
-        # Reconstruct from buffer (find matching row)
-        if row < len(self._log_buffer):
-            entry = self._log_buffer[row]
+        # ARCH-ENG-319: the table shows a FILTERED view; the row maps to
+        # `self._view_entries`. The old `self._log_buffer[row]` only agreed
+        # with the visible rows when no filter was active — with a filter on,
+        # clicking a row showed the details of the WRONG entry.
+        view = getattr(self, "_view_entries", None)
+        if view is None:
+            view = self._log_buffer
+        if row < len(view):
+            entry = view[row]
             lines = [
                 f"Time: {entry.get('ts', 'N/A')}",
                 f"Severity: {entry.get('severity', 'N/A')}",
@@ -1543,24 +1587,14 @@ class MainWindow(TabBuildersMixin, QMainWindow):
     def _do_apply_log_filter(self):
         if not hasattr(self, "log_table"):
             return
-        self.log_table.setRowCount(0)
-        filter_text = self.log_filter.text().lower()
-        severity_filter = self.log_severity_combo.currentText()
-        category_filter = (self.log_category_combo.currentText()
-                          if hasattr(self, "log_category_combo") else "All")
-        for e in self._log_buffer:
-            if severity_filter != "All" and e.get("severity") != severity_filter:
-                continue
-            if category_filter != "All" and e.get("category") != category_filter:
-                continue
-            if filter_text and filter_text not in e.get("msg", "").lower():
-                continue
-            self._append_log_to_table(e)
-        if getattr(self, "auto_scroll_logs", None) and self.auto_scroll_logs.isChecked():
-            self.log_table.scrollToBottom()
+        # ARCH-ENG-319: one rebuild path shared with the replay — the table is
+        # always "the filtered buffer", no separate block logic to drift.
+        self._replay_log_view()
 
     def _clear_log(self):
         self._log_buffer.clear()
+        if hasattr(self, "_view_entries"):
+            self._view_entries = []
         if hasattr(self, "log_table"):
             self.log_table.setRowCount(0)
 
@@ -1578,7 +1612,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             # should be unreachable; if it ever fires, the title would silently
             # claim an old release. Keep it in step with app/version.py — the
             # single authority — and prefer fixing the import over bumping this.
-            __version__ = "2.1.132"
+            __version__ = "2.1.135"
         title_lbl = QLabel(f"MrBot1000 v{__version__}")
         title_lbl.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         title_lbl.setStyleSheet(

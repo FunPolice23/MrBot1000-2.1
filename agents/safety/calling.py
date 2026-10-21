@@ -165,7 +165,7 @@ from agents.safety.handlers import (
     _tool_workshop_payment_get, _tool_workshop_payment_list,
     _tool_workshop_deliverable, _tool_workshop_deliverable_list,
     _tool_workshop_note, _tool_workshop_note_list,
-    _tool_record_payment, _tool_social_post,
+    _tool_record_payment, _tool_social_post, _tool_social_read,
     _tool_file_read, _tool_file_write, _tool_file_list, _tool_run_command,
     _tool_query_db,
     # ARCH-ENG-227: dispatch.py reaches handlers as `runtime._tool_*` on THIS

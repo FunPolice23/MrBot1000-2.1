@@ -697,8 +697,43 @@ class FeatureTabBuildersMixin:
             return w
 
     def create_logs_tab(self):
-        """Live Logs tab with full information display including tokens/sec and trigger info."""
-        w = QWidget()
+        """Live Logs tab with full information display including tokens/sec and trigger info.
+
+        ARCH-ENG-319: the whole content lives on a `_LogTabShell`. The log
+        table is a view that is (correctly) left untouched while hidden, so a
+        rebuild must happen every time the tab becomes visible — the replay
+        that used to run at the end of this builder executed while the widget
+        was still hidden, the hidden-tab guard deferred every row, and the
+        operator opened an always-empty Live Logs tab until they poked the
+        filter. The shell's showEvent schedules that rebuild now.
+        """
+        from PySide6.QtCore import QTimer
+
+        class _LogTabShell(QWidget):
+            def __init__(self, rebuild):
+                super().__init__()
+                self._rebuild = rebuild
+                self._pending = False
+
+            def showEvent(self, ev):
+                super().showEvent(ev)
+                if self.isVisible() and not self._pending:
+                    self._pending = True
+                    QTimer.singleShot(0, self._after_show)
+
+            def hideEvent(self, ev):
+                super().hideEvent(ev)
+                self._pending = False
+
+            def _after_show(self):
+                self._pending = False
+                if self.isVisible():
+                    try:
+                        self._rebuild()
+                    except Exception:
+                        pass
+
+        w = _LogTabShell(self._replay_log_buffer)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(10)
@@ -786,9 +821,13 @@ class FeatureTabBuildersMixin:
         splitter.setStretchFactor(1, 1)  # details gets 1x
         splitter.setSizes([400, 150])
         lay.addWidget(splitter)
-        
-        # Replay buffered logs
-        self._replay_log_buffer()
+
+        # ARCH-ENG-319: the build-time replay stays for non-lifecycle callers
+        # (direct construction paths that never go through the lazy-tab
+        # machinery); the shell's showEvent covers the real UI path where the
+        # widget is still hidden here.
+        if self.log_table.isVisible():
+            self._replay_log_buffer()
         return w
 
 
@@ -1162,7 +1201,9 @@ class FeatureTabBuildersMixin:
         mb_row = QHBoxLayout()
         mb_load = QPushButton("🦞 Load Moltbook Feed")
         mb_load.setToolTip(
-            "Read the live Moltbook feed (needs MOLTBOOK_API_KEY). Read-only.")
+            "Read the live Moltbook feed — public, no registration needed "
+            "(ARCH-ENG-320). Posting still requires MOLTBOOK_API_KEY + an "
+            "approved approval. Read-only.")
         mb_post = QPushButton("✍️ Post to Moltbook…")
         mb_post.setToolTip(
             "Draft a post/response. Opens a human approval first; the agent "
@@ -2545,6 +2586,15 @@ class FeatureTabBuildersMixin:
         lay.addWidget(payg)
 
     def _build_appearance_group(self, lay, _seed_fx):
+        # ARCH-ENG-318: this method parses MRBOT_FX_COMPACT_DENSITY /
+        # MRBOT_FX_ROUNDED_CORNERS through the canonical parser (ARCH-ENG-203
+        # migrated the parsing itself), but the delegation import lived only in
+        # `create_settings_tab` and `_build_provider_sections` -- both function
+        # scoped. Building the Settings tab then died with
+        # "NameError: name '_env_bool' is not defined" and the whole tab was
+        # caught-empty. Import it here too.
+        from app.effects import env_bool as _env_bool
+
         # Appearance (v2.0.26: customizable theme coloring + effects toggles)
         apg = QGroupBox("Appearance")
         apl = QFormLayout(apg)

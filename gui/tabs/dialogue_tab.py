@@ -1541,7 +1541,7 @@ class DialogueTab(QWidget):
         # has already been appended to conversation_history, and re-reading the
         # context then would find the reply's own values and report nothing
         # (a self-poisoning vacuous check).
-        pass  # MUTATED
+        self._last_request_context = context
         brain = self._brain_for(self.current_speaker)
         # ARCH-ENG-279 (AV-03) wired the gate; ARCH-ENG-313 made it advisory.
         self._apply_model_advisory(brain)

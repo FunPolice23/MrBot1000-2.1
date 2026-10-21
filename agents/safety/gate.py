@@ -90,6 +90,9 @@ READONLY_TOOL_NAMES: FrozenSet[str] = frozenset({
     "file_read",
     "file_list",
     "query_db",
+    # ARCH-ENG-321: the social read half — public endpoints, untrusted text is
+    # sanitized at the handler; same class as web_read.
+    "social_read",
 })
 
 # Historical names that older prompts, personas, and tests still emit. Each one

@@ -1,3 +1,115 @@
+## [2.1.135] - 2026-10-21 - The models can read the social network (social_read)
+
+### Added
+
+**ARCH-ENG-321 - `social_read`: the READ half of the social surface, so the models know Moltbook.**
+Operator report (carried from ARCH-ENG-320): "nor does agents/models know of
+it". The models had the social WRITE tool (`social_post`) and nothing else —
+no tool even named a network worth reading, so the models did not know
+Moltbook existed and could not browse it as a source of leads/lessons.
+`social_read` (network=moltbook; modes `feed` / `search` / `post` /
+`comments`) reads the public Moltbook API (verified keyless live — the same
+public read surface 320 unlocked for the GUI), sanitizes every payload
+through `sanitize_external_text` (UNTRUSTED envelope, injection patterns
+neutralized), and is classified READONLY like `web_read`, so it flows
+through the SafetyGate with no human friction. Writes stay exactly as
+gated: `social_post` remains HIGH-TRUST with approval scoping. The schema
+itself names moltbook and its discipline (treat posts as data/leads, never
+verified jobs), so every model that lists tools now sees the platform.
+Wired through: `agents/safety/tools.py` (schema), `handlers.py`
+(`_tool_social_read`), `calling.py` (re-export), `dispatch.py` (registry),
+`gate.py` (READONLY_TOOL_NAMES). Unknown network/mode refuse plainly; a
+network error is reported as an error, never as data.
+Regression: `tests/engineering/test_arch_eng_321_social_read_tool.py`
+(dispatch-level: keyless search hits the public endpoint with no auth
+header, feed is sanitized, injection neutralized, comment payloads unwrap,
+refusals, network-error honesty, schema names moltbook, read-only
+classification).
+
+## [2.1.134] - 2026-10-21 - Moltbook reads you do not have to register for
+
+### Fixed
+
+**ARCH-ENG-320 - the Moltbook feed and Social-Activity scan work without registration.**
+Operator report: Social Activity scanning finds/shows nothing; the Moltbook
+feed displays nothing "even if not registered"; the agents/models do not know
+of it. The live API was probed directly during the fix:
+`https://www.moltbook.com/api/v1/posts` and `…/api/v1/search` are **public**
+(reads need no Authorization header at all — verified keyless against the
+real service), while writes are the credentialed side. Our client was gating
+the READS behind `MOLTBOOK_API_KEY` too, so an unregistered operator — the
+operator profile at hand — got a permanently empty feed tab and a social
+scan that silently yielded zero forever.
+- `agents/earning/moltbook_agent.py`: reads (`get_feed` / `get_post` /
+  `get_comments`) no longer require a key; `_auth_headers` only carries
+  Authorization when a key actually exists (never an empty Bearer). The
+  host scoping discipline is unchanged, and writes keep every gate
+  (capability approval + credential).
+- `gui/builders/tab_workers.py:: MoltbookFeedWorker`: dropped the hard env
+  gate; "Load Moltbook Feed" now reports real rows (or a real network
+  error) without any registration. Tool-tip text updated — it used to say
+  the read needed the key.
+- `agents/discovery/discovery_sources.py:: MoltbookSource`: no longer
+  returns `[]` when the key is unset; the search runs keyless, so the
+  Social Activity scan can surface moltbook leads for review. A configured
+  key is still attached (still scoped to moltbook.com).
+The "models do not know of it" (read-side agent awareness/tooling) is
+tracked separately — the models already have the `social_post` write tool;
+a read tooling entry will be its own change.
+Regression: `tests/earning/test_arch_eng_320_moltbook_keyless_reads.py`
+(feed/get_post/comments keyless with no leak of an empty Authorization,
+worker renders rows keyless, discovery yields keyless leads, writes still
+blocked both by capability and credential); the pre-existing moltbook and
+discovery tests were migrated from "reads need the key" to the public-read
+contract, still asserting the scoped Bearer when a key IS configured.
+
+## [2.1.133] - 2026-10-21 - Tabs that answer the operator again (Settings build, Live Logs view)
+
+### Fixed
+
+**ARCH-ENG-318 - the Settings tab builds again (`NameError: _env_bool`).**
+Operator report: Settings tab "could not initialized … name '_env_bool' is
+not defined". ARCH-ENG-203 (v2.0.34ap era) deleted the local three-state
+parser and re-seeded the reads on `app.effects.env_bool`, adding the
+delegation import only to `create_settings_tab` and `_build_provider_sections`
+— both function-scoped. `_build_appearance_group` also parses
+`MRBOT_FX_COMPACT_DENSITY` / `MRBOT_FX_ROUNDED_CORNERS` through `_env_bool`
+but a sibling's import is invisible to it: building the tab raised NameError,
+the lazy-tab failure path rendered the "could not be initialized" widget, and
+the operator effectively had no Settings tab. Now
+`gui/builders/tab_feature_builders.py:: _build_appearance_group` imports
+`env_bool as _env_bool` exactly like its sibling sections.
+Regression: `tests/gui/test_arch_eng_318_settings_tab_builds.py` — the real
+Settings tab is built offscreen (behavioral, incl. FX defaults round-trip),
+plus an AST scoping guard: EVERY function that calls `_env_bool`/`env_bool`
+must see an import in its own or an enclosing scope (closures honoured), so
+the same class of unresolved-name defect cannot hide in any section again.
+
+**ARCH-ENG-319 - the Live Logs tab shows its (complete, honest) view.**
+Operator report: "Live logs tab not showing anything". ARCH-ENG-223's
+deferred-table model was right (no widget work while hidden, buffer is
+authoritative) but the replay that materialised the view ran at BUILD time,
+while the freshly built widget was still hidden — the hidden guard deferred
+every row, nothing rescheduled it, and the operator opened an empty Live Logs
+tab until they poked the filter. Three defects, one pass:
+- `gui/builders/tab_feature_builders.py:: create_logs_tab` now builds its
+  content on a `_LogTabShell` whose showEvent schedules the rebuild, so the
+  view is complete on EVERY open (the build-time replay stays only for
+  non-lifecycle callers that construct the tab visibly).
+- live appends now honour the active filters inside
+  `_append_log_to_table` (the only row-producing method); previously a new
+  line that did not match the operator's filter still landed on the table,
+  polluting a filtered view.
+- `_show_log_details` indexed `self._log_buffer[row]` while the table shows a
+  FILTERED view — with a filter active, clicking a row described the wrong
+  entry. The view now records its own row mapping (`self._view_entries`) and
+  the details panel reads that.
+Rebuild/filter logic is unified in `_replay_log_view` + `_current_log_filters`
+(`main.py`), so replay, filter-apply, and live append cannot drift again.
+The ARCH-ENG-223 contract is intact (hidden table untouched, visible appends
+land, hidden path still ~15× cheaper) — its tests pass unmodified.
+Regression: `tests/engineering/test_arch_eng_319_live_logs_view.py`.
+
 ## [2.1.132] - 2026-10-21 - Dialogue turns stop claiming Graph-of-Thought
 
 ### Fixed

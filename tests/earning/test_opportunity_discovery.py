@@ -205,11 +205,26 @@ class TestExistingIntegrationsAsSources(unittest.TestCase):
         for s in srcs:
             self.assertIsInstance(s, BaseOpportunitySource)
 
-    def test_moltbook_source_requires_explicit_api_key(self):
+    def test_moltbook_source_works_without_a_key(self):
+        """ARCH-ENG-320: the search endpoint is public — an unregistered
+        operator still gets leads instead of a silent eternal zero."""
         os.environ.pop("MOLTBOOK_API_KEY", None)
-        self.assertEqual(MoltbookSource().discover(), [])
+        payload = {"results": [{
+            "type": "post", "id": "paid-nokey", "title": "Paid agent task",
+            "content": "Client offers a bounty for a data pipeline.",
+            "submolt": {"name": "general", "display_name": "General"},
+        }]}
+        response = mock.Mock()
+        response.json.return_value = payload
+        response.raise_for_status.return_value = None
+        with mock.patch("requests.get", return_value=response) as get:
+            opps = MoltbookSource().discover()
+        self.assertEqual(len(opps), 1)
+        # No Authorization header at all — a read never leaks an empty token.
+        sent_headers = get.call_args.kwargs["headers"]
+        self.assertNotIn("Authorization", sent_headers)
 
-    def test_moltbook_source_filters_posts_and_preserves_provenance(self):
+    def test_moltbook_source_key_sends_bearer_and_preserves_provenance(self):
         os.environ["MOLTBOOK_API_KEY"] = "test-key"
         payload = {
             "results": [
@@ -232,6 +247,10 @@ class TestExistingIntegrationsAsSources(unittest.TestCase):
         os.environ.pop("MOLTBOOK_API_KEY", None)
         self.assertEqual(len(opps), 1)
         self.assertTrue(opps[0].human_required)
+        # The configured key IS attached when present, and only to moltbook.
+        sent_headers = get.call_args.kwargs["headers"]
+        self.assertEqual(sent_headers["Authorization"], "Bearer test-key")
+        self.assertTrue(get.call_args.args[0].startswith("https://www.moltbook.com"))
         self.assertEqual(opps[0].external_url,
                          "https://www.moltbook.com/post/paid-1")
         self.assertEqual(opps[0].provenance,

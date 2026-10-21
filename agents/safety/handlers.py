@@ -1239,6 +1239,104 @@ def _tool_social_post(
     return f"[social_post: posted to {network} behind approval {approval_id}: {result}]"
 
 
+def _tool_social_read(args: Dict[str, Any]) -> str:
+    """Read from a social/agent network (READ-ONLY, public endpoints).
+
+    ARCH-ENG-321: the models had the social WRITE tool (`social_post`) but no
+    way to read the platform, and nothing in the toolset even named a network —
+    so they did not know Moltbook existed and never referenced it. This tool
+    makes the read side first-class: the feed, the semantic search, a single
+    post, and a post's comments.
+
+    Reads are public on Moltbook (verified keyless — ARCH-ENG-320), so this is
+    a plain READONLY tool: automatic gate approval, same as web_read. The key
+    gives nothing extra here and is never required for reads. Everything the
+    platform returns is UNTRUSTED external content and is sanitized before it
+    reaches model context. Unknown networks refuse plainly — never fabricate
+    a read.
+    """
+    network = str(args.get("network", "moltbook")).strip().lower()
+    mode = str(args.get("mode", "feed")).strip().lower()
+    if network != "moltbook":
+        return (f"[social_read: '{network}' is not a readable social network. "
+                "Supported networks: moltbook (public API).]")
+    limit = max(1, min(int(args.get("limit", 10) or 10), 50))
+    query = str(args.get("query", "")).strip()
+    post_id = str(args.get("post_id", "")).strip()
+    by_mode_required = {"search": query, "post": post_id, "comments": post_id}
+    required = by_mode_required.get(mode)
+    if mode not in {"feed", "search", "post", "comments"}:
+        return (f"[social_read: unknown mode '{mode}'. Modes: feed, search, "
+                "post, comments.]")
+    if mode != "feed" and required is not None and not required:
+        return (f"[social_read: mode '{mode}' requires "
+                f"{'query' if mode == 'search' else 'post_id'}]")
+
+    try:
+        import requests
+        from agents.earning.moltbook_agent import MoltbookPoster
+        from agents.knowledge.prompt_sanitize import sanitize_external_text
+
+        poster = MoltbookPoster(http_client=requests)
+        if mode == "feed":
+            result = poster.get_feed(sort="hot", limit=limit)
+            posts = result.get("feed", {}).get("posts", []) \
+                if isinstance(result.get("feed"), dict) else []
+            label = "feed"
+        elif mode == "search":
+            response = requests.get(
+                "https://www.moltbook.com/api/v1/search",
+                params={"q": query, "type": "posts", "limit": limit},
+                headers={"Content-Type": "application/json"},
+                timeout=15)
+            response.raise_for_status()
+            payload = response.json()
+            posts = payload.get("results", []) if isinstance(payload, dict) else []
+            label = "search"
+        elif mode == "post":
+            result = poster.get_post(post_id)
+            p = result.get("post") or {}
+            body = p.get("post") if isinstance(p.get("post"), dict) else p
+            content = sanitize_external_text(
+                str(body.get("content", ""))[:8000], source="social post")
+            head = (f"post {post_id}: {body.get('title', '')!r} by "
+                    f"{(body.get('author') or {}).get('name', '')!r} "
+                    f"(upvotes {body.get('upvotes', 0)})")
+            return f"[social_read (post): {head}]\n{content}"
+        else:  # comments
+            result = poster.get_comments(post_id, sort="best", limit=limit)
+            raw = result.get("comments")
+            if isinstance(raw, dict):
+                raw = raw.get("comments", [])
+            posts = raw if isinstance(raw, list) else []
+            label = "comments"
+
+        lines = []
+        for p in posts if isinstance(posts, list) else []:
+            if not isinstance(p, dict):
+                continue
+            title = str(p.get("title", ""))
+            text = str(p.get("content", ""))[:300]
+            who = str((p.get("author") or {}).get("name") or "")
+            # `submolt` lives on every post shape (feed + search payloads).
+            submolt = p.get("submolt") or {}
+            community = str(submolt.get("display_name")
+                            or submolt.get("name") or "")
+            # The id is surfaced so the agent can follow up with mode=post /
+            # mode=comments without re-searching.
+            pid = str(p.get("post_id") or p.get("id") or "")
+            lines.append(
+                f"- [{community or '?'}] {title!r} — {who or '?'} "
+                f"(id {pid or '?'}): "
+                + sanitize_external_text(text, source="social post"))
+        if not lines and mode in {"feed", "comments"}:
+            return f"[social_read ({label}): no posts returned.]"
+        return (f"[social_read ({label}, {len(lines)} item(s))]\n"
+                + "\n".join(lines))
+    except Exception as exc:
+        return f"[social_read: network error — {exc}]"
+
+
 # ── System Tool Implementations ───────────────────────────────────────────
 
 def refuse_secret_argv(argv: Sequence[str]) -> str:

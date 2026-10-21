@@ -134,6 +134,8 @@ def execute_tool(name: str, arguments: Dict[str, Any],
         "query_db": runtime._tool_query_db,
         "record_payment": runtime._tool_record_payment,
         "social_post": runtime._tool_social_post,
+        # ARCH-ENG-321: the read half of the social surface. READ-ONLY.
+        "social_read": runtime._tool_social_read,
     }
     handler = handlers.get(name)
     if handler is None:
