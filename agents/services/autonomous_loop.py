@@ -437,7 +437,19 @@ class AutonomousLoop:
             self._check_limits(opp_id, started)
             self._stage_check_skill_fit(result, opportunity, facts)
             self._check_limits(opp_id, started)
-            self._stage_check_economics(result, opportunity, facts)
+            if not self._stage_check_economics(result, opportunity, facts):
+                # ARCH-ENG-155: the stage used to return nothing and the loop
+                # ignored it, so a policy DEFER/REJECT could not stop anything.
+                # A reject here is a decision, not a failure claim: it names the
+                # policy verdict and never reaches execute.
+                reasons = []
+                for stage in result.stages:
+                    if stage.stage == "check_economics":
+                        reasons = stage.data.get("policy_reasons") or []
+                return self._finalize(
+                    result, facts, t0, "reject",
+                    "Economic policy did not select this opportunity: "
+                    + (", ".join(reasons) or "policy_verdict"))
             self._check_limits(opp_id, started)
             self._stage_check_risk(result, opportunity, facts)
             self._check_limits(opp_id, started)
@@ -596,16 +608,127 @@ class AutonomousLoop:
             duration_s=time.time()-t0))
 
     def _stage_check_economics(self, result, opp, facts):
+        """Apply the operator's deterministic economic policy to this opportunity.
+
+        ARCH-ENG-155: this stage USED to compute ``estimated_hourly`` and then
+        discard it — it recorded the number and returned COMPLETED whatever the
+        economics were. OBSERVED: an opportunity with ``advertised_amount=5``,
+        ``estimated_net_value=-500``, ``estimated_effort=200`` produced
+        ``estimated_hourly: -2.5`` and status ``completed``, so the loop went on
+        to plan, execute and submit work that loses money on every axis.
+
+        ``agents/earning/economic_policy.py`` — a complete, tested deterministic
+        gate layer (net value, risk-adjusted hourly return, staleness,
+        confidence, risk penalty, payment delay, productive hours, autonomy
+        level, plus the legality/capability/identity/evidence gates) — was
+        imported by NOTHING in production (OBSERVED: 0 non-test importers). The
+        logic to make this decision existed and ran only in its own unit tests.
+
+        Now the stage builds an ``EconomicPrediction`` from what the opportunity
+        actually carries, evaluates it against the policy from settings.json,
+        and returns False when the policy says DEFER/REJECT. Returning False is
+        the loop's existing "this stage failed" contract (the same one
+        ``_stage_deduplicate`` and ``_stage_validate`` use), so ``_run``
+        finalizes as a reject WITHOUT reaching execute — a reject is not a
+        failure claim, and the reason string names the policy verdict.
+
+        Fails OPEN on a policy that cannot be evaluated: an exception here must
+        not halt the autonomous loop, so the stage records the error and keeps
+        the pre-existing COMPLETED behaviour. The gate only ever tightens the
+        decision when it could actually be computed.
+        """
         t0 = time.time()
         advertised = float(getattr(opp, "advertised_amount", 0) or 0)
         estimated = float(getattr(opp, "estimated_net_value", 0) or 0)
         effort = float(getattr(opp, "estimated_effort", 0) or 0)
         hourly = estimated / effort if effort > 0 else 0.0
-        result.stages.append(StageResult(stage="check_economics", status=StageStatus.COMPLETED,
+
+        verdict = None
+        policy_error = ""
+        try:
+            from agents.earning.economic_policy import (
+                DecisionAction,
+                EconomicPrediction,
+                load_policy,
+                evaluate_prediction,
+            )
+            prediction = EconomicPrediction(
+                opportunity_id=facts.opportunity_id,
+                # `EconomicPrediction.expected_net_value` is DERIVED:
+                # payout * p_success * p_payment - costs. The opportunity's own
+                # `estimated_net_value` is the authoritative figure (the
+                # discoverer/evaluator already applied whatever success and
+                # payment risk they believed), so the probabilities are fixed
+                # at 1.0 and the whole gap between advertised payout and that
+                # estimate is carried as `startup_cost`. The arithmetic then
+                # reproduces the estimate EXACTLY:
+                #   advertised - (advertised - estimated) == estimated
+                # so the policy decides on the number the loop already trusts,
+                # and a payout-probability model can never overwrite it.
+                payout_amount=advertised,
+                probability_of_success=1.0,
+                probability_of_payment=1.0,
+                startup_cost=max(0.0, advertised - estimated),
+                active_work_hours=max(effort, 0.0),
+                time_to_payment_hours=float(
+                    getattr(opp, "time_to_payment_hours", 0) or 0),
+                normalized_risk_penalty=self._risk_penalty(opp),
+                confidence=float(getattr(opp, "confidence", 0.0) or 0.0),
+            )
+            verdict = evaluate_prediction(prediction, load_policy())
+        except Exception as exc:  # never let policy evaluation halt the loop
+            policy_error = str(exc)
+
+        if policy_error:
+            result.errors.append(f"Economic policy error: {policy_error}")
+
+        rejected = (
+            verdict is not None
+            and verdict.action
+            in (DecisionAction.REJECT, DecisionAction.DEFER)
+        )
+
+        data = {
+            "advertised_value": advertised,
+            "estimated_net_value": estimated,
+            "estimated_effort": effort,
+            "estimated_hourly": hourly,
+        }
+        if verdict is not None:
+            data["policy_action"] = verdict.action.value
+            data["policy_version"] = verdict.policy_version
+            data["policy_reasons"] = list(verdict.reasons)
+            data["policy_expected_net_value"] = verdict.expected_net_value
+            data["policy_risk_adjusted_hourly"] = (
+                verdict.risk_adjusted_hourly_return)
+
+        result.stages.append(StageResult(
+            stage="check_economics",
+            status=StageStatus.FAILED if rejected else StageStatus.COMPLETED,
             opportunity_id=facts.opportunity_id,
-            data={"advertised_value": advertised, "estimated_net_value": estimated,
-                  "estimated_effort": effort, "estimated_hourly": hourly},
-            duration_s=time.time()-t0))
+            data=data,
+            duration_s=time.time() - t0))
+        return not rejected
+
+    @staticmethod
+    def _risk_penalty(opp) -> float:
+        """Map an opportunity's risk signals onto the policy's 0..1 penalty.
+
+        ``economic_policy`` takes a *normalized* penalty, while opportunities
+        carry ``risk_level`` (low/medium/high, produced by
+        ``agents/earning/evaluation.py``) and ``scam_prob``. Both are folded in
+        so the policy sees the strongest signal the opportunity actually has;
+        an unreadable risk_level is treated as medium rather than low, because
+        assuming safety on unknown input is how a gate gets bypassed.
+        """
+        by_level = {"low": 0.2, "medium": 0.5, "high": 0.8}
+        level = getattr(opp, "risk_level", None)
+        penalty = by_level.get(
+            str(level).lower() if level else "", 0.5)
+        scam = float(getattr(opp, "scam_prob", 0.0) or 0.0)
+        if scam:
+            penalty = max(penalty, min(max(scam, 0.0), 1.0))
+        return min(max(penalty, 0.0), 1.0)
 
     def _stage_check_risk(self, result, opp, facts):
         t0 = time.time()
@@ -672,19 +795,47 @@ class AutonomousLoop:
         t0 = time.time()
         executed = False; error = ""
         try:
-            if self.task_executor is not None and hasattr(self.task_executor, 'run'):
-                from agents.earning.spec import Task
-                task = Task(task_type=getattr(opp, "task_type", "GENERAL"),
-                    required_capabilities=getattr(opp, "required_skills", []),
-                    inputs={"opportunity": opp}, expected_outputs={"execution_result": "task completed"},
-                    tools_required=[], estimated_effort=float(getattr(opp, "estimated_effort", 0) or 0),
-                    validation_method="deterministic", human_required=False,
-                    execution_mode="automated", payment_conditions={})
-                exec_result = self.task_executor.run(task)
-                self._last_exec_result = exec_result
-                executed = exec_result.success
-                if not executed:
-                    error = "; ".join(exec_result.errors) if exec_result.errors else "execution failed"
+            # ARCH-ENG-147: the guard used to test `hasattr(task_executor, 'run')`.
+            # TaskExecutor defines `execute(self, task, entry)` and no `run`, so
+            # the guard was permanently False: every run fell into the `else`
+            # branch and reported "no_task_executor" for a component that IS
+            # constructed and wired at app/earning_pipeline.py:166-170. The message
+            # named a missing component that was present, which is why this read
+            # as an infrastructure gap rather than a wiring bug.
+            #
+            # Two shape rules for `execute`, both enforced by
+            # tests/engineering/test_arch_eng_147_task_executor_seam.py:
+            #   1. it needs TWO positionals — the task AND the portfolio entry;
+            #   2. it treats `task` as a DICT (step 1 does task.get("task_type")),
+            #      so passing the Task spec object would raise AttributeError.
+            if self.task_executor is not None and hasattr(self.task_executor, 'execute'):
+                # The entry is the portfolio row this opportunity owns — the same
+                # lookup _stage_rerank performs. With no portfolio (or no row for
+                # this id) there is nothing to execute against, so we fail CLOSED
+                # rather than fabricate an entry and claim success.
+                entry = self._portfolio_entry(opp)
+                if entry is None:
+                    error = "no_portfolio_entry"
+                else:
+                    task = {
+                        "task_type": getattr(opp, "task_type", "GENERAL"),
+                        "description": getattr(opp, "description", ""),
+                        "required_capabilities": getattr(opp, "required_skills", []),
+                        "inputs": {"opportunity": opp},
+                        "expected_outputs": {"execution_result": "task completed"},
+                        "tools_required": [],
+                        "estimated_effort": float(getattr(opp, "estimated_effort", 0) or 0),
+                        "validation_method": "deterministic",
+                        "human_required": False,
+                        "execution_mode": "automated",
+                        "payment_conditions": {},
+                    }
+                    exec_result = self.task_executor.execute(task, entry)
+                    self._last_exec_result = exec_result
+                    executed = bool(getattr(exec_result, "success", False))
+                    if not executed:
+                        error = ("; ".join(getattr(exec_result, "errors", []) or [])
+                                 or "execution failed")
             else:
                 # Missing execution infrastructure must never become a success.
                 error = "no_task_executor"
@@ -710,6 +861,35 @@ class AutonomousLoop:
         if not executed: result.errors.append(error or "execution failed")
         return executed
 
+    def _portfolio_entry(self, opp):
+        """The portfolio row this opportunity owns, or None.
+
+        ARCH-ENG-147: `TaskExecutor.execute(task, entry)` requires the portfolio
+        entry as its second positional, so the execute stage must resolve one.
+        This is the same lookup `_stage_rerank` performs (load_all + match on
+        opportunity_id), centralised so the two cannot diverge.
+
+        Returns None when there is no portfolio or no matching row. Callers must
+        treat None as "cannot execute" and fail closed — inventing an entry would
+        let the loop claim an execution it never performed.
+        """
+        if self.portfolio is None:
+            return None
+        opp_id = getattr(opp, "id", None) or getattr(opp, "opportunity_id", None)
+        if not opp_id:
+            return None
+        try:
+            if hasattr(self.portfolio, "get"):
+                entry = self.portfolio.get(opp_id)
+                if entry is not None:
+                    return entry
+            for entry in self.portfolio.load_all():
+                if getattr(entry, "opportunity_id", None) == opp_id:
+                    return entry
+        except Exception:
+            return None
+        return None
+
     def _stage_validate(self, result, opp, facts):
         t0 = time.time()
         # Validation must prove a real executor artifact. Missing validators,
@@ -722,7 +902,10 @@ class AutonomousLoop:
             validator = get_validator(getattr(opp, "task_type", "GENERAL"))
             if validator is None or not hasattr(validator, "validate"):
                 validation_error = "no_validator"
-            elif self.task_executor is None or not hasattr(self.task_executor, "run"):
+            elif self.task_executor is None or not hasattr(self.task_executor, "execute"):
+                # ARCH-ENG-147: this probe used to test the absent `run`, matching
+                # the old execute guard. Both now probe `execute` so validation
+                # and execution can never disagree about the executor's surface.
                 validation_error = "no_task_executor"
             else:
                 exec_result = getattr(self, "_last_exec_result", None)
@@ -793,6 +976,9 @@ class AutonomousLoop:
     def _stage_verify(self, result, opp, facts):
         t0 = time.time()
         verified = False; evidence_found = False; payment_amount = 0.0
+        # The Evidence object that actually satisfied the payment gate. It must be
+        # handed to `mark_paid_verified` — see the note at the call site below.
+        payment_evidence = None
         try:
             if self.evidence_store is not None and hasattr(self.evidence_store, 'for_subject'):
                 evidence = self.evidence_store.for_subject("opportunity", opp.id or opp.opportunity_id)
@@ -817,12 +1003,27 @@ class AutonomousLoop:
                         if eligible and externally_verified:
                             verified = True
                             payment_amount += float(getattr(ev, "amount", 0) or 0)
+                            payment_evidence = ev
                     elif ev.status == EvidenceStatus.VERIFIED:
                         evidence_found = True
             if verified and self.lifecycle is not None and hasattr(self.lifecycle, 'mark_paid_verified'):
                 try:
-                    lifecycle_state = self.lifecycle.mark_paid_verified(opp.id or opp.opportunity_id,
-                        amount=payment_amount)
+                    # ARCH-ENG-143: pass the Evidence that satisfied the gate.
+                    # `mark_paid_verified(id, amount=...)` with NO evidence lands in
+                    # its fail-closed tail ("no evidence attached" -> stays
+                    # 'submitted'), and the line below then overwrites the
+                    # `verified` this stage just established with
+                    # `status != "paid"`. So a fully-verified L3/L5 payout was
+                    # computed here and immediately discarded — reproduced: a
+                    # $750 on-chain balance delta yielded payment_amount=750.0
+                    # but paid=False and lifecycle status 'active'. Passing the
+                    # Evidence re-enters the policy-gated path, which is exactly
+                    # the transition contract this stage already checked, so the
+                    # lifecycle reaches 'paid' on the same evidence rather than
+                    # on the caller's assertion.
+                    lifecycle_state = self.lifecycle.mark_paid_verified(
+                        opp.id or opp.opportunity_id,
+                        amount=payment_amount, evidence=payment_evidence)
                     # Fail CLOSED: if the lifecycle did not actually reach "paid" —
                     # including when it returned None or raised — the payment is NOT
                     # verified. Defaulting the getattr to "paid" here previously
@@ -1067,21 +1268,37 @@ class AutonomousLoop:
                             entry.work_status = WorkStatus.FAILED
                         elif result.decision == "await_approval":
                             entry.work_status = WorkStatus.AWAITING_APPROVAL
-                        # Keep policy scoring truthful: completed-unpaid runs are not
-                        # successful paid outcomes.
-                        entry.policy_score = result.paid
-                        entry.explanation = result.explanation
+                        # ARCH-ENG-216: `entry.policy_score = result.paid` is GONE, and
+                        # so is `entry.explanation`.
+                        #
+                        # `policy_score` is declared `float` and means "how
+                        # attractive is this opportunity". `result.paid` is a
+                        # BOOL meaning "did this particular run get paid". Those
+                        # are different questions, so writing one over the other
+                        # was a category error before it was a type error.
+                        #
+                        # The visible effect: every opportunity the autonomous
+                        # loop touched was written as 0.0, rendered "0%" in the
+                        # Opportunities tab, and then hidden by that tab's
+                        # minimum-score filter. Work the agent had actually
+                        # performed vanished from the operator's view.
+                        #
+                        # `entry.explanation` was worse -- `PortfolioEntry` has
+                        # no such field, so the assignment was silently dropped
+                        # by add()'s 24-column INSERT. It read as though the
+                        # reasoning were being recorded. It was not.
+                        #
+                        # The score is now written by
+                        # `OpportunityPortfolio.rescore_all()`, which persists
+                        # what `QueuePolicy.score` computes. Work STATUS above
+                        # still tracks the run outcome, which is the field that
+                        # should have held it.
                         self.portfolio.update(entry)
                         break
             except Exception as exc:
                 result.errors.append(f"Portfolio sync error: {exc}")
 
-    def _get_opp_from_facts(self, facts: Any):
-        """Extract opportunity from facts store."""
-        if facts is None:
-            return None
-        # Facts store may have the opportunity attached
-        return getattr(facts, 'opportunity', None)
-
-
+# ARCH-ENG-255 (Y-02): `_get_opp_from_facts` was the last method in this
+# class and had zero references; it was deleted. The live loop reads facts
+# through the stage functions.
 __all__ = ["StageStatus", "StageResult", "AutonomousResult", "AutonomousLoop", "ExplanationBuilder"]

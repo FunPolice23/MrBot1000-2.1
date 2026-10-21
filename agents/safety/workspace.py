@@ -256,6 +256,34 @@ class TaskWorkspace:
         Promotes status to 'submitted' and records the archive location. Real
         platform upload (Fiverr/Upwork) is a later plug-in point.
         """
+        # ARCH-ENG-299 (H-01): QualityController was demo-only. It is now a
+        # second, independent pre-submission gate on the actual deliverables.
+        # DocumentScanner is deterministic; a missing/unreadable file blocks
+        # rather than silently submitting unchecked work.
+        files = self.list_files()
+        if files:
+            try:
+                from agents.evidence.document_scanner import QualityController
+                check = QualityController().pre_submit_check(
+                    [str(self.path / f) for f in files], [])
+                if not check.get("passed", False):
+                    self._log("[Workspace] submission blocked by quality gate")
+                    return {
+                        "platform": self.platform,
+                        "job_id": self.job_id,
+                        "status": "blocked",
+                        "quality": check,
+                        "files": files,
+                    }
+            except Exception as exc:
+                self._log(f"[Workspace] quality gate error: {exc}")
+                return {
+                    "platform": self.platform,
+                    "job_id": self.job_id,
+                    "status": "blocked",
+                    "error": f"quality gate error: {exc}",
+                    "files": files,
+                }
         data = self._read_status()
         if data.get("status") not in (STATUS_DONE, STATUS_WORKING):
             self.set_status(STATUS_WORKING)

@@ -56,6 +56,54 @@ def get_all_tools() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "propose_code_patch",
+                "description": (
+                    "Propose a change to one of this program's own source files. "
+                    "This DOES NOT change anything. The new content is first "
+                    "rehearsed against a copy of the file in the practice "
+                    "folder, and only if that rehearsal passes is a proposal "
+                    "queued for a human to approve. Until the human approves, "
+                    "nothing in the running program is altered. If approved, "
+                    "the change is applied with a backup, and can be reverted "
+                    "from that backup. If you omit new_content, CoderWorker "
+                    "reads the file and drafts the complete replacement itself "
+                    "(still approval-gated). Use this only when you have found "
+                    "a concrete defect and can state why it matters -- not to "
+                    "restyle, reorganise, or 'improve' working code."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "Repo-relative path of the file to patch, e.g. agents/runtime/dual_brain.py"
+                        },
+                        "new_content": {
+                            "type": "string",
+                            "description": ("The COMPLETE new file content, not a diff or a "
+                                            "fragment. Omit to let CoderWorker draft it.")
+                        },
+                        "issue": {
+                            "type": "string",
+                            "description": ("Optional defect description for CoderWorker when "
+                                            "new_content is omitted.")
+                        },
+                        "motivation": {
+                            "type": "string",
+                            "description": "What defect prompted this, and why the new content fixes it."
+                        },
+                        "authored_by": {
+                            "type": "string",
+                            "description": "Your name (e.g. 'edward' or 'jacob')."
+                        }
+                    },
+                    "required": ["target", "motivation"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "workshop_list",
                 "description": "List files in an organized workshop folder.",
                 "parameters": {
@@ -145,6 +193,281 @@ def get_all_tools() -> List[Dict[str, Any]]:
                     },
                     "required": ["title", "client", "description"]
                 }
+            }
+        },
+        # ── Workshop typed surface (ARCH-ENG-248, AY-01) ─────────────────────
+        # The typed readers/writers these schemas expose were implemented and
+        # dead: the model could create a proposal and never list, read or
+        # re-status it. `workshop_account`/`workshop_payment` were dispatched
+        # and gated but MISSING from this registry (so no model could see
+        # them); they are declared here with the rest.
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_proposal_list",
+                "description": "List proposal documents in the workshop.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_proposal_get",
+                "description": "Read one proposal document by filename.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string", "description": "Proposal filename, e.g. proposal_acme_20260101_120000.md"}
+                    },
+                    "required": ["filename"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_proposal_status",
+                "description": "Update the status line of a proposal document.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string", "description": "Proposal filename"},
+                        "status": {"type": "string", "description": "New status, e.g. Sent, Accepted, Paid"}
+                    },
+                    "required": ["filename", "status"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_research",
+                "description": "Add a research note to the workshop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Research title"},
+                        "content": {"type": "string", "description": "Findings / summary"},
+                        "tags": {"type": "array", "items": {"type": "string"},
+                                 "description": "Optional tags"}
+                    },
+                    "required": ["title", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_research_read",
+                "description": "Read one research note by filename.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filename": {"type": "string", "description": "Research filename"}},
+                    "required": ["filename"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_research_list",
+                "description": "List research notes in the workshop.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_script",
+                "description": "Create a script document in the workshop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Script name"},
+                        "language": {"type": "string", "description": "python, bash, powershell, javascript or batch"},
+                        "description": {"type": "string", "description": "What the script does"},
+                        "code": {"type": "string", "description": "Script body"}
+                    },
+                    "required": ["name", "language", "code"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_script_read",
+                "description": "Read one script document by filename.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filename": {"type": "string", "description": "Script filename"}},
+                    "required": ["filename"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_script_list",
+                "description": "List script documents in the workshop.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_application",
+                "description": "Create a job-application document.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "platform": {"type": "string", "description": "Platform, e.g. Upwork"},
+                        "job_type": {"type": "string", "description": "Job type"},
+                        "details": {"type": "object", "description": "Key/value application details"}
+                    },
+                    "required": ["platform"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_application_list",
+                "description": "List job-application documents in the workshop.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_account",
+                "description": "Add a platform account record.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "platform": {"type": "string", "description": "Platform name"},
+                        "username": {"type": "string", "description": "Account username"},
+                        "email": {"type": "string", "description": "Account email"}
+                    },
+                    "required": ["platform", "username", "email"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_account_get",
+                "description": "Show one stored account. Passwords are always masked.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"platform": {"type": "string", "description": "Platform name"}},
+                    "required": ["platform"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_account_list",
+                "description": "List stored accounts. Passwords are always masked.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_account_remove",
+                "description": "Remove a stored account record.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"platform": {"type": "string", "description": "Platform name"}},
+                    "required": ["platform"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_payment",
+                "description": "Add a payment method record.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {"type": "string", "description": "Method name, e.g. paypal"},
+                        "identifier": {"type": "string", "description": "Address / account identifier"},
+                        "is_crypto": {"type": "boolean", "description": "True for a crypto address"}
+                    },
+                    "required": ["method", "identifier"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_payment_get",
+                "description": "Show one stored payment method.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"method": {"type": "string", "description": "Method name"}},
+                    "required": ["method"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_payment_list",
+                "description": "List stored payment methods.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_deliverable",
+                "description": "Add a deliverable document to the workshop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Deliverable title"},
+                        "content": {"type": "string", "description": "Deliverable content"},
+                        "client": {"type": "string", "description": "Client name"},
+                        "platform": {"type": "string", "description": "Platform"}
+                    },
+                    "required": ["title", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_deliverable_list",
+                "description": "List deliverable documents in the workshop.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_note",
+                "description": "Add a note to the workshop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Note title"},
+                        "content": {"type": "string", "description": "Note content"},
+                        "tags": {"type": "array", "items": {"type": "string"},
+                                 "description": "Optional tags"}
+                    },
+                    "required": ["title", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workshop_note_list",
+                "description": "List notes in the workshop.",
+                "parameters": {"type": "object", "properties": {}}
             }
         },
         {

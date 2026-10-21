@@ -19,6 +19,7 @@ def submit_gig_proposal(
     track_fn: Callable[..., Any],
     record_submission_fn: Callable[[Any], None],
     lifecycle: Any = None,
+    persist_proposal_fn: Optional[Callable[[Any, str], None]] = None,
 ) -> Any:
     """Submit a proposal through review, human/ramp, and evidence gates."""
     try:
@@ -164,6 +165,16 @@ def submit_gig_proposal(
 
     record_submission_fn(opportunity)
     track_fn(opportunity, "submitted", note=f"proposal_id={proposal_id}")
+    # ARCH-ENG-249 (AF-01): persist the SUBMITTED proposal (deduped by
+    # title+platform) so the live DB Stats count stops being zero by
+    # construction. A persistence failure cannot un-submit the proposal, so
+    # it must never raise -- the submission is already recorded by the
+    # lifecycle/ramp path above.
+    if persist_proposal_fn is not None:
+        try:
+            persist_proposal_fn(opportunity, draft)
+        except Exception:
+            pass
     if evidence is not None and lifecycle is not None:
         lifecycle.mark_submitted(
             opportunity.id,

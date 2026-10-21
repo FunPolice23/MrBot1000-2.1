@@ -204,6 +204,18 @@ class WebEyes:
         (very short text or Cloudflare "Just a moment…"), fall back to
         Playwright when available.
         """
+        # ARCH-ENG-290 (I-01): the tool handler guarded only its own entry
+        # point. Every direct caller of WebEyes reached requests.get with no
+        # SSRF check, so put the same guard on the fetcher itself.
+        from agents.safety.instructions import InstructionGate
+        if not InstructionGate._is_safe_fetch_url(url):
+            return {
+                "ok": False,
+                "url": url,
+                "error": ("Fetch refused: the URL does not resolve to a public "
+                          "address (SSRF guard)"),
+                "ssrf_blocked": True,
+            }
         try:
             import requests
             from bs4 import BeautifulSoup

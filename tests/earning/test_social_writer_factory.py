@@ -13,7 +13,8 @@ import types
 import unittest
 from unittest import mock
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 class _Resp:

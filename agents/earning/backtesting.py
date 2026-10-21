@@ -163,6 +163,7 @@ class BacktestEngine:
         self.initial_balance = initial_balance
         self.fee_pct = fee_pct
         self.results: List[BacktestResult] = []
+        self._entry_price = 0.0    # ARCH-ENG-142: the open position's entry price
     
     def run(self, strategy: Strategy, data: List[Dict], symbol: str = "UNKNOWN") -> BacktestResult:
         """Run a backtest."""
@@ -170,6 +171,7 @@ class BacktestEngine:
         position = 0.0
         trades = []
         equity_curve = []
+        self._entry_price = 0.0    # ARCH-ENG-142: this position's real entry
         
         prices = []
         for i, bar in enumerate(data):
@@ -186,14 +188,29 @@ class BacktestEngine:
             signal = strategy.generate_signal(signal_data)
             
             if signal == SignalType.BUY and balance > 0:
-                # Buy with 100% of balance
-                quantity = balance / price
-                fees = balance * self.fee_pct
+                # Size the position so notional + fees actually fits the balance.
+                # ARCH-ENG-142: the old `quantity = balance / price` made
+                # `cost = quantity*price + fees = balance*(1 + fee_pct) > balance`
+                # STRUCTURALLY always true, so with the default fee_pct=0.001 the
+                # engine could never open a position (reproduced: an always-BUY
+                # strategy over 5 bars produced 0 trades). Reserving the fee out
+                # of the balance first makes the fill affordable at any fee_pct.
+                if price <= 0:
+                    continue        # a zero/negative price is never tradable
+                spendable = balance / (1.0 + self.fee_pct)
+                quantity = spendable / price
+                fees = spendable * self.fee_pct
                 cost = quantity * price + fees
-                
-                if cost <= balance:
+
+                # ARCH-ENG-142: an epsilon on the affordability check. At exact
+                # break-even, `quantity*price + fees` can land 1 ulp above the
+                # balance (e.g. price 110.0, balance 1000.0), so the old strict
+                # `cost <= balance` silently refused every fill and the engine
+                # reported zero trades for a working strategy.
+                if cost <= balance + 1e-9:
                     balance -= cost
                     position += quantity
+                    self._entry_price = price   # ARCH-ENG-142: track the real entry
                     trades.append(Trade(
                         timestamp=bar.get("timestamp", time.time()),
                         symbol=symbol,
@@ -204,10 +221,20 @@ class BacktestEngine:
                     ))
             
             elif signal == SignalType.SELL and position > 0:
+                # ARCH-ENG-142: a zero/negative price is never tradable; without
+                # this guard a malformed bar liquidates the position for $0.
+                if price <= 0:
+                    continue
                 # Sell entire position
                 proceeds = position * price
                 fees = proceeds * self.fee_pct
-                pnl = proceeds - (position * trades[-1].price if trades else 0) - fees
+                # ARCH-ENG-142: PnL must be measured against THIS position's
+                # entry price, not `trades[-1].price` — after a prior sell that
+                # is the previous SELL price, so a second round trip booked
+                # pnl=0 and corrupted win_rate / profit_factor (reproduced).
+                entry = self._entry_price if self._entry_price else (
+                    trades[-1].price if trades else 0)
+                pnl = proceeds - (position * entry) - fees
                 
                 balance += proceeds - fees
                 
@@ -229,7 +256,14 @@ class BacktestEngine:
         
         # Calculate metrics
         final_balance = balance + (position * prices[-1] if prices else 0)
-        total_return = (final_balance / self.initial_balance - 1) * 100
+        # ARCH-ENG-142: a zero/absent initial balance or a zero price used to
+        # raise ZeroDivisionError out of the GUI tab instead of degrading to a
+        # "backtest unavailable" result (reproduced on close:0.0, on a bar with
+        # neither close nor price, and on initial_balance=0).
+        if self.initial_balance > 0:
+            total_return = (final_balance / self.initial_balance - 1) * 100
+        else:
+            total_return = 0.0
         
         winning = sum(1 for t in trades if t.pnl > 0)
         losing = sum(1 for t in trades if t.pnl < 0)
@@ -257,9 +291,12 @@ class BacktestEngine:
         for _, eq in equity_curve:
             if eq > peak:
                 peak = eq
-            dd = (peak - eq) / peak
-            if dd > max_dd:
-                max_dd = dd
+            # ARCH-ENG-142: a zero peak (initial_balance=0) used to divide by
+            # zero here.
+            if peak > 0:
+                dd = (peak - eq) / peak
+                if dd > max_dd:
+                    max_dd = dd
         
         # Profit factor
         gross_profit = sum(t.pnl for t in trades if t.pnl > 0)

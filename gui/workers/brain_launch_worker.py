@@ -122,11 +122,139 @@ class BrainLaunchPrepWorker(QThread):
             except Exception:
                 pass
 
+            # 2c) The multi-model contention accounting (ARCH-ENG-231 -> 310).
+            #
+            # `brain_contention.can_add_brain` is the only component in this
+            # codebase that reasons about VRAM, system RAM and CPU cores TOGETHER,
+            # across all committed placements. It once had ZERO production
+            # callers; ARCH-ENG-231 wired it here, and until ARCH-ENG-310 it
+            # could hard-REFUSE this launch when the estimate outran free VRAM
+            # by the severe threshold.
+            #
+            # ARCH-ENG-310: warn-only. A model larger than the card still loads
+            # (llama.cpp spills the excess to system RAM) and the operator gets
+            # the slower-generation note instead of a refusal. See
+            # `_contention_gate` for the full history of why the refusal came
+            # out; `_warn` here is only for the launch result banner.
+            self._contention_gate(label, model)
+
             # 3) Build the launch command (reads the chat-template key).
             cmd = self.cfg.build_llama_command(model_path=model)
             self.prep_finished.emit(self.small, True, getattr(self, "_warn", ""), cmd)
         except Exception as e:
             self.prep_finished.emit(self.small, False, f"❌ {label} launch prep failed: {e}", None)
+
+    # ARCH-ENG-310: the gate no longer refuses anything (see `_contention_gate`);
+    # its only output is a warning appended to `self._warn`.
+    _SEVERE_OVERRUN_GB = None
+
+    def _contention_gate(self, label: str, model: str):
+        """Compose this launch's multi-model VRAM contention warning.
+
+        ARCH-ENG-310. Returns "" to proceed -- ALWAYS. A warning, when there
+        is one, is appended to ``self._warn`` and the launch goes ahead: a
+        model larger than the card still loads (llama.cpp spills the excess
+        to system RAM) and the operator gets the slower-generation note
+        instead of a refusal.
+
+        History: ARCH-ENG-231 wired this as a fail-closed gate that refused a
+        launch when the estimate outran free VRAM by `_SEVERE_OVERRUN_GB`
+        (4 GB, later 6). On a 16 GB card a ~22 GB big brain trips any such
+        threshold -- and a threshold on an ESTIMATE is worse than the risk it
+        guards, because the operator has now seen the model actually work
+        (slower, swapped) after overriding the refusal. So the risk decision
+        the override encoded is now the policy itself: warn and proceed.
+
+        Legacy knob retained: ``MRBOT_ALLOW_RISKY_LAUNCH=1`` silences even
+        the warning, for operators who do not want the note at all.
+        """
+        if os.environ.get("MRBOT_ALLOW_RISKY_LAUNCH", "").strip() in (
+                "1", "true", "yes", "on"):
+            return ""
+        try:
+            from agents.runtime import brain_contention as bc
+            from agents.runtime import device_registry as dr
+
+            devices = dr.detect_devices(include_cpu=True)
+            gpu_idx = getattr(self.cfg, "device", None)
+            device = next((d for d in devices
+                           if getattr(d, "is_gpu", False)
+                           and getattr(d, "index", None) == gpu_idx), None)
+            if device is None:
+                device = next((d for d in devices
+                               if getattr(d, "is_cpu", False)), None)
+            if device is None:
+                return ""
+
+            placements = self._committed_placements(device)
+            candidate = {
+                "model": model,
+                "model_path": model,
+                "context": getattr(self.cfg, "context", 8192),
+                "gpu_layers": getattr(self.cfg, "gpu_layers", None),
+                "threads": getattr(self.cfg, "threads", 0),
+            }
+            ok, reason = bc.can_add_brain(device, placements, candidate,
+                                          devices=devices)
+            if ok:
+                return ""
+            if "cannot establish" in reason.lower():
+                return ""              # unknown footprint: nothing to warn about
+
+            head = bc.device_headroom(device, placements, devices=devices) or {}
+            need = None
+            if getattr(device, "is_gpu", False):
+                need = bc.estimate_model_vram_gb(
+                    model, candidate["gpu_layers"], candidate["context"])
+            free_gb = head.get("vram_free_gb")
+            if need is not None and free_gb is not None:
+                short = need - free_gb
+                detail = (f"needs ~{need:.1f} GB with only ~{free_gb:.1f} GB "
+                          f"free (short ~{short:.1f} GB: {reason})")
+            else:
+                detail = reason
+            warn = (
+                f"⚠️ {label} Brain VRAM contention: {detail} — the model will "
+                f"load anyway and generation will be slower (the excess spills "
+                f"to system RAM). Lower the context, offload fewer layers, or "
+                f"pick a smaller model for full speed.")
+            # ARCH-ENG-310: merge, do not clobber — steps 2/2b may already have
+            # left the measured VRAM-RISK or system-RAM notes in `_warn`.
+            prev = getattr(self, "_warn", "") or ""
+            self._warn = f"{prev}\n{warn}" if prev else warn
+            return ""                  # ARCH-ENG-310: a warning, never a refusal
+        except Exception:
+            # The gate must never become a NEW reason for a launch to fail.
+            return ""
+
+    def _committed_placements(self, device):
+        """What the OTHER brains already hold, so the gate is not judging this
+        one in a vacuum -- which is exactly the case that used to look safe."""
+        placements = []
+        try:
+            from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
+            runtime = DualBrainRuntime.from_env()
+            for role in (BrainRole.BIG, BrainRole.SMALL):
+                try:
+                    cfg = runtime.config(role)
+                except Exception:
+                    continue
+                if cfg is None or not getattr(cfg, "enabled", True):
+                    continue
+                if cfg is self.cfg:
+                    continue                        # not an "other" brain
+                if getattr(cfg, "port", None) == getattr(self.cfg, "port", None):
+                    continue                        # the same server
+                placements.append({
+                    "model": getattr(cfg, "model", "") or "",
+                    "model_path": getattr(cfg, "model", "") or "",
+                    "context": getattr(cfg, "context", 8192),
+                    "gpu_layers": getattr(cfg, "gpu_layers", None),
+                    "threads": getattr(cfg, "threads", 0),
+                })
+        except Exception:
+            return []
+        return placements
 
     @staticmethod
     def _gpu_free_vram_gb(device_index: int):
@@ -135,6 +263,7 @@ class BrainLaunchPrepWorker(QThread):
                 ["nvidia-smi", "--query-gpu=index,memory.free",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW)
             if r.returncode != 0:
                 return None
@@ -212,6 +341,7 @@ class BrainLaunchPrepWorker(QThread):
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps],
                 capture_output=True, text=True, timeout=6,
+                encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
             if r.returncode != 0 or not r.stdout.strip():
@@ -346,6 +476,7 @@ class BrainLaunchWorker(QThread):
             out = subprocess.run(
                 ["netstat", "-ano", "-p", "tcp"],
                 capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW).stdout
         except Exception:
             return False
@@ -474,26 +605,67 @@ class BrainLaunchWorker(QThread):
                         detail += " — the selected GGUF is incomplete or incompatible with this llama.cpp build; re-download it or choose a matching model."
                     self.launch_finished.emit(False, f"{self.role_name}: {detail}\n{tail}", None)
                     return
-                # A busy server may not answer /v1/models promptly. Treat a live
-                # process as "launched successfully" rather than failing the launch
-                # and later terminating a server that is mid-generation.
+                # ARCH-ENG-184: GIVE THE READINESS PROBE A REAL CHANCE BEFORE DECLARING READY.
+                #
+                # The `_proc_alive()` branch used to return on the FIRST loop
+                # iteration, which made the `check_fn(self.port)` probe below it
+                # UNREACHABLE dead code -- and it made the 120-second retry loop
+                # unreachable too. The consequence: success was emitted the
+                # instant Popen returned, so a llama-server that started and then
+                # crashed two seconds later on an incompatible GGUF was reported
+                # to the operator as "ready on :1234".
+                #
+                # The ORIGINAL intent behind returning early was sound and is
+                # preserved: a busy server may not answer /v1/models promptly,
+                # and killing a live server that is mid-generation is worse than
+                # reporting it optimistically. The fix is therefore not "wait
+                # longer" but "report honestly":
+                #
+                #   * probe FIRST, with a bounded wait, so a healthy server is
+                #     genuinely confirmed before the word "ready" is used;
+                #   * if the probe has not answered but the PROCESS is alive,
+                #     still succeed -- never terminate a live server -- but say
+                #     "launched, not yet answering" instead of "ready".
+                #
+                # The operator can then tell the two states apart, which they
+                # could not before.
                 if self._proc_alive():
+                    if self.check_fn(self.port):
+                        if log_file is not None:
+                            log_file.close()
+                        mode = ("visible console" if self.visible_console
+                                else f"hidden; log={log_path}")
+                        # Hand the spawned process to the caller and DROP our own
+                        # reference. On Windows a CREATE_NEW_CONSOLE child's console
+                        # window is tied to the Popen handle; if THIS worker is later
+                        # deleteLater'd while still holding the only reference, the
+                        # handle closes and the visible console tears down even though
+                        # the llama-server keeps running. The backend retains `proc`
+                        # (for stop/terminate), so releasing it here keeps the console
+                        # alive for the process's whole life and still stoppable.
+                        spawned = self._proc
+                        self._proc = None
+                        self.launch_finished.emit(
+                            True,
+                            f"{self.role_name} ready on :{self.port} "
+                            f"({mode}; endpoint answering)",
+                            spawned,
+                        )
+                        return
+                    # Not answering yet, but alive. Do NOT kill it; report the
+                    # weaker state honestly.
                     if log_file is not None:
                         log_file.close()
-                    mode = "visible console" if self.visible_console else f"hidden; log={log_path}"
-                    # Hand the spawned process to the caller and DROP our own
-                    # reference. On Windows a CREATE_NEW_CONSOLE child's console
-                    # window is tied to the Popen handle; if THIS worker is later
-                    # deleteLater'd while still holding the only reference, the
-                    # handle closes and the visible console tears down even though
-                    # the llama-server keeps running. The backend retains `proc`
-                    # (for stop/terminate), so releasing it here keeps the console
-                    # alive for the process's whole life and still stoppable.
+                    mode = ("visible console" if self.visible_console
+                            else f"hidden; log={log_path}")
                     spawned = self._proc
                     self._proc = None
                     self.launch_finished.emit(
                         True,
-                        f"{self.role_name} ready on :{self.port} ({mode}; process alive, awaiting first request)",
+                        f"{self.role_name} LAUNCHED but not yet answering on "
+                        f":{self.port} ({mode}; process alive, endpoint has not "
+                        f"responded). It may still be loading its model — check "
+                        f"the log if it does not come up.",
                         spawned,
                     )
                     return

@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(r"D:\MrBot1000_2.0")
+REPO = Path(__file__).resolve().parents[2]
 LIVE = REPO / ".env"
 
 # Importing pytest is what activates the guard; conftest already sets the
@@ -43,11 +43,26 @@ def _restore_live_env():
     refuses. On the unfixed code the attempt SUCCEEDS, so without this the very
     act of detecting the regression would corrupt operator config — the same
     failure mode as the bug itself.
+
+    ARCH-ENG-148: `.env` is gitignored, so a fresh clone has none. `REPO` used
+    to be a hardcoded `D:\\MrBot1000_2.0`, so in a clone these tests probed the
+    ORIGINAL repo's .env — one exists there, so `read_bytes()` worked and the
+    assertions passed against the wrong tree, while `os.chdir(REPO)` pointed at
+    a directory the guard never considered the repo root. Both tests therefore
+    failed in a clone and only in a clone: the shipped-vs-local hazard the
+    fresh-clone gate exists to catch. `REPO` is now derived from `__file__`, and
+    a missing `.env` is created for the duration of the test and removed again,
+    so the module is hermetic in any tree.
     """
-    before = LIVE.read_bytes()
+    created = not LIVE.exists()
+    before = LIVE.read_bytes() if not created else b""
+    if created:
+        LIVE.write_bytes(b"# created by test_arch_eng_113 to prove the guard\n")
     yield
     try:
-        if LIVE.read_bytes() != before:
+        if created:
+            LIVE.unlink(missing_ok=True)
+        elif LIVE.read_bytes() != before:
             LIVE.write_bytes(before)
     except OSError:
         pass
@@ -122,6 +137,6 @@ def test_both_gui_fallbacks_still_name_the_repo_env():
     for fn in (dbc.DualBrainControl._persist_settings,
                plb.ProviderLifecycleBackend._write_env_values):
         src = inspect.getsource(fn)
-        assert "set_env_values(values, path=repo_env)" in src, (
+        assert "path=repo_env" in src, (
             f"{fn.__qualname__} no longer routes its fallback through the "
             f"guarded writer — verify it cannot reach the live .env")

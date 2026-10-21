@@ -41,6 +41,7 @@ Environment contract (all optional; defaults match the llama-server scripts)
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -48,7 +49,19 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# ARCH-ENG-222: added so a context clamp is VISIBLE. Silently reducing the
+# context an operator configured is exactly the kind of change that must not
+# happen quietly -- a brain that suddenly answers from a shorter window looks
+# like a model regression, not a safety clamp.
+logger = logging.getLogger(__name__)
+
+# ARCH-ENG-307: context-clamp notes already logged this process, keyed by
+# (role, reason). build_config runs several times during startup and each run
+# used to re-emit the identical INFO line; this keeps the note visible once
+# without touching the logging level.
+_CONTEXT_NOTES_LOGGED: set = set()
 
 
 class BrainRole(str, Enum):
@@ -228,7 +241,17 @@ class BrainConfig:
         if not self.display_name:
             self.display_name = defaults["display_name"]
         if not self.gpu_label:
-            self.gpu_label = defaults["gpu_label"]
+            # Derive the label from the target device instead of a hardcoded
+            # literal. The old defaults baked in the legacy assumptions
+            # ("GPU 0 (detected hardware)" for big, "CPU / System RAM" for
+            # small), so a small brain that now targets a real GPU still
+            # rendered as CPU/RAM until the GUI's _apply_runtime overwrote it —
+            # which is why a restored 2nd GPU looked like a duplicate CPU row.
+            # This does not detect hardware; it just stops lying about the
+            # device the config already names. Detection still owns the truth
+            # (dual_brain_control._apply_runtime / apply_hardware_fallback).
+            self.gpu_label = (
+                f"GPU {self.device}" if self.device >= 0 else "CPU / System RAM")
         if self.provider not in SUPPORTED_PROVIDERS:
             self.provider = PROVIDER_LLAMACPP
         if not self.kv_cache:
@@ -379,28 +402,48 @@ class BrainConfig:
             if self.spec_draft_n_max is not None and self.spec_draft_n_max > 0:
                 cmd += ["--spec-draft-n-max", str(self.spec_draft_n_max)]
 
-        # Check if model template uses raise_exception and provide fallback
+        # Check if model template uses raise_exception and decide what to do.
+        #
+        # ARCH-ENG-270 (X-01): the decision used to be silent; log at the point
+        # the fallback is actually applied -- the wrapper told you what the
+        # predicate would say; this tells you what the running command did.
+        #
+        # ARCH-ENG-311: the builtin-substitution fallback is now OPT-IN. The
+        # operator's llama.cpp build runs its chat through the Jinja engine
+        # (`--jinja` default on) whose evaluator — minja — implements
+        # `raise_exception()` itself and renders the model's OWN template, so
+        # substituting a bare builtin (e.g. 6-char `chatml` for a Qwen3.5) was
+        # actively harmful: it dropped the embedded template's tool-call
+        # rendering and thinking delimiters, which the Dialogue tab's
+        # tool-calling path (agents/dialogue/chat_completion.py sends
+        # `tools` + `tool_choice=auto` to llama-server) depends on. Old llama.cpp
+        # builds whose Jinja could not run such templates can restore the legacy
+        # behaviour with MRBOT_LEGACY_CHAT_TEMPLATE_FALLBACK=1.
         if model and self._model_needs_raise_exception(model):
-            fallback_template = self._get_fallback_template(model)
-            if fallback_template:
-                cmd += ["--chat-template", fallback_template]
-        
+            legacy = (os.environ.get("MRBOT_LEGACY_CHAT_TEMPLATE_FALLBACK", "")
+                      .strip().lower() in ("1", "true", "yes", "on"))
+            if legacy:
+                fallback_template = self._get_fallback_template(model)
+                if fallback_template:
+                    cmd += ["--chat-template", fallback_template]
+                    logger.info(
+                        "Chat template for %s contains raise_exception(); "
+                        "applying legacy fallback template (%d chars)",
+                        model, len(fallback_template))
+                else:
+                    logger.warning(
+                        "Chat template for %s contains raise_exception() but no "
+                        "legacy fallback template is available; the server may "
+                        "reject every request", model)
+            else:
+                logger.info(
+                    "Chat template for %s contains raise_exception(); left to "
+                    "llama.cpp's Jinja engine, which implements raise_exception "
+                    "and keeps the model's own tool-call rendering "
+                    "(MRBOT_LEGACY_CHAT_TEMPLATE_FALLBACK=1 forces the legacy "
+                    "builtin substitution)", model)
+
         return cmd
-    
-    def get_template_info(self, model_path: str) -> dict:
-        """Get template info for logging purposes."""
-        try:
-            from agents.providers.gguf_meta import read_metadata
-            meta = read_metadata(model_path)
-            template = meta.get("tokenizer.chat_template", "")
-            needs_fallback = "raise_exception" in template
-            return {
-                "needs_fallback": needs_fallback,
-                "fallback_template": self._get_fallback_template(model_path) if needs_fallback else None,
-                "template_len": len(template)
-            }
-        except Exception as e:
-            return {"needs_fallback": False, "fallback_template": None, "error": str(e)}
     
     @staticmethod
     def _model_needs_raise_exception(model_path: str) -> bool:
@@ -420,7 +463,8 @@ class BrainConfig:
     
     @staticmethod
     def _get_fallback_template(model_path: str) -> str:
-        """Get a compatible built-in chat template for models with broken templates."""
+        """Legacy builtin chat-template substitution (only restored via
+        ``MRBOT_LEGACY_CHAT_TEMPLATE_FALLBACK=1``, ARCH-ENG-311)."""
         try:
             from agents.providers.gguf_meta import read_scalar_metadata
             meta = read_scalar_metadata(model_path, ("general.architecture",))
@@ -532,8 +576,19 @@ def build_slot_config(placement: Dict[str, Any], slot: int,
     """
     is_cpu = bool(placement.get("is_cpu"))
     device_index = int(placement.get("index", -1))
-    port = int(placement.get("port", 1234 + slot))
+    # A cloud placement carries port=None (no local server); treat None as the
+    # sequential default so int() never sees NoneType.
+    _port = placement.get("port")
+    port = int(_port) if _port is not None else (1234 + slot)
     defaults = ROLE_DEFAULTS[role]
+    # Roster-driven: BrainRoster.to_placements carries the slot's provider/model.
+    # Legacy device placements lack them -> llamacpp (byte-identical to before).
+    provider = str(placement.get("provider") or PROVIDER_LLAMACPP)
+    model = str(placement.get("model") or "")
+    if provider in (PROVIDER_LLAMACPP, PROVIDER_VLLM, PROVIDER_KOBOLDCPP):
+        endpoint = f"http://127.0.0.1:{port}/v1"   # per-slot local server
+    else:
+        endpoint, _ = _resolve_provider_endpoint(provider, defaults, {})  # cloud/shared
     # A GPU-hosted brain offloads by default (gpu_layers None = auto); a CPU
     # pool brain is system-RAM only (gpu_layers 0). Big brains get the big
     # context/threads defaults, small brains the small ones.
@@ -541,9 +596,9 @@ def build_slot_config(placement: Dict[str, Any], slot: int,
     context = defaults["context"] if role is BrainRole.BIG else 4096 if is_cpu else defaults["context"]
     return BrainConfig(
         role=role,
-        provider=PROVIDER_LLAMACPP,
-        endpoint=f"http://127.0.0.1:{port}/v1",
-        model="",
+        provider=provider,
+        endpoint=endpoint,
+        model=model,
         device=(device_index if not is_cpu else 0),
         port=port,
         context=context,
@@ -623,10 +678,13 @@ def apply_hardware_fallback(config: BrainConfig, gpu_indexes: set[int]) -> Brain
     """
     if config.role is BrainRole.SMALL and config.provider == PROVIDER_LLAMACPP:
         if config.device not in gpu_indexes:
-            if config.gpu_layers != 0:
-                config.gpu_layers = 0
-                config.gpu_label = "CPU / System RAM"
-                config.decision_support_only = True
+            # Target GPU is gone. Force CPU offload AND correct the label
+            # unconditionally — the label must not depend on the prior
+            # gpu_layers value, or a config that already carried gpu_layers=0
+            # (or a pre-seeded "GPU 1" label) keeps the wrong text.
+            config.gpu_layers = 0
+            config.gpu_label = "CPU / System RAM"
+            config.decision_support_only = True
         else:
             # Target GPU is present. Undo a stale CPU-only lock so the brain can
             # use the hardware again; clear the fallback marker too. Restore to
@@ -637,37 +695,16 @@ def apply_hardware_fallback(config: BrainConfig, gpu_indexes: set[int]) -> Brain
     return config
 
 
-def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> BrainConfig:
-    """Build a ``BrainConfig`` for a role from environment (or an injected map).
+def _resolve_provider_endpoint(provider: str, defaults: Dict[str, Any],
+                               e: Any) -> "tuple[str, str]":
+    """Resolve ``(endpoint_default, provider_endpoint)`` for a provider kind.
 
-    ``env`` is the environment mapping (defaults to ``os.environ``). This
-    indirection keeps tests hermetic without mutating the real environment.
+    Local providers default to a loopback endpoint overridable with
+    ``<PROVIDER>_BASE_URL``; cloud providers use their OpenAI-compatible default
+    (``CLOUD_PROVIDER_DEFAULT_ENDPOINTS``), also overridable. Shared by
+    ``build_config`` (legacy env path) and the roster path so both resolve
+    endpoints identically — one source of truth, no drift.
     """
-    e = env if env is not None else os.environ
-    if not hasattr(e, "get"):
-        raise TypeError("env must be a mapping with string keys")
-    prefix = "BIG_BRAIN" if role is BrainRole.BIG else "SMALL_BRAIN"
-    defaults = ROLE_DEFAULTS[role]
-
-    def _g(name: str, default: str = "") -> str:
-        return (e.get(f"{prefix}_{name}", "") or "").strip() or default
-
-    def _i(name: str, default: int) -> int:
-        try:
-            return int((e.get(f"{prefix}_{name}", "") or "").strip() or default)
-        except (TypeError, ValueError):
-            return default
-
-    def _b(name: str, default: bool = True) -> bool:
-        raw = (e.get(f"{prefix}_{name}", "") or "").strip().lower()
-        if not raw:
-            return default
-        return raw in ("1", "true", "yes", "on")
-
-    provider = _g("PROVIDER", defaults["provider"]).lower()
-    display_name = _g("NAME", defaults["display_name"])
-    if provider not in SUPPORTED_PROVIDERS:
-        provider = PROVIDER_LLAMACPP
     endpoint_default = defaults["endpoint"]
     provider_endpoint = ""
     if provider == PROVIDER_OLLAMA:
@@ -689,11 +726,214 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
         provider_endpoint = e.get("KOBOLDCPP_BASE_URL", "").strip().rstrip("/")
         endpoint_default = provider_endpoint or "http://127.0.0.1:5001/v1"
     elif provider in CLOUD_PROVIDER_DEFAULT_ENDPOINTS:
-        # Cloud: default OpenAI-compatible endpoint, overridable with
-        # <PROVIDER>_BASE_URL (e.g. OPENAI_BASE_URL). The API key is resolved
-        # separately at client-build time (provider_keys), never stored here.
         provider_endpoint = e.get(f"{provider.upper()}_BASE_URL", "").strip().rstrip("/")
         endpoint_default = provider_endpoint or CLOUD_PROVIDER_DEFAULT_ENDPOINTS[provider]
+    return endpoint_default, provider_endpoint
+
+
+def _config_from_roster_slot(role: "BrainRole", roster: Any,
+                             e: Any) -> Optional["BrainConfig"]:
+    """Build a ``BrainConfig`` from the roster's primary enabled slot for *role*.
+
+    Returns ``None`` when the roster has no enabled slot for the role, so the
+    caller falls back to the legacy env path. The slot's provider/model drive the
+    config; the endpoint resolves through the SAME ``_resolve_provider_endpoint``
+    the legacy path uses. Ports: a local slot keeps the role default port unless
+    the operator set one; a cloud slot needs no port.
+    """
+    slots = roster.big if role is BrainRole.BIG else roster.small
+    slot = next((s for s in slots if s.enabled), None)
+    if slot is None:
+        return None
+    defaults = ROLE_DEFAULTS[role]
+    # Start from the legacy env config so the operator's tuned llama.cpp flags
+    # (context/threads/batch/kv_cache/split_mode + all 9 perf flags:
+    # flash_attn/cache_reuse/context_shift/ctx_checkpoints/kv_offload/show_perf/
+    # n_cpu_moe/cpu_moe/n_cpu_ffn) are PRESERVED, then override only the
+    # roster-driven identity: provider/model/port/device_id/endpoint. This fixes
+    # the flags-reset P1 (the roster path used to rebuild from factory defaults).
+    cfg = build_config(role, e)   # legacy path (roster=None) - env-tuned fields
+    is_cpu_default = role is BrainRole.SMALL and slot.is_local and not slot.device_id
+    port = slot.port if slot.port > 0 else cfg.port
+    cfg.provider = slot.provider
+    cfg.model = slot.model
+    cfg.port = port
+    cfg.device_id = slot.device_id
+    if slot.provider in (PROVIDER_LLAMACPP, PROVIDER_VLLM, PROVIDER_KOBOLDCPP):
+        cfg.endpoint = f"http://127.0.0.1:{port}/v1"   # per-slot local server
+    else:
+        cfg.endpoint, _ = _resolve_provider_endpoint(slot.provider, defaults, e)
+    # A CPU roster slot is system-RAM only (gpu_layers 0) AND gets the
+    # decision-support posture back (Security's P2 fix: it was hardcoded False,
+    # dropping the prompt-level advisory-only guardrail for CPU roster brains).
+    if is_cpu_default:
+        cfg.gpu_layers = 0
+    cfg.decision_support_only = is_cpu_default
+    return cfg
+
+
+# ARCH-ENG-222: fraction of VRAM left for compute, CUDA context, allocator
+# fragmentation and the compositor. The rest is what weights + KV may share.
+_VRAM_COMPUTE_RESERVE = 0.25
+
+# Fallback context when the model file is unknown, keyed on the device's VRAM.
+# Used when there is no GGUF to measure -- e.g. a cloud provider, or a local
+# slot whose model name is not a path.
+_VRAM_TIER_CONTEXT = ((8.0, 8192), (12.0, 16384), (24.0, 32768))
+
+
+def _tier_context_for(base_context: int, kv_type_bytes: int) -> int:
+    """Scale a tier's f16 context allowance for the actual KV byte width.
+
+    ARCH-ENG-291 (M-03): the fallback path was handed ``kv_type_bytes`` and
+    ignored it, so a q8_0 operator got the f16-sized allowance. The tier table
+    is calibrated for 2-byte KV entries; a narrower entry fits proportionally
+    more context. Never expand beyond the configured default (the caller still
+    applies that clamp), and keep the measured path's 256-token granularity.
+    """
+    try:
+        width = float(kv_type_bytes or 2.0)
+    except (TypeError, ValueError):
+        width = 2.0
+    width = max(width, 0.5)
+    scaled = int(base_context * (2.0 / width))
+    scaled = (scaled // 256) * 256
+    return max(4096, scaled)
+
+
+def _vram_safe_context(default_context: int, role: "BrainRole",
+                       device_index: int, gpu_layers: Optional[int],
+                       model_path: Optional[str] = None,
+                       kv_type_bytes: int = 2) -> Tuple[int, str]:
+    """Clamp *default_context* to what the target device's VRAM can actually hold.
+
+    ARCH-ENG-222. `ROLE_DEFAULTS` ships `context: 64768` with `kv_cache: "f16"`.
+    For an 8B-class model (36 layers, 8 KV heads, 128 head dim) that is
+
+        2 * 36 * 8 * 128 * 2 bytes * 64768 tokens  =  9.55 GB of KV cache
+
+    before a single weight is loaded. On the operator's GTX 1660 Super (6 GB)
+    that is not a slow context, it is a hard allocation failure: CUDA OOM ->
+    Windows TDR -> display-driver reset or reboot. On the 16 GB card it leaves
+    almost nothing for weights.
+
+    The configured value is still what the operator ASKED for, and this only
+    changes the DEFAULT. An explicit `BIG_BRAIN_CONTEXT` in `.env` still wins
+    untouched -- a deliberate setting is not second-guessed.
+
+    Measured against the real file when there is one, via
+    `gguf_meta.estimate_vram_gb` (already cached). Otherwise falls back to a
+    VRAM tier table. Never returns MORE than `default_context`: this narrows a
+    risky default, it does not expand one.
+    """
+    try:
+        from agents.runtime import device_registry as dr
+        devices = dr.detect_devices(include_cpu=False)
+    except Exception:
+        return default_context, "device detection failed; keeping the configured default"
+
+    dev = next((d for d in devices if getattr(d, "is_gpu", False)
+                and getattr(d, "index", -1) == device_index), None)
+    if dev is None:
+        return default_context, "target device not detected; keeping the configured default"
+    vram_bytes = float(getattr(dev, "memory_gb", 0.0)) * 1e9
+    if vram_bytes <= 0:
+        return default_context, "detected device reports no VRAM; keeping the configured default"
+
+    budget = vram_bytes * (1.0 - _VRAM_COMPUTE_RESERVE)
+
+    # Measure the real model when we can.
+    if model_path and os.path.isfile(model_path):
+        try:
+            from agents.providers.gguf_meta import estimate_vram_gb
+            est = estimate_vram_gb(model_path, context=default_context,
+                                   kv_type_bytes=kv_type_bytes)
+            if est.get("complete"):
+                weights_gb = float(est.get("weights_gb") or 0.0)
+                kv_bytes = 2 * est["n_layer"] * est["kv_head"] * est["head_dim"] \
+                    * kv_type_bytes
+                if kv_bytes <= 0:
+                    return default_context, "model reports a zero-byte KV token; keeping default"
+                room = budget - weights_gb * 1e9
+                if room <= 0:
+                    return (_VRAM_TIER_CONTEXT[0][1],
+                            f"weights ({weights_gb:.1f} GB) already exceed the "
+                            f"{vram_bytes/1e9:.1f} GB budget; clamped to the lowest tier")
+                fits = int(room // kv_bytes)
+                fits = (fits // 256) * 256          # round down to a 256 multiple
+                fits = max(4096, min(fits, default_context))
+                fits = min(fits, default_context)
+                if fits >= default_context:
+                    return default_context, (
+                        f"weights {weights_gb:.1f} GB + KV at {default_context} ctx "
+                        f"fits the {vram_bytes/1e9:.1f} GB budget; no clamp needed")
+                return fits, (f"clamped {default_context} -> {fits}: weights "
+                              f"{weights_gb:.1f} GB + KV at {default_context} ctx = "
+                              f"{weights_gb + est['kv_gb']:.1f} GB exceeds the "
+                              f"{vram_bytes/1e9:.1f} GB budget for this device")
+        except Exception:
+            pass                                # fall through to the tier table
+
+    for ceiling, ctx in _VRAM_TIER_CONTEXT:
+        if vram_bytes < ceiling * 1e9:
+            allowed = _tier_context_for(ctx, kv_type_bytes)
+            if allowed >= default_context:
+                return default_context, "device VRAM is sufficient for the configured default"
+            # ARCH-ENG-291 (M-03): report the KV width that produced the
+            # allowance so a q8_0/q4_0 operator can see why it differs.
+            # ARCH-ENG-307: say WHY the tier table ran. The measured path
+            # above reports its own numbers; reaching this line means the
+            # model was NOT measurable, which is the operative fact for an
+            # operator deciding whether to trust the clamped default.
+            why = (f"model at {model_path} was not measurable" if model_path
+                   else "no local model file to measure")
+            return allowed, (f"{why}; {vram_bytes/1e9:.1f} GB VRAM tier "
+                             f"allows {allowed} at {kv_type_bytes}-byte KV, "
+                             f"not {default_context}")
+    return default_context, "device has ample VRAM for the configured default"
+
+
+def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None,
+                 roster: Any = None) -> BrainConfig:
+    """Build a ``BrainConfig`` for a role from environment (or an injected map).
+
+    ``env`` is the environment mapping (defaults to ``os.environ``). This
+    indirection keeps tests hermetic without mutating the real environment.
+    """
+    e = env if env is not None else os.environ
+    if not hasattr(e, "get"):
+        raise TypeError("env must be a mapping with string keys")
+    prefix = "BIG_BRAIN" if role is BrainRole.BIG else "SMALL_BRAIN"
+    defaults = ROLE_DEFAULTS[role]
+
+    # Phase 4: when a roster is supplied, the roster's primary enabled slot for
+    # this role drives the config; roster=None (the default) keeps the legacy env
+    # path byte-identical.
+    if roster is not None:
+        cfg = _config_from_roster_slot(role, roster, e)
+        if cfg is not None:
+            return cfg
+
+    def _g(name: str, default: str = "") -> str:
+        return (e.get(f"{prefix}_{name}", "") or "").strip() or default
+
+    def _i(name: str, default: int) -> int:
+        try:
+            return int((e.get(f"{prefix}_{name}", "") or "").strip() or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _b(name: str, default: bool = True) -> bool:
+        raw = (e.get(f"{prefix}_{name}", "") or "").strip().lower()
+        if not raw:
+            return default
+        return raw in ("1", "true", "yes", "on")
+
+    provider = _g("PROVIDER", defaults["provider"]).lower()
+    display_name = _g("NAME", defaults["display_name"])
+    if provider not in SUPPORTED_PROVIDERS:
+        provider = PROVIDER_LLAMACPP
+    endpoint_default, provider_endpoint = _resolve_provider_endpoint(provider, defaults, e)
     gpu_raw = _g("GPU_LAYERS", "")
     gpu_layers: Optional[int] = None
     if gpu_raw:
@@ -704,7 +944,41 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
     cpu_only = role is BrainRole.SMALL and gpu_layers == 0
     threads = _i("THREADS", defaults.get("threads", 8))
     batch = _i("BATCH", 256 if cpu_only else defaults.get("batch", 2048))
-    context_default = 4096 if cpu_only else defaults["context"]
+    explicit_context = bool((e.get(f"{prefix}_CONTEXT", "") or "").strip())
+    if cpu_only:
+        context_default = 4096
+        context_reason = "CPU-only slot; using the small default context"
+    elif explicit_context:
+        # ARCH-ENG-307: an explicit CONTEXT in the environment is a deliberate
+        # operator setting and wins untouched -- the ARCH-ENG-222 contract.
+        # The VRAM clamp narrows only the DEFAULT, so with an override present
+        # the clamp result was never used; emitting its note anyway told the
+        # operator the context "allows 16384 ... not 32768" while the brain
+        # actually ran 32768. Compute nothing, log nothing.
+        try:
+            context_default = int((e.get(f"{prefix}_CONTEXT", "") or "").strip())
+        except (TypeError, ValueError):
+            context_default = defaults["context"]
+        context_reason = "explicit CONTEXT override; the VRAM default-clamp is not applied"
+    else:
+        # ARCH-ENG-222: the 64768 default needs ~9.5 GB of KV on an 8B-class
+        # model, which cannot fit a 6 GB card. See `_vram_safe_context`.
+        context_default, context_reason = _vram_safe_context(
+            defaults["context"], role,
+            _i("DEVICE", defaults["device"]),
+            gpu_layers,
+            model_path=_g("MODEL_PATH", "") or None,
+            kv_type_bytes=2 if _g("KV_CACHE", defaults.get("kv_cache", "f16")).lower() != "q8_0" else 1,
+        )
+        if context_default != defaults["context"]:
+            # ARCH-ENG-307: build_config runs several times during startup
+            # (fresh lookups, roster syncs, settings reloads) and every run
+            # re-logged the same tier note -- five identical INFO lines for
+            # one decision. Log each distinct note once per process.
+            note = (role.value, context_reason)
+            if note not in _CONTEXT_NOTES_LOGGED:
+                _CONTEXT_NOTES_LOGGED.add(note)
+                logger.info("[%s] context %s", role.value, context_reason)
 
     # ── Optional llama.cpp flags (v2.1.9). Each returns None when the env key is
     # absent so build_llama_command omits the flag and llama.cpp keeps its own
@@ -733,6 +1007,22 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
             return None
         return raw in ("1", "true", "yes", "on")
 
+    def _opt_bool_no_m(name: str) -> Optional[bool]:
+        """ARCH-ENG-315: parse a "Keep X in system RAM" checkbox key.
+
+        The GUI phrase is what the OPERATOR wants; the config field is
+        llama.cpp's offload state, where ``False`` emits ``--no-…-offload``.
+        Checked ("true") therefore means *keeping it out of VRAM* — an
+        explicit `offload disabled` — and unchecked/absent means llama.cpp's
+        own default (offload enabled). The old parse read the box as if it
+        were the offload state itself, so a checked "Keep KV cache in system
+        RAM"/"Keep projector on CPU" box emitted NO flag at all.
+        """
+        raw = _opt_bool(name)
+        if raw is None:
+            return None
+        return not raw
+
     return BrainConfig(
         role=role,
         provider=provider,
@@ -754,7 +1044,9 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
         cache_reuse=_opt_int("CACHE_REUSE"),
         context_shift=_opt_bool("CONTEXT_SHIFT"),
         ctx_checkpoints=_opt_int("CTX_CHECKPOINTS"),
-        kv_offload=_opt_bool("KV_OFFLOAD"),
+        # ARCH-ENG-315: KV_OFFLOAD/MMPROJ_OFFLOAD GUI boxes are phrased as the
+        # operator's wish ("keep in system RAM"); see _opt_bool_no_m.
+        kv_offload=_opt_bool_no_m("KV_OFFLOAD"),
         show_perf=_b("SHOW_PERF", True),
         n_cpu_moe=_opt_int("N_CPU_MOE"),
         cpu_moe=_opt_bool("CPU_MOE"),
@@ -777,7 +1069,7 @@ def build_config(role: BrainRole, env: Optional[Dict[str, str]] = None) -> Brain
         reasoning_format=_g("REASONING_FORMAT", ""),
         # multimodal
         mmproj=_g("MMPROJ", ""),
-        mmproj_offload=_opt_bool("MMPROJ_OFFLOAD"),
+        mmproj_offload=_opt_bool_no_m("MMPROJ_OFFLOAD"),
     )
 
 
@@ -815,6 +1107,31 @@ class DualBrainRuntime:
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "DualBrainRuntime":
         return cls(big=build_config(BrainRole.BIG, env),
                    small=build_config(BrainRole.SMALL, env))
+
+    @classmethod
+    def from_roster(cls, roster: Any, env: Optional[Dict[str, str]] = None) -> "DualBrainRuntime":
+        """Build the runtime from a ``BrainRoster`` (Phase 4).
+
+        Each role's config comes from the roster's primary enabled slot; a role
+        with no enabled slot falls back to the legacy env path for that role.
+        """
+        return cls(big=build_config(BrainRole.BIG, env, roster=roster),
+                   small=build_config(BrainRole.SMALL, env, roster=roster))
+
+    @classmethod
+    def from_settings(cls, env: Optional[Dict[str, str]] = None,
+                      root: Optional[str] = None) -> "DualBrainRuntime":
+        """Build the runtime from the persisted roster when present, else legacy.
+
+        This is the Phase 4 entry point that reads the roster instead of the
+        legacy ``{prefix}_MAIN_ENABLED`` gates. No ``"roster"`` key in
+        settings.json -> legacy env path, byte-identical.
+        """
+        from agents.runtime.brain_roster import BrainRoster
+        roster = BrainRoster.load_or_none(root)
+        if roster is not None:
+            return cls.from_roster(roster, env)
+        return cls.from_env(env)
 
     @staticmethod
     def provider_diagnostics(
@@ -1006,8 +1323,55 @@ class DualBrainRuntime:
             return []
         with self._lock:
             cached = self._health_cache.get(role)
+            # ARCH-ENG-188: THE CACHE NEVER EXPIRED.
+            #
+            # `checked_at` was RECORDED (line 1140) and never READ. So once a
+            # role was cached, `list_models` returned that snapshot forever
+            # unless the caller explicitly passed `refresh=True` — and the only
+            # in-tree caller is `health(refresh=refresh_health)`, whose
+            # `refresh_health` defaults to False.
+            #
+            # The visible consequence: a server that died kept reporting
+            # `reachable: True` with its full model list, indefinitely, while
+            # the panel showed it as running. That is the THIRD instance of one
+            # recurring defect in this release:
+            #
+            #   * ARCH-ENG-179 — provider status re-applied the previous snapshot,
+            #     so a stopped provider could never be reported stopped.
+            #   * ARCH-ENG-185 — `_blocked_personas` was add-only, so a cleared
+            #     gate stayed blocking in the live prompt.
+            #   * ARCH-ENG-188 — the health cache had a timestamp that nothing
+            #     consulted, so a dead server stayed reachable.
+            #
+            # All three are the same mistake: an OBSERVATION cached and then
+            # presented as current fact, with no expiry. The common shape is a
+            # field written for exactly this purpose and never read — so the fix
+            # is always to consult what was already being recorded.
+            #
+            # The TTL is deliberately short. This cache exists to stop the UI
+            # re-probing on every repaint, not to make a down server look up.
+            # The stale entry is left in place until the fresh probe replaces
+            # it, so a failing probe does not erase the last known state
+            # mid-call and leave a half-populated snapshot behind.
             if cached is not None and not refresh:
-                return list(cached.get("models", []))
+                try:
+                    ttl = float(os.getenv("DUAL_BRAIN_HEALTH_TTL", "10"))
+                except ValueError:
+                    ttl = 10.0
+                if ttl > 0:
+                    try:
+                        age = time.time() - float(
+                            cached.get("checked_at") or 0.0)
+                    except (TypeError, ValueError):
+                        age = float("inf")
+                    if age <= ttl:
+                        return list(cached.get("models", []))
+                # Expired, or caching disabled entirely (ttl <= 0 means "do not
+                # cache"). The `ttl > 0` test is explicit rather than relying on
+                # `age <= ttl`, because Windows' `time.time()` has ~15 ms
+                # granularity: an entry written moments ago can measure as
+                # exactly 0.0, which would satisfy `0.0 <= 0.0` and serve a cache
+                # hit for an operator who asked for no caching at all.
         payload = self._http_get(cfg.models_path, timeout=self.HEALTH_TIMEOUT_S)
         models: List[str] = []
         if payload:

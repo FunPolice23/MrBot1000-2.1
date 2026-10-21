@@ -11,6 +11,11 @@ Design goals (from the redesign spec):
     message_type, timestamp, priority, payload, status, parent_message_id.
   - Asynchronous, correlation-id tracked, thread-safe, observable.
   - Cancellation (via CancellationToken), retry bookkeeping, failure reporting.
+    ARCH-ENG-247 (AN-02): cancellation is HONOURED at delivery -- `_deliver`
+    consults the token before and between handlers, and the first production
+    caller is a dual-brain collaboration run (the Collaboration tab's Stop
+    cancels the run's correlation, so remaining stage deliveries are
+    refused and the handoff stops before the next stage).
   - Queue isolation is preserved by the caller (Manager/Summarizer keep their
     own threads + queues); the bus is the routing/observability layer.
   - NO circular Chat↔Main loops: the bus rejects a request that would replay an
@@ -249,7 +254,9 @@ class EventBus:
     - Subscribers register by handler, message_type, destination, or source.
     - publish() performs loop-prevention (cycle + self-loop) and dedup of
       already-delivered request message_ids.
-    - Cancellation tokens are tracked per message_id / correlation_id.
+    - Cancellation tokens are tracked per message_id / correlation_id AND
+      honoured at delivery (ARCH-ENG-247): a cancelled correlation's remaining
+      handlers are skipped, and the drop is counted (`cancelled_drops`).
     - All delivery is synchronous within publish(); callers that need async
       delivery push onto their own thread queue inside the handler.
     """
@@ -273,10 +280,31 @@ class EventBus:
         # correlation_id -> CancellationToken
         self._tokens_by_corr: Dict[str, CancellationToken] = {}
         self.max_loop_depth = 6
+        # ARCH-ENG-166: `_inflight`, `_delivered`, `_edges`, `_tokens` and
+        # `_tokens_by_corr` were only ever cleared by `reset()`. They are keyed
+        # by message_id / correlation_id, so a long-running session publishes
+        # unbounded keys — every message the brain council, the coordinator and
+        # the discovery loop ever sent stayed reachable for the life of the
+        # process, and `_edges` (the loop-prevention replay set) never expired a
+        # single edge. On a desktop app that runs for days that is a slow leak
+        # of the whole message history.
+        #
+        # The retention is bounded FIFO: the oldest keys are evicted once the
+        # cap is exceeded. The cap is deliberately far above any real
+        # correlation's working set, so a live chain is never evicted
+        # mid-flight; `_inflight` is additionally never pruned while its
+        # message is still IN_FLIGHT (see `_prune`).
+        self._retention_limit = 5000
         # observability counters
         self.loop_violations = 0
         self.dedup_drops = 0
         self.total_published = 0
+        self.pruned_keys = 0
+        # ARCH-ENG-247: deliveries refused because their correlation was
+        # cancelled. Counted so cancellation is observable rather than a
+        # silent no-op (the pre-fix state: tokens were stored and never
+        # consulted, so `cancel()` changed a flag nothing read).
+        self.cancelled_drops = 0
 
     # ── singleton ──────────────────────────────────────────────────────────
     @classmethod
@@ -407,10 +435,46 @@ class EventBus:
                 self._tokens[msg.message_id] = token
                 self._tokens_by_corr[msg.correlation_id or msg.message_id] = token
             msg.status = MessageStatus.IN_FLIGHT
+            self._prune()
 
         # deliver outside the lock to avoid deadlocks from re-entrant publish
         self._deliver(msg)
         return True
+
+    def _prune(self) -> None:
+        """ARCH-ENG-166: bound the retention maps. Caller must hold `self._lock`.
+
+        FIFO eviction by insertion order (dicts preserve it). `_inflight` entries
+        whose message is still IN_FLIGHT are skipped rather than evicted, so a
+        live chain is never truncated out from under its own parent walk in
+        `_prior_sources`.
+        """
+        limit = self._retention_limit
+        if limit <= 0:
+            return
+
+        for mapping in (self._delivered, self._edges, self._tokens_by_corr):
+            excess = len(mapping) - limit
+            if excess <= 0:
+                continue
+            for key in list(mapping)[:excess]:
+                mapping.pop(key, None)
+                self.pruned_keys += 1
+
+        excess = len(self._tokens) - limit
+        if excess > 0:
+            for key in list(self._tokens)[:excess]:
+                self._tokens.pop(key, None)
+                self.pruned_keys += 1
+
+        excess = len(self._inflight) - limit
+        if excess > 0:
+            for key in list(self._inflight)[:excess]:
+                msg = self._inflight.get(key)
+                if msg is not None and msg.status == MessageStatus.IN_FLIGHT:
+                    continue          # still live; keep it
+                self._inflight.pop(key, None)
+                self.pruned_keys += 1
 
     def _prior_sources(self, msg: Message) -> set:
         """Walk the parent chain for this correlation and collect every node
@@ -442,18 +506,54 @@ class EventBus:
             pass
 
     def _deliver(self, msg: Message) -> None:
+        # ARCH-ENG-247: subscription order, not set order. Delivery order
+        # determines who can cooperatively cancel the rest of the chain, so
+        # it must be deterministic: the handler that subscribes first runs
+        # first (subscribe a guard first to give it the veto).
         with self._lock:
-            handlers = set(self._handlers)
-            handlers |= set(self._by_type.get(msg.message_type, []))
-            handlers |= set(self._by_dest.get(msg.destination, []))
-            handlers |= set(self._by_source.get(msg.source, []))
-            handlers = list(handlers)
+            handlers: List[Handler] = []
+            for h in (list(self._handlers)
+                      + list(self._by_type.get(msg.message_type, []))
+                      + list(self._by_dest.get(msg.destination, []))
+                      + list(self._by_source.get(msg.source, []))):
+                if h not in handlers:
+                    handlers.append(h)
+        # ARCH-ENG-247 (AN-02): delivery honours cancellation. Before this,
+        # the token was stored by publish() and set by cancel(), but nothing
+        # ever read it -- so `cancel()` returned True and changed nothing.
+        # Checked before the loop and between handlers, so a handler that
+        # cancels its own correlation (the cooperative case) stops the rest
+        # of the chain, and a concurrent cancel() stops a delivery in
+        # progress. The message is marked CANCELLED and counted, never
+        # silently dropped.
+        if self._is_cancelled(msg):
+            self.cancelled_drops += 1
+            msg.status = MessageStatus.CANCELLED
+            return
         for h in handlers:
+            if self._is_cancelled(msg):
+                self.cancelled_drops += 1
+                msg.status = MessageStatus.CANCELLED
+                return
             try:
                 h(msg)
             except Exception:
                 # a misbehaving handler must never break delivery to others
                 pass
+
+    def _is_cancelled(self, msg: Message) -> bool:
+        """True when THIS message was published with a token that has since
+        been cancelled.
+
+        Keyed by message_id only: a token is attached to a message at publish
+        time, so a token-less publish (e.g. a terminal run update, or any
+        caller that chose not to opt in) is never refused. Falling back to
+        `_tokens_by_corr` here would make a cancelled correlation swallow
+        exactly the messages published to REPORT the cancellation.
+        """
+        with self._lock:
+            tok = self._tokens.get(msg.message_id)
+            return tok is not None and tok.cancelled
 
     # ── cancellation ────────────────────────────────────────────────────────
     def cancel(self, message_id_or_correlation: str,
@@ -517,6 +617,14 @@ class EventBus:
                 "dedup_drops": self.dedup_drops,
                 "inflight": len(self._inflight),
                 "tokens": len(self._tokens),
+                # ARCH-ENG-247: cancellation is observable.
+                "cancelled_drops": self.cancelled_drops,
+                # ARCH-ENG-166: expose the retention state so a slow leak is
+                # observable rather than inferred.
+                "edges": len(self._edges),
+                "delivered": len(self._delivered),
+                "retention_limit": self._retention_limit,
+                "pruned_keys": self.pruned_keys,
             }
 
     def reset(self) -> None:
@@ -533,6 +641,7 @@ class EventBus:
             self.loop_violations = 0
             self.dedup_drops = 0
             self.total_published = 0
+            self.pruned_keys = 0
 
 
 # ── Qt delivery bridge ────────────────────────────────────────────────────

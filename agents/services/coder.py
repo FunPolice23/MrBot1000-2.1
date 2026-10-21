@@ -46,10 +46,67 @@ class CoderWorker(WorkerAgent):
         "  • The file must remain valid Python (it will be syntax-checked before write).\n"
     )
 
-    def __init__(self, api_key: str, log_signal=None, db=None):
+    def __init__(self, api_key: str, log_signal=None, db=None, patch_service=None):
         super().__init__(api_key, log_signal, db=db)
         self._logger = AgentLogger(db=db, source="CoderWorker", signal=log_signal)
         self._changes_made = 0
+        # ARCH-ENG-204: the approval-gated patch service.
+        #
+        # Every other component that edits source goes through this:
+        # `composition_root` builds it, `self_improvement_commands` proposes and
+        # applies against it, and `main.py:1600` runs its post-apply regression
+        # monitor. CoderWorker was the single holdout -- it called
+        # `safe_write_file()` directly, so an agent rewrite of the program's own
+        # source skipped approval, skipped verify, and had no rollback path.
+        #
+        # When it is None this agent REFUSES to modify an existing file rather
+        # than falling back to an ungated write. See `_submit_edit`.
+        self._patch_service = patch_service
+
+    def _submit_edit(self, file_path: str, new_content: str,
+                     motivation: str, detail: str) -> Dict[str, Any]:
+        """Propose an edit to an EXISTING file through the human-approval gate.
+
+        Returns a dict; on success ``status`` is ``pending_approval`` and NO file
+        has been touched yet. The write happens later, in
+        `CodePatchService.apply_approved`, and only after a human approves that
+        exact item -- at which point the service backs the file up first,
+        writes atomically, verifies, and rolls back if verification fails.
+
+        The fallback matters: with no patch service available this returns a
+        refusal rather than writing. Silently degrading to a direct write would
+        reintroduce exactly the hole this wiring closes, and it would do so
+        quietly -- the caller would see ``success`` and no backup would exist.
+        """
+        service = self._patch_service
+        if service is None or not hasattr(service, "propose"):
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": (
+                    "no approval-gated patch service is attached to CoderWorker; "
+                    "refusing to edit an existing file ungated (ARCH-ENG-204)"),
+            }
+        if not os.path.exists(file_path):
+            # Creating a NEW file has no prior content to lose and no backup to
+            # take. Creation still goes through safe_write_file, which is not a
+            # gate but is not a hazard: there is nothing to overwrite.
+            if self.safe_write_file(file_path, new_content):
+                self._changes_made += 1
+                return {"ok": True, "status": "created", "file": file_path}
+            return {"ok": False, "status": "write_failed", "file": file_path}
+
+        from agents.services.self_improvement_commands import propose_code_patch
+
+        return propose_code_patch(
+            service,
+            authored_by="coder",
+            motivation=motivation,
+            detail=detail,
+            target_path=file_path,
+            patch_text=new_content,
+            validation="py_compile",
+        )
 
     def _codebase_context(self) -> str:
         return (
@@ -142,13 +199,31 @@ class CoderWorker(WorkerAgent):
         ))
         result["changes"] = diff
 
-        if self.safe_write_file(file_path, fixed_content):
+        # ARCH-ENG-204: this used to call `self.safe_write_file(file_path,
+        # fixed_content)` directly -- an ungated write of the program's own
+        # source. It now proposes the change for approval; the service takes the
+        # backup, writes atomically, verifies, and rolls back on failure.
+        submitted = self._submit_edit(
+            file_path, fixed_content,
+            motivation=f"analyze_and_fix: {issue_description[:200]}",
+            detail=(
+                f"Coder proposed a fix to {file_path}.\n"
+                f"Issue: {issue_description}\n"
+                f"Diff: {len(diff)} diff lines, "
+                f"{len(original_content)} -> {len(fixed_content)} chars."
+            ),
+        )
+        if submitted.get("ok"):
             result["success"] = True
-            result["notes"] = "File updated successfully"
-            self._changes_made += 1
+            result["status"] = submitted.get("status", "pending_approval")
+            result["patch_id"] = submitted.get("patch_id", "")
+            result["notes"] = (
+                "Fix prepared and awaiting human approval; no file was modified."
+                if result["status"] == "pending_approval"
+                else f"File {result['status']}")
         else:
-            result["notes"] = "Write blocked or failed"
-
+            result["notes"] = (
+                f"Edit refused: {submitted.get('reason', submitted.get('status'))}")
         return result
 
     def file_write(self, file_path: str, content: str, verify: bool = True) -> dict:
@@ -167,13 +242,27 @@ class CoderWorker(WorkerAgent):
                 result["notes"] = f"Invalid Python: {e}"
                 return result
 
-        if self.safe_write_file(file_path, content):
+        # ARCH-ENG-204: gated, as in `analyze_and_fix`. A full-file write to the
+        # program's own source requires approval.
+        submitted = self._submit_edit(
+            file_path, content,
+            motivation="file_write: author supplied complete file content",
+            detail=(
+                f"Coder proposed a full-file write to {file_path} "
+                f"({len(content)} chars, syntax {'ok' if verify else 'unverified'})."
+            ),
+        )
+        if submitted.get("ok"):
             result["success"] = True
-            result["notes"] = "File written successfully"
-            self._changes_made += 1
+            result["status"] = submitted.get("status", "pending_approval")
+            result["patch_id"] = submitted.get("patch_id", "")
+            result["notes"] = (
+                "Write prepared and awaiting human approval; no file was modified."
+                if result["status"] == "pending_approval"
+                else f"File {result['status']}")
         else:
-            result["notes"] = "Write failed"
-
+            result["notes"] = (
+                f"Write refused: {submitted.get('reason', submitted.get('status'))}")
         return result
 
     def refactor(self, file_path: str, refactor_instructions: List[str]) -> dict:
@@ -206,7 +295,24 @@ class CoderWorker(WorkerAgent):
             return {"success": False,
                     "notes": f"REFUSED: rewrite would truncate by {drop_pct}% — keeping original"}
 
-        if self.safe_write_file(file_path, fixed):
-            return {"success": True, "notes": "Refactoring applied"}
-        return {"success": False, "notes": "Write failed"}
+        # ARCH-ENG-204: gated, as in `analyze_and_fix`. `refactor` previously called
+        # `safe_write_file` directly, with no approval, no verify and no
+        # rollback -- the same holdout this ticket closes.
+        submitted = self._submit_edit(
+            file_path, fixed,
+            motivation="refactor: " + "; ".join(refactor_instructions)[:200],
+            detail=(
+                f"Coder proposed a refactor of {file_path}.\n"
+                f"Instructions:\n{instructions_text}\n"
+                f"{len(original)} -> {len(fixed)} chars."
+            ),
+        )
+        if not submitted.get("ok"):
+            return {"success": False, "status": submitted.get("status", "blocked"),
+                    "notes": f"Refactor refused: {submitted.get('reason', '')}"}
+        return {"success": True,
+                "status": submitted.get("status", "pending_approval"),
+                "patch_id": submitted.get("patch_id", ""),
+                "notes": "Refactor prepared and awaiting human approval; "
+                         "no file was modified."}
 

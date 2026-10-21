@@ -247,6 +247,39 @@ class TestHumanGates(unittest.TestCase):
         self.assertEqual(len(gates), 0)
 
 
+class _FakeEvidenceStore:
+    """Minimal in-memory stand-in for `EvidenceStore` (ARCH-ENG-158).
+
+    Returns real `Evidence` instances, which is what the payment gate requires.
+    """
+
+    def __init__(self):
+        self._items = []
+
+    def add(self, ev):
+        self._items.append(ev)
+        return ev
+
+    def for_subject(self, subject_type, subject_id):
+        return [ev for ev in self._items
+                if getattr(ev, "subject_type", None) == subject_type
+                and getattr(ev, "subject_id", None) == subject_id]
+
+    def record(self, ev):
+        return self.add(ev)
+
+
+class _DictEvidenceStore(_FakeEvidenceStore):
+    """A store that returns hand-built dicts instead of `Evidence`.
+
+    Models the legacy laundering shape (`{"verified": True}`) so the gate's
+    refusal can be asserted.
+    """
+
+    def for_subject(self, subject_type, subject_id):
+        return [{"verified": True, "amount": 9999.0}]
+
+
 class TestExecutor(unittest.TestCase):
     """14-step execution pipeline."""
 
@@ -266,7 +299,14 @@ class TestExecutor(unittest.TestCase):
         return entry
 
     def test_full_pipeline_pass(self):
-        """Full 14-step pipeline for a coding task with valid output."""
+        """Full 14-step pipeline for a coding task with valid output.
+
+        ARCH-ENG-158: this test used to assert `final_status == "paid"` for a task
+        with NO payment evidence anywhere. That assertion encoded the bug as
+        intended behaviour, which is why the fabricated-verification defect
+        survived every self-audit pass. Submission is not payment: the pipeline
+        now completes the work and reports `payment_unverified`.
+        """
         task = {
             "task_id": "code-1",
             "task_type": "coding",
@@ -282,8 +322,170 @@ class TestExecutor(unittest.TestCase):
         entry = self._make_entry("code-1")
         result = self.executor.execute(task, entry)
         self.assertTrue(result.success)
-        self.assertEqual(result.final_status, "paid")
+        self.assertEqual(result.final_status, "payment_unverified")
+        self.assertFalse(result.paid)
         self.assertGreaterEqual(result.completed_steps, 10)
+
+    def test_pipeline_does_not_mark_paid_without_evidence(self):
+        """ARCH-ENG-158: the portfolio must not reach PAID with no evidence.
+
+        The executor is constructed with no evidence store at all — the exact
+        production shape before this fix's wiring landed. Steps 12/14 must fail
+        closed and leave the entry in PAYMENT_PENDING.
+        """
+        task = {
+            "task_id": "code-noev",
+            "task_type": "coding",
+            "required_capabilities": ["CODING"],
+            "description": "Write a Python function",
+            "output": {
+                "code": "def hello():\n    return 'world'\n",
+                "tests": "def test_hello():\n    assert hello() == 'world'\n",
+                "test_passed": True,
+            },
+        }
+        entry = self._make_entry("code-noev")
+        result = self.executor.execute(task, entry)
+        self.assertFalse(result.paid)
+        self.assertNotEqual(result.final_status, "paid")
+        self.assertEqual(
+            self.portfolio.get("code-noev").work_status, WorkStatus.PAYMENT_PENDING)
+
+    def test_pipeline_marks_paid_only_with_l3_payment_evidence(self):
+        """ARCH-ENG-158: real L3 payment evidence DOES reach PAID.
+
+        The gate must be a floor, not a wall: a genuine externally-verified
+        payment still books, otherwise the fix would have destroyed the earning
+        path rather than repaired it.
+        """
+        from agents.evidence.evidence import (
+            Evidence, EvidenceStatus, VerificationResult, VerificationLevel,
+        )
+
+        store = _FakeEvidenceStore()
+        executor = TaskExecutor(self.portfolio, self.validator, self.gate_mgr,
+                                evidence_store=store)
+
+        # SUBMITTED->PAID requires THREE slots (evidence_policy.REQUIREMENTS):
+        # platform_submission, completion_confirmation, and any recognised
+        # payment type — each VERIFIED at >= L3. Supplying only the payment
+        # record is not enough, which is the policy working as designed.
+        for etype in ("platform_submission", "completion_confirmation"):
+            store.add(Evidence.create(
+                evidence_type=etype,
+                subject_type="opportunity",
+                subject_id="code-paid",
+                source="upwork_api",
+            ).verify(VerificationResult(
+                status=EvidenceStatus.VERIFIED,
+                method="authenticated_api_response",
+                level=VerificationLevel.L4_INDEPENDENT_VERIFICATION,
+                actor="test",
+            )))
+
+        paid_ev = Evidence.create(
+            evidence_type="payment_gross",
+            subject_type="opportunity",
+            subject_id="code-paid",
+            source="upwork_api",
+            amount=500.0,
+        ).verify(VerificationResult(
+            status=EvidenceStatus.VERIFIED,
+            method="authenticated_api_response",
+            level=VerificationLevel.L4_INDEPENDENT_VERIFICATION,
+            actor="test",
+        ))
+        store.add(paid_ev)
+
+        task = {
+            "task_id": "code-paid",
+            "task_type": "coding",
+            "required_capabilities": ["CODING"],
+            "description": "Write a Python function",
+            "output": {
+                "code": "def hello():\n    return 'world'\n",
+                "tests": "def test_hello():\n    assert hello() == 'world'\n",
+                "test_passed": True,
+            },
+        }
+        entry = self._make_entry("code-paid")
+        result = executor.execute(task, entry)
+        self.assertTrue(result.paid)
+        self.assertEqual(result.final_status, "paid")
+        self.assertEqual(
+            self.portfolio.get("code-paid").work_status, WorkStatus.PAID)
+
+    def test_pipeline_rejects_l1_manual_payment_evidence(self):
+        """ARCH-ENG-158: a manual/L1 attestation is NOT enough for PAID.
+
+        `revenue_eligibility` keeps manual money in 'pending' for exactly this
+        reason; the portfolio status must agree with that policy.
+        """
+        from agents.evidence.evidence import (
+            Evidence, EvidenceStatus, VerificationResult, VerificationLevel,
+        )
+
+        store = _FakeEvidenceStore()
+        executor = TaskExecutor(self.portfolio, self.validator, self.gate_mgr,
+                                evidence_store=store)
+
+        manual = Evidence.create(
+            evidence_type="manual_attestation",
+            subject_type="opportunity",
+            subject_id="code-manual",
+            source="operator",
+            amount=500.0,
+        ).verify(VerificationResult(
+            status=EvidenceStatus.VERIFIED,
+            method="manual_attestation",
+            level=VerificationLevel.L1_SELF_REPORTED,
+            actor="operator",
+        ))
+        store.add(manual)
+
+        task = {
+            "task_id": "code-manual",
+            "task_type": "coding",
+            "required_capabilities": ["CODING"],
+            "description": "Write a Python function",
+            "output": {
+                "code": "def hello():\n    return 'world'\n",
+                "tests": "def test_hello():\n    assert hello() == 'world'\n",
+                "test_passed": True,
+            },
+        }
+        entry = self._make_entry("code-manual")
+        result = executor.execute(task, entry)
+        self.assertFalse(result.paid)
+        self.assertEqual(result.final_status, "payment_unverified")
+        self.assertEqual(
+            self.portfolio.get("code-manual").work_status, WorkStatus.PAYMENT_PENDING)
+
+    def test_pipeline_rejects_legacy_verified_dict_shape(self):
+        """ARCH-ENG-158: a `{"verified": True}`-shaped object can never book.
+
+        The gate consumes `Evidence` instances returned by `for_subject`. A dict
+        is rejected, matching `handlers._is_approved`.
+        """
+        store = _DictEvidenceStore()
+        executor = TaskExecutor(self.portfolio, self.validator, self.gate_mgr,
+                                evidence_store=store)
+        task = {
+            "task_id": "code-dict",
+            "task_type": "coding",
+            "required_capabilities": ["CODING"],
+            "description": "Write a Python function",
+            "output": {
+                "code": "def hello():\n    return 'world'\n",
+                "tests": "def test_hello():\n    assert hello() == 'world'\n",
+                "test_passed": True,
+            },
+        }
+        entry = self._make_entry("code-dict")
+        result = executor.execute(task, entry)
+        self.assertFalse(result.paid)
+        self.assertEqual(
+            self.portfolio.get("code-dict").work_status, WorkStatus.PAYMENT_PENDING)
 
     def test_pipeline_stops_at_human_gate(self):
         """Pipeline stops at step 6 when human gate detected."""

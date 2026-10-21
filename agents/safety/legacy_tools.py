@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agents.safety.policy import command_argv, resolve_command_cwd, resolve_project_path
-from agents.safety.handlers import _is_secret_file
+from agents.safety.handlers import _is_secret_file, refuse_secret_argv
 
 # Project root
 PROJECT_ROOT = resolve_project_path(".")
@@ -102,14 +102,19 @@ def _run_command(cmd: str, cwd: Optional[str] = None) -> str:
     except ValueError as e:
         # Same message the pre-fix code produced for unparseable commands.
         return f"[Command error: {e}]"
-    for token in argv:
-        name = Path(token).name
-        if name and _is_secret_file(Path(name)):
-            return (
-                f"[Command refused: the command names a credential/key store "
-                f"('{token}'). Read .env.example for the key names and ask the "
-                "operator for any value.]"
-            )
+    # ARCH-ENG-211: this scan is no longer private to this function. It used to
+    # exist ONLY here, which meant the other dispatcher -- the hardened one in
+    # handlers._tool_run_command -- never consulted it. So `type .env` was
+    # refused through the Big Brain tool loop and executed through dispatch.
+    # The hardened path was strictly more permissive than the path it replaced.
+    #
+    # Both now call `refuse_secret_argv`, which uses the same `_is_secret_file`
+    # authority this module already imported -- so ARCH-ENG-133's "one
+    # blocklist, not two that can drift" is finally true of the *dispatchers*,
+    # not just of the blocklist.
+    refusal = refuse_secret_argv(argv)
+    if refusal:
+        return refusal
     try:
         safe_cwd = resolve_command_cwd(cwd)
         result = subprocess.run(
@@ -120,6 +125,7 @@ def _run_command(cmd: str, cwd: Optional[str] = None) -> str:
             text=True,
             timeout=30,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            encoding="utf-8", errors="replace",
         )
         out = result.stdout.strip()
         err = result.stderr.strip()
@@ -242,8 +248,57 @@ TOOL_DEFS: List[Dict[str, Any]] = [
 ]
 
 
-def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
-    """Execute a tool by name with given arguments."""
+def execute_tool(name: str, arguments: Dict[str, Any],
+                 authorization: object | None = None) -> str:
+    """Execute a tool by name with given arguments.
+
+    ARCH-ENG-164 — THIS DISPATCHER HAD NO AUTHORIZATION.
+
+    `agents/safety/dispatch.py:execute_tool` is the gated entry point: it runs
+    `AuthorizedActionDispatcher.authorize`, enqueues an approval item when the
+    gate returns NEEDS_APPROVAL, and hands mutating handlers the
+    `_DISPATCH_CAPABILITY` token they require. This function implemented a
+    SECOND, parallel dispatcher that did none of that — it executed
+    `write_file` and `run_command` directly, with only the secret-path and argv
+    policy checks below standing between a model and the filesystem.
+
+    It was not an active exploit: the only caller (`agents/brains/big_brain.py`)
+    ran `safety_gate.check(...)` itself and only called this on ALLOWED. But the
+    function itself was a public, unguarded API, and
+    `agents/earning/router.py:get_tools_for_task` / `get_all_tools` advertised its
+    `TOOL_DEFS` — including `write_file` and `run_command` — to model-facing
+    callers. Any new importer would have inherited an unguarded path by accident,
+    which is exactly how the second dispatcher came to exist.
+
+    Mutating tools now require the same `_DISPATCH_CAPABILITY` token the hardened
+    handlers require. Read-only tools keep working unchanged so the ARCH-ENG-133
+    secret-redaction guarantees (which are tested here) still hold — they never
+    needed a gate, only the two layers applied below.
+
+    ARCH-ENG-164 also removed a dead import: the `web_search` branch did
+    `from hermes_tools import web_search`, and `hermes_tools` has never been a
+    dependency of this project (it appears in no requirements file), so that
+    branch raised ImportError on every stock install and the blanket
+    `except Exception` turned it into a "[Tool error: ...]" string. It now
+    delegates to the real web tool in `agents.safety.calling`.
+    """
+    # Mutating tools require proof that the SafetyGate approved this call.
+    # The names are this module's own (`read_file`/`write_file`), which the
+    # gate classifies as ALIASES of `file_read`/`file_write`; `MUTATING_TOOLS`
+    # holds the canonical names, so check both spellings rather than
+    # canonicalizing (canonicalizing would rewrite `read_file` -> `file_read`
+    # and fall through this module's dispatch table to "[Unknown tool]").
+    from agents.safety.calling import _DISPATCH_CAPABILITY
+    try:
+        from agents.safety.calling import _MUTATING_TOOLS
+        mutating = (name in _MUTATING_TOOLS
+                    or name in ("write_file", "run_command", "file_write"))
+    except Exception:
+        mutating = name in ("write_file", "run_command", "file_write")
+    if mutating and authorization is not _DISPATCH_CAPABILITY:
+        return (f"[Authorization required: {name} must be invoked through the "
+                f"SafetyGate-approved dispatcher]")
+
     try:
         if name == "read_file":
             return _read_file(arguments["path"])
@@ -254,12 +309,10 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
         elif name == "run_command":
             return _run_command(arguments["command"], arguments.get("cwd"))
         elif name == "web_search":
-            from hermes_tools import web_search
-            result = web_search(arguments["query"], limit=int(arguments.get("limit", 5)))
-            lines = []
-            for item in result.get("data", {}).get("web", []):
-                lines.append(f"- {item.get('title','')}: {item.get('url','')}")
-            return "\n".join(lines) if lines else "[No results]"
+            # ARCH-ENG-164: was `from hermes_tools import web_search`, a package
+            # this project has never depended on. Use the real tool.
+            from agents.safety.calling import _tool_web_search
+            return _tool_web_search(arguments)
         elif name == "analyze_document":
             # ARCH-ENG-133: analyze_document reads through the same private
             # reader, so a secret path would be dumped into model context inside

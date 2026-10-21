@@ -14,11 +14,13 @@ source of truth for its own certainty.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 
 from agents.cognition.epistemic import context_note
 from agents.cognition.fact_ledger import Claim, ClaimStatus, FactLedger, LedgerEntry, SourceKind
 from agents.cognition.operator_override import OperatorOverrideRegistry
+from agents.evidence.numeric_evidence import has_unsupported_values, unsupported_values
 
 
 def _extract_claims_from_context(context: str) -> list[tuple[str, str]]:
@@ -102,6 +104,56 @@ class DialogueHonestyService:
         # after a while and must not accumulate without limit.
         self._max_claims = max(10, int(max_claims))
         self._seen: set[str] = set()
+        # ARCH-ENG-156: monetary values a turn cited that appear nowhere in the
+        # context that turn was shown. Bounded to the same order as the ledger
+        # so a runaway cannot grow this list without limit.
+        self._numeric_gaps: list[dict] = []
+
+    # ── Numeric evidence check (ARCH-ENG-156) ────────────────────────────────
+
+    def check_numeric_support(
+        self,
+        response_text: str,
+        context_text: str,
+    ) -> list[str]:
+        """Report monetary values the turn cited with no evidence in its context.
+
+        The check is deliberately a *reporter*, never a gate: a value the model
+        derived arithmetically from the context is legitimate and must not be
+        suppressed. What it prevents is a fabricated ``$9,999.00`` being
+        indistinguishable from a quoted one.
+
+        Returns the raw unsupported values (e.g. ``"$200"``) for the turn, and
+        records them for :meth:`to_dict`. Empty list means every cited value is
+        backed by the context the model was actually shown.
+
+        A model may only legitimately quote a number it was shown in its
+        context, so an empty *context_text* means there is nothing to check
+        against and no finding is recorded — a turn with no context cannot be
+        judged against one.
+        """
+        if not context_text:
+            return []
+        try:
+            gaps = unsupported_values(response_text, context_text)
+        except Exception:
+            # The check is pure Decimal/string work and must never break a turn.
+            return []
+        if gaps:
+            self._numeric_gaps.append(
+                {"values": list(gaps), "ts": time.time()}
+            )
+            if len(self._numeric_gaps) > self._max_claims:
+                del self._numeric_gaps[: len(self._numeric_gaps) - self._max_claims]
+        return gaps
+
+    def numeric_gaps(self) -> list[dict]:
+        """Recorded unsupported-monetary-value findings, newest last."""
+        return list(self._numeric_gaps)
+
+    def has_numeric_gaps(self) -> bool:
+        """True when any turn cited a monetary value with no evidence."""
+        return bool(self._numeric_gaps)
 
     # ── Recording ────────────────────────────────────────────────────────────
 
@@ -209,4 +261,6 @@ class DialogueHonestyService:
             "standing_count": len(self.standing_claims()),
             "verified_count": len(self.ledger.verified_claims()),
             "override_count": len(self.overrides.active()),
+            # ARCH-ENG-156: turns that cited money with no evidence in context.
+            "numeric_gap_count": len(self._numeric_gaps),
         }

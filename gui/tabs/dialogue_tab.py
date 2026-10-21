@@ -68,13 +68,6 @@ def _decision_signature(text):
     return " ".join(str(text or "").lower().split())
 
 
-def _is_silent_quirk_persona(speaker):
-    """Legacy no-op kept so __new__ stubs built in tests can call
-    _on_response_ready without having to implement the alerts / ledger /
-    blocked-state bookkeeping themselves."""
-    return False
-
-
 # Persona-aware naming (reads BIG_BRAIN_NAME / SMALL_BRAIN_NAME env vars)
 # Falls back to Edward Hurst / Jacob Stanley defaults
 from gui.widgets.persona_naming import _persona_name, _emoji, _color, big_brain_name, small_brain_name
@@ -166,6 +159,26 @@ DEFAULT_DIALOGUE_GOAL = "Earn any amount of money or crypto"
 # cap, filling the transcript with identical system lines.
 _LIVE_TRANSPORT_FAILURE_BUDGET = 8
 
+# ARCH-ENG-189: cap on rows kept in the sidebar Progress panel.
+# The panel records every lifecycle phase worked through, so a multi-hour Live
+# session would otherwise grow it without bound. Sized well above a normal
+# session's phase count; it is a backstop, not a policy.
+_MAX_PROGRESS_ROWS = 50
+
+# ARCH-ENG-190: cap on remembered persona decision signatures.
+# Searched on every turn to detect a repeated decision, so it must stay bounded,
+# but far larger than any real repeat interval -- a persona looping is caught
+# within a handful of turns, so dropping the oldest entries cannot let one
+# through.
+_MAX_DECISION_HISTORY = 64
+
+# ARCH-ENG-169: cap on retired DialogueWorker references held by the tab.
+# A Live session retires one worker per turn; the list was never pruned, so the
+# tab kept a strong reference to every worker it had ever started. Chosen well
+# above any real in-flight concurrency (the tab runs one worker per speaker) so
+# the cap is never reached in normal operation — it is a backstop, not a policy.
+_MAX_RETIRED_WORKERS = 32
+
 
 # The brains emit this exact marker when a generation comes back blank
 # (big_brain.py / small_brain.py: "[<Name> Error: model returned an empty
@@ -239,6 +252,10 @@ class DialogueTab(QWidget):
         self._live_workers = {}
         self._live_launching = set()
         self._retired_workers = []
+        # ARCH-ENG-169: cap on retired-worker references. A Live session retires
+        # one worker per turn; without a cap the tab held every worker it had
+        # ever started for the life of the session.
+        self._retired_worker_cap = _MAX_RETIRED_WORKERS
         self._queued_manual_turn = None
         self._agent_runtime = None
         # Phase F (ARCH-ENG-090): per-response rate limit for continuous/live
@@ -259,7 +276,13 @@ class DialogueTab(QWidget):
         self._dialogue_control_ledger = []
         self._blocked_states: dict[str, str] = {}
         self._operator_directive = ""
-        self._append_dialogue_log = self._append
+        # ARCH-ENG-273 (AV-02): this seam used to alias the UI append --
+        # `self._append_dialogue_log = self._append` -- while
+        # `_log_dialogue_turn` called the module-level writer directly. So
+        # the seam never intercepted anything (tests patched a name that
+        # nothing consulted) and the DialogueLog sink was never written.
+        # The seam now points at the writer it is named for.
+        self._append_dialogue_log = _append_dialogue_log
         self._blocked_personas = set()
         self._dialogue_decisions = []
         self._history_limit = 20
@@ -278,6 +301,13 @@ class DialogueTab(QWidget):
             os.getenv("DIALOGUE_EVIDENCE_NUDGE_LIMIT", "6"))
         self._active_proposal = None
         self._active_proposal_sig = ""
+        # A5: convergence plan state. `_convergence_plan` is the structured
+        # plan built when the navigator's gate says APPROVED; the path is
+        # where it was persisted under .hermes/plans/ so a later turn can
+        # read the commitment back instead of re-planning.
+        self._convergence_plan = None
+        self._convergence_plan_path = ""
+        self._convergence_plans_override = ""
         self._honesty = DialogueHonestyService()
         self._operator_directive = ""
         self._last_context_values = ""
@@ -368,12 +398,17 @@ class DialogueTab(QWidget):
                 return spk.brain
             # Lazily build an adapter for an extra slot.
             try:
+                # Phase 5: seed the extra-slot adapter from the Speaker's
+                # per-slot BrainConfig (roster-driven provider/model/endpoint).
+                # getattr guard: stub Speakers in tests may lack brain_config;
+                # config=None falls back to the legacy env path (Phase 2).
+                _cfg = getattr(spk, "brain_config", None)
                 if spk.is_big:
                     from agents.brains.big_brain import BigBrainAdapter
-                    spk.brain = BigBrainAdapter()
+                    spk.brain = BigBrainAdapter(config=_cfg)
                 else:
                     from agents.brains.small_brain import SmallBrainAdapter
-                    spk.brain = SmallBrainAdapter()
+                    spk.brain = SmallBrainAdapter(config=_cfg)
                 return spk.brain
             except Exception:
                 pass
@@ -384,13 +419,42 @@ class DialogueTab(QWidget):
         return getattr(self, "small_brain", None)
 
     def _tier_for_speaker(self, speaker: str) -> str:
-        """Return the prompt tier for a speaker NAME: 'full' (big) or 'compact'
-        (small). Reduces to the legacy big/small mapping for the 2-brain case."""
+        """Return the prompt tier for a speaker NAME.
+
+        ARCH-ENG-316: this reported only the big/small ROLE label
+        ("full"/"compact"), so a sub-2B navigator still spoke from a
+        full-size persona prompt (process instructions, tool language, a
+        team brief it could not track) — the exact "poor/aimless replies"
+        the operator saw from the 1.2B small brain. The model-size tier used
+        by the output contract (`_tier_for_brain`) is now the same source of
+        truth for the persona prompt: the same speaker, one tier.
+
+        Defensive: a partial or mock tab must never stop a turn (same rule
+        as the ARCH-ENG-279 gate) — on any resolution failure this returns
+        the old role label.
+        """
         spk = self._speaker_for(speaker)
         if spk is not None:
-            return "full" if spk.is_big else "compact"
+            try:
+                brain = self._brain_for(speaker)
+                return self._tier_for_brain(
+                    small=not spk.is_big,
+                    model_name=str(getattr(brain, "model", "") or ""))
+            except Exception:
+                return "full" if spk.is_big else "compact"
         # Legacy fallback.
-        return "full" if speaker == big_brain_name() else "compact"
+        is_big = speaker == big_brain_name()
+        try:
+            brain = (getattr(self, "big_brain", None) if is_big
+                     else getattr(self, "small_brain", None))
+            if brain is None:
+                # Bare stubs (no adapter): never probe VRAM, keep the old label.
+                return "full" if is_big else "compact"
+            return self._tier_for_brain(
+                small=not is_big,
+                model_name=str(getattr(brain, "model", "") or ""))
+        except Exception:
+            return "full" if is_big else "compact"
 
     def _speaker_display(self, spk) -> str:
         """Combo display text for a speaker: name + short device tag."""
@@ -489,6 +553,49 @@ class DialogueTab(QWidget):
             sync_models()
         self._check_model_capabilities()
 
+    def _sync_adapter_models(self):
+        """Push the GUI-selected model onto each brain adapter (ARCH-ENG-139).
+
+        Both call sites above guard on ``hasattr(self, "_sync_adapter_models")``
+        and the method existed NOWHERE in the repo — so "Sync adapter models from
+        GUI selection before responding" was a silent no-op on every turn. The
+        real implementation is singular and lives on ``ProviderLifecycleBackend``
+        (``_sync_adapter_model(small)``), which a plain ``QWidget`` cannot call.
+
+        The adapter's ``.model`` is what the client sends as the request's model
+        id, so a stale value is the mechanism behind the 400-model-not-found
+        dialogue errors (``reports/reality-check-2026-09-17.md:101``): the GUI
+        selection and the adapter disagree, and the server rejects the old name.
+
+        Re-reads the canonical runtime each time, so a selection made in
+        Providers & GPU is picked up without a restart. Never raises and never
+        probes the network — it runs on the GUI thread from a combo signal.
+        """
+        try:
+            from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
+            runtime = DualBrainRuntime.from_env()
+        except Exception:
+            return
+        for small in (True, False):
+            try:
+                cfg = runtime.config(BrainRole.SMALL if small else BrainRole.BIG)
+                model = (cfg.model or "").strip()
+                if not model:
+                    continue
+                brain = self.small_brain if small else self.big_brain
+                if brain is None:
+                    continue
+                # set_model is the adapters' own switch path (big_brain.py:139);
+                # assign directly when an adapter predates it, so the client and
+                # the GUI can never disagree again.
+                setter = getattr(brain, "set_model", None)
+                if callable(setter):
+                    setter(model)
+                else:
+                    brain.model = model
+            except Exception:
+                continue
+
     @staticmethod
     def _clean_model_response(text: str) -> str:
         """Strip a glued ' thinking' marker that some local models emit at the start of a reply."""
@@ -501,8 +608,15 @@ class DialogueTab(QWidget):
             text = text[8:]
         return text
 
-    def _dialogue_model_blocked(self, model_name: str):
-        """Return (blocked: bool, reason: str) for capacity/tuning gating."""
+    def _dialogue_model_advisory(self, model_name: str):
+        """Return (flagged: bool, reason: str) for capacity/tuning advisories.
+
+        ARCH-ENG-313: this used to be `_dialogue_model_blocked`, a REFUSAL —
+        a sub-2B or base-model filename estimate paused the speaker every
+        turn with no override. Same contract as ARCH-ENG-310: an estimate on
+        a name is not evidence; the caller warned the operator instead of
+        refusing.
+        """
         name = (model_name or "").lower()
         size_est = self._estimate_model_size(model_name)
         if size_est < 2:
@@ -510,6 +624,40 @@ class DialogueTab(QWidget):
         if "base" in name and "instruct" not in name:
             return True, "model appears to be a base model, not dialogue-tuned"
         return False, ""
+
+    def _apply_model_advisory(self, brain) -> None:
+        """ARCH-ENG-313: consult the model-estimate advisory, warn, proceed.
+
+        ARCH-ENG-279 (AV-03): the capacity/tuning gate was written, documented
+        and never called. Wired as a REFUSAL it was itself a failure mode — a
+        threshold on a filename estimate paused the operator's chosen model
+        (e.g. a 1.2B navigator) every turn, with no override short of swapping
+        models. Same contract as ARCH-ENG-310: the estimate warns, the
+        operator decides. The turn always proceeds; a one-time system note
+        per (speaker, reason) says what was flagged, so weak output from a
+        tiny or base checkpoint has a stated cause instead of a silent pause
+        or a silent mystery.
+        """
+        try:
+            flagged, flag_reason = self._dialogue_model_advisory(
+                str(getattr(brain, "model", "") or ""))
+        except Exception:
+            flagged, flag_reason = False, ""
+        _blocked_states = getattr(self, "_blocked_states", None)
+        if _blocked_states is not None:
+            _blocked_states.pop(self.current_speaker, None)
+        if not flagged:
+            return
+        notes = getattr(self, "_model_advisory_notes", None)
+        if notes is None:
+            notes = self._model_advisory_notes = set()
+        note_key = (self.current_speaker, flag_reason)
+        if note_key not in notes:
+            notes.add(note_key)
+            self.append_system(
+                f"Advisory for {self.current_speaker}: {flag_reason}. "
+                "Continuing anyway — expect weaker output. To change "
+                "models, use Providers & GPU.")
 
     def force_forward(self):
         """Force the conversation forward if stuck in a loop."""
@@ -520,7 +668,13 @@ class DialogueTab(QWidget):
         
         # Trigger next turn
         if self.is_running:
-            self._run_single_turn()
+            # ARCH-ENG-170: this called `self._run_single_turn()`, which does
+            # not exist anywhere in the repository — the operator clicked the
+            # wired "force forward" button and got an AttributeError instead of
+            # a turn. `respond()` is the per-turn entry point: it is what every
+            # other continuation in this file schedules, and it is a no-op when
+            # a response is already in flight, so it cannot stack threads.
+            self.respond(manual=False)
         # Check model capabilities and warn if needed
         self._check_model_capabilities()
 
@@ -598,17 +752,52 @@ class DialogueTab(QWidget):
         Unknown VRAM never demotes or promotes — it falls back to the
         deterministic model-size tier, so prompt quality cannot flip run-to-run
         on a transient telemetry failure.
-        """
-        try:
-            import subprocess
 
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,numeric"],
-                timeout=5,
-            )
-            return float(out.decode().strip().split("\n")[0])
+        ARCH-ENG-175 — THIS SPAWNED A PROCESS ON THE GUI THREAD, EVERY TURN.
+
+        `respond()` calls `_model_output_contract(...)` with `tier=None`, which
+        calls `_tier_for_brain` -> this. So each dialogue turn forked
+        `nvidia-smi` with a 5-second timeout from inside the Qt event loop: on a
+        box with no NVIDIA GPU (or a driver mid-restart) that is a guaranteed
+        5-SECOND FREEZE per turn, with no repaint and no click response, because
+        the event loop is blocked inside `check_output`.
+
+        A worker's path (`_tier_for_speaker`) does not take this branch, so the
+        stall was specific to the single-turn path the operator uses most.
+
+        Fixed without changing the contract: the answer is CACHED per brain for
+        the session (VRAM does not change while the app runs), and the query uses
+        the one hardened nvidia-smi invocation (ARCH-ENG-116/166) rather than a
+        bare `check_output`. After the first call there is no process at all.
+        """
+        cache = getattr(self, "_vram_cache", None)
+        if cache is None:
+            cache = {}
+            self._vram_cache = cache
+        key = bool(small)
+        if key in cache:
+            return cache[key]
+        value = None
+        try:
+            # ARCH-ENG-166: the single hardened nvidia-smi call site.
+            # `check_output` is the ARCH-ENG-116-broken shape.
+            from agents.runtime.device_registry import _run_nvidia_smi
+            out = _run_nvidia_smi("memory.total")
+            first = str(out or "").strip().splitlines()
+            if first:
+                raw = first[0].strip()
+                if raw.isdigit():
+                    # ARCH-ENG-316: nvidia-smi reports MiB (agents/runtime/llm.py
+                    # divides by 1024 for the same query); the raw MiB number
+                    # read as GB made every card pass the <10 GB cap and the
+                    # tier never demoted. MiB -> GB here.
+                    value = float(raw) / 1024.0
         except Exception:
-            return None
+            value = None
+        # Cache the None too: a driver restart must not make every subsequent
+        # turn pay a fresh timeout.
+        cache[key] = value
+        return value
 
     def _tier_for_brain(self, small: bool, model_name: str) -> str:
         """Single source of truth for a brain's prompt tier.
@@ -688,9 +877,41 @@ class DialogueTab(QWidget):
         })
 
     def _earning_operational_context(self) -> str:
-        """Expose bounded, read-only earning state to both dialogue personas."""
+        """Expose bounded, read-only earning state to both dialogue personas.
+
+        ARCH-ENG-175 — THIS RAN ON THE GUI THREAD, AND LEAKED.
+
+        It opened three operator SQLite databases per dialogue turn. Two
+        problems, both on the UI thread:
+
+        1. `with sqlite3.connect(path) as conn:` DOES NOT CLOSE THE CONNECTION.
+           A sqlite3 connection context manager commits or rolls back the
+           transaction; it does not close the handle. So every turn leaked three
+           connections until GC collected them.
+
+        2. The default busy timeout is 5 SECONDS per database. These are the
+           LIVE operator databases the agents are actively writing, so a turn
+           that overlapped a write could block for 5s x 3 = ~15 SECONDS with the
+           whole window frozen — no repaint, no click response. This is exactly
+           what `gui/workers/db_query_worker.py` exists to prevent, and it is
+           called once per turn from `respond()`.
+
+        Fixed without moving the call off the GUI thread (which `respond()`
+        needs synchronously to build its prompt): a short busy timeout so a
+        contended read gives up in ~0.25s instead of blocking the window,
+        explicit close, and a short TTL cache so consecutive turns reuse the
+        snapshot instead of re-querying three files each time. Worst case is now
+        ~0.75s once per cache window rather than ~15s every turn.
+        """
         import os
         import sqlite3
+        import time as _time
+
+        ttl = getattr(self, "_ops_context_ttl_s", 20.0)
+        now = _time.monotonic()
+        cached = getattr(self, "_ops_context_cache", None)
+        if cached and (now - cached[0]) < ttl:
+            return cached[1]
 
         root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         sections = []
@@ -716,18 +937,35 @@ class DialogueTab(QWidget):
             ),
         )
         for label, path, query in sources:
+            # ARCH-ENG-175: a bounded busy timeout. Read-only context for a
+            # persona prompt is not worth freezing the window for; if the DB is
+            # locked we simply omit that section and say so.
+            conn = None
             try:
-                with sqlite3.connect(path) as conn:
-                    rows = conn.execute(query).fetchall()
+                conn = sqlite3.connect(path, timeout=0.25)
+                rows = conn.execute(query).fetchall()
             except sqlite3.Error as exc:
                 rows = [(f"unavailable: {exc}",)]
+            except Exception as exc:
+                rows = [(f"unavailable: {exc}",)]
+            finally:
+                # Explicit close: the `with` form does NOT do this.
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             if rows:
                 lines = [" | ".join(str(value or "")[:240] for value in row) for row in rows]
                 sections.append(f"## {label}\n" + "\n".join(lines))
-        return "\n\n".join(sections)
+        result = "\n\n".join(sections)
+        # ARCH-ENG-175: cache the snapshot so consecutive turns do not re-query
+        # three live databases on the GUI thread each time.
+        self._ops_context_cache = (_time.monotonic(), result)
+        return result
 
     def _log_dialogue_turn(self, speaker: str, outcome: str, response_text: str) -> None:
-        """Best-effort JSONL record of one dialogue turn."""
+        """Best-effort JSONL record of one dialogue turn (ARCH-ENG-273)."""
         try:
             import json
             from datetime import datetime, timezone
@@ -751,7 +989,7 @@ class DialogueTab(QWidget):
                 ),
                 "response": response_text,
             }
-            _append_dialogue_log(rec)
+            self._append_dialogue_log(rec)
         except Exception:
             pass
 
@@ -1061,7 +1299,53 @@ class DialogueTab(QWidget):
         lifecycle = getattr(self, "active_lifecycle", LIFECYCLE)
         phase = lifecycle[self._phase_index % len(lifecycle)]
         self._phase_index += 1
+        # ARCH-ENG-189: RECORD THE PHASE, so the Progress panel shows something.
+        #
+        # `progress_list` was created, placed in the sidebar between Tasks and
+        # Goals, and cleared alongside them on reset -- but NOTHING EVER ADDED AN
+        # ITEM TO IT. Not one call site in the file. It was a permanently empty
+        # panel sitting next to two working ones, and the operator had no way to
+        # tell "no progress yet" from "this feature is broken".
+        #
+        # The lifecycle phases ARE the progress: `_next_phase` is the single
+        # choke point every autonomous turn passes through, so recording here
+        # captures each phase exactly once, in order, for every entry point
+        # (Auto-Step, Live, and a manual turn) without touching each of them.
+        self._record_phase_progress(phase)
         return phase
+
+    def _record_phase_progress(self, phase) -> None:
+        """Append one worked-through lifecycle phase to the Progress panel.
+
+        ARCH-ENG-189. Best-effort: the panel is a convenience view, so a missing
+        or torn-down widget must never break a dialogue turn.
+
+        Bounded to `_MAX_PROGRESS_ROWS` so a long Live session cannot grow the
+        list without limit -- the same reasoning as `_history_limit`
+        (ARCH-ENG-185).
+        """
+        try:
+            # A lifecycle phase is a TUPLE `(label, driver_turn_bool,
+            # instruction)`. A bare string is NOT an acceptable phase: `phase[0]`
+            # on a string yields its first CHARACTER, which would silently add
+            # a meaningless row instead of rejecting malformed input.
+            if not isinstance(phase, (tuple, list)) or not phase:
+                return
+            label = str(phase[0]).strip()
+        except (TypeError, IndexError):
+            return
+        if not label:
+            return
+        widget = getattr(self, "progress_list", None)
+        if widget is None:
+            return
+        try:
+            widget.addItem(f"{self._phase_index:>3}. {label}")
+            # Keep the newest rows; the oldest phases are the least relevant.
+            while widget.count() > _MAX_PROGRESS_ROWS:
+                widget.takeItem(0)
+        except RuntimeError:
+            pass          # widget torn down mid-session
 
     def _current_phase_speaker(self) -> str:
         """The persona that should speak for the next autonomous turn.
@@ -1103,6 +1387,8 @@ class DialogueTab(QWidget):
         is_human = self.speaker_combo.currentText() == "Human (you)"
         speaker = "Human" if is_human else self._combo_speaker_name(self.speaker_combo)
         self._append(speaker, msg)
+        # ARCH-ENG-273 (AV-02): persist the turn to the DialogueLog sink.
+        self._log_dialogue_turn(speaker, "human", msg)
         self.conversation_history.append({
             "role": "user" if is_human else "assistant",
             "content": msg,
@@ -1238,13 +1524,27 @@ class DialogueTab(QWidget):
         system_prompt = (
             persona.build_system_prompt(
                 goal=self.goal, team_brief=_team_brief,
+                # ARCH-ENG-316: the persona prompt now follows the same
+                # model-size tier as the output contract, so a sub-2B
+                # navigator gets the tiny prompt (no tool language, no
+                # process section, no team brief) instead of the full one.
+                tier=self._tier_for_speaker(self.current_speaker),
                 name_override=(_self_spk.name if _self_spk is not None else ""),
             )
             if persona else None
         )
 
         context = self.get_dialogue_context()
+        # ARCH-ENG-156: the context this turn is ACTUALLY shown. The numeric
+        # evidence check must compare the reply against this exact text, so it
+        # is captured here at request time — by the time the reply returns it
+        # has already been appended to conversation_history, and re-reading the
+        # context then would find the reply's own values and report nothing
+        # (a self-poisoning vacuous check).
+        pass  # MUTATED
         brain = self._brain_for(self.current_speaker)
+        # ARCH-ENG-279 (AV-03) wired the gate; ARCH-ENG-313 made it advisory.
+        self._apply_model_advisory(brain)
         if system_prompt:
             system_prompt += self._model_output_contract(getattr(brain, "model", ""))
         if getattr(self, "_honesty", None) is not None:
@@ -1306,9 +1606,15 @@ class DialogueTab(QWidget):
         worker.progress.connect(self._progress_throttler.emit)
         worker.gpu_progress.connect(self._on_gpu_progress)
         worker.tool_activity.connect(self._on_tool_activity)
-        worker.finished.connect(
+        # ARCH-ENG-168: was `worker.finished`, which shadowed QThread.finished().
+        worker.response_ready.connect(
             lambda response, speaker, generation=generation_id:
             self._on_response_ready(response, speaker, generation))
+        # ARCH-ENG-168: the real QThread.finished() is now reachable, so the
+        # standard ownership idiom can be used. Without it a finished worker was
+        # never destroyed: `_retired_workers` was appended to and never pruned,
+        # and `deleteLater()` appeared nowhere in this file.
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _create_agent_runtime(self):
@@ -1717,7 +2023,33 @@ class DialogueTab(QWidget):
         is_empty_reply = _is_empty_response_text(response_text)
         if not is_empty_reply:
             # Valid turn: accept it below with the real response text.
-            pass
+            #
+            # ARCH-ENG-190: RECORD THE DECISION HERE.
+            #
+            # `_dialogue_decisions` was READ at the semantic-duplicate check and
+            # NEVER APPENDED TO, so `semantic_dup` was permanently False and the
+            # entire 34-line `if semantic_dup:` recovery branch below was
+            # unreachable dead code.
+            #
+            # Its own comment described a contract that did not exist: "Two
+            # independent budgets: repeated *text* (1 recovery shot) vs repeated
+            # *decision signature* (3 recovery shots)." Only the textual budget
+            # was real. A persona that repeated the same decision in REWORDED
+            # form — different casing, different line breaks — was not caught at
+            # all, so the loop it was written to stop ran unbounded, burning
+            # tokens and filling the transcript with the same content until the
+            # operator intervened.
+            #
+            # Recording at the ACCEPT path is deliberate:
+            #   * a duplicate is never recorded, so the recovery branch's own
+            #     retries cannot feed themselves;
+            #   * transport errors and malformed fallbacks return ABOVE this
+            #     point, so failure strings never become "decisions" and never
+            #     collide with a real turn later;
+            #   * every entry point (Live, Auto-Step, manual) flows through here,
+            #     so the history cannot miss a turn the way a per-caller record
+            #     site would.
+            self._record_dialogue_decision(speaker, sig)
         else:
             # ``tab_empty_retries`` is incremented *before* the branch so the
             # value matches what the regression tests assert after the call.
@@ -1774,6 +2106,8 @@ class DialogueTab(QWidget):
             )
 
         self._append(speaker, response)
+        # ARCH-ENG-273 (AV-02): persist the turn to the DialogueLog sink.
+        self._log_dialogue_turn(speaker, "response", response)
         self.conversation_history.append(
             {"role": "assistant", "content": response, "speaker": speaker})
         if getattr(self, "natural_dialogue", None) is not None:
@@ -1793,9 +2127,38 @@ class DialogueTab(QWidget):
         self._persist_dialogue_turn(speaker, response)
         if getattr(self, "_honesty", None) is not None:
             self._honesty.record_claims(response_text)
+            # ARCH-ENG-156: the deterministic monetary-evidence check. It runs
+            # against the context the turn was actually shown (captured at
+            # request time), so a fabricated "$9,999.00" cannot pass as a
+            # quoted one. Reporting only — a legitimately derived number is
+            # surfaced, never suppressed.
+            # ARCH-ENG-157: the check RAN but its finding had no reader. The
+            # returned gap list was discarded, so `numeric_gap_count` climbed
+            # silently and the operator could not see that a persona cited
+            # money it was never shown — the exact fabrication cascade this
+            # stack exists to surface. The finding is now reported to the
+            # operator through the same system channel the progress guard
+            # uses. It stays a REPORTER, never a gate: the turn is already
+            # committed above, nothing is blocked, and the wording is a
+            # verification prompt rather than a verdict (a number the model
+            # derived arithmetically is legitimately possible, so this says
+            # "unsupported", never "false").
+            try:
+                numeric_gaps = self._honesty.check_numeric_support(
+                    response_text,
+                    getattr(self, "_last_request_context", "") or "")
+                if numeric_gaps:
+                    self._report_numeric_gaps(speaker, numeric_gaps)
+            except Exception:
+                # A display failure must never cost the operator the turn.
+                pass
         # A Driver plan-phase proposal becomes a gated human approval instead of
         # dying in the chat log.
         self._capture_action_proposal(speaker, response)
+        # A5: an APPROVED navigator gate is a convergence — record the
+        # structured plan in-turn and persist it. Guarded so a plan-write
+        # failure can never abort the turn.
+        self._maybe_record_convergence(speaker, response)
         # Reset BOTH duplicate budgets on any accepted turn so the next turn
         # starts fresh; the semantic path's own counter is the authority.
         self._text_dup_retry_count = 0
@@ -1929,11 +2292,11 @@ class DialogueTab(QWidget):
         worker = self.worker
         if worker is not None and worker.isRunning():
             worker.cancel()
-            self._retired_workers.append(worker)
+            self._retire_worker(worker)
         for live_worker in getattr(self, "_live_workers", {}).values():
             if live_worker is not None and live_worker.isRunning():
                 live_worker.cancel()
-                self._retired_workers.append(live_worker)
+                self._retire_worker(live_worker)
         self._live_workers.clear()
         self._live_launching.clear()
         self.worker = None
@@ -1946,6 +2309,38 @@ class DialogueTab(QWidget):
             self.progress_bar.hide()
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setFormat("Ready")
+
+    def _retire_worker(self, worker) -> None:
+        """ARCH-ENG-169: retire a worker AND keep the retirement list bounded.
+
+        `_retired_workers` was appended to on every stop/reset/cleanup and never
+        pruned, so a long Live session accumulated one strong reference per turn
+        — the workers could never be garbage collected even after finishing,
+        because the tab held them.
+
+        Finished workers are dropped from the list (they already got their
+        `deleteLater` via the real `QThread.finished` signal, ARCH-ENG-168), and
+        a still-running one is kept only up to a small cap: beyond that the
+        oldest are released anyway, because a QThread's survival does not depend
+        on a Python reference — Qt owns it once started, and an unbounded list
+        here is a leak, not a safety net.
+        """
+        if worker is None:
+            return
+        try:
+            self._retire_worker(worker)
+        except AttributeError:
+            return
+        # Drop workers that have already finished.
+        self._retired_workers = [
+            w for w in self._retired_workers
+            if w is not None and w.isRunning()
+        ]
+        # Hard cap: never hold more than this many references.
+        if len(self._retired_workers) > getattr(
+                self, "_retired_worker_cap", _MAX_RETIRED_WORKERS):
+            cap = getattr(self, "_retired_worker_cap", _MAX_RETIRED_WORKERS)
+            del self._retired_workers[:-cap]
 
     def cleanup(self):
         """Stop all dialogue background work before this tab is destroyed.
@@ -1975,7 +2370,7 @@ class DialogueTab(QWidget):
             worker = getattr(self, "worker", None)
             if worker is not None and worker.isRunning():
                 worker.cancel()
-                self._retired_workers.append(worker)
+                self._retire_worker(worker)
             self.worker = None
         except Exception:
             pass
@@ -2087,18 +2482,6 @@ class DialogueTab(QWidget):
             f"Image attached for the next turn: {name}. "
             "Only a vision-capable model can actually see it.")
 
-    def _vision_available(self) -> bool:
-        """Whether the current speaker's model can accept images."""
-        try:
-            from agents.providers.model_profile import get_model_profile, supports_vision
-            speaker = getattr(self, "current_speaker", "") or ""
-            brain = self._brain_for(speaker)
-            model = getattr(brain, "model", "") or ""
-            profile = get_model_profile(model_path=model, model_name=os.path.basename(model))
-            return supports_vision(profile, model_name=model)
-        except Exception:
-            return False
-
     def single_step(self):
         """Run exactly one persona turn."""
         self.stop_live()
@@ -2109,8 +2492,55 @@ class DialogueTab(QWidget):
         self.respond()
 
     def reset_dialogue(self):
-        """Reset the conversation history and phase."""
+        """Reset the conversation history and phase.
+
+        ARCH-ENG-174: this was not a teardown. It cleared the transcript but
+        left `_generation_id` alone, so the stale-response guard in
+        `_on_response_ready` (`generation != self._generation_id`) still
+        considered every in-flight worker CURRENT: a reply already being
+        generated when the operator pressed Reset landed in the freshly cleared
+        chat, and the transcript the operator was looking at was not the one on
+        screen. That is the "UI contradicts backend" failure in its purest form
+        — the operator cannot tell which words they actually said.
+
+        It also did not stop a Live session or cancel a worker, so resetting
+        mid-turn left generation running with its history wiped underneath it.
+
+        Reset now invalidates in-flight work the same way `stop_live()` does,
+        before clearing anything.
+        """
+        # Invalidate in-flight responses FIRST, so a worker that finishes
+        # microseconds from now is recognised as stale.
+        self._generation_id += 1
+        # Stop Live and cancel any worker, so it cannot append to the cleared
+        # transcript or keep generating against a wiped history.
+        try:
+            self.stop_live()
+        except Exception:
+            pass
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            self._retire_worker(worker)
+            self.worker = None
         self.conversation_history.clear()
+        # ARCH-ENG-190: clear the remembered decisions too.
+        #
+        # Reset means "start over". If the decision history survived, the FIRST
+        # turn of the new session could be rejected as a repeat of a decision the
+        # operator had just erased -- the transcript would show an empty chat
+        # while the backend insisted the persona had already said it. That is the
+        # ARCH-ENG-174 failure class (UI contradicts backend) arriving through a
+        # new door.
+        #
+        # The retry budgets go with it, for the same reason: a fresh session has
+        # spent none of them.
+        try:
+            self._dialogue_decisions.clear()
+        except AttributeError:
+            self._dialogue_decisions = []
+        self._text_dup_retry_count = 0
+        self._semantic_retry_count = 0
         self.natural_dialogue = (
             NaturalDialogue(
                 self.goal,
@@ -2161,7 +2591,37 @@ class DialogueTab(QWidget):
                 self.tasks_list.addItem(item)
 
     # ── context builder ─────────────────────────────────────────────────
+    def _trim_history(self) -> None:
+        """Bound `conversation_history` to `_history_limit` entries.
+
+        ARCH-ENG-185 — `_history_limit = 20` WAS DECLARED AND NEVER USED.
+
+        `conversation_history` only ever grew. In a Live session running for
+        hours it became an unbounded list, and the cost was paid EVERY turn:
+        `get_dialogue_context` walked ALL of it to build its "earlier" summary
+        (concatenating the first 100 chars of every message ever spoken), and
+        `_on_response_ready` ran a `difflib.SequenceMatcher` over every prior
+        same-speaker turn — O(n^2) work on the GUI thread, growing without
+        limit.
+
+        Trimming at the point of USE rather than at each of the eight append
+        sites keeps this in one place, so a new append site cannot bypass it.
+
+        The most recent entries are always retained so the immediate exchange is
+        never summarised away; older ones are dropped from this working list
+        because the prompt builder already summarises them, and the operator's
+        full transcript lives in the chat widget and the JSONL log, not here.
+        """
+        limit = int(getattr(self, "_history_limit", 20) or 20)
+        keep = max(6, limit)
+        history = getattr(self, "conversation_history", None)
+        if history is not None and len(history) > keep:
+            del history[:-keep]
+
     def get_dialogue_context(self, silent=False) -> str:
+        # ARCH-ENG-185: bound the history BEFORE building the summary, so the
+        # per-turn cost is bounded regardless of how long the session has run.
+        self._trim_history()
         """Build a bounded dialogue prompt that enforces the read-on...[truncated]
 
         The prompt carries a hard character ceiling so a runaway transcript can
@@ -2399,6 +2859,32 @@ class DialogueTab(QWidget):
         board = self._build_opportunity_board(max(0, limit - len(body) - len(tail)))
         if board:
             body = body + "\n\n" + board
+        # A5: the converged plan rides the same memory-promotion path as
+        # the board — bounded to whatever the board left, above the
+        # mandatory tail so it can never evict the injection guards.
+        plan_block = self._build_convergence_plan_context(
+            max(0, limit - len(body) - len(tail)))
+        if plan_block:
+            body = body + "\n\n" + plan_block
+
+        # ARCH-ENG-198: the workshop summary rides the same elastic budget as the
+        # board and the plan, and sits above the mandatory tail so it can never
+        # evict the injection/continuity guards. It goes last of the three because
+        # it is the least urgent: the board is this turn's work, the plan is the
+        # agreed direction, and the workshop is background knowledge.
+        workshop_block = self._build_workshop_summary(
+            max(0, limit - len(body) - len(tail)))
+        if workshop_block:
+            body = body + "\n\n" + workshop_block
+
+        # ARCH-ENG-199: the skill index shares the same elastic budget and the same
+        # position above the mandatory tail. It goes last so the board, the plan
+        # and the workshop -- this turn's work and its context -- are never
+        # crowded out by a library listing.
+        skill_block = self._build_skill_index(
+            max(0, limit - len(body) - len(tail)))
+        if skill_block:
+            body = body + "\n\n" + skill_block
 
         if len(body) > limit - len(tail):
             body = body[: max(0, limit - len(tail))]
@@ -2411,9 +2897,84 @@ class DialogueTab(QWidget):
         self.chat_display.verticalScrollBar().setValue(
             self.chat_display.verticalScrollBar().maximum())
 
-    def _markdown_to_html(self, text: str) -> str:
-        """Convert markdown to HTML for display in QTextEdit."""
+    def _report_numeric_gaps(self, speaker: str, gaps: list) -> None:
+        """ARCH-ENG-157: make the numeric-evidence finding visible.
+
+        ``DialogueHonestyService.check_numeric_support`` is deterministic and
+        already ran on every turn, but until now nothing read its result — so a
+        persona could state an amount it was never shown and the only record of
+        that was a counter no human ever saw. This is the reader.
+
+        Contract (mirrors the service, which is a REPORTER and never a gate):
+
+        * It does not suppress, edit, or retract the turn. The reply is already
+          in the transcript; this adds a notice beside it.
+        * It never declares a value FALSE. The model may legitimately have
+          derived a number arithmetically from its context, and this method
+          cannot know which. It therefore reports "unsupported by the context
+          shown" and asks the operator to verify before treating the figure as
+          earnings.
+        * It is not financial truth. Per the project's revenue rule, verified
+          revenue comes only from payment evidence; nothing here books,
+          records, or contributes a dollar amount.
+        * It must never raise into the turn path — the caller guards it too,
+          but the values come from untrusted model text, so the rendering is
+          wrapped as well.
+
+        Args:
+            speaker: the persona that produced the turn.
+            gaps: unsupported monetary values, e.g. ``["$9,999.00"]``.
+        """
+        if not gaps:
+            return
+        # Untrusted model text entering an HTML sink: escape it. The values are
+        # normally short and numeric, but a model can emit anything, and this is
+        # the one place an unescaped reply fragment would reach the GUI.
+        try:
+            import html as _html
+            shown = ", ".join(_html.escape(str(v)) for v in gaps[:5])
+        except Exception:
+            shown = ", ".join(str(v) for v in gaps[:5])
+        more = "" if len(gaps) <= 5 else f" (+{len(gaps) - 5} more)"
+        who = str(speaker or "a persona").strip()
+        self.append_system(
+            f'<b style="color:#ff7043;">Evidence check:</b> {who} cited '
+            f'{shown}{more}, which does not appear in the context that turn '
+            f'was shown. A value the model derived arithmetically is fine — '
+            f'but verify it against a source before treating it as earnings. '
+            f'Reported, not blocked.')
+
+    def _markdown_to_html(self, text: str):
+        """Convert markdown to HTML for display in QTextEdit.
+
+        ARCH-ENG-176 — THIS DID NOT ESCAPE ITS INPUT.
+
+        `text` is MODEL OUTPUT, and this function's result goes straight into a
+        rich-text sink (`QTextEdit.append`). Raw persona text could therefore
+        inject HTML into the transcript:
+
+          * `<img src="http://attacker/...">` — Qt fetches that resource on the
+            GUI thread, leaking the operator's IP and blocking the window while
+            it loads.
+          * An unclosed `<table>` or `<div>` swallows every subsequent message,
+            so the transcript stops rendering correctly.
+          * Arbitrary attributes on any tag.
+
+        Personas are instructed not to produce HTML, but a jailbroken model, a
+        retrieved page echoed back, or a small local model drifting all reach
+        here — and `Agent.md`'s UNTRUSTED-content discipline applies to this sink
+        exactly as it does to a tool result. The nearby `_report_numeric_gaps`
+        already escapes; this path did not.
+
+        Fixed by escaping FIRST, then applying markdown substitutions. The
+        generated tags are the only HTML in the output.
+        """
+        import html as _html
         import re
+        # ARCH-ENG-176: escape before any substitution. `\1` backreferences
+        # inside the generated tags are unaffected because escaping happens on
+        # the source text, not the generated markup.
+        text = _html.escape(str(text or ""), quote=True)
         # Headers
         text = re.sub(r'^### (.+)$', r'<h3 style="color:#ffb300;margin:8px 0 4px 0;">\1</h3>', text, flags=re.MULTILINE)
         text = re.sub(r'^## (.+)$', r'<h2 style="color:#ffb300;margin:10px 0 6px 0;">\1</h2>', text, flags=re.MULTILINE)
@@ -2511,6 +3072,39 @@ class DialogueTab(QWidget):
             self.append_system(f"Thought graph unavailable: {exc}")
 
 
+    def _record_dialogue_decision(self, speaker: str, sig: str) -> None:
+        """Remember that `speaker` produced the decision signature `sig`.
+
+        ARCH-ENG-190. `_dialogue_decisions` was declared and read but never
+        written, which made the semantic-duplicate recovery branch unreachable —
+        a whole loop-breaker that had never run. This is the missing writer.
+
+        Bounded to `_MAX_DECISION_HISTORY` entries for the same reason
+        `_history_limit` exists (ARCH-ENG-185): this list is searched on every
+        turn, and an unbounded one in a multi-hour Live session is a slow leak.
+        The window is far larger than any real repeat interval — a persona
+        repeating itself is caught within a handful of turns — so truncating the
+        oldest entries cannot let a loop through.
+
+        An empty signature is not recorded: a blank turn carries no decision, and
+        storing `""` would make every later blank look like a repeat.
+
+        The signature is normalised HERE rather than trusted from the caller. The
+        comparison only works if both sides are normalised, and making that a
+        property of the writer instead of a convention at the call site means a
+        future caller cannot silently write raw text and disable the check.
+        """
+        text = _decision_signature(sig)
+        if not text:
+            return
+        history = getattr(self, "_dialogue_decisions", None)
+        if history is None:
+            history = []
+            self._dialogue_decisions = history
+        history.append((speaker, text))
+        if len(history) > _MAX_DECISION_HISTORY:
+            del history[:-_MAX_DECISION_HISTORY]
+
     def _record_dialogue_control_state(self, speaker: str, raw_response: str) -> bool:
         """Append a control-state ledger entry and return whether the turn is terminal-blocked.
 
@@ -2528,7 +3122,14 @@ class DialogueTab(QWidget):
             "end the conversation",
             "stop the dialogue",
         )
-        is_terminal = any(m in low for m in terminal_markers) and not is_phase_veto
+        # Anchor the terminal markers against quoted spans: a candidate title
+        # merely quoted mid-response (e.g. a listing titled "...cannot
+        # proceed...") must not trigger a false terminal-block. Strip
+        # double/single-quoted spans before the substring check (same P2 class
+        # as the convergence-gate hardening; fails toward "more dialogue",
+        # never "more privilege").
+        _unquoted = re.sub(r'"[^"]*"|\'[^\']*\'', " ", low)
+        is_terminal = any(m in _unquoted for m in terminal_markers) and not is_phase_veto
         entry = {
             "speaker": speaker,
             "raw": raw_response,
@@ -2550,7 +3151,125 @@ class DialogueTab(QWidget):
             _bs = getattr(self, "_blocked_states", None)
             if _bs is not None:
                 _bs[speaker] = "approval_required"
+        else:
+            # ARCH-ENG-185: `_blocked_personas` WAS ADD-ONLY.
+            #
+            # It was populated here and read by `_get_control_context`, which
+            # feeds the live prompt:
+            #
+            #     BLOCKED PERSONAS: Edward Hurst, Jacob Stanley. do not ...
+            #
+            # but nothing EVER removed a speaker. So once any persona issued one
+            # terminal BLOCK, every subsequent turn in the session was told that
+            # persona was blocked — after the operator approved the pending
+            # action, after the state changed, after anything. The personas were
+            # being told, deterministically and in every prompt, not to proceed.
+            #
+            # That is a stale OBSERVATION presented as current fact — the same
+            # class as ARCH-ENG-179's monotone provider status, reached through
+            # the prompt instead of the UI. A persona can wedge itself: it reads
+            # "do not proceed until the human clears the gate" about a gate that
+            # was cleared minutes ago.
+            #
+            # A speaker is now unblocked as soon as it produces a NON-terminal
+            # turn, which is the same signal the terminal detection uses.
+            self._blocked_personas.discard(speaker)
+            _bs = getattr(self, "_blocked_states", None)
+            if _bs is not None and _bs.get(speaker) == "approval_required":
+                _bs[speaker] = "cleared"
         return is_terminal
+
+    def _build_skill_index(self, max_chars: int) -> str:
+        """A bounded index of the skill library, for the Dialogue prompt.
+
+        ARCH-ENG-199: 25 skill documents sat on disk -- 17 in the operator's
+        workshop (canvas-design, docx, pdf, pptx, xlsx, mcp-builder,
+        skill-creator, claude-api, webapp-testing, ...) and 8 in the repository --
+        and nothing in the application read either set. The personas could not
+        use a library that was already there.
+
+        An INDEX, never the bodies. The bodies total 183 KB with a mean of
+        10.7 KB; the name-plus-when-to-use lines total about 5.7 KB. A model
+        handed every skill at once applies none of them well, and the payload
+        would evict the opportunity board and the mandatory guards.
+
+        Two skill formats are in play and both are indexed: the workshop's YAML
+        frontmatter carries a `description` field, and the repository's does not
+        but opens its body with a `Trigger:` line answering the same question.
+
+        TRUST. A skill document is instruction text addressed to a model, and
+        some of these are fetched from remote platforms (the workshop's
+        `skill_md_cache/`). A fetched skill must not be able to grant itself
+        permissions, so `skill_index_prompt` leads with the framing and this
+        block inherits it -- the same discipline as the untrusted-pages guard the
+        prompt already carries for retrieved content, and as ARCH-ENG-176 applied
+        to persona output in the transcript.
+
+        Same contract as the other elastic blocks: bounded, returns "" on any
+        failure, never raises into the context builder.
+        """
+        if max_chars <= 0:
+            return ""
+        try:
+            from agents.knowledge.skill_index import skill_index_prompt
+            return skill_index_prompt(max_chars)
+        except Exception:
+            return ""
+
+    def _build_workshop_summary(self, max_chars: int) -> str:
+        """Tell the personas their workshop exists and what is in it.
+
+        ARCH-ENG-198: THE WORKSHOP WAS BUILT, GATED, AND NEVER ANNOUNCED.
+
+        `agents/knowledge/workshop.py` is 889 lines with proposals, research,
+        scripts, applications, accounts, payment methods, deliverables, templates,
+        notes, search and summaries. It is exposed as tools
+        (`workshop_read`/`list`/`write`/`mkdir`/`storage`), the mutating ones are
+        gated behind `_require_mutation_capability` (ARCH-ENG-164/165), and
+        `workshop_read` is hardened against secret leakage (ARCH-ENG-134).
+
+        But `get_workspace_summary()` had **zero callers**. So the personas had no
+        way to learn the workshop existed unless the operator happened to ask.
+        They would start a Live session, be asked to earn money, and reason from
+        an empty mental model while several hundred megabytes of their own prior
+        work sat unused one directory away.
+
+        This is the same defect class as the stale caches in v2.1.114 -- a thing
+        that exists, is correct, and is simply never mentioned.
+
+        FRAMING, deliberately: the block states that these are the operator's own
+        prior artifacts, that they are NOT verified earnings, and that writing
+        still goes through the approval-gated tools. Without that, a summary of
+        13 past proposals reads to a model as 13 completed jobs.
+
+        Same contract as `_build_opportunity_board`: bounded, elastic, returns ""
+        on any failure, and never raises into the context builder.
+        """
+        if max_chars <= 0:
+            return ""
+        try:
+            from agents.knowledge.workshop import get_workshop
+            summary = get_workshop().get_workspace_summary()
+        except Exception:
+            return ""
+        if not summary or not str(summary).strip():
+            return ""
+
+        header = (
+            "## YOUR WORKSHOP (your own prior work — NOT verified earnings)\n"
+            "This is the shared workshop on disk: files, proposals, research and "
+            "accounts you or a previous session produced. Read it with the "
+            "workshop_read tool, and add to it with the approval-gated "
+            "workshop_write. Nothing listed here is proof of payment, and a file "
+            "you wrote earlier is not evidence that a client accepted it."
+        )
+        block = header + "\n" + str(summary).strip()
+        if len(block) > max_chars:
+            # Trim the summary, never the header: the framing is the part that
+            # stops a pile of prior artifacts reading as completed income.
+            room = max(0, max_chars - len(header) - 1)
+            block = header + "\n" + str(summary).strip()[:room]
+        return block
 
     def _build_opportunity_board(self, max_chars: int) -> str:
         """Return the visible opportunity board, bounded to *max_chars*.
@@ -2668,6 +3387,169 @@ class DialogueTab(QWidget):
             return ""
         return header + "\n" + "\n".join(rows)
 
+    # -- A5: convergence plan -------------------------------------------------
+    def _convergence_plans_dir(self):
+        """Where convergence plans are written (.hermes/plans by default).
+
+        Overridable per-instance (and via MRBOT_PLANS_DIR in the pure module)
+        so tests never touch the operator's real plans directory.
+        """
+        override = getattr(self, "_convergence_plans_override", "") or ""
+        if override:
+            return override
+        from agents.dialogue import convergence_plan as _cp
+        return str(_cp.plans_dir())
+
+    def _is_navigator_gate_speaker(self, speaker: str) -> bool:
+        """True when *speaker* is the navigator (non-driver) tier.
+
+        The binary APPROVED/BLOCKED gate belongs to the navigator turn
+        (LIFECYCLE phases 2 and 4), so a driver's own "approved" must never be
+        read as a convergence decision.
+        """
+        try:
+            return self._tier_for_speaker(speaker) != "full"
+        except Exception:
+            return speaker != _BIG
+
+    def _convergence_committed_action(self, speaker: str):
+        """The concrete action this convergence committed to, or None.
+
+        The lifecycle asks the navigator for a gate twice: phase 2 (a veto on
+        the *proposal*, before any commitment) and phase 4 (the go/no-go on the
+        driver's committed ACTION/PLATFORM/EXPECTED). Only the latter is a
+        convergence — so a concrete committed action must already exist. An
+        approval with nothing committed behind it would write a content-free
+        plan and crowd the real one out of later-turn context.
+        """
+        proposal = getattr(self, "_active_proposal", None) or {}
+        if not proposal.get("action"):
+            from agents.dialogue import convergence_plan as _cp
+            proposal = _cp.find_action_proposal(
+                getattr(self, "conversation_history", []) or []) or {}
+        return proposal if proposal.get("action") else None
+
+    def _convergence_candidate(self):
+        """The candidate the board is showing (same source as the board)."""
+        provider = getattr(self, "_visible_opportunity_entries", None)
+        entries = None
+        if callable(provider):
+            try:
+                _owner, entries = provider()
+            except Exception:
+                entries = None
+        if not entries:
+            try:
+                owner = self.parent()
+                while owner is not None and not hasattr(
+                        owner, "opportunity_portfolio"):
+                    owner = owner.parent()
+                if owner is not None:
+                    entries = list(owner.opportunity_portfolio.list_all())
+            except Exception:
+                entries = None
+        return entries[0] if entries else None
+
+    def _maybe_record_convergence(self, speaker: str, response: str) -> None:
+        """A5: on an APPROVED navigator gate, record the converged plan.
+
+        Purely additive — the existing APPROVED/BLOCKED decision logic is
+        untouched. Builds the four-section plan (steps / requirements / risks /
+        next action) from this turn's own content, keeps it in memory for the
+        current turn, and persists ONE markdown file per convergence so later
+        turns read the commitment back instead of re-planning.
+
+        Defensive by contract: a plan-write failure (read-only disk, bad path)
+        must never abort a dialogue turn, so every step is guarded.
+        """
+        try:
+            from agents.dialogue import convergence_plan as _cp
+            if not _cp.is_convergence_approval(response):
+                return  # BLOCKED (or no gate): never a convergence
+            if not self._is_navigator_gate_speaker(speaker):
+                return  # the gate belongs to the navigator, not the driver
+            proposal = self._convergence_committed_action(speaker)
+            if not proposal:
+                # The navigator approved a PROPOSAL (phase 2), not a
+                # committed plan (phase 4). Nothing has converged yet.
+                return
+            candidate = self._convergence_candidate()
+            digest = None
+            if candidate is not None:
+                try:
+                    from agents.dialogue.opportunity_analysis import (
+                        analyse_candidate)
+                    digest = analyse_candidate(candidate)
+                except Exception:
+                    digest = None
+            plan = _cp.build_convergence_plan(
+                goal=getattr(self, "goal", "") or "",
+                speaker=speaker,
+                gate_text=response,
+                proposal=proposal,
+                candidate=candidate,
+                digest=digest,
+            )
+            self._convergence_plan = plan
+            path = ""
+            try:
+                path = _cp.write_convergence_plan(
+                    plan, directory=self._convergence_plans_dir())
+            except Exception as exc:
+                self.append_system(
+                    "Convergence plan not persisted (" + str(exc)
+                    + "); the plan stays in this turn's context only.")
+            self._convergence_plan_path = path
+            if path:
+                self.append_system(
+                    "Convergence recorded: " + os.path.basename(path))
+        except Exception:
+            # A plan failure is never a dialogue failure.
+            pass
+
+    def _build_convergence_plan_context(self, max_chars: int) -> str:
+        """The converged plan as a read-only context block (bounded).
+
+        Same promotion path as the opportunity board: the in-memory plan for
+        the current session, otherwise the persisted file read back from
+        .hermes/plans/ so a restart still surfaces the commitment.
+        """
+        if max_chars <= 0:
+            return ""
+        try:
+            from agents.dialogue import convergence_plan as _cp
+            plan = getattr(self, "_convergence_plan", None)
+            if isinstance(plan, dict) and plan:
+                return _cp.plan_context_block(plan, max_chars=max_chars)
+            path = getattr(self, "_convergence_plan_path", "") or ""
+            if not path:
+                # A5 (restart-safe): a fresh session has no recorded path,
+                # so fall back to the newest persisted plan for the ACTIVE
+                # goal. _convergence_plans_dir() already honors the
+                # per-instance override, so an isolated directory stays
+                # isolated; marker-gating means an operator's own plan file
+                # is never mistaken for a convergence.
+                path = _cp.latest_convergence_plan(
+                    self._convergence_plans_dir(),
+                    goal=getattr(self, "goal", "") or "")
+            if not path:
+                return ""
+            stored = _cp.read_convergence_plan(path, max_chars=max_chars)
+            if not stored:
+                return ""
+            header = (
+                "## CONVERGENCE PLAN (read-only — restored from "
+                + os.path.basename(path) + ")\n"
+                "The pair already converged on this plan and the navigator "
+                "approved it. Work the steps below; do not restart planning. "
+                "Registration and any account or payment action still requires "
+                "human approval.\n\n"
+            )
+            block = header + stored
+            return block[:max_chars] if len(block) > max_chars else block
+        except Exception:
+            return ""
+
     def _get_control_context(self) -> str:
         """Build the control-state context string for the active turn."""
         parts = []
@@ -2694,7 +3576,17 @@ class DialogueTab(QWidget):
         speaker: str,
         tool_event: dict,
     ):
-        """Record a verified tool event and render it separately from persona text."""
+        """Record a tool event and render it separately from persona text.
+
+        ARCH-ENG-173: "Record a VERIFIED tool event" was the old docstring, and
+        the body did not check. It set `real_evidence = True`, reset the live
+        progress guard, and printed "[TOOL] actual tool call: ..." for EVERY
+        event regardless of status. So a BLOCKED tool, an errored tool, and —
+        worst — an approval-queue failure where the tool provably never ran were
+        all shown to the operator as real tool activity, and each silenced the
+        "you are not making progress" nudge. A persona could therefore stall
+        indefinitely behind a tool that could never succeed.
+        """
         name = tool_event.get("name", "unknown")
         status = tool_event.get("status", "unknown")
         result_preview = tool_event.get("result_preview", "")
@@ -2703,11 +3595,19 @@ class DialogueTab(QWidget):
             speaker,
             f"Tool event: {name} status={status} source={source}.",
         )
-        self._dialogue_control_ledger[-1]["real_evidence"] = True
-        # A real tool ran: reset the live progress guard so the loop does not
-        # nudge personas that are actively gathering evidence.
-        self._live_turns_since_evidence = 0
-        bits = [f"[TOOL] actual tool call: {name}"]
+        # ARCH-ENG-173: only an EXECUTED tool is evidence. The flag is optional
+        # so an older emitter that lacks it still behaves correctly.
+        executed = tool_event.get("executed")
+        if executed is None:
+            executed = status == "executed"
+        if executed:
+            self._dialogue_control_ledger[-1]["real_evidence"] = True
+            # A real tool ran: reset the live progress guard so the loop does
+            # not nudge personas actively gathering evidence.
+            self._live_turns_since_evidence = 0
+            bits = [f"[TOOL] actual tool call: {name}"]
+        else:
+            bits = [f"[TOOL] tool call did NOT run: {name} (status={status})"]
         # Truncate preview for display but mark it clearly so the operator
         # knows it's a preview, not the full result.
         preview_display = result_preview
@@ -2733,9 +3633,22 @@ class DialogueTab(QWidget):
 class DialogueWorker(QThread):
     """Background worker for dialogue inference (persona-driven)."""
 
-    finished = Signal(str, str)  # response, speaker
+    # ARCH-ENG-168: this was `finished = Signal(str, str)`, which SHADOWS
+    # `QThread.finished()`. QThread already defines a zero-argument `finished`
+    # signal that Qt emits from C++ when the thread stops; redefining it with a
+    # different arity rebinds that name to the Python signal, so Qt's own
+    # completion emission resolves to a two-argument slot. Consequences: the
+    # standard `worker.finished.connect(worker.deleteLater)` idiom breaks on an
+    # arity mismatch, and Qt-internal completion handling can raise inside the
+    # C++ event dispatch -- the `Qt6Core 0xc0000409` class this app has fought
+    # before.
+    #
+    # It carries a response, so it is not "finished" in the Qt sense anyway: it
+    # means "this turn produced a reply". Named for what it means.
+    response_ready = Signal(str, str)  # response, speaker
+
     progress = Signal(str, str, bool)  # speaker, text, running
-    tool_activity = Signal(str, dict)  # speaker, tool_event
+    tool_activity = Signal(str, str, dict)  # speaker, tool_name, tool_event
     gpu_progress = Signal(int, int, float)  # slot, tok_count, elapsed_s (ARCH-ENG-101)
 
     def __init__(self, brain, context, history, speaker, system_prompt=None,
@@ -2888,8 +3801,28 @@ class DialogueWorker(QThread):
         return " ".join(bits)
 
     def cancel(self):
-        """Request cancellation; the provider call remains non-blocking to Qt."""
+        """Request cancellation; the provider call remains non-blocking to Qt.
+
+        ARCH-ENG-169: this set ONLY `_cancelled`. `main.py` additionally calls
+        `QThread.requestInterruption()`, but nothing in this class ever polled
+        `isInterruptionRequested()` — so on the shutdown path the only signal
+        the worker received was a flag it checks BETWEEN operations. A worker
+        blocked in a CPU-model HTTP read before its first token had no way to
+        observe either, and `main.py` then discarded the result of
+        `thread.wait(5000)`, so the QThread could still be running when Qt
+        destroyed it: "QThread: Destroyed while thread is still running" — the
+        `Qt6Core 0xc0000409` abort class.
+
+        `run()` and the stream callback now poll `isInterruptionRequested()` as
+        well, so both the Qt-standard request and the internal flag have teeth.
+        """
         self._cancelled = True
+        # Also raise Qt's own interruption flag, so `run()` can observe it via
+        # the standard API rather than only the private attribute.
+        try:
+            self.requestInterruption()
+        except RuntimeError:
+            pass          # already finished; nothing to interrupt
 
     def _ensure_model_selected(self):
         """Resolve a loaded server model without touching the GUI thread."""
@@ -2903,9 +3836,25 @@ class DialogueWorker(QThread):
         if selected and selected.lower() != "unknown":
             self.brain.model = selected
 
+    def _stop_requested(self) -> bool:
+        """True when EITHER cancellation mechanism has fired (ARCH-ENG-169).
+
+        The internal flag is checked between operations; Qt's interruption flag
+        is what `main.py`'s shutdown path raises. Polling only one of them is how
+        a worker survives teardown — so `cancel()` raises BOTH and this reads
+        BOTH, and `isInterruptionRequested()` is guarded because it throws once
+        the underlying `QThread` object is gone.
+        """
+        if self._cancelled:
+            return True
+        try:
+            return bool(self.isInterruptionRequested())
+        except RuntimeError:
+            return False
+
     def run(self):
         try:
-            if self._cancelled:
+            if self._stop_requested():
                 return
             self._ensure_model_selected()
             self.progress.emit(self.speaker, "", True)
@@ -2914,7 +3863,7 @@ class DialogueWorker(QThread):
                 kwargs["system_prompt"] = self.system_prompt
 
             def on_stream(chunk):
-                if self._cancelled:
+                if self._stop_requested():
                     # Abort the blocking provider read so cancel() has teeth:
                     # raising out of the per-chunk callback propagates through
                     # the streaming generator and unblocks run() immediately
@@ -2943,7 +3892,7 @@ class DialogueWorker(QThread):
             def on_tool(tool_event):
                 # Emit each verified tool call/result once so the tab can render
                 # it separately from persona text and record real evidence.
-                if self._cancelled or not tool_event:
+                if self._stop_requested() or not tool_event:
                     return
                 key = (
                     tool_event.get("name"),
@@ -2970,17 +3919,17 @@ class DialogueWorker(QThread):
             if self.images:
                 kwargs["images"] = self.images
             response = self.brain.chat(self.context, self.history, **kwargs)
-            if self._cancelled:
+            if self._stop_requested():
                 return
             
-            # Anti-repetition check
+            # Anti-repetition check (ARCH-ENG-232 / AV-01)
             if self.anti_repetition and (
                 self._is_bad_dialogue_response(response)
                 or self._is_repetitive(response)
             ):
                 # Try again with a stronger prompt
                 for attempt in range(self.max_retries):
-                    if self._cancelled:
+                    if self._stop_requested():
                         return
                     retry_context = self.context + (
                         "\n\n[RETRY REQUIRED: Ignore model identity boilerplate and prior drafts. "
@@ -3011,15 +3960,41 @@ class DialogueWorker(QThread):
                                                          int(_base * 1.5))
                     response = self.brain.chat(
                         retry_context, self.history, **retry_kwargs)
-                    if self._cancelled:
+                    if self._stop_requested():
                         return
-                    if not self._is_bad_dialogue_response(response):
+                    # ARCH-ENG-232: the exit test must cover BOTH halves of
+                    # the entry test. It previously re-checked only
+                    # `_is_bad_dialogue_response`, so a retry that stopped being
+                    # "bad" but stayed repetitive was accepted as a recovery.
+                    if not (self._is_bad_dialogue_response(response)
+                            or self._is_repetitive(response)):
                         break
+                else:
+                    # ARCH-ENG-232: every attempt was rejected. The loop used to
+                    # fall out of the `for` here with the REJECTED text still
+                    # bound to `response`, and the two emits below wrote it into
+                    # the shared transcript -- so the verdict computed at :3834
+                    # and :3872 was silently discarded whenever the retries ran
+                    # out, and the validator's own docstring claim ("rejected
+                    # before it can enter the shared transcript") was false on
+                    # exactly the path that needed it.
+                    #
+                    # `_safe_fallback_response` already exists for this case --
+                    # its docstring is literally "Return a bounded, phase-aware
+                    # fallback when retries are exhausted" -- and it had three
+                    # tests but ZERO production callers. The tests pinned the
+                    # text generator and never drove the worker, which is why
+                    # the suite stayed green while the caller was missing.
+                    #
+                    # `for/else` fires when the loop completes without `break`,
+                    # and also when `max_retries == 0` so the loop body never
+                    # runs. That second case matters: a rejected FIRST response
+                    # used to reach the emit with no retry at all.
+                    response = self._safe_fallback_response()
 
-            
             response = response or "(empty)"
             self.progress.emit(self.speaker, response, False)
-            self.finished.emit(response, self.speaker)
+            self.response_ready.emit(response, self.speaker)
         except _WorkerCancelled:
             # Cancelled mid-read (ARCH-ENG-102): exit quietly. Emitting an
             # error here would feed a bogus "Error:" turn into the transcript
@@ -3028,7 +4003,7 @@ class DialogueWorker(QThread):
         except Exception as e:
             error_response = f"Error: {str(e)}"
             self.progress.emit(self.speaker, error_response, False)
-            self.finished.emit(error_response, self.speaker)
+            self.response_ready.emit(error_response, self.speaker)
     
     def _is_repetitive(self, response: str) -> bool:
         """Check if the response is repetitive or stuck."""

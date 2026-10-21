@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 
 _PROTECTED_NONEMPTY_KEYS = {"BIG_BRAIN_MODEL", "SMALL_BRAIN_MODEL"}
@@ -115,8 +115,21 @@ def _env_write_refusal(path: Optional[Path] = None) -> str:
     return ""
 
 
-def set_env_values(values: dict, *, path: Optional[Path] = None) -> bool:
-    """Persist values atomically while preserving unknown keys and comments."""
+def set_env_values(
+    values: dict,
+    *,
+    path: Optional[Path] = None,
+    remove_keys: Optional[Set[str]] = None,
+) -> bool:
+    """Persist values atomically while preserving unknown keys and comments.
+
+    ARCH-ENG-314: ``remove_keys`` lists keys that must DISAPPEAR from the
+    file. The GUI's advanced llama.cpp controls express "unset" as
+    "no line at all" — a checked box once written ``(prefix_)CPU_MOE=true``
+    and no UI action could ever retract it, so the operator's unchecking was
+    silently reverted on every reload. A key that exists in BOTH ``values``
+    and ``remove_keys`` is written (the explicit value wins over removal).
+    """
     env = path or env_file_path()
     refusal = _env_write_refusal(path)
     if refusal:
@@ -124,6 +137,7 @@ def set_env_values(values: dict, *, path: Optional[Path] = None) -> bool:
     lines = _read_env_lines(env)
     keys = {key: (str(value) if value is not None else "")
             for key, value in values.items()}
+    removals = {key for key in (remove_keys or ()) if key not in keys}
     # Refuse to persist a value that is really a comment. This is what turned
     # the Nous key into the literal string "# Optional: Your Nous Research API
     # key" (every request then 401'd). An empty value is correct here; a
@@ -152,6 +166,10 @@ def set_env_values(values: dict, *, path: Optional[Path] = None) -> bool:
             if key in keys:
                 covered.add(key)
                 output.append(f"{key}={keys[key]}")
+                continue
+            if key in removals:
+                # Stale value for a control the operator has unset — the line
+                # goes, so the flag returns to llama.cpp's own default.
                 continue
         output.append(line)
     for key, value in keys.items():

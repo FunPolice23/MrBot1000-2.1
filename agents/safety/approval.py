@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 import os
 import sys
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -273,11 +274,17 @@ class HumanApprovalQueue:
         """Approve / deny / defer a pending item.
 
         Returns True if the item existed and was pending.
+
+        ARCH-ENG-166: the `_find` + status check ran BEFORE the lock was
+        acquired, so two threads (a GUI decision and the safety guard's
+        decision thread) could both observe PENDING and both proceed to decide
+        the same irreversible action. The whole check-then-act is now inside
+        one critical section, so an approval is decided exactly once.
         """
-        item = self._find(item_id)
-        if item is None or item.status != ApprovalStatus.PENDING:
-            return False
         with self._get_lock():
+            item = self._find(item_id)
+            if item is None or item.status != ApprovalStatus.PENDING:
+                return False
             item.status = decision
             item.decided_at = time.time()
             item.decided_by = decided_by
@@ -325,10 +332,22 @@ class HumanApprovalQueue:
     # ── Queries ────────────────────────────────────────────────────────────────
 
     def pending(self) -> List[ApprovalItem]:
-        return [i for i in self._items if i.status == ApprovalStatus.PENDING]
+        with self._get_lock():
+            return [i for i in self._items if i.status == ApprovalStatus.PENDING]
 
     def all(self) -> List[ApprovalItem]:
-        return list(self._items)
+        with self._get_lock():
+            return list(self._items)
+
+    # ARCH-ENG-166: `find_by_id` is the lookup every irreversible-action
+    # consumer uses to confirm a human decision (platform_submitter,
+    # live_trading, code_patch_service, SafetyGuard). It took NO lock while a
+    # single shared queue instance was mutated from GUI threads, the safety
+    # guard's decision thread, and every worker that enqueues — and `_items` is
+    # also TRUNCATED by the history bound, so a concurrent reader could observe
+    # a list mid-mutation. A torn read here is a financial-integrity bug. The
+    # lock is now taken across the lookup AND the restored-decided test, so the
+    # two cannot be evaluated against different states.
 
     def find_by_id(self, item_id: str) -> Optional[ApprovalItem]:
         """Look up an item by id, refusing decisions restored from a prior run.
@@ -343,15 +362,18 @@ class HumanApprovalQueue:
         from disk is returned normally: it authorizes nothing until a human
         decides it in this process. ``all()`` still exposes the full history.
         """
-        item = self._find(item_id)
-        if item is None:
-            return None
-        if item.id in self._restored_decided:
-            return None
-        return item
+        with self._get_lock():
+            item = self._find(item_id)
+            if item is None:
+                return None
+            if item.id in self._restored_decided:
+                return None
+            return item
 
     def items_for_kind(self, kind: ApprovalKind) -> List[ApprovalItem]:
-        return [i for i in self._items if i.kind == kind and i.status == ApprovalStatus.PENDING]
+        with self._get_lock():
+            return [i for i in self._items
+                    if i.kind == kind and i.status == ApprovalStatus.PENDING]
 
     def pending_count(self) -> int:
         return len(self.pending())
@@ -408,13 +430,23 @@ class HumanApprovalQueue:
             retained = {i.id for i in self._items}
             self._restored_decided &= retained
             self._decided_in_process &= retained
-            with open(self._log_path, "w", encoding="utf-8") as f:
+            # ARCH-ENG-265 (AM-02): write atomically, then replace. The old
+            # `open(..., "w")` + json.dump truncated the log first, so a crash
+            # mid-write left _load() with nothing to restore -- and the failure
+            # was swallowed by `except Exception: pass`. This file IS the
+            # human-decision record; losing it silently is not best-effort.
+            tmp_path = self._log_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(
                     [i.to_dict() for i in self._items],
                     f, indent=2,
                 )
-        except Exception:
-            pass  # persistence is best-effort
+            os.replace(tmp_path, self._log_path)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Approval-queue persistence failed (%s). Human decisions made "
+                "in this process are held in memory only and will not survive "
+                "a restart.", exc)
 
     def _load(self):
         """Restore persisted items from the JSON log (best-effort).

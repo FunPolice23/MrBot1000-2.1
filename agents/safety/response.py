@@ -167,12 +167,17 @@ def _remove_reasoning_channels(text: str) -> str:
 
 
 def _remove_think_blocks(text: str) -> str:
-    """Remove LFM/Gemma think blocks without exposing hidden reasoning."""
-    if not text:
-        return ""
-    text = re.sub(r"<think>.*?</think>", "", text,
-                  flags=re.IGNORECASE | re.DOTALL)
-    return text.strip()
+    """Remove LFM/Gemma think blocks without exposing hidden reasoning.
+
+    BE-01 (ARCH-ENG-239): this was one of four live case-differing copies of
+    the same match. It now delegates to the canonical matcher in
+    ``agents/brains/worker_thinking`` (case-insensitive, DOTALL); kept as a
+    thin documented alias because ``agents.safety.__init__`` and
+    ``agents.safety.calling`` re-export it under this name.
+    """
+    from agents.brains.worker_thinking import strip_think_blocks
+
+    return strip_think_blocks(text)
 
 
 def _visible_response_content(message: Any, profile: dict[str, Any] = None) -> str:
@@ -184,9 +189,13 @@ def _visible_response_content(message: Any, profile: dict[str, Any] = None) -> s
     ``reasoning_content`` carries the only visible output, fall back to it so
     the operator still receives a response instead of an opaque empty error.
 
-    If a ``profile`` is provided, use the family-specific thinking extractor
-    to strip inline ``<think>`` or ``<|channel>thought`` blocks from the
-    visible output.
+    If a ``profile`` is provided, strip the family-specific inline ``<think>``
+    or ``<|channel>thought`` blocks from the visible output. The logic is
+    inlined here on purpose: ARCH-ENG-262 (BE-02) deleted
+    ``model_profile.extract_thinking_from_content`` -- a superseded copy whose
+    `<|channel>thought` match was *less* tolerant than this one (no whitespace
+    allowance around the markers), and whose only consumer had already inlined
+    the better version.
     """
     content = getattr(message, "content", None) or ""
     reasoning = getattr(message, "reasoning_content", None)
@@ -207,7 +216,7 @@ def _visible_response_content(message: Any, profile: dict[str, Any] = None) -> s
         elif thinking_kind == "enable_thinking_param":
             # Qwen/DeepSeek: reasoning_content already handled above, but also
             # strip any leftover <think> blocks in content just in case.
-            cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL).strip()
+            cleaned = _remove_think_blocks(cleaned)
     return cleaned
 
 

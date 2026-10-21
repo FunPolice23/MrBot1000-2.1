@@ -2,12 +2,16 @@
 mrbot_cli — read-only CLI for inspecting a live or offline MrBot1000 runtime.
 
 Usage examples:
-    python -m agents.mrbot_cli providers           # brain servers + .env config
-    python -m agents.mrbot_cli providers --json    # same, as JSON
-    python -m agents.mrbot_cli models              # what llama-server reports on each port
-    python -m agents.mrbot_cli dialogue            # current DialogueTab state (offline file read)
-    python -m agents.mrbot_cli db-stats           # SQLite portfolio summary
-    python -m agents.mrbot_cli health              # one-line pass/fail per subsystem
+    # ARCH-ENG-267 (AR-01): the module lives at agents/services/mrbot_cli.py.
+    # `python -m agents.mrbot_cli ...` (the old form shown here) failed with
+    # ModuleNotFoundError for every documented command.
+    python -m agents.services.mrbot_cli providers           # brain servers + .env config
+    python -m agents.services.mrbot_cli providers --json    # same, as JSON
+    python -m agents.services.mrbot_cli models              # what llama-server reports on each port
+    python -m agents.services.mrbot_cli dialogue            # current DialogueTab state (offline file read)
+    python -m agents.services.mrbot_cli db-stats           # SQLite portfolio summary
+    python -m agents.services.mrbot_cli health              # one-line pass/fail per subsystem
+    python -m agents.services.mrbot_cli opportunities python  # keyword search, earning memory
 
 Secrets safety:
     Never prints full credential values. Endpoint URLs are public localhost
@@ -432,6 +436,65 @@ def cmd_health(args):
 
 # ── CLI wiring ────────────────────────────────────────────────────────────────
 
+def cmd_opportunities(args):
+    """Search the earning memory by keyword (ARCH-ENG-274, W-03).
+
+    ``EarningPipeline.search_opportunities_by_keyword`` implemented exactly
+    this lookup but had no caller at all, so the only keyword-driven view of
+    discovered opportunities was unreachable. The store is
+    ``earning_memory.db`` (``opportunity_memory.memory_data`` holds the JSON
+    record), so this is a read-only LIKE over it -- no pipeline, no model, no
+    network. The record shape is printed defensively: memory entries written
+    by older versions may omit any field.
+    """
+    db_path = REPO_ROOT / "earning_memory.db"
+    keyword = (args.keyword or "").strip()
+    if not keyword:
+        print("\n  mrbot-cli opportunities: keyword is required\n")
+        return
+    if not db_path.exists():
+        print(f"\n  Earning memory not found: {db_path}")
+        print("  (discovery writes it; run the app once first)\n")
+        return
+    limit = max(1, int(args.limit))
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT memory_type, memory_data FROM opportunity_memory "
+            "WHERE memory_data LIKE ? ORDER BY rowid DESC LIMIT ?",
+            (f"%{keyword}%", limit),
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        print(f"\n  Query failed: {exc}\n")
+        return
+
+    records = []
+    for row in rows:
+        try:
+            data = json.loads(row["memory_data"])
+        except Exception:
+            data = {}
+        records.append({
+            "type": row["memory_type"],
+            "title": data.get("title") or data.get("name") or "(untitled)",
+            "amount": data.get("min_amount")
+                      or data.get("estimated_usd_value") or 0,
+            "url": data.get("url") or "",
+        })
+
+    if getattr(args, "json", False):
+        print(json.dumps(records, indent=2))
+        return
+
+    print(f"\n  Keyword : {keyword}")
+    print(f"  Matches : {len(records)} (limit {limit})")
+    for rec in records:
+        print(f"  - [{rec['type']}] {rec['title']} (${rec['amount']})")
+    print()
+
+
 SUBCOMMANDS: Dict[str, Dict[str, Any]] = {
     "providers": {
         "func": cmd_providers,
@@ -467,6 +530,19 @@ SUBCOMMANDS: Dict[str, Dict[str, Any]] = {
         "func": cmd_health,
         "help": "One-line summary: .env, both servers, and SQLite DB presence.",
         "args": lambda p: None,
+    },
+    "opportunities": {
+        "func": cmd_opportunities,
+        "help": "Search discovered opportunities by keyword (offline, read-only).",
+        "args": lambda p: [
+            p.add_argument(
+                "keyword",
+                help="Substring to match in the stored opportunity record."),
+            p.add_argument("--limit", type=int, default=20,
+                           help="Maximum matches (default 20)."),
+            p.add_argument("--json", action="store_true",
+                           help="Output as JSON."),
+        ][0],  # side effects only
     },
 }
 SUBCOMMANDS["db"] = SUBCOMMANDS["db-stats"]  # alias

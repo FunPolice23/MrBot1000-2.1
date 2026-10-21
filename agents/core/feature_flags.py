@@ -28,7 +28,29 @@ _LEGACY_ENV = {
 
 
 def _truthy(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    """ARCH-ENG-203: delegate to the one canonical env parser.
+
+    This was a fifth independent parser for boolean environment values, and it
+    disagreed with the one reading the SAME variable.
+
+    `_LEGACY_ENV` maps `self_improvement` to `PIPELINE_ALLOW_SELF_IMPROVE`, and
+    `app/action_pipeline.py` reads that variable with `.lower() == "true"`.
+    So for `PIPELINE_ALLOW_SELF_IMPROVE=1`:
+
+        feature_enabled("self_improvement")  ->  True   (this function)
+        ActionPipeline.allow_self_improve    ->  False  (== "true")
+
+    Two components disagreed about whether self-improvement was permitted, over
+    a spelling an operator would reasonably write. Neither raised; the gate was
+    simply open on one path and closed on the other.
+
+    The default is False, which preserves the fail-closed contract documented on
+    `feature_enabled`: an unset variable, an empty one, or an unrecognised one
+    all leave the feature disabled. Only an explicit true token enables it.
+    """
+    from app.effects import env_bool
+
+    return env_bool("_truthy_input", False, env={"_truthy_input": value})
 
 
 def feature_enabled(name: str, env: Mapping[str, str] | None = None) -> bool:

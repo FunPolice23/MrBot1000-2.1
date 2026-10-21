@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Protocol
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox, QDoubleSpinBox
@@ -38,15 +38,174 @@ def _qt_object_alive(obj) -> bool:
             return False
 
 
-class ProviderLifecycleBackend:
-    """Provider-control implementations used by the Qt facade.
+# ARCH-ENG-194: THE MIXIN CONTRACT, WRITTEN DOWN.
+#
+# Every name below is something `ProviderLifecycleBackend` reads off `self` and
+# does NOT define itself. They are the facade's, not the backend's. Listing them
+# turns 47 implicit dependencies into a checked contract: the guard test asserts
+# each one exists on `DualBrainControl`, so removing or renaming one fails a test
+# instead of raising AttributeError when the operator clicks Start.
+#
+# The `bb_*` / `sb_*` entries are the llama-server parameter controls (context,
+# GPU layers, batch, threads, KV type, tensor split). They appear here because
+# the backend reads them to build the llama command line -- which is why a
+# settings-persistence gap in them shows up as a server that ignores the value.
+#
+# `big_brain`, `small_brain` and `parent` are supplied at runtime by the
+# application (brain instances and the Qt parent), so they are required but
+# cannot be verified by class inspection alone.
+class ProviderLifecycleHost(Protocol):
+    """What `ProviderLifecycleBackend` requires of the object it is mixed into."""
 
-    This backend is intentionally free of widget construction. Its methods
-    operate on the facade passed as ``self`` for compatibility during the
-    extraction; the next slice will replace the remaining dynamic dispatch
-    with explicit service calls.
+    # ?? Methods the backend calls ???????????????????????????????????????????
+    _set_loading: Callable[[bool, bool, str], None]
+    _record_start_failure: Callable[..., None]
+    _repopulate_model_combo: Callable[..., None]
+    _current_model_path: Callable[[bool], str]
+    _resolve_model_path: Callable[..., str]
+    _snapshot_settings_values: Callable[[], dict]
+    _brain_port: Callable[[bool], int]
+    _brain_models_url: Callable[[bool], str]
+    _discover_gguf_models: Callable[[bool], list]
+    _kill_llama_on_port: Callable[[int], list]
+    _persist_settings: Callable[[], None]
+    _restart_brain_with: Callable[..., None]
+
+    # ?? State the backend reads or mutates ??????????????????????????????????
+    provider_manager: Any
+    provider_checker: Any
+    runtime: Any
+    provider_probed: bool
+    _PLACEHOLDER_MARKERS: Any
+    _external_lifecycle_finished: Any
+    small_brain_model_changed: Any
+    big_brain_model_changed: Any
+    log_display: Any
+    start_all_btn: Any
+    stop_all_btn: Any
+    auto_start_check: Any
+    show_server_consoles_check: Any
+    # Big-brain llama controls
+    bb_status: Any
+    bb_model_label: Any
+    bb_ctx_spin: Any
+    bb_gpu_layers_spin: Any
+    bb_batch_spin: Any
+    bb_threads_spin: Any
+    bb_split_combo: Any
+    bb_kv_combo: Any
+    bb_start_btn: Any
+    bb_stop_btn: Any
+    # Small-brain llama controls
+    sb_status: Any
+    sb_model_label: Any
+    sb_ctx_spin: Any
+    sb_gpu_layers_spin: Any
+    sb_batch_spin: Any
+    sb_threads_spin: Any
+    sb_split_combo: Any
+    sb_kv_combo: Any
+    sb_start_btn: Any
+    sb_stop_btn: Any
+    # Supplied at runtime by the application
+    big_brain: Any
+    small_brain: Any
+    parent: Any
+
+
+#: Every member `ProviderLifecycleHost` requires, as plain strings.
+#:
+#: Derived from the class annotations plus the three runtime-supplied names, so
+#: the guard test has a single list to check rather than re-deriving it (which
+#: would let a rename in the backend silently shrink the contract).
+HOST_METHODS: tuple = (
+    "_set_loading", "_record_start_failure", "_repopulate_model_combo",
+    "_current_model_path", "_resolve_model_path", "_snapshot_settings_values",
+    "_brain_port", "_brain_models_url", "_discover_gguf_models",
+    "_kill_llama_on_port", "_persist_settings", "_restart_brain_with",
+)
+
+HOST_ATTRS: tuple = (
+    "provider_manager", "provider_checker", "runtime", "provider_probed",
+    "_PLACEHOLDER_MARKERS", "_external_lifecycle_finished",
+    "small_brain_model_changed", "big_brain_model_changed", "log_display",
+    "start_all_btn", "stop_all_btn", "auto_start_check",
+    "show_server_consoles_check",
+    "bb_status", "bb_model_label", "bb_ctx_spin", "bb_gpu_layers_spin",
+    "bb_batch_spin", "bb_threads_spin", "bb_split_combo", "bb_kv_combo",
+    "bb_start_btn", "bb_stop_btn",
+    "sb_status", "sb_model_label", "sb_ctx_spin", "sb_gpu_layers_spin",
+    "sb_batch_spin", "sb_threads_spin", "sb_split_combo", "sb_kv_combo",
+    "sb_start_btn", "sb_stop_btn",
+    # Supplied at runtime by the application, so class inspection cannot verify
+    # them; they are listed so the omission is deliberate rather than forgotten.
+    "big_brain", "small_brain", "parent",
+)
+
+#: True when `host` provides everything the backend reads off `self`.
+#:
+#: Runtime-evaluable so the check works on an INSTANCE, where instance
+#: attributes (the controls created during `setup_ui`) actually exist. A
+#: class-level check would report all 32 attributes as missing, because they are
+#: assigned while the UI is built rather than declared on the class.
+def host_contract_satisfied(host) -> list:
+    """Return the names in `HOST_METHODS` + `HOST_ATTRS` that `host` lacks.
+
+    Empty list means the mixin can be used with this object.
+    """
+    missing = []
+    for name in tuple(HOST_METHODS) + tuple(HOST_ATTRS):
+        if not hasattr(host, name):
+            missing.append(name)
+    return missing
+
+class ProviderLifecycleBackend:
+    """Provider-control implementations, MIXED IN to a Qt facade.
+
+    ARCH-ENG-194: THE COUPLING IS NOW DECLARED AND CHECKED, NOT DISCOVERED.
+
+    This backend is intentionally free of widget construction, but it is NOT
+    independent of its host. Measured across the two files:
+
+      * 64 methods here, 104 on ``DualBrainControl``, with only two shared names
+        (``_log`` and ``cleanup``). Nothing is duplicated -- this is a clean
+        horizontal split of provider control away from widget code, which is
+        the right shape.
+      * but this backend references **115 distinct** ``self.<attr>``, and only
+        **48** are defined here. The other **67 live on the widget**: 12 widget
+        *methods* (``_set_loading`` x19, ``_record_start_failure`` x6,
+        ``_repopulate_model_combo`` x6, ``_current_model_path`` x5,
+        ``_brain_port`` x4, ``_resolve_model_path`` x3, ``_snapshot_settings_values``
+        x2, ``_brain_models_url``, ``_discover_gguf_models``, ``_kill_llama_on_port``,
+        ``_persist_settings``, ``_restart_brain_with``) and 55 data attributes
+        (``provider_checker`` x12, ``runtime`` x8, ``sb_status`` x5, the
+        ``sb_*`` controls ``_set_loading`` drives, ``_persist_dirty``,
+        ``_persist_thread``, ``we_started_*``, ...).
+
+    So ``self`` here means "the facade", and that was previously only knowable by
+    grepping. ``ProviderLifecycleHost`` below states the requirement
+    explicitly, and ``test_arch_eng_194_mixin_contract.py`` asserts every member
+    of it exists on the real widget -- so dropping one becomes a test failure
+    instead of an ``AttributeError`` discovered when a user clicks Start.
+
+    WHY COMPOSITION WAS NOT DONE INSTEAD. Passing the widget as ``self`` is
+    semantically identical to mixing it in, so "converting" would be a rename,
+    not a refactor: ~180 ``self.`` sites inside this file to rewrite, for zero
+    architectural gain, against a test surface that already subclasses and
+    monkey-patches these methods. Real decoupling needs a view object exposing
+    55 attributes and 12 methods -- a rewrite, not a remediation, and not one
+    that should be attempted without a dedicated test pass over the Providers &
+    GPU tab.
+
+    What this buys instead: the next person who considers the 180-site rewrite
+    finds the measured numbers and the reason here, rather than rediscovering
+    them.
     """
 
+    # ARCH-ENG-252 (V-01) / ARCH-ENG-253 (V-02): the unreachable temperature
+    # preset table and the duplicate llama model probe were deleted. The spin
+    # box is the only temperature control, and model selection goes through the
+    # live provider lifecycle.
     def _refresh_small_brain_models(self):
         """Populate the Small Brain dropdown with ALL local .gguf, selecting the
         currently-loaded model if the server is up."""
@@ -77,21 +236,6 @@ class ProviderLifecycleBackend:
             self._log(f"Big Brain model refresh (server offline): {type(e).__name__}")
         self._repopulate_model_combo(False, loaded)
 
-    def _get_llama_model(self, port: int, prefer: str = "") -> str:
-        """Get model name from llama-server API. Returns prefer if available, else first model."""
-        try:
-            req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                models = ProviderStatusChecker.extract_model_ids(data)
-                if prefer and prefer in models:
-                    return prefer
-                if models:
-                    return models[0]
-        except Exception:
-            pass  # best-effort model fallback
-        return ""
-
     # ═══════════════════════════════════════════════════════════════════
     # VRAM-AFFINITY GUARD (warn-but-allow, v2.0.37c)
     # ═══════════════════════════════════════════════════════════════════
@@ -111,6 +255,7 @@ class ProviderLifecycleBackend:
             r = subprocess.run(
                 ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW)
             if r.returncode != 0:
                 return None
@@ -213,23 +358,28 @@ class ProviderLifecycleBackend:
             self._log(f"⚠️ {('Small' if small else 'Big')} Brain: {result['warning']}")
         return result["value"]
 
-    def _validate_model_before_launch(self, small: bool, model_path: str) -> bool:
-        """Reject malformed GGUFs before spawning llama-server."""
-        try:
-            from agents.providers.gguf_meta import validate_model
-            errors = validate_model(model_path)
-        except Exception as exc:
-            self._log(f"⚠️ Model preflight skipped: {exc}")
-            return True
-        if not errors:
-            return True
-        label = "Small" if small else "Big"
-        self._log(
-            f"❌ {label} Brain model preflight failed: {errors[0]}. "
-            "Download a complete GGUF matching the model architecture and llama.cpp build.")
-        self._set_loading(small, False, "")
-        return False
-    
+    # ARCH-ENG-218: `_validate_model_before_launch` REMOVED.
+    #
+    # This was a GGUF preflight that nothing called. It was not, however, a
+    # missing safety check: `BrainLaunchPrepWorker.run()` performs the identical
+    # preflight and ABORTS the launch when it fails --
+    #
+    #     # 1) GGUF preflight -- reject malformed files before spawning.
+    #     errors = validate_model(model)
+    #     if errors:
+    #         self.prep_finished.emit(self.small, False, "... preflight failed ...", None)
+    #         return
+    #
+    # That is the better placement anyway: it runs on the prep worker, before a
+    # command is built or a process spawned, and reports through the
+    # `prep_finished` signal the UI already listens to. This copy returned a
+    # bool no one read, and set loading state the UI never saw.
+    #
+    # So it was a SUPERSEDED DUPLICATE, not a hole. Both facts are worth
+    # stating, because "zero callers" on its own says nothing -- this function
+    # had none, and the safety property it was written for was fully enforced
+    # by a method twenty lines away in a different file.
+
     def _show_vram_warning(self, small: bool, model_path: str, need: float, free: float, result: dict):
         """Show VRAM warning dialog on GUI thread."""
         if small:
@@ -263,10 +413,28 @@ class ProviderLifecycleBackend:
         """
         self._begin_stop_brain(True)
 
+    def _runtime_from_settings(self):
+        """Build the runtime from the persisted roster, flushing pending edits.
+
+        ARCH-ENG-153: ``BrainRosterPanel._on_changed`` debounces its write
+        behind a 400 ms timer, and this is a READ of what that write
+        produced. Calling ``DualBrainRuntime.from_settings()`` directly meant
+        an edit followed by Start inside the window launched the previous
+        model. Every read site goes through here so a new caller cannot
+        reintroduce the lag. Never raises.
+        """
+        try:
+            from gui.widgets.brain_roster_panel import flush_pending_roster_edit
+            flush_pending_roster_edit(getattr(self, "brain_roster_panel", None))
+        except Exception:
+            pass
+        from agents.runtime.dual_brain import DualBrainRuntime
+        return DualBrainRuntime.from_settings()
+
     def _begin_stop_brain(self, small: bool):
         label = "Small Brain" if small else "Big Brain"
         from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-        runtime = self.runtime or DualBrainRuntime.from_env()
+        runtime = self.runtime or self._runtime_from_settings()
         cfg = runtime.config(BrainRole.SMALL if small else BrainRole.BIG)
         if cfg.provider != "llamacpp":
             model = cfg.model
@@ -321,7 +489,7 @@ class ProviderLifecycleBackend:
         self._set_start_in_progress(small, True)
         try:
             from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-            runtime = DualBrainRuntime.from_env()
+            runtime = self._runtime_from_settings()
             cfg = runtime.config(BrainRole.SMALL if small else BrainRole.BIG)
             self._log(f"Checking {label}...")
             worker = ProviderProbeWorker(
@@ -361,18 +529,26 @@ class ProviderLifecycleBackend:
         """Start Small Brain on its configured local hardware/provider."""
         try:
             from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-            rt = DualBrainRuntime.from_env()
+            rt = self._runtime_from_settings()
             cfg = rt.config(BrainRole.SMALL)
             if not cfg.enabled:
                 self._log("ℹ️ Small Brain is disabled in Settings; no local server started.")
                 self._set_loading(True, False, "")
+                # ARCH-ENG-178: every terminal path must release the re-entrancy
+                # guard, or the brain logs "start already in progress" forever and
+                # can never be started again in this session.
+                self._clear_start_in_progress(True)
                 return
             active_local = self.provider_manager.resolve_enabled_provider(local=True)
             if active_local != cfg.provider:
                 self._log(f"ℹ️ Small Brain has no active {cfg.provider} route; select or enable a provider in Settings.")
                 self._set_loading(True, False, "")
+                self._clear_start_in_progress(True)      # ARCH-ENG-178
                 return
             if cfg.provider != "llamacpp":
+                # Hands off to the external-brain path, which owns the terminal
+                # transition from there.
+                self._clear_start_in_progress(True)      # ARCH-ENG-178
                 self._start_external_brain(True, cfg)
                 return
             detected_gpu_indexes = {gpu.index for gpu in self.provider_manager.get_gpus()}
@@ -494,16 +670,20 @@ class ProviderLifecycleBackend:
         values = self._snapshot_settings_values()
         if not values:
             return
+        # ARCH-ENG-314: ride the stale-key set through the writer call chain so
+        # un-setting an advanced flag persists exactly as a setting does.
+        remove_keys = set(getattr(self, "_stale_env_keys", None) or ())
         self._persist_dirty = False
         # Arm the drain BEFORE spawning the writer (see _persist_settings_async).
         self._arm_persist_drain()
-        self._start_persist_write(values)
+        self._start_persist_write(values, remove_keys)
 
-    def _start_persist_write(self, values: dict):
+    def _start_persist_write(self, values: dict, remove_keys=None):
         """Spawn the background .env writer. Called on the GUI thread only."""
         import threading
         self._persist_thread = threading.Thread(
-            target=self._persist_settings_worker, args=(values,),
+            target=self._persist_settings_worker,
+            args=(values, set(remove_keys or ())),
             name="persist-settings", daemon=True)
         self._persist_thread.start()
 
@@ -556,7 +736,9 @@ class ProviderLifecycleBackend:
                 self._stop_persist_drain()
                 return
             if values:
-                self._start_persist_write(values)
+                self._start_persist_write(
+                    values,
+                    set(getattr(self, "_stale_env_keys", None) or ()))
                 return
         # Idle: nothing queued, nothing left to write. The worker sets its
         # confirmation AFTER its final write, so stay armed for one extra tick
@@ -579,11 +761,11 @@ class ProviderLifecycleBackend:
             except Exception:
                 pass
 
-    def _persist_settings_worker(self, values: dict):
+    def _persist_settings_worker(self, values: dict, remove_keys=None):
         """Background .env writer — pure file I/O, never touches Qt."""
-        self._write_env_values(values)
+        self._write_env_values(values, remove_keys=remove_keys)
 
-    def _write_env_values(self, values: dict):
+    def _write_env_values(self, values: dict, remove_keys=None):
         """Background .env writer — pure file I/O, no Qt/widget access."""
         try:
             import pathlib
@@ -592,13 +774,14 @@ class ProviderLifecycleBackend:
             except Exception:
                 return
             try:
-                set_env_values(values)
+                set_env_values(values, remove_keys=remove_keys)
             except EnvWriteRefused:
                 return
             except Exception:
                 repo_env = pathlib.Path(__file__).resolve().parents[2] / ".env"
                 try:
-                    set_env_values(values, path=repo_env)
+                    set_env_values(
+                        values, path=repo_env, remove_keys=remove_keys)
                 except Exception:
                     return
             for k in ("SMALL_BRAIN_MODEL", "BIG_BRAIN_MODEL", "SHOW_BRAIN_CONSOLES"):
@@ -674,18 +857,21 @@ class ProviderLifecycleBackend:
         """Start Big Brain (llama-server on 5060 Ti, port 1234)."""
         try:
             from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-            rt = DualBrainRuntime.from_env()
+            rt = self._runtime_from_settings()
             cfg = rt.config(BrainRole.BIG)
             if not cfg.enabled:
                 self._log("ℹ️ Big Brain is disabled in Settings; no local server started.")
                 self._set_loading(False, False, "")
+                self._clear_start_in_progress(False)     # ARCH-ENG-178
                 return
             active_local = self.provider_manager.resolve_enabled_provider(local=True)
             if active_local != cfg.provider:
                 self._log(f"ℹ️ Big Brain has no active {cfg.provider} route; select or enable a provider in Settings.")
                 self._set_loading(False, False, "")
+                self._clear_start_in_progress(False)     # ARCH-ENG-178
                 return
             if cfg.provider != "llamacpp":
+                self._clear_start_in_progress(False)     # ARCH-ENG-178
                 self._start_external_brain(False, cfg)
                 return
             self._log("Starting Big Brain (llama-server on 5060 Ti)...")
@@ -694,6 +880,7 @@ class ProviderLifecycleBackend:
             if not model:
                 self._log("❌ Big Brain: no model found. Set BIG_BRAIN_MODEL in .env or pick a real model, then Start.")
                 self._set_loading(False, False, "")
+                self._clear_start_in_progress(False)     # ARCH-ENG-178
                 return
             # Snapshot GUI values, then run the heavy I/O off-thread (see the
             # Small Brain path / _dispatch_launch_prep for the rationale).
@@ -852,6 +1039,7 @@ class ProviderLifecycleBackend:
             # VRAM (many seconds). Schedule a bounded re-probe so the row flips
             # Stopped -> Running once it's actually reachable (same contract as
             # the slots 0/1 reprobe path).
+            setattr(self, f"_slot_{slot}_reprobe_done", False)
             self._schedule_slot_reprobe(slot)
         else:
             self._log(f"❌ {label} failed to start")
@@ -860,24 +1048,68 @@ class ProviderLifecycleBackend:
     def _schedule_slot_reprobe(self, slot: int, attempts: int = 90):
         """Re-probe provider status until the just-launched slot server answers
         (or the bounded ~3 min budget runs out). Mirrors
-        ``_on_launch_success_reprobe`` for the extra slots (2+)."""
+        ``_on_launch_success_reprobe`` for the extra slots (2+).
+
+        ARCH-ENG-223: THE PROBE USED TO RUN ON THE GUI THREAD.
+
+        `check_llama_server` defaults to `timeout=10`
+        (`agents/providers/provider_lifecycle.py:53`), and this method is
+        invoked from a `QTimer.singleShot`. With the 2 s interval and a 90-attempt
+        budget that is up to 3 minutes of GUI-thread blocking HTTP.
+
+        The case this loop exists for is precisely the one that times out: a
+        just-launched llama-server accepts the TCP socket immediately but cannot
+        answer `/v1/models` until the model is resident in VRAM, which is many
+        seconds on a large local model. So the slow path is the NORMAL path here,
+        not an edge case.
+
+        Now it copies the pattern `_refresh_provider_status` uses 300 lines
+        below in this same file: one daemon thread per probe, skipped while the
+        previous one is still alive, with the reschedule already armed before
+        the thread starts so the GUI returns immediately. The blocking check
+        never leaves this function.
+        """
         if getattr(self, "_closing", False):
             return
         cfg = self._slot_config(slot)
         if cfg is None:
             return
-        # Already reachable? Stop rescheduling.
-        try:
-            running, _models = self.provider_checker.check_llama_server(cfg.port)
-        except Exception:
-            running = False
-        if running:
-            self._refresh_provider_status()
+
+        # Already answered? A previous probe reached the server, so this loop has
+        # done its job. `running` used to return from THIS frame; with the check
+        # moved onto the worker thread the flag has to be read on the next tick
+        # instead, or the loop would keep probing for the full 90 attempts after
+        # the server was already up.
+        if getattr(self, f"_slot_{slot}_reprobe_done", False):
             return
-        self._refresh_provider_status()
+
+        # Re-arm FIRST, so the loop's cadence does not depend on how long the
+        # probe takes. This is the whole point: the timer must fire on schedule
+        # whether or not the server is up yet.
         if attempts > 0:
             QTimer.singleShot(
                 2000, lambda: self._schedule_slot_reprobe(slot, attempts - 1))
+
+        # Do not pile up threads while a previous probe is still blocked on the
+        # socket -- the same guard `_refresh_provider_status` uses.
+        pending = getattr(self, "_slot_reprobe_thread", None)
+        if pending is not None and pending.is_alive():
+            return
+
+        def _probe():
+            try:
+                running, _models = self.provider_checker.check_llama_server(cfg.port)
+            except Exception:
+                running = False
+            # Read back on the next tick, on the GUI thread. The loop is already
+            # armed, so there is nothing to schedule from here.
+            setattr(self, f"_slot_{slot}_reprobe_done", bool(running))
+            self._refresh_provider_status()
+
+        thread = threading.Thread(
+            target=_probe, daemon=True, name=f"slot-reprobe-{slot}")
+        self._slot_reprobe_thread = thread
+        thread.start()
 
     def _stop_slot(self, slot: int):
         """Stop an extra brain slot (2+) by terminating its child or its port."""
@@ -910,14 +1142,6 @@ class ProviderLifecycleBackend:
             setattr(self, f"_slot_{slot}_server_process", None)
         else:
             self._log(f"ℹ️ {label} was not running")
-
-    def _on_temp_preset(self, text: str, spin: QDoubleSpinBox, env_key: str):
-        """Apply a temperature preset to the spinbox and persist."""
-        presets = {"0.0 (Precise)": 0.0, "0.3 (Low)": 0.3, "0.5 (Default)": 0.5,
-                   "0.7 (Medium)": 0.7, "1.0 (Creative)": 1.0, "1.5 (Wild)": 1.5}
-        if text in presets:
-            spin.setValue(presets[text])
-            self._persist_settings()
 
     def _unload_external_model(self, small, provider, endpoint, model, label):
         ok, message = self.provider_checker.unload_provider_model(
@@ -1061,7 +1285,7 @@ class ProviderLifecycleBackend:
         if getattr(self, "_last_small_model_emitted", None) == model_name:
             return
         from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-        runtime = DualBrainRuntime.from_env()
+        runtime = self._runtime_from_settings()
         cfg = runtime.config(BrainRole.SMALL)
         if cfg.provider != "llamacpp":
             self._select_external_model(True, model_name, runtime, cfg)
@@ -1092,7 +1316,7 @@ class ProviderLifecycleBackend:
         if getattr(self, "_last_big_model_emitted", None) == model_name:
             return
         from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-        runtime = DualBrainRuntime.from_env()
+        runtime = self._runtime_from_settings()
         cfg = runtime.config(BrainRole.BIG)
         if cfg.provider != "llamacpp":
             self._select_external_model(False, model_name, runtime, cfg)
@@ -1204,7 +1428,7 @@ class ProviderLifecycleBackend:
         # Settings can change provider/model values while this widget remains
         # open. Re-resolve from the current environment so probes never use a
         # startup-only runtime snapshot.
-        runtime = self.runtime or DualBrainRuntime.from_env()
+        runtime = self.runtime or self._runtime_from_settings()
 
         def _probe_cfg(cfg):
             """Probe one BrainConfig -> (running, models, external, selected)."""
@@ -1217,34 +1441,92 @@ class ProviderLifecycleBackend:
                 running, models = self.provider_checker.check_llama_server(
                     cfg.port, timeout=2)
                 return running, models, False, cfg.model
-            server_running, models = self.provider_checker.check_endpoint(cfg.models_path)
+            # Pass the provider so a CLOUD probe carries its Bearer token —
+            # without it a valid cloud brain probes 401 and its row shows
+            # "Stopped" forever.
+            # Short timeout (2s), matching the llamacpp path above: the default
+            # 10s lets an unreachable cloud endpoint exceed the 4s liveness
+            # window and the status-refresh wait, so the probe never emits and
+            # every row sticks at "Checking...".
+            server_running, models = self.provider_checker.check_endpoint(
+                cfg.models_path, timeout=2, provider=cfg.provider)
             if cfg.provider in ("lmstudio", "ollama"):
                 loaded_server, loaded_models = self.provider_checker.check_loaded_provider(
-                    cfg.provider, cfg.endpoint)
+                    cfg.provider, cfg.endpoint, timeout=2)
                 selected = (cfg.model or "").strip().lower()
                 loaded = {str(item).strip().lower() for item in loaded_models}
                 role_loaded = bool(selected and selected in loaded)
                 return server_running and loaded_server and role_loaded, models, True, cfg.model
             return server_running, models, True, cfg.model
 
-        # Probe every slot (N-brain): slots 0/1 are the role configs; slots 2+
-        # are extra enabled devices. Each becomes a per-slot dict so the GUI can
-        # update ALL rows, not just the two role brains (fixes the CPU row
-        # stuck at "Checking...").
-        slots = runtime.slots()
-        slot_results = []
-        for i, cfg in enumerate(slots):
-            try:
-                running, models, external, selected = _probe_cfg(cfg)
-            except Exception:
-                running, models, external, selected = False, [], False, ""
-            slot_results.append({
-                "slot": i,
-                "role": cfg.role.value if hasattr(cfg.role, "value") else str(cfg.role),
-                "device_id": getattr(cfg, "device_id", ""),
-                "running": running, "models": models,
-                "external": external, "selected": selected,
-            })
+        def _probe_with_deadline(cfg, deadline_s: float = 2.0):
+            """Run _probe_cfg with a HARD total deadline.
+
+            urlopen(timeout=N) is a PER-OPERATION timeout (connect + each read),
+            so a busy/trickling llama-server can keep a read alive past N by
+            sending data in small chunks — the probe then blocks past the status
+            wait and rows stick at "Checking...". Run the check on a daemon
+            sub-thread and join with a hard deadline; on timeout treat the slot
+            as Stopped (never block the whole refresh).
+            """
+            import threading
+            box = {}
+
+            def _run():
+                try:
+                    box["v"] = _probe_cfg(cfg)
+                except Exception:
+                    box["v"] = (False, [], False, "")
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(deadline_s)
+            return box.get("v", (False, [], False, ""))
+
+        # Probe one status entry per VISIBLE row (N-brain), not per runtime
+        # slot. _build_provider_rows can render more rows than runtime.slots()
+        # returns (the empty-env fixture has 0 runtime slots but the rows are
+        # synthesized), and _apply_slot_statuses matches entry["slot"] to
+        # rows[slot] by index — so emitting per runtime-slot left the extra
+        # rows stuck at "Checking...". Map each row to its slot config
+        # (Stopped when none) so the status count always matches the rows.
+        rows = getattr(self, "_provider_rows", None)
+        if rows:
+            slot_results = []
+            for i, row in enumerate(rows):
+                cfg = None
+                try:
+                    cfg = runtime.slot_config(getattr(row, "slot", i))
+                except Exception:
+                    cfg = None
+                try:
+                    running, models, external, selected = _probe_with_deadline(cfg)
+                except Exception:
+                    running, models, external, selected = False, [], False, ""
+                role = getattr(row, "role", "") or ("big" if i == 0 else "small")
+                slot_results.append({
+                    "slot": i,
+                    "role": role,
+                    "device_id": getattr(cfg, "device_id", "") if cfg is not None else "",
+                    "running": running, "models": models,
+                    "external": external, "selected": selected,
+                })
+        else:
+            # Standalone backend (no rendered rows): fall back to runtime slots.
+            slots = runtime.slots()
+            slot_results = []
+            for i, cfg in enumerate(slots):
+                try:
+                    running, models, external, selected = _probe_with_deadline(cfg)
+                except Exception:
+                    running, models, external, selected = False, [], False, ""
+                slot_results.append({
+                    "slot": i,
+                    "role": cfg.role.value if hasattr(cfg.role, "value") else str(cfg.role),
+                    "device_id": getattr(cfg, "device_id", ""),
+                    "running": running, "models": models,
+                    "external": external, "selected": selected,
+                })
         # Legacy keys for slots 0/1 (back-compat with existing consumers).
         # Slot 0 = Big Brain, slot 1 = Small Brain (runtime ordering).
         bb = slot_results[0] if len(slot_results) > 0 else None

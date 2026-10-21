@@ -382,6 +382,12 @@ class DiscoveryScheduler:
         return {
             "tasks": len(tasks),
             "opportunities": len(all_opps),
+            # ARCH-ENG-282 (F-01): the opportunities themselves, not only the
+            # count. `run_discovery_cycle` used to be the sole caller of tick()
+            # and discarded this list, so the scheduler's read side could never
+            # feed the live evaluate/filter stages. The count is kept for
+            # existing readers; `found` is the live payload.
+            "found": all_opps,
             "errors": errors,
             "exploration": sum(1 for t in tasks if t.is_exploration),
             "exploitation": sum(1 for t in tasks if not t.is_exploration),

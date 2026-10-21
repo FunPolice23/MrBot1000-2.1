@@ -36,7 +36,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
-from agents.core.comms import EventBus, Message, MessageType, MessageStatus
+from agents.core.comms import (
+    CancellationToken, EventBus, Message, MessageStatus, MessageType,
+)
 from agents.core.comms_log import MessageLog
 from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
 from agents.cognition import ThoughtEdge, ThoughtEdgeKind, ThoughtGraph, ThoughtNode, ThoughtNodeKind
@@ -161,6 +163,13 @@ class DualBrainCoordinator:
         self.stage_roles = stage_roles or dict(STAGE_ROLES)
         self._lock = threading.RLock()
         self._runs: Dict[str, RunRecord] = {}
+        # ARCH-ENG-247 (AN-02): one cancellation token per run, created on
+        # demand from the bus. The token is the mechanism the Stop control
+        # pulls; `collaborate` consults it before every stage (cooperative
+        # cancellation at a safe point -- a stage's model call is
+        # synchronous and is not interrupted mid-call).
+        self._run_tokens: Dict[str, "CancellationToken"] = {}
+        self._active_run_id: Optional[str] = None
 
     @staticmethod
     def _noop_model(role: BrainRole, stage: CollaborationStage, prompt: str) -> str:
@@ -177,11 +186,60 @@ class DualBrainCoordinator:
         return ordered[:limit]
 
     # ── message helpers ─────────────────────────────────────────────────────
-    def _record(self, msg: Message) -> None:
+    def _record(self, msg: Message, *, cancellable: bool = True) -> None:
+        """Persist the message, then publish it on the bus.
+
+        ARCH-ENG-247 (AN-02): this is the bus's first production publisher.
+        Before it, the class docstring's claim ("Every stage publishes a
+        typed REQUEST then a typed RESULT on the EventBus") was false -- the
+        messages were only written to the local MessageLog, so the bus's one
+        subscriber (QtEventBridge) and every cancellation token had nothing
+        to read. ``cancellable=False`` is used for terminal run updates: an
+        operator who cancels still needs to SEE the cancellation.
+        """
         try:
             self.log.record(msg)
         except Exception:
             pass  # logging must never break orchestration
+        try:
+            token = None
+            if cancellable:
+                with self._lock:
+                    token = self._run_tokens.get(msg.correlation_id or "")
+            self.bus.publish(msg, token=token)
+        except Exception:
+            pass  # bus delivery must never break orchestration
+
+    # ── cancellation (ARCH-ENG-247, AN-02) ─────────────────────────────────
+    def active_run_id(self) -> Optional[str]:
+        with self._lock:
+            return self._active_run_id
+
+    def cancel_run(self, run_id: str,
+                   reason: str = "cancelled by operator") -> bool:
+        """Cancel a run's correlation: remaining deliveries for it are
+        refused and ``collaborate`` stops before the next stage.
+
+        Cooperative by design -- a stage's model call is synchronous, so the
+        token is consulted at the stage boundary, never mid-call.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return False
+            run.status = MessageStatus.CANCELLED
+            run.error = reason
+            run.updated_at = time.time()
+            correlation_id = run.correlation_id
+        self.bus.cancel(correlation_id, reason)
+        return True
+
+    def cancel_active_run(self,
+                          reason: str = "cancelled by operator") -> bool:
+        run_id = self.active_run_id()
+        if not run_id:
+            return False
+        return self.cancel_run(run_id, reason)
 
     # ── full handoff ────────────────────────────────────────────────────────
     def collaborate(self, goal: str,
@@ -200,23 +258,50 @@ class DualBrainCoordinator:
         run.thought_graph.add_node(
             ThoughtNode("goal", ThoughtNodeKind.GOAL, goal, source="operator")
         )
+        token = self.bus.get_token(run.correlation_id)
         with self._lock:
             self._runs[run.run_id] = run
+            self._run_tokens[run.correlation_id] = token
+            self._active_run_id = run.run_id
         ordered = stages or [s for s in CollaborationStage]
-        for stage in ordered:
-            stage_run = self._run_stage(run, stage)
-            run.stages.append(stage_run)
-            run.updated_at = time.time()
-            if not stage_run.success:
-                run.status = MessageStatus.FAILED
-                run.error = f"{stage.value} stage failed: {stage_run.error or 'unknown error'}"
+        try:
+            for stage in ordered:
+                if token.cancelled:
+                    # ARCH-ENG-247: cooperative stop at the stage boundary.
+                    # The run already carries CANCELLED (cancel_run sets it);
+                    # this path also covers a cancel that arrived between
+                    # stages, before the next model call would spend money.
+                    run.status = MessageStatus.CANCELLED
+                    run.error = run.error or "cancelled by operator"
+                    run.updated_at = time.time()
+                    self._emit(MessageType.AUTONOMOUS_RUN_UPDATE, run)
+                    return run
+                stage_run = self._run_stage(run, stage)
+                run.stages.append(stage_run)
+                run.updated_at = time.time()
+                if not stage_run.success:
+                    run.status = MessageStatus.FAILED
+                    run.error = f"{stage.value} stage failed: {stage_run.error or 'unknown error'}"
+                    self._emit(MessageType.AUTONOMOUS_RUN_UPDATE, run)
+                    return run
+            if token.cancelled:
+                # A cancel that arrived DURING the last stage has no next
+                # boundary to stop at -- but the operator still cancelled the
+                # run, and reporting it DONE would overstate the work.
+                run.status = MessageStatus.CANCELLED
+                run.error = run.error or "cancelled by operator"
+                run.updated_at = time.time()
                 self._emit(MessageType.AUTONOMOUS_RUN_UPDATE, run)
                 return run
-        run.status = MessageStatus.DONE
-        run.final_result = run.stages[-1].result if run.stages else ""
-        run.updated_at = time.time()
-        self._emit(MessageType.AUTONOMOUS_RUN_UPDATE, run)
-        return run
+            run.status = MessageStatus.DONE
+            run.final_result = run.stages[-1].result if run.stages else ""
+            run.updated_at = time.time()
+            self._emit(MessageType.AUTONOMOUS_RUN_UPDATE, run)
+            return run
+        finally:
+            with self._lock:
+                if self._active_run_id == run.run_id:
+                    self._active_run_id = None
 
     def _run_stage(self, run: RunRecord, stage: CollaborationStage) -> StageRun:
         role = self.stage_roles[stage]
@@ -304,7 +389,12 @@ class DualBrainCoordinator:
         return stage_run
 
     def _emit(self, mtype: MessageType, run: RunRecord) -> None:
-        """Publish a terminal/update event about a run (observability)."""
+        """Publish a terminal/update event about a run (observability).
+
+        Terminal updates are published OUTSIDE the run's cancellation token
+        (ARCH-ENG-247): a cancelled run's last word must still reach the
+        operator.
+        """
         msg = Message(
             message_type=mtype,
             source="coordinator",
@@ -312,7 +402,7 @@ class DualBrainCoordinator:
             correlation_id=run.correlation_id,
             payload={"run": run.to_dict()},
         )
-        self._record(msg)
+        self._record(msg, cancellable=False)
 
 
 __all__ = [

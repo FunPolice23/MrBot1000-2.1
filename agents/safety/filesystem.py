@@ -16,6 +16,28 @@ from agents.brains.base_worker import (
 
 
 class WorkerFilesystemMixin:
+    def _blocked_signal(self, message: str) -> bool:
+        """Emit the operator BLOCKED signal AND the typed safety_event.
+
+        ARCH-ENG-243 (BD-01): every `safe_write_file` refusal USE to emit
+        only the mix-in's log signal, so the Insights panel's "Safety
+        incidents" counter (which reads typed `safety` events) never saw
+        the write gate's blocks. One helper now reports both; the emission
+        is AFTER the refusal is decided and guarded, so telemetry can never
+        alter or break the gate.
+
+        Returns False so block sites read `return self._blocked_signal(...)`.
+        """
+        self.log_signal.emit(message)
+        try:
+            from agents.core.event_logger import StructuredEventLogger
+            StructuredEventLogger.instance().safety_event(
+                gate_type="filesystem_write", blocked=True,
+                description=message)
+        except Exception:
+            pass
+        return False
+
     def safe_write_file(self, filename: str, content: str) -> bool:
         """Write a file safely inside ROOT_FOLDER only, with a pre-edit backup.
 
@@ -23,8 +45,8 @@ class WorkerFilesystemMixin:
         before overwriting, and refuses protected/write-excluded directories.
         """
         if not is_safe_filename(filename):
-            self.log_signal.emit(f"BLOCKED: filename '{filename}' is on blocklist")
-            return False
+            return self._blocked_signal(
+                f"BLOCKED: filename '{filename}' is on blocklist")
 
         # Refuse to overwrite the app's own import-critical source files. The
         # Coder's full-file-rewrite path has repeatedly truncated these (e.g.
@@ -33,10 +55,9 @@ class WorkerFilesystemMixin:
         # Matched by basename so absolute paths and nested copies are also blocked.
         _bn = Path(filename).name
         if _bn in PROTECTED_SOURCE_FILES:
-            self.log_signal.emit(
+            return self._blocked_signal(
                 f"BLOCKED: protected app source '{_bn}' — refusing overwrite "
                 f"(use an external editor for intentional dev changes)")
-            return False
 
         root_resolved = Path(ROOT_FOLDER).resolve()
         # Accept absolute paths that live under root; otherwise treat as relative.
@@ -47,23 +68,41 @@ class WorkerFilesystemMixin:
         # Write-excluded directories (VCS, venvs, caches, publish mirror, backups).
         rel_parts = full_path.relative_to(root_resolved).parts if str(full_path).startswith(str(root_resolved)) else ()
         if any(part in WRITE_EXCLUSION_DIRS for part in rel_parts):
-            self.log_signal.emit(f"BLOCKED: write to protected dir '{'/'.join(rel_parts)}'")
-            return False
+            return self._blocked_signal(
+                f"BLOCKED: write to protected dir '{'/'.join(rel_parts)}'")
 
         if not is_safe_path(root_resolved, full_path):
-            self.log_signal.emit("BLOCKED: Write outside root folder or unsafe symlink")
-            return False
+            return self._blocked_signal(
+                "BLOCKED: Write outside root folder or unsafe symlink")
 
         if len(content) > self.max_file_size:
-            self.log_signal.emit(f"BLOCKED: File size exceeds {self.max_file_size // 1024 // 1024}MB")
-            return False
+            return self._blocked_signal(
+                f"BLOCKED: File size exceeds {self.max_file_size // 1024 // 1024}MB")
 
         _, _, free = shutil.disk_usage(ROOT_FOLDER)
         if free < 100 * 1024 * 1024:
-            self.log_signal.emit("BLOCKED: Free space < 100MB")
-            return False
+            return self._blocked_signal("BLOCKED: Free space < 100MB")
 
         # Backup-before-edit (2.0.19): keep a recoverable copy of the original.
+        #
+        # ARCH-ENG-204: A FAILED BACKUP NOW BLOCKS THE WRITE.
+        #
+        # This used to log "Backup skipped: {e}" and fall through to the write.
+        # So any transient failure -- a full disk, a locked file, a permissions
+        # problem, a path too long for the timestamped name -- silently degraded
+        # the guarantee from "a recoverable copy exists before we overwrite" to
+        # "we tried, and if that did not work we overwrote anyway".
+        #
+        # That is the worst possible shape for a safety mechanism, because it
+        # reports success. `safe_write_file` returned True, the caller logged
+        # "Created safely", and the only record that no backup existed was a log
+        # line most callers never surface. An agent rewriting source would
+        # destroy the file with nothing to restore from, while every indicator
+        # said it was fine.
+        #
+        # The contract is now the one the operator asked for: NO EDIT WITHOUT A
+        # BACKUP. A new file has nothing to back up, so it is not a backup
+        # failure -- only an existing target that cannot be copied is.
         try:
             backup_root = root_resolved / BACKUP_DIRNAME
             backup_root.mkdir(parents=True, exist_ok=True)
@@ -73,9 +112,17 @@ class WorkerFilesystemMixin:
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             if full_path.exists():
                 shutil.copy2(full_path, backup_path)
+                # Confirm the copy is actually usable. A truncated or empty
+                # backup is not a backup, and would restore the file to nothing.
+                if not backup_path.exists() or backup_path.stat().st_size == 0:
+                    return self._blocked_signal(
+                        f"BLOCKED: backup of '{filename}' is unusable "
+                        f"(missing or zero bytes) — refusing to overwrite")
                 self.log_signal.emit(f"Backed up -> {backup_path}")
         except Exception as e:
-            self.log_signal.emit(f"Backup skipped: {e}")
+            return self._blocked_signal(
+                f"BLOCKED: could not back up '{filename}' ({e}) — "
+                f"refusing to overwrite without a recoverable copy")
 
         try:
             full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +160,38 @@ class WorkerFilesystemMixin:
 
     # ── Research Methods (used by Manager) ────────────────────────────────────
 
+    def _cached_read(self, folder_path: str, relative_path: str, path: Path,
+                     size: int, mtime: float) -> str:
+        """Read a file through ``file_cache`` (ARCH-ENG-271, AF-02).
+
+        The ``file_cache`` table has been READ by the DB-Stats panel and
+        CLEARED by a live "Clear file cache" button since the beginning, but
+        nothing ever wrote it -- so the counter was permanently 0 and the
+        button cleared nothing. Every research read now goes through it,
+        mtime-validated: an unchanged file is served from the cache, an edited
+        one is re-read and re-saved.
+
+        Cache failures always degrade to a direct read. A cache must never be
+        able to break research.
+        """
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                cached = db.get_cached_file(
+                    folder_path, relative_path, current_mtime=mtime)
+                if cached is not None:
+                    return cached
+            except Exception:
+                pass
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        if db is not None:
+            try:
+                db.save_file_to_cache(
+                    folder_path, relative_path, content, size, mtime)
+            except Exception:
+                pass
+        return content
+
     def research_all(self) -> dict:
         """Scan ROOT_FOLDER (.py files) and user-selected research_folder."""
         root_parts = []
@@ -124,10 +203,13 @@ class WorkerFilesystemMixin:
                 if count >= 30:
                     break
                 try:
-                    size = p.stat().st_size
+                    st = p.stat()
+                    size = st.st_size
                     if size >= 50000:
                         continue
-                    content = p.read_text(encoding="utf-8", errors="ignore")[:1200]
+                    rel_root = p.relative_to(ROOT_FOLDER).as_posix()
+                    content = self._cached_read(
+                        str(ROOT_FOLDER), rel_root, p, size, st.st_mtime)[:1200]
                     root_parts.append(f"[ROOT/{p.name}] ({size} bytes)\n{content}\n---")
                     count += 1
                 except Exception:
@@ -179,7 +261,9 @@ class WorkerFilesystemMixin:
                         skipped_ext.append(str(p.relative_to(rf)))
                         continue
 
-                    size = p.stat().st_size
+                    st = p.stat()
+                    size = st.st_size
+                    mtime = st.st_mtime
                     if size >= RESEARCH_MAX_BYTES:
                         skipped_large.append(f"{p.relative_to(rf)} ({size // 1024}KB)")
                         continue
@@ -188,7 +272,8 @@ class WorkerFilesystemMixin:
                     rel_path = rel.as_posix()
 
                     try:
-                        content = p.read_text(encoding="utf-8", errors="ignore")
+                        content = self._cached_read(
+                            str(rf), rel_path, p, size, mtime)
                         display_content = content[:RESEARCH_MAX_CHARS]
                         piece = f"[{rel.as_posix()}] ({size} bytes)\n{display_content}\n---\n"
                         # v2.0.24d: enforce a TOTAL budget so a huge folder can't
@@ -234,13 +319,34 @@ class WorkerFilesystemMixin:
             except Exception as e:
                 self.log_signal.emit(f"Error scanning research folder: {e}")
 
-        return {
+        payload = {
             "root": root_text,
             "research": research_text,
             "research_path": rf,
             "research_file_count": research_file_count,
             "research_files": research_files,
         }
+
+        # ARCH-ENG-272 (AF-03): persist the snapshot. `research_cache` had a
+        # reader (`load_latest_research_cache`) and a live DB-Stats counter but
+        # no writer, so the counter and the "last good snapshot" fallback were
+        # both permanently empty. Save first, then publish the compact snapshot
+        # that `chat_router` already looks for -- until now nothing called
+        # `update_research_snapshot`, so the dialogue's research context always
+        # read "(not set)".
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                db.save_research_cache(payload)
+            except Exception as exc:
+                self.log_signal.emit(f"Research snapshot not cached: {exc}")
+        try:
+            from agents.brains.shared_context import get_shared_context
+            get_shared_context().update_research_snapshot(payload)
+        except Exception as exc:
+            self.log_signal.emit(f"Research snapshot not shared: {exc}")
+
+        return payload
 
     def file_index(self) -> str:
         """Return a compact index of all files in the research folder."""
@@ -298,8 +404,10 @@ class WorkerFilesystemMixin:
                 continue
 
             try:
-                size = p.stat().st_size
-                content = p.read_text(encoding="utf-8", errors="ignore")
+                st = p.stat()
+                size = st.st_size
+                content = self._cached_read(
+                    folder_path, name, p, size, st.st_mtime)
                 display_content = content[:DEEP_READ_MAX_CHARS]
                 parts.append(f"[{name}] ({size} bytes)\n{display_content}\n---")
             except Exception as e:

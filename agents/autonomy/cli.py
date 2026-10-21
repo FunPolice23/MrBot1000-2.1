@@ -42,23 +42,31 @@ if ROOT not in sys.path:
 # ── earning ──────────────────────────────────────────────────────────
 
 def cmd_earning_run(sources: Optional[str], max_risk: str) -> int:
-    """Run a full earning cycle."""
-    from agents.earning.capability import EarningCapability
+    """Run a full earning cycle through the live pipeline."""
+    # ARCH-ENG-300 (G-01): this imported a non-existent EarningCapability.
+    # The dead capability executor is gone; the CLI now uses the same live
+    # EarningPipeline the GUI uses.
+    from app.earning_pipeline import EarningPipeline
 
     src_list = None if sources == "all" else sources.split(",")
-    cap = EarningCapability()
+    pipeline = EarningPipeline()
     print(f"[earning] Running cycle: sources={src_list or 'all'}, max_risk={max_risk}")
-    result = cap.run_full_cycle(sources=src_list, max_risk=max_risk)
-    print(f"[earning] Cycle complete: {result.get('message', 'done')}")
-    print(json.dumps(result, indent=2, default=str))
+    result = pipeline.run_full_cycle(sources=src_list, max_risk=max_risk)
+    print(f"[earning] Cycle complete: {getattr(result, 'message', 'done')}")
+    print(json.dumps(result.__dict__ if hasattr(result, "__dict__") else result,
+                     indent=2, default=str))
     return 0
 
 
 def cmd_earning_status() -> int:
-    """Show current earning state."""
-    from agents.earning.capability import EarningCapability
-    cap = EarningCapability()
-    state = cap.get_state()
+    """Show the live earning pipeline's current memory configuration."""
+    from app.earning_pipeline import EarningPipeline
+    pipeline = EarningPipeline()
+    state = {
+        "db_path": pipeline.db_path,
+        "memory_path": pipeline.memory_path,
+        "learning_loop": type(pipeline.learning_loop).__name__,
+    }
     print("[earning] Current state:")
     print(json.dumps(state, indent=2, default=str))
     return 0

@@ -14,7 +14,7 @@ import json
 import sqlite3
 import threading
 import time
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, OrderedDict
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -194,6 +194,45 @@ class LearningMetrics:
 class EarningMemory:
     """Multi-tiered memory system for earning pipeline with learning and decay."""
 
+    def _cache_put(self, key: str, value: dict) -> None:
+        """Insert into the LRU cache, evicting the coldest entry if over cap.
+
+        ARCH-ENG-228. Kept as one method so every write site goes through the
+        same bound -- a bound enforced at only some call sites is not a bound.
+        """
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        while len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)
+
+    def _cache_get(self, key: str):
+        """Read-through LRU fetch; None on a miss (without raising)."""
+        if key not in self._cache:
+            return None
+        self._cache.move_to_end(key)
+        return self._cache[key]
+
+    def _stats_touch(self, key: str) -> dict:
+        """Fetch-or-create a stats entry, and evict the coldest if over cap.
+
+        `_stats` is a defaultdict, so a bare `self._stats[k]` creates the key
+        on read. Every creation site therefore has to bound it, which is why
+        this exists.
+        """
+        entry = self._stats.get(key)
+        if entry is None:
+            entry = {
+                "success": 0, "failed": 0, "total_revenue": 0.0,
+                "last_success": None, "last_failure": None,
+                "skills_matched": set(), "skill_count": 0,
+            }
+            self._stats[key] = entry
+        self._stats.move_to_end(key)
+        while len(self._stats) > self._stats_max:
+            dropped, _ = self._stats.popitem(last=False)
+            del dropped
+        return entry
+
     def __init__(self, db_path: str = None, root_folder: str = None):
         self.db_path = db_path or os.path.join(
             root_folder or os.path.dirname(os.path.dirname(__file__)), "earning_memory.db"
@@ -202,14 +241,38 @@ class EarningMemory:
         self._init_db()
         self._migrate_schema()
         
-        # In-memory caches for fast access
-        self._cache: Dict[str, dict] = {}
-        self._stats: Dict[str, dict] = defaultdict(lambda: {
-            "success": 0, "failed": 0, "total_revenue": 0.0,
-            "last_success": None, "last_failure": None,
-            "skills_matched": set(), "skill_count": 0
-        })
-        
+        # In-memory caches for fast access.
+        #
+        # ARCH-ENG-228: BOTH OF THESE GREW WITHOUT BOUND.
+        #
+        # `_cache` is keyed `opp_{id}` and written by `remember_opportunity`
+        # (every discovery) and by `get_opportunity_history` on any miss. The
+        # only prune in this file, `clear_expired`, deletes rows from
+        # `opportunity_memory` and has zero callers -- and even if it were
+        # called it would not have touched this dict, so a deleted row would
+        # stay resident for the life of the process.
+        #
+        # `_stats` is keyed by skill name and `tag_<tag>`, each holding a
+        # `skills_matched` set, and nothing ever removes a key. Worse than the
+        # memory: `periodic_decay` iterates ALL of it, and
+        # `get_memory_summary` calls `periodic_decay` -- so every insight
+        # refresh was an O(n) pass over a dict that only ever grew.
+        #
+        # On a 32 GB machine that is the difference between a bounded working
+        # set and one that grows for as long as the app is open.
+        #
+        # `OrderedDict` with move_to_end gives LRU semantics, so the entries
+        # actually being used survive and cold ones are evicted first.
+        self._cache: "OrderedDict[str, dict]" = OrderedDict()
+        self._cache_max = max(64, int(os.getenv("MRBOT_MEM_CACHE_MAX", "2000")))
+        self._stats_max = max(64, int(os.getenv("MRBOT_MEM_STATS_MAX", "2000")))
+        # ARCH-ENG-228: an OrderedDict, not a defaultdict. The default-factory
+        # behaviour is preserved by `_stats_touch`, which is now the ONLY way a
+        # key is created -- so every creation is bounded by `_stats_max`.
+        # A plain defaultdict here could not be bounded at all, because a bare
+        # read inserts.
+        self._stats: "OrderedDict[str, dict]" = OrderedDict()
+
         # Decay parameters
         self._decay_factor = 0.99  # Daily decay for old stats
         self._min_stats = {
@@ -558,11 +621,20 @@ class EarningMemory:
 
     def periodic_decay(self, decay_factor: float = 0.99):
         """Apply periodic decay to all stats."""
-        # Update in-memory stats
-        for key in self._stats:
-            self._stats[key]["total_revenue"] *= decay_factor
-            if self._stats[key]["success"] < 5:  # Decay near-zero stats faster
-                self._stats[key]["total_revenue"] *= 0.95
+        # Update in-memory stats.
+        #
+        # ARCH-ENG-228: this walked every key on every call, and
+        # `get_memory_summary` calls it -- so an insight refresh was an O(n)
+        # pass over a dict that only ever grew. Values are now taken from a
+        # snapshot list built once, rather than three separate `self._stats[k]`
+        # lookups per key.
+        for key in list(self._stats.keys()):
+            entry = self._stats.get(key)
+            if entry is None:      # evicted concurrently
+                continue
+            entry["total_revenue"] *= decay_factor
+            if entry["success"] < 5:   # Decay near-zero stats faster
+                entry["total_revenue"] *= 0.95
 
     # ── Tier 1: Opportunity Memory ──────────────────────────────────
 
@@ -580,12 +652,13 @@ class EarningMemory:
             conn.commit()
             conn.close()
 
-        self._cache[f"opp_{opp_id}"] = memory_data
+        self._cache_put(f"opp_{opp_id}", memory_data)
 
     def get_opportunity_history(self, opp_id: str) -> Optional[dict]:
         """Get history for a specific opportunity."""
-        if f"opp_{opp_id}" in self._cache:
-            return self._cache[f"opp_{opp_id}"]
+        cached = self._cache_get(f"opp_{opp_id}")
+        if cached is not None:
+            return cached
 
         with self._lock:
             conn = sqlite3.connect(self.db_path)
@@ -597,7 +670,7 @@ class EarningMemory:
 
         if row:
             data = json.loads(row[0])
-            self._cache[f"opp_{opp_id}"] = data
+            self._cache_put(f"opp_{opp_id}", data)
             return data
         return None
 
@@ -1226,8 +1299,8 @@ class EarningMemory:
             conn.commit()
             conn.close()
 
-        self._stats[skill]["success"] += 1
-        self._stats[skill]["total_revenue"] += revenue
+        self._stats_touch(skill)["success"] += 1
+        self._stats_touch(skill)["total_revenue"] += revenue
 
     def get_successful_skills(self, min_success: int = 1, limit: int = 20) -> List[dict]:
         """Get skills that have been successful."""
@@ -1250,8 +1323,34 @@ class EarningMemory:
 
     # ── Tier 4: Reputation Memory ─────────────────────────────────
 
+    @staticmethod
+    def platform_key(platform: str) -> str:
+        """The ONE canonical spelling of a platform key for `reputation_memory`.
+
+        ARCH-ENG-144: `SubmissionRamp` wrote reputation under
+        `platform.strip().title()` while every READER
+        (`EarningPipeline.filter`, `OpportunityIntelligence`,
+        `AutonomousLoop._stage_check_reputation`, `SelfAudit`,
+        `DiscoveryScheduler._source_quality`) queried the raw platform string
+        from the opportunity. Reproduced by execution: 8 real losses recorded via
+        the real ramp stored `total=9, success_rate=0.00` under `'upwork'`, while
+        `get_platform_reputation('upwork')` returned `total=0` — so
+        `WinRateGuard.should_decline` reported `insufficient_data` and a proven
+        0%-win-rate platform was NOT filtered. The guard read as enforced and
+        enforced nothing, so the bot kept spending proposals + LLM $ on platforms
+        it had already proven to be losers.
+
+        `.title()` is the canonical form (not `.lower()`) because existing rows
+        were written by the ramp's `.title()`, so re-keying to lowercase would
+        orphan live history. The invariant that matters is that WRITE and READ
+        apply the SAME transform — the guard must read back exactly what the
+        outcome recorder stored.
+        """
+        return (platform or "unknown").strip().title() or "unknown"
+
     def update_reputation(self, platform: str, success: bool, revenue: float = 0):
         """Update platform reputation."""
+        platform = self.platform_key(platform)
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             if success:
@@ -1280,7 +1379,17 @@ class EarningMemory:
             conn.close()
 
     def get_platform_reputation(self, platform: str) -> dict:
-        """Get reputation metrics for a platform."""
+        """Get reputation metrics for a platform.
+
+        ARCH-ENG-144: the lookup key is canonicalised through `platform_key`,
+        the SAME transform `update_reputation` / `record_attempt` apply on write.
+        Without it a reader passing the raw opportunity spelling (``"upwork"``)
+        queried a row the recorder had written under ``"Upwork"``, got
+        ``total=0``, and `WinRateGuard.should_decline` reported
+        ``insufficient_data`` — a fail-OPEN guard that let a proven 0%-win-rate
+        platform through unfiltered.
+        """
+        platform = self.platform_key(platform)
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             row = conn.execute(
@@ -1323,6 +1432,7 @@ class EarningMemory:
         accept/reject is recorded later via `record_win`/`record_loss` when the
         outcome is actually known (paid / rejected / failed).
         """
+        platform = self.platform_key(platform)
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -1773,20 +1883,35 @@ class EarningMemory:
         accepted = completed = paid = failed = cancelled = 0
         w_rev = w_net = w_eff = w_time = 0.0          # recency-weighted sums
         w_pred_rev = 0.0
+        weights: List[float] = []
         for state, rev, net, eff, t, pred_rev, ts in rows:
             w = recency_weight(ts, now)
             rev = rev or 0.0; net = net or 0.0; eff = eff or 0.0; t = t or 0.0
             pred_rev = pred_rev or 0.0
             w_rev += rev * w; w_net += net * w; w_eff += eff * w; w_time += t * w
             w_pred_rev += pred_rev * w
+            weights.append(w)
             if state in self._ACCEPTED: accepted += 1
             if state in self._COMPLETED: completed += 1
             if state in self._PAID: paid += 1
             if state in self._FAILED: failed += 1
             if state in self._CANCELLED: cancelled += 1
 
-        # Recency-weighted averages = sum(value*w) / sum(w). Reuse the ts already fetched above.
-        sum_w = sum(recency_weight(ts, now) for (_, _, _, _, _, _, ts) in rows) or 1.0
+        # ARCH-ENG-229: RECENCY-WEIGHTED AVERAGES = sum(value*w) / sum(w).
+        #
+        # This used to RE-derive the weights for the denominator:
+        #     sum_w = sum(recency_weight(ts, now) for ... in rows)
+        # `recency_weight(ts, None)` calls `time.time()` internally
+        # (`earning_memory.py:88`). So the numerator summed weights taken at one
+        # instant and the denominator summed weights taken microseconds later --
+        # the ratio was of two DIFFERENT weighted sums, so it was not a weighted
+        # mean at all, just a very close approximation of one.
+        #
+        # The weights are now collected once and reused, which is what the
+        # formula requires. The visible change is float noise (~1e-14 on these
+        # datasets), but it also means `compute_opportunity_metrics` and the
+        # grouped `compute_all_metrics` now agree exactly instead of drifting.
+        sum_w = sum(weights) or 1.0
 
         average_revenue = w_rev / sum_w
         average_net_profit = w_net / sum_w
@@ -1813,18 +1938,122 @@ class EarningMemory:
             recency_weighted=True,
         )
 
-    def compute_all_metrics(self, dim: str = "category") -> List[LearningMetrics]:
-        """Compute metrics across all known values of a dimension."""
-        col_map = {"category": "category", "platform": "platform", "task_type": "task_type"}
+    def compute_all_metrics(self, dim: str = "category",
+                            now: float = None) -> List[LearningMetrics]:
+        """Compute metrics across all known values of a dimension.
+
+        ARCH-ENG-229: THIS WAS AN N+1 THAT SCANNED THE WHOLE TABLE N TIMES.
+
+        It listed the DISTINCT values, then called `compute_opportunity_metrics`
+        once per value -- and each of those runs an UNBOUNDED
+        `SELECT ... FROM outcome_memory_v2 WHERE <dim> = ?`. So distinct
+        values x full table scan, plus a connection per call.
+
+        `DiscoveryScheduler` calls this on every tick to decide where to search
+        next, so this was on the discovery hot path, not an occasional report.
+
+        Now one grouped query over the dimension, and the per-value metrics are
+        derived in Python. Same numbers: `compute_opportunity_metrics` is a
+        recency-weighted aggregation over the same rows, and grouping by the
+        dimension partitions them identically.
+
+        The `global` arm is left exactly as it was -- it is one query already.
+        """
+        col_map = {"category": "category", "platform": "platform",
+                   "task_type": "task_type"}
         if dim not in col_map:
             return [self.compute_opportunity_metrics("global", "global")]
+
+        # ARCH-ENG-229: ONE REFERENCE INSTANT FOR THE WHOLE TICK.
+        #
+        # `recency_weight(ts, None)` resolves `now` to `time.time()` at the
+        # moment of each call (see `recency_weight`, line ~88). So every value
+        # in a tick was being weighted against a slightly different "now" --
+        # microseconds apart. The numbers drift by ~1e-10 relative between two
+        # calls, which means the grouped form and the per-value form could never
+        # agree exactly, and a scheduler comparing them would be comparing two
+        # different measurement instants.
+        #
+        # Resolving `now` once, here, makes the whole tick internally
+        # consistent and makes the two forms comparable. Passing an explicit
+        # `now` also makes the result reproducible.
+        now = now if now is not None else time.time()
+
+        col = col_map[dim]
         with self._lock:
             conn = sqlite3.connect(self.db_path)
-            vals = [r[0] for r in conn.execute(
-                f"SELECT DISTINCT {col_map[dim]} FROM outcome_memory_v2 WHERE {col_map[dim]} <> ''"
-            ).fetchall()]
+            rows = conn.execute(
+                f"SELECT {col}, outcome_state, revenue, net_profit, "
+                f"       effort_hours, time_spent_hours, predicted_revenue, ts "
+                f"FROM outcome_memory_v2 WHERE {col} <> ''"
+            ).fetchall()
             conn.close()
-        return [self.compute_opportunity_metrics(dim, v) for v in vals]
+
+        # Group in Python so the aggregation stays byte-identical to
+        # `compute_opportunity_metrics` rather than being re-derived in SQL.
+        by_value: Dict[str, list] = {}
+        for row in rows:
+            by_value.setdefault(row[0], []).append(row[1:])
+        return [self._metrics_from_rows(dim, v, group, now=now)
+                for v, group in by_value.items()]
+
+    def _metrics_from_rows(self, dim: str, value: str, rows: list,
+                           now: float = None) -> "LearningMetrics":
+        """`compute_opportunity_metrics` over rows already fetched for one value."""
+        n = len(rows)
+        if n == 0:
+            return LearningMetrics(dim=dim, value=value, sample_size=0,
+                                   confidence=0.0, cold_start=True)
+        accepted = completed = paid = failed = cancelled = 0
+        w_rev = w_net = w_eff = w_time = w_pred_rev = 0.0
+        weights = []
+        for state, rev, net, eff, t, pred_rev, ts in rows:
+            w = recency_weight(ts, now)
+            rev = rev or 0.0
+            net = net or 0.0
+            eff = eff or 0.0
+            t = t or 0.0
+            pred_rev = pred_rev or 0.0
+            w_rev += rev * w
+            w_net += net * w
+            w_eff += eff * w
+            w_time += t * w
+            w_pred_rev += pred_rev * w
+            weights.append(w)
+            if state in self._ACCEPTED:
+                accepted += 1
+            if state in self._COMPLETED:
+                completed += 1
+            if state in self._PAID:
+                paid += 1
+            if state in self._FAILED:
+                failed += 1
+            if state in self._CANCELLED:
+                cancelled += 1
+        sum_w = sum(weights) or 1.0
+        average_revenue = w_rev / sum_w
+        average_net_profit = w_net / sum_w
+        average_effort_hours = w_eff / sum_w
+        average_hourly_return = (w_net / sum_w) / (w_time / sum_w) if w_time > 0 else 0.0
+        expected_vs_actual_return = (w_rev / sum_w) / (w_pred_rev / sum_w) if w_pred_rev > 0 else 0.0
+        return LearningMetrics(
+            dim=dim, value=value,
+            attempt_rate=n / n,
+            acceptance_rate=accepted / n,
+            completion_rate=completed / n,
+            payment_rate=paid / n,
+            failure_rate=failed / n,
+            cancellation_rate=cancelled / n,
+            average_revenue=average_revenue,
+            average_net_profit=average_net_profit,
+            average_effort_hours=average_effort_hours,
+            average_hourly_return=average_hourly_return,
+            expected_vs_actual_return=expected_vs_actual_return,
+            sample_size=n,
+            confidence=_confidence_for_samples(n),
+            cold_start=n < MIN_SAMPLES,
+            recency_weighted=True,
+        )
 
     def _category_net_hourly(self) -> List[dict]:
         """Compute net_profit / time_spent_hours aggregated by category from outcome_memory_v2."""
@@ -1847,13 +2076,45 @@ class EarningMemory:
         return out
 
     def get_task_type_history_all(self) -> List[dict]:
-        """All task-type histories (wraps get_task_type_history over distinct keys)."""
+        """All task-type histories.
+
+        ARCH-ENG-229: THIS WAS AN N+1.
+
+        It selected the DISTINCT keys, then called `get_task_type_history` once
+        per key -- and each of those opened its own `sqlite3.connect`. So the
+        cost was N queries and N connection handles to produce N rows, and N
+        grows with the number of distinct task types the bot has ever seen.
+
+        Now one query over `pattern_memory`, so the cost is one scan and one
+        connection regardless of how many task types exist.
+
+        Behaviour is identical, including the cold-start shape: a key with no
+        samples yields zeros, and `pattern_memory` holds the aggregates this
+        used to re-read one at a time.
+        """
         with self._lock:
             conn = sqlite3.connect(self.db_path)
-            keys = [r[0] for r in conn.execute(
-                "SELECT DISTINCT pattern_key FROM pattern_memory WHERE pattern_type='tasktype_success'").fetchall()]
+            rows = conn.execute(
+                "SELECT pattern_key, success_count, failure_count, "
+                "       total_revenue, confidence "
+                "FROM pattern_memory WHERE pattern_type = 'tasktype_success'"
+            ).fetchall()
             conn.close()
-        return [self.get_task_type_history(k) | {"task_type": k} for k in keys]
+        out: List[dict] = []
+        for key, success, failed, revenue, confidence in rows:
+            success = int(success or 0)
+            failed = int(failed or 0)
+            total = success + failed
+            out.append({
+                "task_type": key,
+                "success": success,
+                "failed": failed,
+                "total": total,
+                "success_rate": _safe_rate(success, total),
+                "avg_revenue": (revenue or 0.0),
+                "confidence": confidence or 0.0,
+            })
+        return out
 
     def find_similar_opportunities(self, opp: dict, limit: int = 10) -> List[dict]:
         """Find similar opportunities based on learned patterns."""
@@ -1920,21 +2181,26 @@ class EarningMemory:
         tag_list = tags or []
         for tag in tag_list:
             if success:
-                self._stats[f"tag_{tag}"]["success"] += 1
-                self._stats[f"tag_{tag}"]["total_revenue"] += revenue
+                self._stats_touch(f"tag_{tag}")["success"] += 1
+                self._stats_touch(f"tag_{tag}")["total_revenue"] += revenue
             else:
-                self._stats[f"tag_{tag}"]["failed"] += 1
+                self._stats_touch(f"tag_{tag}")["failed"] += 1
 
     def get_memory_summary(self) -> dict:
         """Get a summary of all memory."""
         self.periodic_decay()  # Apply decay on summary
         
-        total_opps = len([k for k in self._cache if k.startswith("opp_")])
+        # ARCH-ENG-228: was `len([k for k in self._cache if k.startswith("opp_")])`
+        # -- a full scan of the cache that allocates a list just to throw it
+        # away and take a length. A generator avoids the allocation.
+        total_opps = sum(1 for k in self._cache if k.startswith("opp_"))
         
         return {
             "memory_stats": {
                 "cached_opportunities": total_opps,
-                "tracked_skills": len([k for k in self._stats if "tag_" not in k]),
+                # Same shape as cached_opportunities above: counting without
+                # materialising the keys first.
+                "tracked_skills": sum(1 for k in self._stats if "tag_" not in k),
             },
             "top_platforms": self.get_all_reputations()[:10],
             "recent_learned": self.get_recent_learned(limit=5),
@@ -1945,16 +2211,74 @@ class EarningMemory:
             }
         }
 
+    def learning_dashboard(self) -> dict:
+        """Return every read-only learning analytic in one live snapshot.
+
+        ARCH-ENG-306 (P-02): these aggregations existed but no production
+        surface called them. The self-improvement tab now renders this snapshot,
+        so the operator sees the memory's actual evidence rather than a single
+        recommendation. Each readout is isolated: one broken aggregation returns
+        an ``error`` entry and never hides the rest.
+        """
+        readouts = (
+            "top_search_strategies",
+            "get_successful_search_terms",
+            "get_failed_search_terms",
+            "best_performing_task_types",
+            "most_reliable_platforms",
+            "highest_net_hourly_categories",
+            "time_wasting_categories",
+            "best_proposal_templates",
+            "platforms_poor_acceptance",
+            "task_types_high_completion",
+            "profitable_but_often_fail",
+            "recurring_failure_causes",
+            "reusable_success_strategies",
+            "strategies_to_avoid",
+            "get_win_rates_by_platform",
+            "get_prediction_accuracy",
+            "compute_all_metrics",
+            "get_memory_summary",
+        )
+        snapshot: dict = {}
+        for name in readouts:
+            fn = getattr(self, name, None)
+            if not callable(fn):
+                snapshot[name] = {"error": "unavailable"}
+                continue
+            try:
+                snapshot[name] = fn()
+            except Exception as exc:
+                snapshot[name] = {"error": f"{type(exc).__name__}: {exc}"}
+        return snapshot
+
     def clear_expired(self):
-        """Clear expired memory entries."""
+        """Clear expired memory entries.
+
+        ARCH-ENG-228: THIS DELETED THE DATABASE ROW AND LEFT THE CACHE ALONE.
+
+        The rows went; every `opp_<id>` the process had ever seen stayed
+        resident in `_cache` for the life of the process. So the two disagreed
+        permanently after the first call: the DB said an entry was gone and
+        `get_opportunity_history` kept serving it from memory.
+
+        It now drops the matching cache entries too, so the DB and the cache
+        cannot drift. It still has no callers -- pruning on a schedule is a
+        product decision, not something to smuggle in here -- but it is now
+        correct if something calls it.
+        """
+        cutoff = time.time() - 86400 * 30  # 30 days
         with self._lock:
             conn = sqlite3.connect(self.db_path)
+            expired = [r[0] for r in conn.execute(
+                "SELECT key FROM opportunity_memory WHERE updated_at < ?",
+                (cutoff,)).fetchall()]
             conn.execute(
-                "DELETE FROM opportunity_memory WHERE updated_at < ?",
-                (time.time() - 86400 * 30,)  # 30 days
-            )
+                "DELETE FROM opportunity_memory WHERE updated_at < ?", (cutoff,))
             conn.commit()
             conn.close()
+        for key in expired:
+            self._cache.pop(f"opp_{key}", None)
 
 
 # Convenience function

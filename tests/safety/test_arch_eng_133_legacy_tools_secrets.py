@@ -33,6 +33,9 @@ from agents.safety.handlers import _is_secret_file
 from agents.safety.policy import PROJECT_ROOT
 from agents.safety.gate import SafetyDecision, SafetyGate
 from agents.integrations.wallet_crypto import redact_secrets
+# ARCH-ENG-164: the token that proves a call passed the SafetyGate. See
+# test_arch_eng_164_legacy_tool_dispatcher.py for the authorization-layer tests.
+from agents.safety.calling import _DISPATCH_CAPABILITY
 
 # Names that mark a credential/key store but need not exist in every checkout
 # (they are gitignored), so the tests create them inside PROJECT_ROOT.
@@ -126,7 +129,16 @@ class Layer2Redaction(unittest.TestCase):
 
 
 class MutatingToolDefenceInDepth(unittest.TestCase):
-    """write_file / run_command are already NEEDS_APPROVAL -- these add layer 2."""
+    """ARCH-ENG-164: the secret layer sits BEHIND the authorization gate.
+
+    ARCH-ENG-164 moved the authorization check in front of this module's
+    dispatcher, so these tests pass `_DISPATCH_CAPABILITY` to reach the layer
+    they actually test. The docstrings here have always said "even behind an
+    approval", and that is still the claim: `write_file` / `run_command` are
+    NEEDS_APPROVAL in the gate, and these add the secret-destination layer
+    behind it. Authorization itself is asserted separately in
+    `test_arch_eng_164_legacy_tool_dispatcher.py`.
+    """
 
     def test_analyze_document_refuses_secret_path(self):
         """analyze_document reads through the same reader; it must refuse too."""
@@ -163,10 +175,20 @@ class MutatingToolDefenceInDepth(unittest.TestCase):
             self.ENV.unlink(missing_ok=True)
 
     def test_write_file_refuses_secret_destination(self):
-        """write_file must not clobber .env / *.key even behind an approval."""
+        """write_file must not clobber .env / *.key even behind an approval.
+
+        ARCH-ENG-164: these calls now carry the `_DISPATCH_CAPABILITY` token,
+        because `legacy_tools.execute_tool` refuses mutating tools that arrive
+        without proof the SafetyGate approved them. The token is passed HERE
+        deliberately: the layer under test is the secret-destination refusal,
+        which must hold *after* authorization — the docstring has always said
+        "even behind an approval". The authorization layer has its own tests in
+        `test_arch_eng_164_legacy_tool_dispatcher.py`.
+        """
         env_before = self.ENV.read_bytes()
         for rel in (".env", "wallet.key", "_arch133_probe.pem"):
-            out = execute_tool("write_file", {"path": rel, "content": "PWNED=1\n"})
+            out = execute_tool("write_file", {"path": rel, "content": "PWNED=1\n"},
+                               authorization=_DISPATCH_CAPABILITY)
             self.assertIn("Write refused", out, f"{rel} was written to!")
             self.assertNotIn("PWNED=1", out)
         self.assertEqual(
@@ -178,18 +200,21 @@ class MutatingToolDefenceInDepth(unittest.TestCase):
     def test_run_command_refuses_command_naming_a_secret_file(self):
         """A command that names a secret store never executes."""
         for cmd in ("type .env", "type wallet.key", "type data/platform_vault.json"):
-            out = execute_tool("run_command", {"command": cmd})
+            out = execute_tool("run_command", {"command": cmd},
+                               authorization=_DISPATCH_CAPABILITY)
             self.assertIn("Command refused", out, f"{cmd!r} executed!")
             self.assertIn(".env.example", out)
 
     def test_run_command_still_executes_normal_commands(self):
         """The guard must not break ordinary read-only commands."""
-        out = execute_tool("run_command", {"command": "python --version"})
+        out = execute_tool("run_command", {"command": "python --version"},
+                           authorization=_DISPATCH_CAPABILITY)
         self.assertIn("Python", out)
 
     def test_run_command_rejects_shell_operators_as_before(self):
         """Pre-existing command_argv validation is unchanged."""
-        out = execute_tool("run_command", {"command": "echo hi && type .env"})
+        out = execute_tool("run_command", {"command": "echo hi && type .env"},
+                           authorization=_DISPATCH_CAPABILITY)
         self.assertIn("shell operators are not allowed", out)
 
 

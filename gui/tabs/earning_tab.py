@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QColor
 from gui.builders.refresh_coordinator import refresh_coordinator
+from agents.integrations.wallet import WalletManager
 
 
 class EarningTab(QWidget):
@@ -91,8 +92,14 @@ class EarningTab(QWidget):
             self.platform_submitter = PlatformSubmitter(
                 safety_guard=self.safety_guard)
             self.microtask_earner = MicrotaskEarner()
+            # ARCH-ENG-154: the operator was built with `None` as its wallet
+            # manager, so `CryptoPayments.create_payment` raised
+            # "'NoneType' object has no attribute 'get_wallet'" on every
+            # Propose Payment click (reproduced by execution). The wallet store
+            # is the shared one, so the operator, the Payments tab and this tab
+            # all read the same wallets.
             self.crypto_operator = RealCryptoOperator(
-                None, safety_guard=self.safety_guard)
+                WalletManager.shared(), safety_guard=self.safety_guard)
 
             self.autonomous_loop = AutonomousLoop(None)
         except Exception as e:
@@ -276,6 +283,12 @@ class EarningTab(QWidget):
         row = QHBoxLayout()
         pay_to = QLineEdit()
         pay_to.setPlaceholderText("To address")
+        # ARCH-ENG-237 (BB-01): this field existed but was a THROWAWAY local —
+        # _on_propose_payment never read it and instead proposed a payment to
+        # the hardcoded placeholder "0x" + "A" * 40, which the scoped approval
+        # faithfully presented to the operator as a real authorisation request.
+        # The field is now stored and read; see the handler.
+        self.pay_recipient = pay_to
         # NOTE: do NOT name this `pay_amount` — ManagementTab (built earlier, main.py:1419)
         # owns self.pay_amount (a QLineEdit) on the SAME parent, and this Earnings tab
         # is built later (main.py:1428) on that same parent. A same-named QDoubleSpinBox
@@ -468,13 +481,24 @@ class EarningTab(QWidget):
 
     def _on_propose_payment(self):
         sender = self.wallet_address_input.text().strip()
-        # payment fields collected from UI controls in future iteration; for now
-        # we use sender as from_address with a placeholder to_address
-        to_address = "0x" + "A" * 40
+        # ARCH-ENG-237 (BB-01): read the operator's real recipient. The old code
+        # fabricated `to_address = "0x" + "A" * 40` here (comment: "placeholder
+        # to_address"), and the scoped PAYMENT approval then asked the human to
+        # authorize a genuine transfer to it. A payment without a recipient is
+        # refused honestly; a placeholder address is never substituted.
+        to_address = self.pay_recipient.text().strip()
         amount = float(self.pay_send_amount.value())
         currency = self.pay_currency.currentText()
         if not sender:
             QMessageBox.warning(self, "Error", "Add a wallet first")
+            return
+        if not to_address:
+            QMessageBox.warning(
+                self, "Error",
+                "Recipient address required. A payment is proposed only to the "
+                "'To address' field's value — no placeholder address is ever "
+                "substituted, because approving one would authorize a real "
+                "transfer to it.")
             return
         try:
             from agents.integrations.wallet import Chain
@@ -488,9 +512,23 @@ class EarningTab(QWidget):
             QMessageBox.critical(self, "Error", str(e))
 
     def _get_wallet_manager(self):
-        if self.main_window and hasattr(self.main_window, "payments_tab") and self.main_window.payments_tab:
-            return self.main_window.payments_tab.wallet_manager
-        return None
+        # ARCH-ENG-154: this read `hasattr(self.main_window, "payments_tab")`,
+        # but `create_payments_tab()` stores the tab as `self._payments_tab`
+        # (gui/builders/tab_feature_builders.py:562) and MainWindow exposes no
+        # `payments_tab` attribute or property anywhere — verified by execution,
+        # `hasattr(main, "payments_tab")` is False on the real shape while
+        # `hasattr(main, "_payments_tab")` is True. So the guard was permanently
+        # False and every wallet surface in this tab was dead: Add Wallet raised
+        # "'NoneType' object has no attribute 'add_wallet'", Propose Payment
+        # raised "'NoneType' object has no attribute 'get_wallet'", the crypto
+        # wallets table stayed at 0 rows, and get_summary()'s wallet
+        # contribution never ran. All five call sites went through here.
+        mw = self.main_window
+        tab = getattr(mw, "payments_tab", None) or getattr(mw, "_payments_tab", None)
+        wm = getattr(tab, "wallet_manager", None)
+        # Fall back to the shared store rather than None, so a wallet added on
+        # either surface is visible on both even before the Payments tab is built.
+        return wm if wm is not None else WalletManager.shared()
 
     # ── Path 4 handlers ────────────────────────────────────────────────────
     def _on_run_autonomy(self):
@@ -520,27 +558,30 @@ class EarningTab(QWidget):
         pending = 0.0
         last30 = 0.0
         
-        # Try to get from earning pipeline if available
-        try:
-            from agents.earning.capability import EarningCapability
-            ec = EarningCapability.instance() if hasattr(EarningCapability, 'instance') else None
-            if ec and hasattr(ec, 'total_earned'):
-                earned = ec.total_earned
-            if ec and hasattr(ec, 'pending_amount'):
-                pending = ec.pending_amount
-        except Exception:
-            pass
-        
-        # Try to get from wallet manager
-        try:
-            wm = self._get_wallet_manager()
-            if wm:
-                for w in wm.list_wallets():
-                    if w.currency == "USD":
-                        earned += w.balance
-        except Exception:
-            pass
-        
+        # ARCH-ENG-300 (G-01): the old branch imported a non-existent
+        # EarningCapability and would always fall through to zero. Removed
+        # rather than kept as a decorative "try". Honest numbers come from
+        # verified payment evidence, not a dead capability object.
+
+        # ARCH-ENG-154 (2nd pass): this loop added every USD wallet BALANCE to
+        # `earned`. It never ran — `_get_wallet_manager()` returned None before
+        # the wiring fix, so the contribution was unreachable. Fixing the wiring
+        # would have ACTIVATED it, and a balance is not revenue: reproduced by
+        # execution, one wallet with `currency="USD", balance=500.0` and ZERO
+        # verified payments made `get_summary()` return `earned=500.0`, which the
+        # Insights panel renders as "💰 Earned: $500.00". Same bug class as
+        # `PayoutVerifier.verify_crypto`'s `observed_usd = current` — the highest
+        # severity in this repo. A wallet can hold funds the agent never earned
+        # (a transfer in, an airdrop, an operator top-up), and nothing here
+        # attributes any of it to completed work.
+        #
+        # Removed rather than repaired: the honest number for `earned` comes from
+        # verified payment evidence (`economic_accounting`, L3+), which this tab
+        # has no access to. Reporting a wallet total under an "Earned" label is a
+        # fabrication at any wiring state, so the path is gone. The wallet list
+        # itself still renders in the crypto wallets table via
+        # `_refresh_crypto_wallets`, which the wiring fix DID make work.
+
         return {
             "earned": earned,
             "pending": pending,

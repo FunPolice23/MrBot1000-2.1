@@ -17,7 +17,32 @@ from PySide6.QtWidgets import (
     QTextEdit, QVBoxLayout, QWidget, QAbstractItemView,
 )
 
-from gui.builders.tab_workers import DataExplorerWorker, LivePortfolioWorker, SocialDiscoveryWorker, MoltbookFeedWorker
+from gui.builders.tab_workers import (
+    DataExplorerWorker, LiveOrderProposalWorker, LivePortfolioWorker,
+    SocialDiscoveryWorker, MoltbookFeedWorker,
+)
+
+
+def _dual_brain_message_log_path() -> str:
+    """Path of the Collaboration tab's message log.
+
+    ARCH-ENG-246: this was computed from ``__file__`` -- i.e. inside the
+    source tree (``gui/dual_brain_messages.db``). A live SQLite store in the
+    checkout is exactly what ARCH-ENG-167's root-hygiene audit exists to
+    prevent, and it caught this one: three governed tests failed on the
+    undeclared store the Collaboration tab created the first time the GUI
+    was built. All persistence lives under the app-data directory beside
+    ``goals.db`` / the event log -- same LOCALAPPDATA convention, same
+    fallback for an unset environment.
+    """
+    data_dir = os.path.join(os.environ.get("LOCALAPPDATA", "."), "MrBot1000")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except OSError:
+        # The log will surface its own failure; constructing a tab must not
+        # die because the data directory is unwritable.
+        pass
+    return os.path.join(data_dir, "dual_brain_messages.db")
 
 
 class FeatureTabBuildersMixin:
@@ -221,6 +246,13 @@ class FeatureTabBuildersMixin:
             guard = getattr(earning, "safety_guard", None) if earning else None
         if guard is not None:
             self.safety_tools_tab.safety_guard = guard
+        # ARCH-ENG-284 (U-01): the instruction gate is the trust anchor every
+        # platform adapter uses. Hand the same instance to the tab that now
+        # owns the quarantine review surface, so an approval here is the
+        # approval the adapters observe. None is valid (gate unavailable) and
+        # the tab then fails visibly closed rather than silently.
+        self.safety_tools_tab.set_instruction_gate(
+            getattr(self, "instruction_gate", None))
         return self.safety_tools_tab
 
     def create_collaboration_tab(self):
@@ -248,8 +280,7 @@ class FeatureTabBuildersMixin:
             return SmallBrainAdapter().chat(prompt)
 
         if not hasattr(self, "dual_brain_coordinator") or self.dual_brain_coordinator is None:
-            msg_log_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dual_brain_messages.db")
+            msg_log_path = _dual_brain_message_log_path()
             self.dual_brain_coordinator = DualBrainCoordinator(
                 runtime=self.dual_brain_runtime,
                 model_fn=_model_fn,
@@ -283,6 +314,10 @@ class FeatureTabBuildersMixin:
         self.management_tab.request_review_proposal.connect(self._on_management_review_proposal)
         self.management_tab.request_submit_proposal.connect(self._on_management_submit_proposal)
         self.management_tab.request_verify_paid.connect(self._on_management_verify_paid)
+        # ARCH-ENG-287 (Z-01): wire the reconciliation surface to the live
+        # lifecycle method it exists to reach.
+        self.management_tab.request_reconcile_paid.connect(
+            self._reconcile_paid_evidence)
 
         return self.management_tab
 
@@ -890,15 +925,46 @@ class FeatureTabBuildersMixin:
         btn_row.addStretch(1)
         # Also refresh diagnostics sections (health, perf, reconciliation)
         diag_refresh_btn = QPushButton("🔍 Refresh Diagnostics")
-        diag_refresh_btn.clicked.connect(self.refresh_diagnostics)
+        # ARCH-ENG-221: `clicked` emits a `bool checked`, which would bind
+        # straight to `force` -- and it is False on a normal click, silently
+        # making the Refresh button a no-op refresh. Wrap it explicitly.
+        diag_refresh_btn.clicked.connect(lambda _=False: self.refresh_diagnostics(force=True))
         btn_row.addWidget(diag_refresh_btn)
         lay.addLayout(btn_row)
 
         # Keep new calls and events visible without requiring a manual refresh.
+        #
+        # ARCH-ENG-221: THIS TIMER WAS NEVER VISIBILITY-GATED.
+        #
+        # It ran every 5 s for the whole process lifetime, whether or not this tab
+        # was on screen, and `refresh_db_stats` is not cheap: `get_llm_stats()`
+        # (app/database.py) is FOUR unindexed full-table aggregates over the
+        # append-only `llm_calls` table, which is written once per LLM call and
+        # never pruned. On top of that it rebuilds four `QTableWidget`s
+        # cell-by-cell -- the event table alone is 100 rows x 4 columns = 400
+        # `QTableWidgetItem` allocations -- on the GUI thread, every tick.
+        #
+        # The consequence on the target machine (6 cores) is a recurring GUI
+        # stall that grows without limit as `llm_calls` grows, in a process
+        # that may already be holding a 10 GB model in RAM.
+        #
+        # It is now stopped while hidden, using the `refresh_coordinator`
+        # pattern already established in this file at :987-1001.
         self._stats_timer = QTimer(self)
         self._stats_timer.setInterval(5000)
         self._stats_timer.timeout.connect(self.refresh_db_stats)
-        self._stats_timer.start()
+
+        def _stats_show(event):
+            self._stats_timer.start()
+            QWidget.showEvent(w, event)
+
+        def _stats_hide(event):
+            self._stats_timer.stop()
+            QWidget.hideEvent(w, event)
+
+        w.showEvent = _stats_show
+        w.hideEvent = _stats_hide
+        # Populate once now; the timer only runs while the tab is visible.
         QTimer.singleShot(0, self.refresh_db_stats)
 
         return w
@@ -957,7 +1023,7 @@ class FeatureTabBuildersMixin:
         lay.addWidget(reconciliation_group, stretch=1)
 
         refresh = QPushButton("Refresh Diagnostics")
-        refresh.clicked.connect(self.refresh_diagnostics)
+        refresh.clicked.connect(lambda _=False: self.refresh_diagnostics(force=True))
         lay.addWidget(refresh)
         self._diagnostics_refresh_button = refresh
         QTimer.singleShot(0, self.refresh_diagnostics)
@@ -1241,16 +1307,31 @@ class FeatureTabBuildersMixin:
             pipeline = getattr(self, "earning_pipeline", None)
             loop = getattr(pipeline, "learning_loop", None) if pipeline else None
             memory = getattr(loop, "memory", None) if loop else None
+            dashboard = holder.get("dashboard")
             if memory is not None:
                 try:
+                    analytics = memory.learning_dashboard()
                     successful_terms = memory.get_successful_search_terms(3)
                     if successful_terms:
                         recommendation = (
                             "Next action: prioritize a new discovery using verified terms: "
                             + ", ".join(successful_terms)
                         )
+                    if dashboard is not None:
+                        lines = []
+                        for name, value in analytics.items():
+                            if isinstance(value, list):
+                                rendered = f"{len(value)} row(s)"
+                            elif isinstance(value, dict) and "error" in value:
+                                rendered = f"unavailable ({value['error']})"
+                            else:
+                                rendered = str(value)
+                            lines.append(f"{name}: {rendered[:180]}")
+                        dashboard.setText("Learning analytics:\n" + "\n".join(lines))
                 except Exception as exc:
                     recommendation = f"Learning recommendation unavailable: {exc}"
+                    if dashboard is not None:
+                        dashboard.setText(f"Learning analytics unavailable: {exc}")
             status.setText(
                 f"{len(rows)} learning insights; {recommendation} "
                 "All changes remain bounded and evidence-gated.")
@@ -1270,6 +1351,14 @@ class FeatureTabBuildersMixin:
         holder["widget"] = widget
 
         # ── Pending code-patch proposals (approval-gated) ─────────────────────
+        # ARCH-ENG-306 (P-02): surface every read-only learning aggregation the
+        # memory computes, not just the single next-action recommendation.
+        dashboard_label = QLabel("Learning analytics: waiting for memory...")
+        dashboard_label.setWordWrap(True)
+        dashboard_label.setStyleSheet("color: #888; font-size: 11px;")
+        widget.layout().addWidget(dashboard_label)
+        holder["dashboard"] = dashboard_label
+
         patch_box = QGroupBox("Pending Code Patches (human approval required)")
         patch_lay = QVBoxLayout(patch_box)
         patch_status = QLabel("No pending code patches")
@@ -1490,13 +1579,34 @@ class FeatureTabBuildersMixin:
         refresh()
         return widget
 
-    def refresh_diagnostics(self):
-        """Refresh sanitized health and reconciliation data without mutations."""
+    def refresh_diagnostics(self, force: bool = False):
+        """Refresh sanitized health and reconciliation data without mutations.
+
+        ARCH-ENG-221: THIS USED TO PASS `refresh_health=True` UNCONDITIONALLY.
+
+        `DualBrainRuntime.list_models` has a 10 s TTL on its health cache
+        (`dual_brain.py:1149`, added by ARCH-ENG-188 precisely so the UI would
+        not re-probe on every repaint). Passing `refresh=True` bypassed that TTL
+        entirely -- so the 5 s diagnostics timer forced a fresh probe twice per
+        TTL, each one `urllib.urlopen(timeout=3)` per role ON THE GUI THREAD
+        (`HEALTH_TIMEOUT_S = 3.0`, `dual_brain.py:877`). Against a llama-server
+        that has accepted the socket but not yet loaded the model, that is up to
+        a 6-second frozen window every 5 seconds.
+
+        Note the shape of the defect: it is the SAME one ARCH-ENG-179, -185 and
+        -188 were raised for, inverted. Those cached an observation and presented
+        it as current fact; this discarded the expiry that was built to stop it,
+        and paid for the probe on the thread that must never block.
+
+        `force=True` remains available for the explicit "Refresh Diagnostics"
+        button, where the operator has asked for live data and can wait.
+        """
         if not hasattr(self, "diagnostics_health_table"):
             return
         try:
             runtime = getattr(self, "dual_brain_runtime", None)
-            snapshot = runtime.snapshot(refresh_health=True) if runtime is not None else {}
+            snapshot = (runtime.snapshot(refresh_health=True) if force else
+                        runtime.snapshot()) if runtime is not None else {}
         except Exception as exc:
             snapshot = {}
             self.log_signal.emit(f"[Diagnostics] Provider health unavailable: {exc}")
@@ -1614,36 +1724,15 @@ class FeatureTabBuildersMixin:
         frame.value_label = val
         return frame
 
+    # ARCH-ENG-278 (AW-03): this is the orchestrator left by splitting the
+    # former 870-line method. Each section is a `_build_*` helper below.
     def create_settings_tab(self):
         # v2.0.33: per-provider main/chat role control. Defined up-front so both
         # the LLM Providers group (OpenAI/Anthropic) and the _prov_row helper can
         # use them without a forward-reference error.
         from gui.widgets.provider_config_widget import ProviderConfigWidget, CloudProviderPanel, LocalProviderPanel
         
-        ROLE_ITEMS = ["Both", "Main only", "Chat only", "Disabled"]
-
-        def _role_from_env(env_prefix):
-            if os.getenv(f"DISABLE_{env_prefix}", "false").lower() == "true":
-                return "Disabled"
-            main_on = os.getenv(f"{env_prefix}_MAIN_ENABLED", "").lower()
-            chat_on = os.getenv(f"{env_prefix}_CHAT_ENABLED", "").lower()
-            if main_on == "" and chat_on == "":
-                return "Both"
-            if main_on != "false" and chat_on != "false":
-                return "Both"
-            if main_on != "false" and chat_on == "false":
-                return "Main only"
-            if main_on == "false" and chat_on != "false":
-                return "Chat only"
-            return "Disabled"
-
-        def _env_bool(name, default=False):
-            v = os.getenv(name, "").strip().lower()
-            if v in ("1", "true", "yes", "on"):
-                return True
-            if v in ("0", "false", "no", "off"):
-                return False
-            return default
+        from app.effects import env_bool as _env_bool
 
         def _seed_fx(name, cb):
             cb.blockSignals(True)
@@ -1655,6 +1744,48 @@ class FeatureTabBuildersMixin:
         inner   = QWidget()
         scroll.setWidget(inner)
         lay     = QVBoxLayout(inner)
+
+        # ARCH-ENG-200: THE RE-HOMING CONTAINER.
+        #
+        # Three group boxes below -- `cloudg`, `localg` and `llamacppg` -- are
+        # built and NEVER added to a layout, because `ProviderConfigWidget` is
+        # the visible surface for those sections. They still had to exist
+        # because `save_settings` reads attributes off their widgets (the
+        # `*_key_edit` / `*_base_edit` fields).
+        #
+        # An UNPARENTED QWidget in Qt is a TOP-LEVEL WINDOW. So these were not
+        # merely invisible -- they were stray windows titled "Cloud Providers",
+        # "Local Providers" and "llama.cpp (local dual-brain)", competing for
+        # the taskbar and the alt-tab list.
+        #
+        # NOTE THE ARGUMENT ORDER: PySide6's signature is QGroupBox(title, parent).
+        # QGroupBox(parent, title) also re-homes the widget but SILENTLY DROPS
+        # THE TITLE -- it binds the parent to the title slot and leaves title()
+        # empty. That was the first attempt here, and the regression suite caught
+        # it because the titles are what diagnostics and the object tree show.
+        #
+        # Re-homing them under one parented, hidden container fixes that without
+        # changing a single value: `QWidget()` with a parent is an ordinary child
+        # object, not a window. Nothing is laid out, so nothing is displayed, and
+        # every `self.<attr>` the save path reads still resolves to a live widget.
+        #
+        # ARCH-ENG-275 (AB-01): the fourth box, `ollama_box`, is GONE rather
+        # than re-homed. It was the hidden second writer of
+        # `OLLAMA_MAIN_MODEL` / `OLLAMA_CHAT_MODEL` (ARCH-ENG-196 could only make
+        # the persisted value win over it) and the only reader of a hidden role
+        # and hide toggle. `ProviderConfigWidget` persists the role and the
+        # model the moment the operator changes them, so there is no value left
+        # that only the hidden box could supply. Nothing here fetches models
+        # either: ARCH-ENG-193 recorded that the old live population had to stay
+        # on a background thread because a blocking fetch froze the Settings
+        # tab, and with the hidden combos gone no fetch runs at build time.
+        rehome = QWidget(inner)          # parented -> a child, never a window
+        rehome.setObjectName("settingsUnrenderedSections")
+        rehome.setVisible(False)         # and never shown even if a layout changes
+        rehome_layout = QVBoxLayout(rehome)
+        # NOTE: `rehome_layout` is intentionally never added to `lay`. Adding
+        # it would re-introduce the duplicate sections this container exists to
+        # retire; its only job is to give the four group boxes a parent.
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(14)
 
@@ -1674,7 +1805,27 @@ class FeatureTabBuildersMixin:
         top_save.setToolTip("Save settings immediately (same as the button at the bottom)")
         top_save.clicked.connect(self.save_settings)
         lay.addWidget(top_save)
+        self._build_registration_group(lay)
+        self._build_provider_sections(lay, rehome, rehome_layout)
+        self._build_performance_group(lay)
+        self._build_llm_group(lay)
+        self._build_rate_group(lay)
+        self._build_model_info_group(lay)
+        self._build_security_group(lay)
+        self._build_feature_group(lay)
+        self._build_pipeline_group(lay)
+        self._build_payout_group(lay)
+        self._build_appearance_group(lay, _seed_fx)
+        self._build_cache_group(lay)
 
+        sb = QPushButton("💾 Save All Settings")
+        sb.clicked.connect(self.save_settings)
+        lay.addWidget(sb)
+
+        lay.addStretch()
+        return scroll
+
+    def _build_registration_group(self, lay):
         # Registration (identity only — wallet/cashApp moved to Payout Destinations below)
         rg = QGroupBox("Agent Registration")
         rl = QFormLayout(rg)
@@ -1693,6 +1844,31 @@ class FeatureTabBuildersMixin:
         self.status_label.setText("Agent status: Not registered")
         rl.addRow(self.status_label)
         lay.addWidget(rg)
+
+    def _build_provider_sections(self, lay, rehome, rehome_layout):
+        # v2.0.33: per-provider main/chat role control. Defined up-front so both
+        # the LLM Providers group (OpenAI/Anthropic) and the _prov_row helper can
+        # use them without a forward-reference error.
+        from gui.widgets.provider_config_widget import ProviderConfigWidget, CloudProviderPanel, LocalProviderPanel
+        
+        ROLE_ITEMS = ["Both", "Main only", "Chat only", "Disabled"]
+
+        # F4 consolidation: the role reader lives in ONE place
+        # (provider_config_widget.role_from_env). This closure used to be a
+        # second copy of that logic, which is how the two panels drift — the
+        # Role dropdown would then show different answers depending on which
+        # one built it. Behaviour is unchanged (see role_from_env's docstring).
+        def _role_from_env(env_prefix):
+            from gui.widgets.provider_config_widget import role_from_env
+            return role_from_env(env_prefix)
+
+        # ARCH-ENG-203: this closure WAS the correct three-state parser, and it
+        # was also a private copy of logic that belongs to `app.effects`, the
+        # module that owns these settings. It is now a one-line delegation so
+        # the semantics live in exactly one place. The two ad-hoc parsers below
+        # (`.lower() == "true"` and `.lower() != "false"`) were seeded from the
+        # same settings and disagreed with each other; see `env_bool`.
+        from app.effects import env_bool as _env_bool
 
         # v2.0.26: providers grouped into CLOUD and LOCAL for clarity.
         # v2.0.32: model field is now a QComboBox (editable) + Fetch button that
@@ -1802,7 +1978,9 @@ class FeatureTabBuildersMixin:
 
             return key, base, model_combo, chat_combo, role_combo, fetch_btn, hide_cb
         # ── Cloud Providers ───────────────────────────────────────────────
-        cloudg = QGroupBox("Cloud Providers")
+        # ARCH-ENG-200: parented, so this is a child object rather than a
+        # stray top-level window. See the re-homing container above.
+        cloudg = QGroupBox("Cloud Providers", rehome)
         cloudg.setObjectName("prov-section")
         cloudl = QVBoxLayout(cloudg)
         cloudl.setContentsMargins(12, 12, 12, 12)
@@ -1912,7 +2090,9 @@ class FeatureTabBuildersMixin:
         # not render a second copy of the provider list.
 
         # ── Local Providers (OpenAI-compatible local servers) ──────────────
-        localg = QGroupBox("Local Providers")
+        # ARCH-ENG-200: parented, so this is a child object rather than a
+        # stray top-level window. See the re-homing container above.
+        localg = QGroupBox("Local Providers", rehome)
         localg.setObjectName("prov-section")
         locall = QVBoxLayout(localg)
         locall.setContentsMargins(12, 12, 12, 12)
@@ -1926,7 +2106,9 @@ class FeatureTabBuildersMixin:
 
         # llama.cpp is a local provider too, but its two role-specific servers
         # are controlled by the Providers & GPU tab rather than generic rows.
-        llamacppg = QGroupBox("llama.cpp (local dual-brain)")
+        # ARCH-ENG-200: parented, so this is a child object rather than a
+        # stray top-level window. See the re-homing container above.
+        llamacppg = QGroupBox("llama.cpp (local dual-brain)", rehome)
         llamacppl = QFormLayout(llamacppg)
         llamacppl.setContentsMargins(12, 12, 12, 12)
         self.llamacpp_big_enabled = QCheckBox("Enabled")
@@ -1944,116 +2126,12 @@ class FeatureTabBuildersMixin:
         self._themeable.append((llamacpp_note, "caption", "font-size:10px;padding-top:3px;"))
         llamacppl.addRow(llamacpp_note)
 
-        # Ollama Local (foundational local provider) — wrapped in its own outlined
-        # prov-section box inside "LLM Providers", with a "Hide when disabled" toggle
-        # like the other providers (v2.0.34an).
-        ollama_box = QGroupBox("Ollama (local)")
-        ollama_box.setObjectName("prov-section")
-        ollama_vbox = QVBoxLayout(ollama_box)
-        ollama_vbox.setContentsMargins(10, 4, 10, 10)
-        ollama_vbox.setSpacing(6)
-        ollama_header = QWidget()
-        ollama_header_lay = QHBoxLayout(ollama_header)
-        ollama_header_lay.setContentsMargins(0, 0, 0, 0)
-        ollama_header_lay.setSpacing(8)
-        ollama_htitle = QLabel("Ollama (local)")
-        ollama_htitle.setStyleSheet(f"font-weight:bold;color:{self._t('accent')};font-size:12px;")
-        ollama_header_lay.addWidget(ollama_htitle)
-        ollama_header_lay.addStretch(1)
-        self.ollama_hide = QCheckBox("Hide when disabled")
-        self.ollama_hide.setChecked(_env_bool("OLLAMA_HIDE", False))
-        ollama_header_lay.addWidget(self.ollama_hide)
-        ollama_coll = QPushButton("\u25be")
-        ollama_coll.setFixedWidth(26)
-        ollama_coll.setCheckable(True)
-        ollama_coll.setChecked(True)
-        ollama_coll.setToolTip("Collapse / expand provider")
-        ollama_header_lay.addWidget(ollama_coll)
-        ollama_vbox.addWidget(ollama_header)
-        ollama_body = QWidget()
-        ollama_box_layout = QFormLayout(ollama_body)
-        ollama_box_layout.setContentsMargins(4, 2, 4, 4)
-        ollama_box_layout.setVerticalSpacing(6)
-        ollama_row = QWidget()
-        ollama_layout = QHBoxLayout(ollama_row)
-        ollama_layout.setContentsMargins(0, 0, 0, 0)
-        self.ollama_model_combo = QComboBox()
-        self.ollama_model_combo.setEditable(True)
-        # Populate from live Ollama on first build so the dropdown reflects
-        # what's actually installed, not a hardcoded guess. Use a set to avoid
-        # duplicates: we add live names, fallback defaults, AND worker names
-        # (which may overlap with the live names above).
-        seen = set()
-        def _add_unique(combo, names):
-            for nm in names:
-                if nm and nm not in seen:
-                    seen.add(nm)
-                    combo.addItem(nm)
-        try:
-            from agents.brains.base_worker import WorkerAgent
-            names = WorkerAgent._ollama_model_names_static()
-            _add_unique(self.ollama_model_combo, names or [])
-        except Exception:
-            pass
-        # Fallback: add common defaults if live query returned nothing.
-        if self.ollama_model_combo.count() == 0:
-            _add_unique(self.ollama_model_combo, [
-                "llama3.2", "llama3:8b", "llama3:70b", "mistral", "codellama",
-                "qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b", "phi3:mini", "gemma2:2b",
-            ])
-        # Default selection reflects the LIVE chosen model (override) so the combo
-        # shows what's actually active; env value is the fallback seed. The dropdown
-        # is silently re-populated from locally-found models at startup via
-        # populate_ollama_model_combos() (ease of switching).
-        _active_main = getattr(self.worker, "_ollama_model_override", None) \
-            or os.getenv("OLLAMA_MODEL", "llama3.2")
-        self.ollama_model_combo.setCurrentText(_active_main)
-        self.ollama_chat_model_combo = QComboBox()
-        self.ollama_chat_model_combo.setEditable(True)
-        _active_chat = getattr(self.worker, "_chat_ollama_model_override", None) \
-            or os.getenv("OLLAMA_CHAT_MODEL", "")
-        self.ollama_chat_model_combo.setCurrentText(_active_chat)
-        self.refresh_chat_model_btn = QPushButton("Refresh")
-        self.refresh_chat_model_btn.clicked.connect(self.refresh_ollama_models)
-        ollama_chat_row = QWidget()
-        ollama_chat_layout = QHBoxLayout(ollama_chat_row)
-        ollama_chat_layout.setContentsMargins(0, 0, 0, 0)
-        ollama_chat_layout.addWidget(self.ollama_chat_model_combo)
-        ollama_chat_layout.addWidget(self.refresh_chat_model_btn)
-        self.refresh_ollama_btn = QPushButton("Refresh")
-        self.refresh_ollama_btn.clicked.connect(self.refresh_ollama_models)
-        ollama_layout.addWidget(self.ollama_model_combo)
-        ollama_layout.addWidget(self.refresh_ollama_btn)
-        self.ollama_role = QComboBox()
-        self.ollama_role.addItems(ROLE_ITEMS)
-        self.ollama_role.setCurrentText(_role_from_env("OLLAMA"))
-        ollama_box_layout.addRow("Ollama Main Model:", ollama_row)
-        ollama_box_layout.addRow("Ollama Chat Model:", ollama_chat_row)
-        ollama_box_layout.addRow("Ollama Role:", self.ollama_role)
-        # v2.0.34ag (A2): per-role GPU offload controls moved to the "Model & GPU" tab.
-        ollama_note = QLabel("Use for: Local private inference. Best for offline/cheap. Cost: free, uses local GPU/CPU.")
-        ollama_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
-        self._themeable.append((ollama_note, "caption", "font-size:10px;padding-top:3px;"))
-        ollama_note.setWordWrap(True)
-        ollama_box_layout.addRow(ollama_note)
-        ollama_vbox.addWidget(ollama_body)
-
-        def _ollama_refresh():
-            # This legacy control block is retained only for save/load
-            # compatibility. ProviderConfigWidget is the visible Settings
-            # surface; showing this unattached box creates a second top-level
-            # window titled "python".
-            ollama_box.hide()
-        self.ollama_hide.toggled.connect(lambda *_: _ollama_refresh())
-        self.ollama_role.currentTextChanged.connect(lambda *_: _ollama_refresh())
-        ollama_coll.toggled.connect(lambda *_: _ollama_refresh())
-        _ollama_refresh()
-
 
         tb = QPushButton("Test Connection")
         tb.clicked.connect(self.test_api_connection)
         lay.addWidget(tb)
 
+    def _build_performance_group(self, lay):
         # v2.0.34ag (A2): LLM Parameters + Model Info moved to the "Model & GPU" tab.
         perfg = QGroupBox("Performance & Cache")
         perfl = QFormLayout(perfg)
@@ -2113,6 +2191,7 @@ class FeatureTabBuildersMixin:
         QTimer.singleShot(200, self._refresh_cache_stats)
         lay.addWidget(perfg)
 
+    def _build_llm_group(self, lay):
         # ── LLM Parameters (relocated from the removed "Model & GPU" tab) ──
         # Generic LLM controls that are still relevant with llama.cpp as the
         # default provider. Widget names are kept identical so save_settings and
@@ -2213,6 +2292,7 @@ class FeatureTabBuildersMixin:
         llml.addRow(winrate_note)
         lay.addWidget(llmg)
 
+    def _build_rate_group(self, lay):
         # ── Provider Rate & Budget (Phase F, ARCH-ENG-091) ──
         # Per-provider calls/sec + daily call cap so a cloud subscription/budget
         # isn't burned too fast. Local providers are hardware-bound (no $ cap
@@ -2255,6 +2335,7 @@ class FeatureTabBuildersMixin:
         prl_box.addRow(prb_note)
         lay.addWidget(prg)
 
+    def _build_model_info_group(self, lay):
         # ── Model Info (relocated from the removed "Model & GPU" tab) ──
         infog = QGroupBox("Model Info")
         infol = QVBoxLayout(infog)
@@ -2288,30 +2369,49 @@ class FeatureTabBuildersMixin:
         # PERF: defer model info refresh to avoid blocking tab paint
         QTimer.singleShot(100, lambda: self._refresh_model_info(live=False))
 
+    def _build_security_group(self, lay):
         # Security Settings with explanations
         secg = QGroupBox("Security")
         secl = QFormLayout(secg)
         secl.setContentsMargins(12, 12, 12, 12)
         secl.setVerticalSpacing(8)
-        self.blocklist_edit = QLineEdit(os.getenv("FILENAME_BLOCKLIST",
-            "config.yaml,.env,credentials.json,id_rsa"))
+        # ARCH-ENG-202: show what is ACTUALLY blocked, not a local guess.
+        #
+        # This used to default to a hardcoded four entries while
+        # `worker_safety` enforced fourteen, so the Settings screen understated
+        # the protection by ten files -- `passwd`, `shadow`, `sudoers`, `id_dsa`,
+        # `hosts`, `.bashrc` and four more were invisible. An operator reading
+        # this screen had no way to know they were blocked.
+        #
+        # The correct default is the runtime's own effective set. `os.getenv`
+        # alone is not enough either: the value is a floor PLUS operator
+        # additions, and the screen must show both.
+        from agents.brains.worker_safety import (effective_blocklist_text,
+                                                 effective_mime_text,
+                                                 refresh_from_env)
+        refresh_from_env()   # .env may have been reloaded since import
+        self.blocklist_edit = QLineEdit(effective_blocklist_text())
         secl.addRow("Blocklist (comma sep):", self.blocklist_edit)
-        blocklist_note = QLabel("Files the agent will never read. Keeps secrets safe.")
+        blocklist_note = QLabel(
+            "Files the agent will never read. These protected entries cannot be "
+            "removed — anything you add here is blocked on top of them.")
         blocklist_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
         self._themeable.append((blocklist_note, "caption", "font-size:10px;padding-top:3px;"))
         blocklist_note.setWordWrap(True)
         secl.addRow(blocklist_note)
 
-        self.blocked_mime_edit = QLineEdit(os.getenv("BLOCKED_MIME_TYPES",
-            "application/x-executable,application/x-sharedlib"))
+        self.blocked_mime_edit = QLineEdit(effective_mime_text())
         secl.addRow("Blocked MIME (comma):", self.blocked_mime_edit)
-        mime_note = QLabel("Blocked file types. Prevents reading binaries or executables.")
+        mime_note = QLabel(
+            "Blocked file types. Prevents reading binaries or executables. "
+            "Same rule — the built-in types cannot be removed.")
         mime_note.setStyleSheet(f"color:{self._t('caption')};font-size:10px;padding-top:3px;")
         self._themeable.append((mime_note, "caption", "font-size:10px;padding-top:3px;"))
         mime_note.setWordWrap(True)
         secl.addRow(mime_note)
         lay.addWidget(secg)
 
+    def _build_feature_group(self, lay):
         # Optional capability boundaries. These are explicit operator controls;
         # risky features remain disabled unless the user opts in and saves.
         featureg = QGroupBox("Optional Features")
@@ -2369,6 +2469,7 @@ class FeatureTabBuildersMixin:
         featurel.addRow(feature_note)
         lay.addWidget(featureg)
 
+    def _build_pipeline_group(self, lay):
         # Action Pipeline with explanations
         pipeg = QGroupBox("Action Pipeline")
         pipel = QFormLayout(pipeg)
@@ -2391,8 +2492,16 @@ class FeatureTabBuildersMixin:
         pipel.addRow("Allow file write/create:", self.pipeline_allow_write_check)
 
         self.pipeline_allow_selfimprove_check = QCheckBox()
+        # ARCH-ENG-238 (AW-02): read the variable through the ONE canonical
+        # env parser. The old inline `.lower() == "true"` disagreed with
+        # `app/action_pipeline.py` (env_bool): for the perfectly reasonable
+        # hand-written `PIPELINE_ALLOW_SELF_IMPROVE=1`, the checkbox rendered
+        # UNCHECKED while the agent was permitted to modify its own code. The
+        # write side (stateChanged -> "true"/"false") is unchanged and remains
+        # readable by every parser.
+        from app.effects import env_bool
         self.pipeline_allow_selfimprove_check.setChecked(
-            os.getenv("PIPELINE_ALLOW_SELF_IMPROVE", "false").lower() == "true")
+            env_bool("PIPELINE_ALLOW_SELF_IMPROVE", False))
         pipel.addRow("Allow self-improvement:", self.pipeline_allow_selfimprove_check)
         for _name, _check in (
             ("PIPELINE_ENABLED", self.pipeline_enabled_check),
@@ -2418,6 +2527,7 @@ class FeatureTabBuildersMixin:
         pipel.addRow(self.pipeline_result_label)
         lay.addWidget(pipeg)
 
+    def _build_payout_group(self, lay):
         # Payout Settings with explanations
         payg = QGroupBox("Payout Destinations")
         payl = QFormLayout(payg)
@@ -2434,6 +2544,7 @@ class FeatureTabBuildersMixin:
         payl.addRow(payout_note)
         lay.addWidget(payg)
 
+    def _build_appearance_group(self, lay, _seed_fx):
         # Appearance (v2.0.26: customizable theme coloring + effects toggles)
         apg = QGroupBox("Appearance")
         apl = QFormLayout(apg)
@@ -2475,12 +2586,19 @@ class FeatureTabBuildersMixin:
             os.getenv("MRBOT_FX_RENDER_QUALITY", "High"))
         apl.addRow("Render quality:", self.fx_render_quality)
         self.fx_compact = QCheckBox()
+        # ARCH-ENG-203: was `.lower() == "true"`, which reads "1", "yes" and
+        # "on" as False while `effects.py` reads them as True -- so the toggle
+        # could show unchecked while the feature was actually on.
         self.fx_compact.setChecked(
-            os.getenv("MRBOT_FX_COMPACT_DENSITY", "false").lower() == "true")
+            _env_bool("MRBOT_FX_COMPACT_DENSITY", False))
         apl.addRow("Compact density:", self.fx_compact)
         self.fx_rounded = QCheckBox()
+        # ARCH-ENG-203: was `.lower() != "false"`, which treats ANY unrecognised
+        # value as True. A typo here would read as ON rather than falling back to
+        # the documented default. It also meant this checkbox and the one four
+        # lines above parsed the same .env format in opposite directions.
         self.fx_rounded.setChecked(
-            os.getenv("MRBOT_FX_ROUNDED_CORNERS", "true").lower() != "false")
+            _env_bool("MRBOT_FX_ROUNDED_CORNERS", True))
         apl.addRow("Rounded corners:", self.fx_rounded)
         self.fx_button_style = QComboBox()
         self.fx_button_style.addItems(["2.5D (beveled)", "2D (flat)"])
@@ -2501,6 +2619,7 @@ class FeatureTabBuildersMixin:
         self.fx_button_style.currentTextChanged.connect(lambda *_: self._apply_effects_now())
         lay.addWidget(apg)
 
+    def _build_cache_group(self, lay):
         # Cache Management
         cg = QGroupBox("Cache Management")
         cl = QVBoxLayout(cg)
@@ -2509,12 +2628,6 @@ class FeatureTabBuildersMixin:
         cl.addWidget(ccb)
         lay.addWidget(cg)
 
-        sb = QPushButton("💾 Save All Settings")
-        sb.clicked.connect(self.save_settings)
-        lay.addWidget(sb)
-
-        lay.addStretch()
-        return scroll
 
     def create_opportunities_tab(self):
         """Create the Opportunities tab — browse, search, and manage discovered opportunities."""
@@ -2699,9 +2812,23 @@ class FeatureTabBuildersMixin:
         self._opp_scan_page = 1
         self._opp_scan_found = 0
         self._opp_scan_last_refresh = 0.0
+        # ARCH-ENG-223: NOT STARTED HERE.
+        #
+        # This ran at 10 Hz for the entire process lifetime -- waking the Qt
+        # event loop ten times a second even when no scan was running, the
+        # queue was empty and the tab was hidden. On a 6-core CPU that is a
+        # small but permanent slice of a core, and 10 Hz of scheduler jitter
+        # landing on every paint.
+        #
+        # It now starts with the scan (`_on_scan_opportunities`) and stops when
+        # the "done" event is drained, so it runs only while there is something
+        # to drain.
         self.opp_scan_drain_timer = QTimer(self)
         self.opp_scan_drain_timer.timeout.connect(self._drain_opportunity_scan)
-        self.opp_scan_drain_timer.start(100)
+        # Fail-safe: if a scan ends without a "done" event reaching the drain
+        # (a worker killed, a queue left with a stale "found"), the timer must
+        # not stay armed forever. Started at scan time, it is also stopped here
+        # on every scan-completion and failure path.
 
         page_row = QHBoxLayout()
         self.opp_prev_btn = QPushButton("Previous")
@@ -2760,6 +2887,7 @@ class FeatureTabBuildersMixin:
         self._configure_live_exchange(exchange)
         register_component("live_trading", self.live_trading_service)
         self.live_portfolio_worker = None
+        self.live_order_worker = None
 
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -2796,11 +2924,74 @@ class FeatureTabBuildersMixin:
         sync_btn = QPushButton("Refresh Live Portfolio")
         sync_btn.clicked.connect(self._refresh_live_portfolio)
         lay.addWidget(sync_btn)
+
+        # ARCH-ENG-283 (G-05): the operator-accessible order path. Before this,
+        # nothing in the product called `assess_order`, `propose_order`, or
+        # `execute_order`; the entire guarded execution flow was test-only.
+        # The request is assessed against live state, then either enqueued as a
+        # scoped approval (default policy) or, for an explicitly enabled
+        # preapproval tier, submitted through `execute_order`'s own gates.
+        order_group = QGroupBox("Order Request (approval-gated)")
+        order_form = QFormLayout(order_group)
+        self.live_order_symbol = QLineEdit("BTC/USD")
+        self.live_order_symbol.setPlaceholderText("Symbol (e.g. BTC/USD)")
+        order_form.addRow("Symbol:", self.live_order_symbol)
+
+        self.live_order_side = QComboBox()
+        self.live_order_side.addItems(["buy", "sell"])
+        order_form.addRow("Side:", self.live_order_side)
+
+        self.live_order_type = QComboBox()
+        self.live_order_type.addItems(["market", "limit"])
+        order_form.addRow("Order type:", self.live_order_type)
+
+        self.live_order_qty = QLineEdit()
+        self.live_order_qty.setPlaceholderText("Base-asset quantity")
+        order_form.addRow("Quantity:", self.live_order_qty)
+
+        self.live_order_limit = QLineEdit()
+        self.live_order_limit.setPlaceholderText(
+            "Limit price (limit orders only)")
+        order_form.addRow("Limit price:", self.live_order_limit)
+
+        self.live_order_profit = QLineEdit("0.5")
+        self.live_order_profit.setPlaceholderText("Expected profit %")
+        order_form.addRow("Expected profit %:", self.live_order_profit)
+
+        self.live_order_confidence = QLineEdit("0.80")
+        self.live_order_confidence.setPlaceholderText("0.0 - 1.0")
+        order_form.addRow("Strategy confidence:", self.live_order_confidence)
+
+        self.live_order_asset = QComboBox()
+        self.live_order_asset.addItems(
+            ["major", "stable", "alt", "meme", "unknown"])
+        order_form.addRow("Asset class:", self.live_order_asset)
+
+        self.live_order_reason = QLineEdit()
+        self.live_order_reason.setPlaceholderText(
+            "Why this order? (advisory; never overrides risk)")
+        order_form.addRow("Reasoning:", self.live_order_reason)
+
+        self.live_order_request_btn = QPushButton(
+            "🛡️ Assess & Request Approval")
+        self.live_order_request_btn.clicked.connect(
+            self._on_live_order_request)
+        order_form.addRow(self.live_order_request_btn)
+
+        self.live_order_status = QLabel(
+            "No order requested. Requires a configured exchange and "
+            "MRBOT_ENABLE_LIVE_TRADING=1.")
+        self.live_order_status.setWordWrap(True)
+        order_form.addRow(self.live_order_status)
+        lay.addWidget(order_group)
+
         self._refresh_live_portfolio()
         return w
 
     def _configure_live_exchange(self, exchange: str):
-        from agents.earning.live_trading import LiveTradingService
+        from agents.earning.live_trading import (
+            LiveTradingService, default_daily_equity_path,
+        )
 
         adapter = None
         adapter_error = ""
@@ -2808,8 +2999,12 @@ class FeatureTabBuildersMixin:
             adapter = self.live_adapter_from_env(exchange)
         except Exception as exc:
             adapter_error = str(exc)
+        # ARCH-ENG-289 (G-06): the risk gate's daily-loss input needs a
+        # durable opening balance. This is the production producer; the
+        # service still works without it for tests/embedded callers.
         self.live_trading_service = LiveTradingService(
             adapter, policy=self.live_trading_policy,
+            daily_equity_path=default_daily_equity_path(),
         )
         self.live_adapter_error = adapter_error
         self.live_selected_exchange = exchange
@@ -2853,6 +3048,97 @@ class FeatureTabBuildersMixin:
         self.live_equity_label.setText(f"${result['equity']:,.2f}")
         self.live_cash_label.setText(f"${result['cash']:,.2f}")
         self.live_error_label.setText(f"Synchronized {result['balances']} non-zero balances")
+
+    def _on_live_order_request(self):
+        """ARCH-ENG-283 (G-05): validate, assess, and propose one order."""
+        service = getattr(self, "live_trading_service", None)
+        if service is None:
+            self.live_order_status.setText("Order: live service unavailable")
+            return
+        status = service.status()
+        if not status.get("configured"):
+            self.live_order_status.setText(
+                "Order: no exchange adapter configured; nothing was requested")
+            return
+        if not status.get("live_enabled"):
+            self.live_order_status.setText(
+                "Order: live trading is disabled (set "
+                "MRBOT_ENABLE_LIVE_TRADING=1); nothing was requested")
+            return
+
+        symbol = self.live_order_symbol.text().strip().upper()
+        if not symbol:
+            self.live_order_status.setText("Order: symbol required")
+            return
+        try:
+            quantity = float(self.live_order_qty.text().strip())
+            limit_price = float(self.live_order_limit.text().strip() or "0")
+            expected_profit = float(self.live_order_profit.text().strip() or "0")
+            confidence = float(self.live_order_confidence.text().strip() or "0")
+        except ValueError:
+            self.live_order_status.setText(
+                "Order: quantity, limit, profit, and confidence must be numeric")
+            return
+        order_type = self.live_order_type.currentText()
+        if quantity <= 0:
+            self.live_order_status.setText("Order: quantity must be positive")
+            return
+        if order_type == "limit" and limit_price <= 0:
+            self.live_order_status.setText(
+                "Order: a limit order needs a positive limit price")
+            return
+
+        from agents.earning.live_trading import TradeIntent
+        intent = TradeIntent(
+            exchange=(getattr(self, "live_selected_exchange", "")
+                      or os.getenv("TRADING_EXCHANGE", "coinbase")),
+            symbol=symbol,
+            side=self.live_order_side.currentText(),
+            quantity=quantity,
+            order_type=order_type,
+            limit_price=limit_price,
+            expected_profit_pct=expected_profit,
+            strategy_confidence=max(0.0, min(1.0, confidence)),
+            asset_class=self.live_order_asset.currentText(),
+            reasoning=self.live_order_reason.text().strip(),
+        )
+
+        worker = getattr(self, "live_order_worker", None)
+        if worker is not None and worker.isRunning():
+            self.live_order_status.setText(
+                "Order: an assessment is already in progress")
+            return
+        self.live_order_request_btn.setEnabled(False)
+        self.live_order_status.setText(
+            "Order: assessing against live market and account state...")
+        worker = LiveOrderProposalWorker(service, intent)
+        self.live_order_worker = worker
+        worker.finished.connect(self._on_live_order_proposed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_live_order_proposed(self, result: dict):
+        self.live_order_worker = None
+        self.live_order_request_btn.setEnabled(True)
+        status = result.get("status", "")
+        if status == "awaiting_approval":
+            approval_id = result.get("approval_id", "")
+            self.live_order_status.setText(
+                f"Awaiting human approval ({approval_id}). Approve it in "
+                "Safety & Tools → Approvals; approval is bound to this exact "
+                "order.")
+            return
+        if result.get("ok") and status in {"preapproved", "live", "executed"}:
+            order = (result.get("execution") or {}).get("order")
+            self.live_order_status.setText(
+                f"Submitted ({status}): {order}")
+            return
+        if status == "blocked":
+            self.live_order_status.setText(
+                "Blocked: " + (result.get("error") or "risk policy refused"))
+            return
+        self.live_order_status.setText(
+            "Order failed: " + (result.get("error") or "unknown error"))
 
     def create_paper_trading_tab(self):
         """Create the Strategy Simulator tab — virtual portfolio testing only."""
@@ -3060,6 +3346,8 @@ class FeatureTabBuildersMixin:
             sources = None if source == "all" else [source]
             self._opp_scan_active = True
             self._opp_scan_found = 0
+            # ARCH-ENG-223: arm the drain timer only while a scan is live.
+            self.opp_scan_drain_timer.start(100)
 
             def add_found_opportunity(opportunity):
                 # Discovery runs off-thread; only pass data through the queue.
@@ -3081,6 +3369,7 @@ class FeatureTabBuildersMixin:
             threading.Thread(target=run_scan, daemon=True, name="opportunity-discovery").start()
         except Exception as exc:
             self._opp_scan_active = False
+            self.opp_scan_drain_timer.stop()
             self.opp_status_label.setText(f"Scan failed: {exc}")
 
     def _drain_opportunity_scan(self):
@@ -3094,6 +3383,8 @@ class FeatureTabBuildersMixin:
                 break
             if event[0] == "done":
                 self._opp_scan_active = False
+                # ARCH-ENG-223: the scan is over; nothing left to drain.
+                self.opp_scan_drain_timer.stop()
                 if event[2]:
                     self.opp_status_label.setText(f"Scan failed: {event[2]}")
                 else:

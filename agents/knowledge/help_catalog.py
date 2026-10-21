@@ -5,15 +5,20 @@ A dependency-light, read-only catalog of the app's major features/controls so
 that a help panel, in-app search box, or automation can answer "what does this
 do?" without importing the GUI. Every entry is grounded in the real code:
 
-    - Main-window tabs built from ``tab_specs`` in main.py:
-    Management, Providers & GPU, Safety & Tools, Chat, Dialogue,
-        Browse Root, Payments, Earnings,
-    Settings, Live Logs, DB Stats.
-  - GUI builders in gui/tab_builders.py (create_* methods) and widgets in
-    gui/ (dual_brain_control.py, dialogue_tab.py, collaboration_tab.py,
-    safety_tools_tab.py, chat_tab.py, model_switcher.py,
-    dual_brain_control.py).
-  - Worker / orchestration modules in agents/ (personas.py, dual_brain_*
+    - Main-window tabs built from ``tab_specs`` in main.py (24 labels;
+      ARCH-ENG-241's test asserts this catalog covers every one of them):
+    Management, Providers & GPU, Model Library, Safety & Tools, Chat,
+    Dialogue, Approvals, Registration, Web Browser, Payments, Earnings,
+    Insights, Opportunities, Social Activity, Self-Improvement,
+    Autonomous Learning, Live Portfolio, Strategy Simulator, Analytics,
+    Reputation, Data Explorer, Settings, Live Logs, DB Stats.
+  - GUI builders in gui/builders/tab_builders.py (composition + refresh)
+    and gui/builders/tab_feature_builders.py (the create_* methods), and
+    widgets in gui/widgets/dual_brain_control.py, gui/tabs/dialogue_tab.py,
+    gui/tabs/collaboration_tab.py, gui/tabs/safety_tools_tab.py, and
+    gui/tabs/chat_tab.py.
+  - Worker / orchestration modules in agents/ (cognition/personas.py,
+    dual_brain_*
     coordinator/runtime, big_brain.py, small_brain.py, gguf_meta.py, etc.)
 
 This module is IMPORTABLE STANDALONE: stdlib only, no Qt, no project deps,
@@ -68,6 +73,20 @@ FEATURES: List[dict] = [
             "(PipelineWorker) using the selected source and max-risk filter. Maps to "
             "_run_earning_cycle() / run_full_cycle().",
         "example": "Select source 'all' and press 'Run Earning Cycle' to scan for new opportunities.",
+    },
+    {
+        "feature": "Earning Goals",
+        "category": "Management",
+        "description":
+            "Create, pause, delete and watch earning goals (goal_system.py's "
+            "GoalTracker over goals.db). A goal is a verifiable target with a verified-current "
+            "amount (current_usd), a path, and optionally the platforms that "
+            "count toward it: only VERIFIED payouts credit a goal -- credits "
+            "flow through evidence rows behind a verified-guard, and a "
+            "payment the ledger could not verify arrives as revenue 0 that "
+            "cannot credit a cent. Verified payouts credit automatically "
+            "when the event names the goal or carries a declared platform.",
+        "example": "Create a $100 freelance goal bound to upwork; watch verified payouts raise its progress.",
     },
     {
         "feature": "Force Self-Improvement",
@@ -169,7 +188,7 @@ FEATURES: List[dict] = [
         "feature": "Chat tab (human conversation)",
         "category": "Chat",
         "description":
-            "Chat surface for conversing with the agent (chat_tab.py, chat_router). Sends your "
+            "Chat surface for conversing with the agent (chat_tab.py). Sends your "
             "message to the configured chat model and streams the reply in a normal Q&A thread.",
         "example": "Type a question in the Chat tab and press Enter to get an answer.",
     },
@@ -210,12 +229,12 @@ FEATURES: List[dict] = [
         "example": "Click once to get a single reply from the active brain and inspect it.",
     },
 
-    # ── Persona system (agents/personas.py) ─────────────────────────────────
+    # ── Persona system (agents/cognition/personas.py) ─────────────────────────────────
     {
         "feature": "Persona system (Driver & Navigator)",
         "category": "Personas",
         "description":
-            "Two named identities in agents/personas.py replacing the generic robot framing. "
+            "Two named identities in agents/cognition/personas.py replacing the generic robot framing. "
             "Driver (ambitious strategist, bias-to-act) binds to the Big Brain; Navigator "
             "(cautious risk-checker) binds to the Small Brain. Each persona carries identity, "
             "strengths, guardrails, and pulls real memory/personality context, and builds a "
@@ -332,12 +351,147 @@ FEATURES: List[dict] = [
         "example": "Open DB Stats to confirm the earning and message databases are growing normally.",
     },
     {
-        "feature": "Browse Root / file browser tab",
-        "category": "Browse Root",
+        "feature": "Web Browser (file browser tab)",
+        "category": "Web Browser",
         "description":
             "A file-browser surface (create_file_browser_tab) rooted at the project directory "
             "for inspecting files and outputs without leaving the app.",
-        "example": "Browse Root to locate a saved proposal draft before it is submitted.",
+        "example": "Open Web Browser to locate a saved proposal draft before it is submitted.",
+    },
+    {
+        "feature": "Model Library / GGUF installer",
+        "category": "Model Library",
+        "description":
+            "An HTTPS Hugging Face GGUF browser and installer (create_model_library_tab). "
+            "Downloading a model refreshes the installed-model selectors the provider tabs use; "
+            "the fetch is outbound HTTPS only, like every other model source in the app.",
+        "example": "Install a GGUF from the library, then pick it in Providers & GPU.",
+    },
+    {
+        "feature": "Collaboration / run monitor",
+        "category": "Collaboration",
+        "description":
+            "The dual-brain collaboration ledger (CollaborationTab over the shared "
+            "DualBrainCoordinator). Goals submitted here run through both brains "
+            "(Big/Small) with a down server degrading a run to FAILED rather than "
+            "blocking or crashing; goals entered on the Dialogue tab are mirrored "
+            "here and the other way around.",
+        "example": "Submit a goal in Collaboration, then follow the run as the other tabs observe the same ledger.",
+    },
+    {
+        "feature": "Approvals / human approval queue",
+        "category": "Approvals",
+        "description":
+            "The queue where the agent's irreversible action proposals wait for a human "
+            "decision (ApprovalPanel over HumanApprovalQueue). Approving or denying items "
+            "here IS the control surface: nothing shown in this panel was executed yet, "
+            "and a denial marks the item rejected rather than silently dropping it.",
+        "example": "Review pending payment and network proposals in Approvals before leaving the machine unattended.",
+    },
+    {
+        "feature": "Registration panel",
+        "category": "Registration",
+        "description":
+            "A gated platform sign-up panel (RegistrationPanel). Registration requests go "
+            "through the human-approval queue; the app does not create accounts on its own.",
+        "example": "Verify a platform registration request in Approvals, never by assumption.",
+    },
+    {
+        "feature": "Insights / earning dashboard",
+        "category": "Insights",
+        "description":
+            "The earning-insights dashboard panel (TabAwareInsightsPanel): charts and "
+            "aggregates over earning history and spend as recorded in the structured "
+            "event log. The dashboard renders what was actually recorded; if no events "
+            "reach the log the panels stay empty rather than inventing numbers.",
+        "example": "Check Insights after a session to see what the event log recorded.",
+    },
+    {
+        "feature": "Opportunities browser",
+        "category": "Opportunities",
+        "description":
+            "Browse, search and manage discovered opportunities in the shared opportunity "
+            "portfolio (OpportunityPortfolio). This is the same portfolio store the "
+            "autonomous runs draw from, not a separate scratch list.",
+        "example": "Filter Opportunities by status before starting an autonomous run.",
+    },
+    {
+        "feature": "Social Activity feed",
+        "category": "Social Activity",
+        "description":
+            "Shows the latest social-source events from the event log and offers a "
+            "discovery action that is itself gated. This tab is optional and only "
+            "appears when feature_enabled('social_automation') is true: set "
+            "MRBOT_ENABLE_SOCIAL_AUTOMATION on to show it; it fails closed otherwise.",
+        "example": "Enable MRBOT_ENABLE_SOCIAL_AUTOMATION to surface Social Activity.",
+    },
+    {
+        "feature": "Self-Improvement history",
+        "category": "Self-Improvement",
+        "description":
+            "Shows self-improvement learning history and pending code-patch proposals "
+            "(learning_history in earning_memory.db). The tab is optional: it appears "
+            "when MRBOT_ENABLE_SELF_IMPROVEMENT is on. Displaying a proposal is not the "
+            "same as executing one -- actually modifying its own code is a separate, "
+            "stricter self-improvement gate, so a visible history cannot mean permission.",
+        "example": "Enable MRBOT_ENABLE_SELF_IMPROVEMENT to see what the agent has learned.",
+    },
+    {
+        "feature": "Autonomous Learning runs",
+        "category": "Autonomous Learning",
+        "description":
+            "Shows autonomous run and stage progress from the durable run store "
+            "(autonomous_runs.db) alongside the opportunity portfolio it drew from. "
+            "The tab is optional and appears only when "
+            "MRBOT_ENABLE_AUTONOMOUS_LEARNING is on.",
+        "example": "Enable MRBOT_ENABLE_AUTONOMOUS_LEARNING to follow run progress here.",
+    },
+    {
+        "feature": "Live Portfolio status",
+        "category": "Live Portfolio",
+        "description":
+            "The live portfolio status surface (create_live_portfolio_tab), wired to the "
+            "live trading service with TRADING_EXCHANGE (default coinbase); no fake "
+            "balance is shown. The tab is optional and appears only when "
+            "MRBOT_ENABLE_LIVE_TRADING is on -- the legacy ENABLE_LIVE_TRADING variable "
+            "is accepted only if the canonical one is absent.",
+        "example": "Enable MRBOT_ENABLE_LIVE_TRADING and set TRADING_EXCHANGE to use Live Portfolio.",
+    },
+    {
+        "feature": "Strategy Simulator (paper trading)",
+        "category": "Strategy Simulator",
+        "description":
+            "Virtual portfolio testing only (create_paper_trading_tab over "
+            "PaperTradingEngine): strategies run against a simulated balance, never "
+            "real funds. The tab is optional and shares the live_trading gate: "
+            "MRBOT_ENABLE_LIVE_TRADING controls whether it is shown.",
+        "example": "Enable MRBOT_ENABLE_LIVE_TRADING to test strategies in the simulator.",
+    },
+    {
+        "feature": "Analytics market data",
+        "category": "Analytics",
+        "description":
+            "Market data and strategy performance views (AnalyticsTab). A read-side "
+            "surface for prices and performance the other tabs do not chart.",
+        "example": "Open Analytics to check performance before adjusting a strategy.",
+    },
+    {
+        "feature": "Reputation tracker",
+        "category": "Reputation",
+        "description":
+            "Tracks the agent's reputation across platforms (ReputationTracker). "
+            "Reputation is a recorded property of past interactions, not a toolbar "
+            "control: the tab reports, it does not set.",
+        "example": "Check Reputation after platform work to see how it was received.",
+    },
+    {
+        "feature": "Data Explorer",
+        "category": "Data Explorer",
+        "description":
+            "A web scraping and data extraction workspace (create_data_explorer_tab). "
+            "Scrapes are network activity like any other: outbound requests, subject "
+            "to the app's ordinary safety gates rather than a special exemption.",
+        "example": "Use Data Explorer to collect page text, then refine it in a skill.",
     },
 
     # ── Help catalog itself ─────────────────────────────────────────────────

@@ -2,17 +2,21 @@
 
 Provides a compact summary view of:
 - Total earned (verified) / pending / last 30 days
-- LLM spend vs budget + current survival tier
+- LLM spend vs budget
 - Active tasks / pending approvals count
 - Recent outcomes (last N)
-- Heartbeat status
 - Structured event log feed (recent safety / approval / earning events)
 - Success metrics row: safety incidents, approval success rate,
   reputation, ROI, uptime
+
+(ARCH-ENG-243: the survival-tier and heartbeat rows were removed — they
+read typed heartbeat events from the legacy manager heartbeat the runtime
+had already retired; with the emitter gone they were pure dead surface.)
 """
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal, QTimer
@@ -31,22 +35,20 @@ class EarningInsightsPanel(QWidget):
     """Dashboard panel for the Earning tab / main window."""
 
     log_signal = Signal(str)
-    approval_signal = Signal(str, str, str)  # kind, title, id
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.parent_window = parent
         self._pending_approvals: List[Dict[str, Any]] = []
         self._recent_outcomes: List[Dict[str, Any]] = []
-        self._tier: str = "unknown"
         self._llm_spend: float = 0.0
         self._llm_budget: float = 0.0
         self._total_earned: float = 0.0
         self._pending_amount: float = 0.0
         self._last30: float = 0.0
         self._active_tasks: int = 0
-        self._heartbeat_running: bool = False
         self._safety_incidents: int = 0
+        self._start_time: float = time.time()
         self._approval_success_rate: float = 1.0
         self._total_outcomes: int = 0
         self._successful_outcomes: int = 0
@@ -61,7 +63,27 @@ class EarningInsightsPanel(QWidget):
         self._setup_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
-        self._timer.start(4000)
+        # ARCH-ENG-230: NOT STARTED HERE.
+        #
+        # This ran every 4 seconds for the whole process lifetime, hidden or
+        # not. Each tick re-queried the event log, rebuilt a 50-row QListWidget,
+        # and -- before ARCH-ENG-230 -- re-applied a stylesheet to eight KPI
+        # labels, forcing eight style re-polishes every four seconds for a tab
+        # the operator may never open.
+        #
+        # `showEvent` starts it and `hideEvent` stops it, so it only runs while
+        # the tab is on screen. Starting in `__init__` would be wrong for the
+        # same reason as the Analytics tab: a widget that is never shown never
+        # receives `hideEvent`.
+        self._timer.setInterval(4000)
+
+    def showEvent(self, event):
+        self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -83,15 +105,17 @@ class EarningInsightsPanel(QWidget):
         self.last30_label = self._kpi_cell("📅 Last 30d", "$0.00", "#2196f3")
         kpis.addWidget(self.last30_label, stretch=1)
 
-        self.spend_label = self._kpi_cell("🤖 LLM Spend", "$0.00", "#9c27b0")
+        self.spend_label = self._kpi_cell("🤖 LLM Spend", "—", "#9c27b0")
         kpis.addWidget(self.spend_label, stretch=1)
-
-        self.tier_label = self._kpi_cell("⚡ Tier", "—", "#607d8b")
-        kpis.addWidget(self.tier_label, stretch=1)
 
         root.addLayout(kpis)
 
-        # Middle row: tasks + approvals + heartbeat
+        # Middle row: tasks + approvals
+        # ARCH-ENG-243: the Heartbeat row is REMOVED — it read typed
+        # heartbeat events from the legacy manager heartbeat, which the
+        # runtime retired long ago (main.py keeps only a no-op stub), so
+        # the row could never again mean anything. With the emitter gone
+        # (ARCH-ENG-243 in event_logger) it was pure dead surface.
         mid = QHBoxLayout()
         tasks_box = QGroupBox("Task Activity")
         tasks_lay = QFormLayout(tasks_box)
@@ -99,8 +123,6 @@ class EarningInsightsPanel(QWidget):
         tasks_lay.addRow("Active tasks:", self.tasks_label)
         self.approvals_label = QLabel("0 pending approval")
         tasks_lay.addRow("Pending approval:", self.approvals_label)
-        self.heartbeat_label = QLabel("Heartbeat: stopped")
-        tasks_lay.addRow("Heartbeat:", self.heartbeat_label)
         mid.addWidget(tasks_box, stretch=1)
 
         # Recent outcomes table
@@ -137,7 +159,7 @@ class EarningInsightsPanel(QWidget):
         self.event_filter = QComboBox()
         self.event_filter.addItems([
             "All", "earning", "approval", "safety",
-            "llm_spend", "heartbeat", "system", "evidence",
+            "llm_spend", "system", "evidence",
         ])
         self.event_filter.currentTextChanged.connect(self._refresh_events)
         feed_ctrl.addWidget(self.event_filter, stretch=1)
@@ -150,10 +172,7 @@ class EarningInsightsPanel(QWidget):
 
     def _kpi_cell(self, label: str, value: str, color: str) -> QLabel:
         lbl = QLabel(f"{label}: {value}")
-        lbl.setStyleSheet(
-            "QLabel { font-size: 11pt; color: #e0e0e0; padding: 4px; }"
-            "QLabel { font-weight: bold; color: %s; }" % color
-        )
+        self._apply_css(lbl, 'QLabel { font-size: 11pt; color: #e0e0e0; padding: 4px; }QLabel { font-weight: bold; color: %s; }' % color)
         return lbl
 
     def _build_metrics_grid(self, root: QVBoxLayout):
@@ -171,7 +190,7 @@ class EarningInsightsPanel(QWidget):
         self._uptime_label = QLabel("Uptime: —")
         lay.addRow("Uptime:", self._uptime_label)
         self._spend_note_label = QLabel("Cloud API cost only — local model usage excluded.")
-        self._spend_note_label.setStyleSheet("color: #88aaff; font-size: 9pt;")
+        self._apply_css(self._spend_note_label, 'color: #88aaff; font-size: 9pt;')
         lay.addRow("Spend basis:", self._spend_note_label)
         root.addWidget(box)
 
@@ -190,42 +209,18 @@ class EarningInsightsPanel(QWidget):
         self._llm_budget = budget
         color = "#ff5555" if spent > budget and budget > 0 else "#9c27b0"
         self.spend_label.setText(f"🤖 LLM Spend: ${spent:,.2f}")
-        self.spend_label.setStyleSheet(
-            "QLabel { font-size: 11pt; }"
-            "QLabel { font-weight: bold; color: %s; }" % color
-        )
+        self._apply_css(self.spend_label, 'QLabel { font-size: 11pt; }QLabel { font-weight: bold; color: %s; }' % color)
         if self._spend_note_label:
             self._spend_note_label.setText(
                 "Cloud API cost only — local model usage excluded."
                 if budget > 0 else ""
             )
 
-    def set_tier(self, tier: str):
-        self._tier = tier
-        color = {"FULL": "#4caf50", "REDUCED": "#ff9800",
-                 "LOW": "#ff5555", "CRITICAL": "#d50000"}.get(tier, "#607d8b")
-        self.tier_label.setText(f"⚡ Tier: {tier}")
-        self.tier_label.setStyleSheet(
-            "QLabel { font-size: 11pt; }"
-            "QLabel { font-weight: bold; color: %s; }" % color
-        )
-
     def set_tasks(self, active: int, pending_approvals: int):
         self._active_tasks = active
         self._pending_approvals = pending_approvals
         self.tasks_label.setText(f"{active} active")
         self.approvals_label.setText(f"{pending_approvals} pending approval")
-
-    def set_heartbeat(self, running: bool):
-        self._heartbeat_running = running
-        self.heartbeat_label.setText(
-            f"Heartbeat: {'running' if running else 'stopped'}"
-        )
-        color = "#4caf50" if running else "#ff5555"
-        self.heartbeat_label.setStyleSheet(
-            "QLabel { font-size: 11pt; }"
-            "QLabel { color: %s; }" % color
-        )
 
     def set_outcomes(self, outcomes: List[Dict[str, Any]]):
         self._recent_outcomes = outcomes
@@ -282,13 +277,37 @@ class EarningInsightsPanel(QWidget):
 
     # ── Metrics setters ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _apply_css(widget, css: str) -> None:
+        """ARCH-ENG-230: set a stylesheet ONLY when it actually changed.
+
+        `QLabel.setStyleSheet` is not a cheap assignment. It invalidates the
+        widget's style, re-runs the style polish and forces a relayout of the
+        label and its ancestors. This tab's `_refresh` ran every 4 seconds and
+        applied a stylesheet to eight KPI labels on each pass -- so eight
+        re-polish cycles every four seconds, for the life of the process, on a
+        6-core machine, almost always writing the SAME colour because the value
+        had not changed.
+
+        The colour is the only thing these stylesheets vary on, so the value is
+        stable between real changes. Skipping the no-op assignment removes
+        essentially all of it.
+        """
+        if widget is None:
+            return
+        try:
+            if widget.styleSheet() != css:
+                widget.setStyleSheet(css)
+        except RuntimeError:
+            pass                      # widget already destroyed by Qt
+
     def set_safety_incidents(self, count: int):
         self._safety_incidents = count
         color = "#ff5555" if count > 0 else "#4caf50"
         if self._safety_label:
             try:
                 self._safety_label.setText(f"Safety incidents: {count}")
-                self._safety_label.setStyleSheet("color: %s; font-weight: bold;" % color)
+                self._apply_css(self._safety_label, 'color: %s; font-weight: bold;' % color)
             except RuntimeError:
                 self._safety_label = None
 
@@ -300,10 +319,7 @@ class EarningInsightsPanel(QWidget):
         if self._success_rate_label:
             try:
                 self._success_rate_label.setText(f"Approval success rate: {rate:.0f}%")
-                self._success_rate_label.setStyleSheet(
-                    "color: %s; font-weight: bold;"
-                    % ("#4caf50" if rate >= 80 else "#ff9800" if rate >= 50 else "#ff5555")
-                )
+                self._apply_css(self._success_rate_label, 'color: %s; font-weight: bold;' % ('#4caf50' if rate >= 80 else '#ff9800' if rate >= 50 else '#ff5555'))
             except RuntimeError:
                 self._success_rate_label = None
 
@@ -312,10 +328,7 @@ class EarningInsightsPanel(QWidget):
         if self._reputation_label:
             try:
                 self._reputation_label.setText(f"Reputation: {score:.1f}/100")
-                self._reputation_label.setStyleSheet(
-                    "color: %s; font-weight: bold;"
-                    % ("#4caf50" if score >= 80 else "#ff9800" if score >= 50 else "#ff5555")
-                )
+                self._apply_css(self._reputation_label, 'color: %s; font-weight: bold;' % ('#4caf50' if score >= 80 else '#ff9800' if score >= 50 else '#ff5555'))
             except RuntimeError:
                 self._reputation_label = None
 
@@ -323,10 +336,7 @@ class EarningInsightsPanel(QWidget):
         if self._roi_label:
             try:
                 self._roi_label.setText(f"ROI: {roi:.0f}%")
-                self._roi_label.setStyleSheet(
-                    "color: %s; font-weight: bold;"
-                    % ("#4caf50" if roi >= 300 else "#ff9800" if roi >= 0 else "#ff5555")
-                )
+                self._apply_css(self._roi_label, 'color: %s; font-weight: bold;' % ('#4caf50' if roi >= 300 else '#ff9800' if roi >= 0 else '#ff5555'))
             except RuntimeError:
                 self._roi_label = None
 
@@ -335,7 +345,7 @@ class EarningInsightsPanel(QWidget):
         if self._uptime_label:
             try:
                 self._uptime_label.setText(f"Uptime: {hours:.1f}h")
-                self._uptime_label.setStyleSheet("color: #2196f3; font-weight: bold;")
+                self._apply_css(self._uptime_label, 'color: #2196f3; font-weight: bold;')
             except RuntimeError:
                 self._uptime_label = None
 
@@ -372,6 +382,24 @@ class TabAwareInsightsPanel(EarningInsightsPanel):
                 )
             elif self.earning_tab and hasattr(self.earning_tab, "refresh_pipeline"):
                 self.earning_tab.refresh_pipeline()
+        except Exception:
+            pass
+
+        # LLM spend / uptime — derived from the event log, the single source
+        # accessible to this panel (CostGuard is not plumbed here). Wired so
+        # the KPIs show real state, not frozen placeholders. The heartbeat /
+        # tier rows were removed with their emitter (ARCH-ENG-243): the
+        # legacy manager heartbeat they read was already retired from the
+        # runtime.
+        try:
+            if self.event_logger:
+                spend_events = self.event_logger.query(
+                    event_type="llm_spend", limit=1000)
+                spend = sum(
+                    float((e.details or {}).get("est_usd", 0.0) or 0.0)
+                    for e in spend_events)
+                self.set_spend(spend, 0.0)
+            self.set_uptime((time.time() - self._start_time) / 3600.0)
         except Exception:
             pass
 
@@ -430,7 +458,7 @@ class TabAwareInsightsPanel(EarningInsightsPanel):
             else:
                 if self._roi_label:
                     self._roi_label.setText("ROI: N/A (no tracked LLM spend)")
-                    self._roi_label.setStyleSheet("color: #9e9e9e; font-weight: bold;")
+                    self._apply_css(self._roi_label, 'color: #9e9e9e; font-weight: bold;')
         except Exception:
             pass
 

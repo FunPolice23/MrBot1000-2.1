@@ -36,6 +36,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 # chat-failure logging) are visible in the launch console. Without a handler
 # the root logger drops records, which is why those diagnostics were invisible.
 import logging as _logging  # noqa: E402
+
+# ARCH-ENG-305 (R-02): shared collector for non-fatal settings failures.
+from gui.error_collector import record_gui_error  # noqa: E402
 if not _logging.getLogger().handlers:
     _logging.basicConfig(
         level=_logging.INFO,
@@ -191,7 +194,9 @@ from PySide6.QtWidgets import (
 from agents.brains.base_worker import ROOT_FOLDER, WorkerAgent
 
 # Phase 6: unified event logger, notification service, human-approval queue,
-# alerting rule engine, and heartbeat system (credit-based survival tiers).
+# alerting rule engine. (ARCH-ENG-243: the survival-tier alert rule is gone
+# with the legacy heartbeat event it filtered -- its emitter was retired and
+# the rule could not even be constructed after the enum member went.)
 from agents.core.event_logger import StructuredEventLogger, Event, EventLevel, EventType
 from agents.core.notifications import NotificationService, NotifLevel, notify
 from agents.safety.approval import HumanApprovalQueue, ApprovalKind, ApprovalStatus
@@ -200,8 +205,8 @@ from agents.core.feature_flags import feature_enabled
 from agents.providers.provider_hot_reload import ProviderHotReload
 from agents.core.alerting import (
     AlertRuleEngine, add_default_rules,
-    llm_spend_threshold_rule, survival_tier_change_rule,
-    safety_block_rule, pending_approval_aging_rule,
+    llm_spend_threshold_rule, safety_block_rule,
+    pending_approval_aging_rule,
 )
 from app.database import AgentDB
 from gui.builders.tab_builders import TabBuildersMixin
@@ -733,6 +738,23 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # GPU poller in Providers & GPU, the refresh timer in Safety & Tools).
         # Leaving them running leaks threads and crashes PySide6 at process exit.
         self._stop_tab_background_threads()
+        # ARCH-ENG-225: THE SAME HAZARD, AND IT HAD BEEN MISSED FROM THIS LIST.
+        #
+        # The provider hot-reload thread is started at :543, polls `.env` every
+        # 2 s, and `stop_monitoring()` had ZERO callers in the codebase -- so it
+        # was only ever ended by the interpreter killing a daemon thread during
+        # finalisation. A full-suite run on this machine died with "Windows fatal
+        # exception: access violation" with `_monitor_loop` as the faulting
+        # thread.
+        #
+        # The callbacks are bound methods of this window; `unregister_all` also
+        # drops them, so the singleton does not keep the whole window alive.
+        try:
+            hr = getattr(self, "provider_hot_reload", None)
+            if hr is not None:
+                hr.stop_monitoring(unregister_all=True)
+        except Exception:
+            pass
         try:
             self._shutdown_ollama()
         except Exception:
@@ -1006,11 +1028,82 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             if item.status != ApprovalStatus.APPROVED:
                 return
             if item.kind == ApprovalKind.ACTION:
-                self._execute_approved_action(item)
+                # ARCH-ENG-283 (G-05): a live-trading order is an ACTION item
+                # whose payload names the exact TradeIntent. It must not fall
+                # through to the generic tool dispatcher, which has no
+                # `live_trade` tool and would silently drop the approval.
+                payload = getattr(item, "payload", None) or {}
+                if (getattr(item, "requested_by", "") == "live_trading"
+                        and isinstance(payload.get("intent"), dict)):
+                    self._execute_approved_live_order(item)
+                else:
+                    self._execute_approved_action(item)
             elif item.kind == ApprovalKind.SUBMISSION:
                 self._execute_approved_submission(item)
         except Exception as e:
             self.log_signal.emit(f"[Approval] Approved action failed to execute: {e}")
+
+    def _execute_approved_live_order(self, item):
+        """ARCH-ENG-283 (G-05): submit the live order the human approved.
+
+        This is the production caller of `LiveTradingService.execute_order`.
+        The service re-reads the queue item by id, verifies that its payload
+        names exactly this order, re-assesses against live exchange state, and
+        refuses if the market moved or the approval was already consumed. This
+        handler adds no trust of its own: it reconstructs the intent from the
+        item the human decided, then lets the service's gates run.
+        """
+        executed = getattr(self, "_executed_approval_ids", None)
+        if executed is None:
+            executed = set()
+            self._executed_approval_ids = executed
+        item_id = getattr(item, "id", "") or ""
+        if item_id and item_id in executed:
+            self.log_signal.emit(
+                "[LiveTrading] Ignored duplicate approval decision for "
+                f"{item_id}; one approval submits at most one order.")
+            return
+
+        service = getattr(self, "live_trading_service", None)
+        if service is None:
+            self.log_signal.emit(
+                "[LiveTrading] Approved order could not be executed: the "
+                "Live Portfolio tab/service is not initialized; no order was "
+                "submitted.")
+            return
+        payload = getattr(item, "payload", None) or {}
+        data = payload.get("intent")
+        if not isinstance(data, dict):
+            self.log_signal.emit(
+                "[LiveTrading] Approved order has no intent payload; no order "
+                "was submitted.")
+            return
+        details = getattr(item, "details", None) or {}
+        try:
+            # Keep the optional ccxt adapter out of the application bootstrap
+            # (the architecture-boundary test forbids main.py importing it).
+            # This helper lives in services/ and imports the live-trading types
+            # only on an actual approved execution.
+            from agents.services.live_order_execution import (
+                reconstruct_approved_order,
+            )
+            intent, assessment = reconstruct_approved_order(data, details)
+            result = service.execute_order(
+                intent, assessment, approval_id=item_id)
+        except Exception as exc:
+            # The service consumes an approval only after every gate, but a
+            # transport failure during create_order is ambiguous: the order may
+            # or may not have reached the exchange, and the service's ledger may
+            # already hold the id. Do not tell the operator to replay it.
+            self.log_signal.emit(
+                f"[LiveTrading] Approved order FAILED; check the exchange "
+                f"before re-approving (the approval may already be consumed): "
+                f"{exc}")
+            return
+        if item_id:
+            executed.add(item_id)
+        self.log_signal.emit(
+            f"[LiveTrading] Executed approved order: {result}")
 
     def _execute_approved_action(self, item):
         """Run an approved ACTION item's tool, re-reading the queue decision.
@@ -1063,7 +1156,14 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             arguments["approval_id"] = item_id
         from agents.safety.dispatch import execute_tool
         try:
-            result = execute_tool(tool, arguments, approved=True)
+            # ARCH-ENG-165: pass the approval id as well as the boolean. The
+            # boolean alone is a caller assertion; with the id, the dispatcher
+            # verifies against the shared queue via `assert_approval_covers`, so
+            # the executed call must be the exact tool + arguments the operator
+            # approved. The id was just re-stamped into `arguments` above from
+            # the item the operator actually decided, so this binds the two.
+            result = execute_tool(tool, arguments, approved=True,
+                                  approval_id=item_id or None)
         except Exception:
             # NOT consumed. The id is deliberately left out of the ledger: an
             # execution that raised may not have taken effect (a network
@@ -1153,11 +1253,22 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         return -1
 
     def _on_event_logged(self, event):
-        """Called when an event is logged. Evaluate alerting rules."""
+        """Called when an event is logged. Evaluate alerting rules and feed
+        the goal tracker."""
         try:
             engine = getattr(self, "alerting_engine", None)
             if engine:
                 engine.process_event(event)
+        except Exception:
+            pass
+        # ARCH-ENG-244 (BF-01): the goal tracker is the event stream's other
+        # live consumer. Credits go through its verified-guard (add_evidence
+        # -- BF-02's single credit path), so an event can never move a
+        # goal's money by an unverified amount; guarded so telemetry-side
+        # failures cannot break the logging path itself.
+        try:
+            from agents.earning.goal_system import GoalTracker
+            GoalTracker.instance().process_event(event)
         except Exception:
             pass
 
@@ -1171,16 +1282,13 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 else:
                     self.log_signal.emit(f"[Provider] Config changed: {key}=***")
             
-            # Re-detect providers
-            from agents.providers.provider_manager import ProviderManager
-            pm = ProviderManager.instance()
-            pm.detect_providers()
-            
-            # Refresh provider status in UI
-            if hasattr(self, 'tabs'):
-                # Refresh current tab if it's a provider-related tab
-                pass
-            
+            # Apply the changes to the running process. ProviderHotReload.apply_changes
+            # pushes the new values into os.environ (the actual "apply" — previously the
+            # handler re-detected providers but never updated os.environ, so it logged
+            # "changes applied" while the running app kept the stale config) and
+            # re-detects. instance() is the fixed singleton.
+            ProviderHotReload.instance().apply_changes(changes)
+
             self.log_signal.emit("[Provider] Configuration updated - changes applied")
         except Exception as e:
             self.log_signal.emit(f"[Provider] Error applying config changes: {e}")
@@ -1220,9 +1328,32 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.log_table.scrollToBottom()
 
     def _append_log_to_table(self, entry):
-        """Append a single log entry to the log table widget."""
+        """Append a single log entry to the log table widget.
+
+        ARCH-ENG-223: THIS RAN FOR EVERY LOG LINE, VISIBLE OR NOT.
+
+        Each call did an `insertRow`, six `setItem` calls, and then
+        `resizeRowToContents(row)` -- the canonical Qt table trap: it
+        invalidates the view layout and forces a size-hint pass over the item's
+        text, per line. Against a styled table capped at 5000 rows, and with
+        every bus event and every worker log going through here, that is
+        sustained layout churn for the life of the session, on the GUI thread,
+        whether or not anyone is looking at the Live Logs tab.
+
+        Now: nothing touches the widget while the tab is hidden. That is safe
+        because every entry is already appended to `self._log_buffer` by
+        `_log_emit`, and both `_replay_log_buffer` (on tab build) and
+        `_do_apply_log_filter` (on filter change) rebuild the table from that
+        buffer. Nothing is lost by deferring the widget work.
+
+        `resizeRowToContents` is kept for the visible case, where wrapped
+        details genuinely need the row height, but it now runs only for rows
+        the operator can actually see.
+        """
         if not hasattr(self, "log_table") or self.log_table is None:
             return
+        if not self.log_table.isVisible():
+            return        # deferred: the buffer is authoritative, the table is a view
         row = self.log_table.rowCount()
         self.log_table.insertRow(row)
         
@@ -1447,7 +1578,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             # should be unreachable; if it ever fires, the title would silently
             # claim an old release. Keep it in step with app/version.py — the
             # single authority — and prefer fixing the import over bumping this.
-            __version__ = "2.1.99"
+            __version__ = "2.1.132"
         title_lbl = QLabel(f"MrBot1000 v{__version__}")
         title_lbl.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         title_lbl.setStyleSheet(
@@ -1474,6 +1605,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                     ("Safety & Tools", self.create_safety_tools_tab),
                     ("Chat",           self.create_chat_tab),
                     ("Dialogue",       self.create_dialogue_tab),
+                    ("Collaboration",  self.create_collaboration_tab),
                     ("Approvals",      self.create_approval_tab),
                     ("Registration",   self.create_registration_tab),
                     ("Web Browser",   self.create_file_browser_tab),
@@ -1593,6 +1725,28 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             svc = getattr(services, "code_patch_service", None)
             if svc is None or not hasattr(svc, "monitor_applied"):
                 return
+            # ARCH-ENG-227: PICK UP DEFERRED PATCHES ON THE SAME TICK.
+            #
+            # `apply_approved` queues an approved patch when its target is in
+            # use, and `drain()` applies queued patches once the target frees.
+            # Nothing ever called `drain()`, so an approved change could sit
+            # queued indefinitely -- the operator would see it approved and
+            # reasonably believe it had landed.
+            #
+            # The self-improvement monitor is the right place: it already runs
+            # on a configurable cadence, it is already gated on the same feature
+            # flag, and it is already the component responsible for keeping the
+            # applied-patch set honest.
+            try:
+                from agents.services.self_improvement_commands import apply_deferred
+                deferred = apply_deferred(svc)
+                if deferred:
+                    self.log_signal.emit(
+                        f"[Self-Improve] applied {len(deferred)} deferred patch(es) "
+                        f"whose target became available.")
+            except Exception as exc:
+                self.log_signal.emit(f"[Self-Improve] deferred apply failed: {exc}")
+
             proposals = svc.monitor_applied()
             if proposals:
                 self.log_signal.emit(
@@ -1779,6 +1933,123 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             self.pay_status.setText("Payout: NOT verified — left as submitted (audit logged)")
         self.log_signal.emit(f"[Payout] {self.pay_status.text()}")
 
+    def _reconcile_paid_evidence(self, opp_id: str, evidence_id: str,
+                                 method: str, note: str):
+        """ARCH-ENG-287 (Z-01): the live caller for `reconcile_evidence`.
+
+        A manual/self-reported payout is recorded as pending evidence and is
+        deliberately refused by the SUBMITTED->PAID gate. `reconcile_evidence`
+        is the ONLY method that can promote such a record to independent
+        verification, and it had no caller anywhere -- a disputed payment could
+        never be resolved.
+
+        This handler is operator-initiated and accepts only the evidence
+        policy's independent-method allow-list. It never calls the reconcile
+        path for an unverified ID, never reconciles another opportunity's
+        evidence, and reports a refused promotion instead of claiming success.
+        """
+        opp_id = (opp_id or "").strip()
+        evidence_id = (evidence_id or "").strip()
+        method = (method or "").strip()
+        if not opp_id:
+            self.pay_status.setText("Reconcile: opportunity id required")
+            return
+        pipe = getattr(self, "earning_pipeline", None)
+        lifecycle = getattr(pipe, "lifecycle", None) if pipe is not None else None
+        store = getattr(lifecycle, "_evidence_store", None) if lifecycle else None
+        if lifecycle is None or store is None:
+            self.pay_status.setText(
+                "Reconcile: lifecycle/evidence store unavailable")
+            return
+        from agents.evidence.evidence_policy import (
+            _INDEPENDENT_RECONCILIATION_METHODS,
+        )
+        from agents.earning.payment_evidence import PAYMENT_EVIDENCE_TYPES
+        if method not in _INDEPENDENT_RECONCILIATION_METHODS:
+            self.pay_status.setText(
+                f"Reconcile: '{method}' is not an independent method; "
+                "refused")
+            return
+        try:
+            if evidence_id:
+                evidence = store.get(evidence_id)
+                if evidence is None:
+                    # An explicit id is a precise operator instruction. Never
+                    # substitute a different record just because the id was
+                    # mistyped or stale.
+                    self.pay_status.setText(
+                        f"Reconcile: evidence {evidence_id} not found; "
+                        "nothing was changed")
+                    return
+            else:
+                # No id supplied: choose the latest monetary evidence for THIS
+                # opportunity that is not already independently verified.
+                evidence = None
+                candidates = []
+                for ev in store.for_subject("opportunity", opp_id):
+                    if ev.evidence_type not in PAYMENT_EVIDENCE_TYPES:
+                        continue
+                    status = str(getattr(ev.status, "value", ev.status)).upper()
+                    level = int(getattr(
+                        ev.verification_level, "value",
+                        ev.verification_level) or 0)
+                    if status in {"VERIFIED", "PARTIALLY_VERIFIED"} and level >= 3:
+                        continue
+                    candidates.append(ev)
+                evidence = candidates[-1] if candidates else None
+            if evidence is None:
+                self.pay_status.setText(
+                    "Reconcile: no unresolved payment evidence for "
+                    f"{opp_id}")
+                return
+            if (str(getattr(evidence, "subject_type", "")) != "opportunity"
+                    or str(getattr(evidence, "subject_id", "")) != opp_id):
+                self.pay_status.setText(
+                    "Reconcile: evidence does not belong to this opportunity")
+                return
+            reconciled = lifecycle.reconcile_evidence(
+                opp_id, evidence.id, reconciler="operator",
+                note=(note or "reconciled from Management payout review"),
+                method=method)
+        except Exception as exc:
+            self.pay_status.setText(f"Reconcile: failed: {exc}")
+            self.log_signal.emit(f"[Reconcile] error: {exc}")
+            return
+        if reconciled is None:
+            self.pay_status.setText(
+                "Reconcile: refused (no store or evidence not found)")
+            self.log_signal.emit(
+                f"[Reconcile] {opp_id}: refused; no evidence was changed")
+            return
+        status = str(getattr(reconciled.status, "value", reconciled.status)).upper()
+        applied = (status in {"VERIFIED", "PARTIALLY_VERIFIED"}
+                   and str(getattr(reconciled, "verification_method", "")) == method)
+        state = lifecycle.get_state(opp_id)
+        if not applied:
+            self.pay_status.setText(
+                f"Reconcile: REFUSED by evidence policy ({status})")
+            self.log_signal.emit(
+                f"[Reconcile] {opp_id}/{evidence.id}: refused; "
+                "the evidence remains non-affirmative")
+            return
+        self.pay_status.setText(
+            f"Reconcile: VERIFIED via {method}; lifecycle={state.get('status')}")
+        # An independently reconciled payment is affirmative evidence; credit
+        # the submission ramp exactly once, as the verify path does.
+        if state.get("status") == "paid":
+            try:
+                level = int(getattr(
+                    reconciled.verification_level, "value",
+                    reconciled.verification_level) or 0)
+                if getattr(reconciled.status, "is_affirmative", False) and level >= 3:
+                    from agents.earning.submission_ramp import get_ramp
+                    hist = (pipe.memory.get_opportunity_history(opp_id) or {})
+                    get_ramp(getattr(pipe, "memory", None)).record_accept(
+                        hist.get("platform") or "unknown")
+            except Exception:
+                pass
+        self.log_signal.emit(f"[Payout] {self.pay_status.text()}")
+
     # ── A1: Gig proposal review + human-confirmed submission ──────────────────
     def _build_upwork_client(self):
         """Construct an UpworkClient from .env creds (or None if absent)."""
@@ -1797,11 +2068,27 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             return None
 
     def _build_reviewer(self):
+        # ARCH-ENG-294 (O-02): ProposalReviewer's optional AnalystWorker was
+        # never supplied, so the quality half of the pre-submission gate was
+        # structurally absent. AnalystWorker's proposal scoring is deterministic
+        # and does not need a live model key; passing an empty key keeps this
+        # path available offline. If the analyst cannot be built, fall back to
+        # the rule-based reviewer rather than dropping the gate.
         try:
             from agents.knowledge.proposal_reviewer import ProposalReviewer
-            return ProposalReviewer()
+            from agents.services.analyst_worker import AnalystWorker
+            analyst = AnalystWorker(
+                api_key="",
+                log_signal=self.log_signal,
+                db=getattr(self, "db", None),
+            )
+            return ProposalReviewer(analyst=analyst)
         except Exception:
-            return None
+            try:
+                from agents.knowledge.proposal_reviewer import ProposalReviewer
+                return ProposalReviewer()
+            except Exception:
+                return None
 
     def _review_proposal_draft(self):
         """Run the review gate on the current draft + job description and show the result."""
@@ -1909,19 +2196,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         self.log_signal.emit(f"[Proposal] {msg}")
 
 
-    def _format_ago(self, seconds: float) -> str:
-        """Format seconds as human-readable 'ago' string."""
-        if seconds <= 0:
-            return "just now"
-        if seconds < 60:
-            return f"{int(seconds)}s ago"
-        if seconds < 3600:
-            mins = int(seconds / 60)
-            return f"{mins}m ago"
-        hours = int(seconds / 3600)
-        mins = int((seconds % 3600) / 60)
-        return f"{hours}h {mins}m ago"
-
     def _apply_llm_budget(self, text: str):
         """A4: apply the daily LLM budget cap live (no restart)."""
         try:
@@ -1956,9 +2230,50 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             "Self-improvement: use the Dialogue tab to direct the peer council")
 
     def force_research_rescan(self):
-        # legacy manager queue removed — route intent to the N-device Dialogue
+        """Actually re-scan the research folder (ARCH-ENG-271/272).
+
+        This handler used to just print "use the Dialogue tab": the button,
+        the worker's ``research_all()`` and both cache tables existed, but
+        nothing ever called the scan. So the file cache was never written, the
+        research-snapshot counter stayed 0, and the dialogue's research
+        context always read "(not set)". The scan now runs here; the worker
+        writes the file cache and the research snapshot as it reads.
+        """
+        worker = getattr(self, "worker", None)
+        if worker is None or not hasattr(worker, "research_all"):
+            self.log_signal.emit("Research re-scan: worker is not available")
+            return
+        self.log_signal.emit("Research re-scan started...")
+        result = None
+        error = None
+        try:
+            result = worker.research_all()
+        except Exception as exc:
+            error = exc
+
+        if result is None:
+            cached = None
+            db = getattr(self, "db", None)
+            folder = getattr(worker, "research_folder", "") or ""
+            if db is not None and folder:
+                try:
+                    cached = db.load_latest_research_cache(folder)
+                except Exception:
+                    cached = None
+            if cached is not None:
+                self.log_signal.emit(
+                    f"Research re-scan failed ({error}); showing the last "
+                    f"cached snapshot from {cached.get('research_path')}")
+            else:
+                self.log_signal.emit(f"Research re-scan failed: {error}")
+            self._refresh_cache_stats()
+            return
+
         self.log_signal.emit(
-            "Research re-scan: use the Dialogue tab to direct the peer council")
+            f"Research re-scan complete: "
+            f"{result.get('research_file_count', 0)} research file(s) from "
+            f"{result.get('research_path') or '(not set)'}")
+        self._refresh_cache_stats()
 
     def clear_file_cache(self):
         reply = QMessageBox.question(
@@ -2094,69 +2409,17 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             import traceback
             traceback.print_exc()
 
-    def _refresh_review_queue(self):
-        """Populate the review queue list + counts from the instruction gate."""
-        try:
-            gate = getattr(self, "instruction_gate", None)
-            if gate is None:
-                return
-            counts = gate.counts()
-            self.review_counts_label.setText(
-                f"Pending: {counts.get('pending',0)}  "
-                f"Allowed: {counts.get('allowed',0)}  "
-                f"Blocked: {counts.get('blocked',0)}")
-            self.review_list.clear()
-            for it in gate.pending(50):
-                title = it.get("title") or it.get("url")
-                self.review_list.addItem(
-                    f"[#{it['id']}] {title}  ({it.get('kind','skill.md')})")
-        except Exception as e:
-            self.review_counts_label.setText(f"Review queue error: {e}")
-
-    def _review_selected(self, approve: bool):
-        """Human-in-the-loop decision on the selected pending instruction."""
-        gate = getattr(self, "instruction_gate", None)
-        if gate is None:
-            return
-        item = self.review_list.currentItem()
-        if not item:
-            return
-        # Parse the id from "[#ID] ..." 
-        text = item.text()
-        import re as _re
-        m = _re.match(r"\[#(\d+)\]", text)
-        if not m:
-            return
-        qid = int(m.group(1))
-        # Resolve the quarantine row to get url + hash for the allow/blacklist.
-        row = None
-        for it in gate.pending(200):
-            if it["id"] == qid:
-                row = it
-                break
-        if row is None:
-            return
-        # related: persist url + skill.md + content_hash so it is ALWAYS ignored.
-        related = f"{row.get('url','')} | skill.md | {row.get('content_hash','')}"
-        try:
-            status = gate.review(qid, approve, url=row.get("url", ""),
-                                 content_hash=row.get("content_hash", ""),
-                                 related=related)
-            self.log_signal.emit(
-                f"[Review] instruction #{qid} -> {status} "
-                f"({'APPROVED' if approve else 'BLACKLISTED'})")
-        except Exception as e:
-            self.log_signal.emit(f"[Review] error: {e}")
-        self._refresh_review_queue()
-
-    def _run_http(self, method, url, tag, **kwargs):
-        w = HttpWorker(method, url, tag, **kwargs)
-        w.result.connect(self._on_http_result)
-        self._http_workers.append(w)
-        w.finished.connect(
-            lambda: self._http_workers.remove(w)
-            if w in self._http_workers else None)
-        w.start()
+    # ARCH-ENG-250 (U-03) / ARCH-ENG-251 (U-04): the dead seconds-to-ago
+    # formatter and `_run_http` (a leftover of the removed review queue) were
+    # deleted here. Both had zero callers and zero tests.
+    #
+    # ARCH-ENG-284 (U-01): the review queue itself moved to the Safety &
+    # Tools tab (`SafetyTab`), which now owns the widgets and the decision
+    # handler. The old `_refresh_review_queue` / `_review_selected` read
+    # `review_list` and `review_counts_label`, neither of which was ever
+    # constructed; keeping a second, unwired copy here would recreate the
+    # dead surface. The tab resolves this window's `instruction_gate`, so
+    # there is still exactly one gate and one review queue.
 
     def _on_http_result(self, tag: str, response):
         if tag == "balance":
@@ -2326,6 +2589,22 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         )
         self.status_label.setText("Agent status: Registered ✓")
 
+    @staticmethod
+    def _active_ollama_models() -> tuple[str, str]:
+        """Return the persisted (main, chat) Ollama model names.
+
+        ARCH-ENG-275 (AB-01): this value used to be read from the hidden
+        Settings combo. `ProviderConfigWidget` writes OLLAMA_MAIN_MODEL /
+        OLLAMA_CHAT_MODEL the moment the operator picks a model, so `.env` is
+        the only trustworthy source of operator intent. OLLAMA_MODEL is the
+        first-run fallback.
+        """
+        fallback = os.getenv("OLLAMA_MODEL", "").strip() or "llama3.2"
+        main = os.getenv("OLLAMA_MAIN_MODEL", "").strip() or fallback
+        chat = (os.getenv("OLLAMA_CHAT_MODEL", "").strip()
+                or os.getenv("OLLAMA_MODEL", "").strip())
+        return main, chat
+
     def test_api_connection(self):
         msgs = []
         # OpenAI
@@ -2369,10 +2648,16 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             else:
                 msgs.append("Anthropic: no key set")
         # Ollama
-        ollama_main, ollama_chat = self._role_enabled(getattr(self, "ollama_role", None))
+        # ARCH-ENG-275 (AB-01): the role comes from the keys the visible
+        # provider surface persists, not from the retired hidden combo.
+        ollama_disabled = os.getenv("DISABLE_OLLAMA", "false").lower() == "true"
+        ollama_main = (not ollama_disabled
+                       and os.getenv("OLLAMA_MAIN_ENABLED", "true").lower() == "true")
+        ollama_chat = (not ollama_disabled
+                       and os.getenv("OLLAMA_CHAT_ENABLED", "true").lower() == "true")
         if ollama_main or ollama_chat:
             try:
-                model = self.ollama_model_combo.currentText().strip()
+                model = self._active_ollama_models()[0]
                 ollama.chat(
                     model=model,
                     messages=[{"role": "user", "content": "test"}],
@@ -2496,8 +2781,7 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                         f"&nbsp;&nbsp;type: {typ}{ex}<br>"
                         f"&nbsp;&nbsp;params: {params} · context: {ctx} tokens<br>"
                         f"&nbsp;&nbsp;price: {price}")
-            main_model = self.ollama_model_combo.currentText().strip()
-            chat_model = self.ollama_chat_model_combo.currentText().strip()
+            main_model, chat_model = self._active_ollama_models()
             
             # Also include currently-active provider/model from worker
             active_provider = getattr(self.worker, "last_provider", "N/A") if hasattr(self, "worker") else "N/A"
@@ -2517,116 +2801,6 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             from PySide6.QtWidgets import QApplication
             QApplication.clipboard().setText(text)
             self.log_signal.emit("[System] Model info copied to clipboard")
-
-    def _fetch_ollama_models(self) -> list[str]:
-        """Best-effort fetch of locally-installed Ollama models from the running
-        server. Returns [] on any failure (server down, no network). Never raises.
-        Used both for the silent startup population (Settings ease-of-switching) and
-        for the manual Refresh button.
-
-        NOTE: This is a blocking network call. Call from a QThread, not the GUI thread.
-        """
-        try:
-            req = urllib.request.Request(
-                "http://127.0.0.1:11434/api/tags",
-                headers={"User-Agent": "MrBot1000"},
-            )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode())
-            return [m["name"] for m in data.get("models", [])]
-        except Exception:
-            return []
-
-    def refresh_ollama_models(self):
-        """Refresh Ollama models in a background thread to avoid GUI freeze."""
-        self.refresh_ollama_btn.setEnabled(False)
-        self.refresh_ollama_btn.setText("Refreshing...")
-        QApplication.processEvents()
-
-        # Run the blocking network call in a background thread
-        class _OllamaRefreshThread(QThread):
-            finished = Signal(list)
-            def __init__(self, fetch_fn):
-                super().__init__()
-                self._fetch_fn = fetch_fn
-            def run(self):
-                models = self._fetch_fn()
-                self.finished.emit(models)
-
-        self._ollama_refresh_thread = _OllamaRefreshThread(self._fetch_ollama_models)
-        self._ollama_refresh_thread.finished.connect(self._on_ollama_refreshed)
-        self._ollama_refresh_thread.start()
-
-    def _on_ollama_refreshed(self, models):
-        """Handle Ollama model refresh completion (GUI thread)."""
-        main_current = self.ollama_model_combo.currentText()
-        chat_current = self.ollama_chat_model_combo.currentText()
-        self.ollama_model_combo.clear()
-        self.ollama_chat_model_combo.clear()
-        if models:
-            self.ollama_model_combo.addItems(models)
-            self.ollama_chat_model_combo.addItems(models)
-            self.ollama_model_combo.setCurrentText(
-                main_current if main_current in models else models[0])
-            self.ollama_chat_model_combo.setCurrentText(
-                chat_current if chat_current in models else models[0])
-            QMessageBox.information(self, "Ollama",
-                                    f"Loaded {len(models)} model(s).")
-        else:
-            self.ollama_model_combo.addItem(main_current or "llama3.2")
-            self.ollama_chat_model_combo.addItem(chat_current or "llama3.2")
-            QMessageBox.warning(self, "Ollama",
-                                "No models found on local Ollama server.")
-
-        self.refresh_ollama_btn.setEnabled(True)
-        self.refresh_ollama_btn.setText("Refresh")
-
-    def populate_ollama_model_combos(self):
-        """v2.0.34al: silently populate the Settings model dropdowns from the
-        locally-found Ollama models (no dialog) so the operator can switch models
-        with a click. Pre-selects the currently-active model; if none are found,
-        leaves the existing (env-defaulted) selection untouched.
-
-        v2.1 fix: runs the HTTP fetch on a background thread so the Settings
-        tab never freezes when Ollama is down (the 5s urlopen timeout was
-        blocking the GUI thread).
-        """
-        import threading
-        self._ollama_fetch_done = False
-
-        def _fetch_in_thread():
-            models = self._fetch_ollama_models()
-            self._ollama_fetch_result = models
-            self._ollama_fetch_done = True
-
-        t = threading.Thread(target=_fetch_in_thread, daemon=True)
-        t.start()
-
-        def _check_result():
-            if not getattr(self, '_ollama_fetch_done', False):
-                # Still fetching — check again in 100ms
-                QTimer.singleShot(100, _check_result)
-                return
-            models = getattr(self, '_ollama_fetch_result', [])
-            if not models:
-                return
-            active_main = getattr(self.worker, "_ollama_model_override", None) \
-                or os.getenv("OLLAMA_MODEL", "").strip() or "llama3.2"
-            active_chat = getattr(self.worker, "_chat_ollama_model_override", None) \
-                or os.getenv("OLLAMA_CHAT_MODEL", "").strip()
-            cur_main = self.ollama_model_combo.currentText()
-            cur_chat = self.ollama_chat_model_combo.currentText()
-            self.ollama_model_combo.clear()
-            self.ollama_chat_model_combo.clear()
-            self.ollama_model_combo.addItems(models)
-            self.ollama_chat_model_combo.addItems(models)
-            self.ollama_model_combo.setCurrentText(
-                cur_main if cur_main in models else (active_main if active_main in models else models[0]))
-            self.ollama_chat_model_combo.setCurrentText(
-                cur_chat if cur_chat in models else (active_chat if active_chat in models else models[0]))
-
-        # Start polling for result
-        QTimer.singleShot(100, _check_result)
 
     def save_settings(self):
         # v2.0.25: snapshot provider-relevant settings BEFORE applying, so we can
@@ -2710,14 +2884,12 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                    getattr(self, "openai_chat_combo", None), _safe_widget_text("openai_key_edit", "OPENAI_API_KEY"), hide_cb=getattr(self, "openai_hide", None))
         _save_provider("ANTHROPIC", getattr(self, "anthropic_role", None), getattr(self, "anthropic_model_combo", None),
                    getattr(self, "anthropic_chat_combo", None), _safe_widget_text("anthropic_key_edit", "ANTHROPIC_API_KEY"), hide_cb=getattr(self, "anthropic_hide", None))
-        _save_provider("OLLAMA", self.ollama_role, self.ollama_model_combo,
-                       self.ollama_chat_model_combo, hide_cb=self.ollama_hide)
-        # The Ollama adapter's `model_env` (from settings.json) must match the env
-        # vars the runtime actually reads: OLLAMA_MAIN_MODEL for main, OLLAMA_CHAT_MODEL
-        # for chat. Previously only OLLAMA_MODEL was written, leaving the adapter's
-        # model_env stale and the choice ambiguous when .env had MAIN/CHAT vars empty.
-        values["OLLAMA_MAIN_MODEL"] = self.ollama_model_combo.currentText().strip()
-        values["OLLAMA_CHAT_MODEL"] = self.ollama_chat_model_combo.currentText().strip()
+        # ARCH-ENG-275 (AB-01): the Ollama model/role/hide keys are NOT written
+        # here. `ProviderConfigWidget` is the only visible surface and it
+        # persists the role (`_persist_provider_role`) and the model
+        # (`_on_model_changed`) the moment the operator changes them. The
+        # hidden combo that used to be a second writer -- the reason
+        # ARCH-ENG-196 had to make the persisted value win -- is deleted.
         # v2.0.34aa (F5): per-role GPU offload layers.
         # Defensive: the spinners live on the lazily-built "Model & GPU" tab, which
         # may not be constructed yet when Settings is saved. Read them only if they
@@ -2795,8 +2967,8 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             web_check = getattr(self, "settings_web_discovery_check", None)
             if web_check is not None:
                 values["ALLOW_WEB_DISCOVERY"] = str(web_check.isChecked())
-        except Exception:
-            pass
+        except Exception as exc:
+            record_gui_error("settings:web-discovery", exc)
 
         # Phase F (ARCH-ENG-091): persist per-provider rate + daily call caps.
         # Read defensively (Settings tab built lazily); only write a key the
@@ -2810,22 +2982,22 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 v = edit.text().strip()
                 if v:
                     values[f"{up}_MAX_CALLS_PER_DAY"] = v
-        except Exception:
-            pass
+        except Exception as exc:
+            record_gui_error("settings:provider-rate-caps", exc)
 
         # Persist payout destinations (wallet/cashApp) from the (possibly lazily-built) Settings tab
         try:
             cashapp_widget = getattr(self, "cashapp_payout_edit", None)
             if cashapp_widget is not None:
                 values["CASHAPP_TAG"] = cashapp_widget.text().strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            record_gui_error("settings:cashapp-payout", exc)
         try:
             solana_widget = getattr(self, "solana_payout_edit", None)
             if solana_widget is not None:
                 values["ATOMIC_SOLANA_ADDRESS"] = solana_widget.text().strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            record_gui_error("settings:solana-payout", exc)
         values["MRBOT_THEME"] = getattr(self, "theme_combo", None).currentText() \
             if getattr(self, "theme_combo", None) is not None \
             else os.getenv("MRBOT_THEME", "Dark")
@@ -2885,6 +3057,101 @@ class MainWindow(TabBuildersMixin, QMainWindow):
             if small_enabled is not None:
                 values["SMALL_BRAIN_ENABLED"] = str(small_enabled)
 
+        # N-brain roster (Phase 4). The roster lives in settings.json (not .env),
+        # and BOTH save handlers own that write (the two-handler rule) — this one
+        # and DualBrainControl._snapshot_settings_values. Read the live panel off
+        # the (lazily-built) Providers & GPU tab so a Settings Save captures the
+        # operator's roster edits; with no panel the persisted roster is merged
+        # back, which keeps the `roster` key present instead of letting this
+        # handler's .env rewrite drop it.
+        try:
+            from gui.widgets.brain_roster_panel import save_roster_from
+            _roster_panel = getattr(
+                getattr(self, "providers_gpu_tab", None), "brain_roster_panel", None)
+            save_roster_from(_roster_panel)
+        except Exception as exc:
+            record_gui_error("settings:brain-roster", exc)
+
+        # ── ARCH-ENG-195: POPULATE `values` BEFORE THE SINGLE WRITE ──────────
+        #
+        # `set_env_values(values)` used to be called ~55 lines ABOVE this point,
+        # while nine keys were inserted into `values` AFTER it. A dict passed to
+        # a writer is a snapshot: those nine keys were therefore never written to
+        # `.env` at all. This was the operator-visible "Save All does not fully
+        # work".
+        #
+        # The six that were silently lost:
+        #   MAX_TOKENS, LLM_TEMPERATURE, LLM_TOP_P
+        #       -> not even os.environ was set, so the value died with the process
+        #          and `_settings_snapshot()` never listed them, so the operator
+        #          was not even prompted to restart.
+        #   DIALOGUE_MAX_TOKENS_BIG / _SMALL, DIALOGUE_AUTO_TOKENS
+        #       -> os.environ only, and `load_dotenv(override=True)` below
+        #          immediately clobbered them back to the .env value.
+        #
+        # Plus nine CONTROLS the handler never read at all, so editing them did
+        # nothing on any path. Several back real safety and spend controls.
+        def _sval(name, default=""):
+            """Read a QLineEdit/QSpinBox-ish control, tolerating absence."""
+            widget = getattr(self, name, None)
+            if widget is None:
+                return default
+            for getter in ("value", "currentText", "text"):
+                fn = getattr(widget, getter, None)
+                if callable(fn):
+                    try:
+                        return fn()
+                    except Exception as exc:
+                        record_gui_error(f"settings:control:{name}", exc)
+                        continue
+            return default
+
+        try:
+            # LLM sampling parameters (were added to `values` AFTER the write).
+            values["MAX_TOKENS"] = str(_sval("max_tokens_spin"))
+            values["LLM_TEMPERATURE"] = str(_sval("temperature_spin"))
+            values["LLM_TOP_P"] = str(_sval("top_p_spin"))
+
+            # Dialogue token limits + auto-scale toggle (same bug).
+            values["DIALOGUE_MAX_TOKENS_BIG"] = str(
+                _sval("dialogue_tokens_big_spin"))
+            values["DIALOGUE_MAX_TOKENS_SMALL"] = str(
+                _sval("dialogue_tokens_small_spin"))
+            auto_cb = getattr(self, "dialogue_auto_tokens_cb", None)
+            values["DIALOGUE_AUTO_TOKENS"] = (
+                "true" if (auto_cb is not None and auto_cb.isChecked()) else "false")
+
+            # ── ARCH-ENG-195: controls the handler never read ─────────────────
+            # Each of these was shown in the Settings tab, editable, and simply
+            # discarded on Save. Consumers are named so a future reader can see
+            # what a regression would cost.
+            values["MAX_FILE_SIZE_MB"] = str(_sval("max_file_spin"))
+            values["RESEARCH_MAX_CHARS"] = str(_sval("research_max_chars"))
+            values["DEEP_READ_MAX_CHARS"] = str(_sval("deep_read_chars"))
+            values["FILENAME_BLOCKLIST"] = str(_sval("blocklist_edit"))
+            values["BLOCKED_MIME_TYPES"] = str(_sval("blocked_mime_edit"))
+            values["LLM_DAILY_BUDGET_USD"] = str(_sval("llm_budget_edit"))
+            values["WINRATE_DECLINE_BELOW"] = str(_sval("winrate_edit"))
+            # Provider base URLs: `_save_provider` is called WITHOUT `base=`
+            # further down, so its `if base != ""` guard skipped them entirely.
+            values["OPENAI_BASE_URL"] = str(_sval("openai_base_edit")).strip()
+            values["ANTHROPIC_BASE_URL"] = str(
+                _sval("anthropic_base_edit")).strip()
+        except Exception as exc:
+            # Never let one malformed control abort the whole save. Record it so
+            # the operator is not left believing everything persisted.
+            self.log_signal.emit(f"[Settings] some values not saved: {exc}")
+
+        # Publish the dialogue keys to the environment as well. This must happen
+        # BEFORE `load_dotenv(override=True)` below, which would otherwise restore
+        # the stale .env values over them.
+        for _k in ("DIALOGUE_MAX_TOKENS_BIG", "DIALOGUE_MAX_TOKENS_SMALL",
+                   "DIALOGUE_AUTO_TOKENS"):
+            try:
+                os.environ[_k] = values[_k]
+            except Exception as exc:
+                record_gui_error(f"settings:env-publish:{_k}", exc)
+
         # v2.0.34aj: single lock-resilient atomic write (replaces ~40 set_key calls
         # that each spawned a .tmp_* temp vulnerable to WinError 32/5 lock races).
         set_env_values(values)
@@ -2892,12 +3159,11 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # Reload env so newly saved keys are visible to os.getenv() in this process
         try:
             load_dotenv(override=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            record_gui_error("settings:dotenv-reload", exc)
 
         # ── Live model switch (no restart required) ──────────────────────────
-        new_chat = self.ollama_chat_model_combo.currentText().strip()
-        new_main = self.ollama_model_combo.currentText().strip()
+        new_main, new_chat = self._active_ollama_models()
         old_chat = getattr(self.worker, "_chat_ollama_model_override", None) or ""
         old_main = getattr(self.worker, "_ollama_model_override", None) or ""
         # registry cache is invalidated so the new <PREFIX>_MODEL/_CHAT_MODEL from
@@ -2921,8 +3187,8 @@ class MainWindow(TabBuildersMixin, QMainWindow):
                 def _unload(old):
                     try:
                         ollama.chat(model=old, messages=[], keep_alive=0)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        record_gui_error(f"settings:unload-model:{old}", exc)
                 for old in (old_chat, old_main):
                     if old:
                         threading.Thread(target=_unload, args=(old,), daemon=True).start()
@@ -2942,33 +3208,18 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         # Update live objects
         self.worker.max_file_size = self.max_file_spin.value() * 1024 * 1024
         # (legacy manager HEARTBEAT_INTERVAL / research-cache-ttl / idle-cooldown removed)
-        # v2.0.36w: save LLM parameters
-        try:
-            values["MAX_TOKENS"] = str(self.max_tokens_spin.value())
-            values["LLM_TEMPERATURE"] = str(self.temperature_spin.value())
-            values["LLM_TOP_P"] = str(self.top_p_spin.value())
-        except Exception:
-            pass
-        # Dialogue token limits (per brain) + auto-scale toggle. Read at
-        # DialogueWorker construction, so a new turn picks the new values up
-        # without a restart.
-        try:
-            values["DIALOGUE_MAX_TOKENS_BIG"] = str(self.dialogue_tokens_big_spin.value())
-            values["DIALOGUE_MAX_TOKENS_SMALL"] = str(self.dialogue_tokens_small_spin.value())
-            values["DIALOGUE_AUTO_TOKENS"] = (
-                "true" if self.dialogue_auto_tokens_cb.isChecked() else "false")
-            os.environ["DIALOGUE_MAX_TOKENS_BIG"] = str(self.dialogue_tokens_big_spin.value())
-            os.environ["DIALOGUE_MAX_TOKENS_SMALL"] = str(self.dialogue_tokens_small_spin.value())
-            os.environ["DIALOGUE_AUTO_TOKENS"] = values["DIALOGUE_AUTO_TOKENS"]
-        except Exception:
-            pass
-        # Apply LLM parameters live
+        #
+        # ARCH-ENG-195: the `values[...]` assignments that used to live here were
+        # removed. They ran AFTER `set_env_values(values)`, so they mutated a dict
+        # nobody read again -- the settings silently never reached `.env`. They
+        # now happen once, before the single write, above. What remains here is
+        # only the LIVE application, which must stay after the reload so it wins.
         try:
             self.worker._max_tokens = int(self.max_tokens_spin.value())
             self.worker._temperature = float(self.temperature_spin.value())
             self.worker._top_p = float(self.top_p_spin.value())
-        except Exception:
-            pass
+        except Exception as exc:
+            record_gui_error("settings:apply-sampling", exc)
         self.log_signal.emit("Settings saved")
 
         # v2.0.25: persist the provider list to settings.json (provider-agnostic,
@@ -3259,12 +3510,26 @@ class MainWindow(TabBuildersMixin, QMainWindow):
         app.setStyleSheet(qss)
         self._restyle_themeable()
         self._apply_shadow_effects(theme, fx)
-        # v2.0.27: push the resolved theme to ui.py so chat/HTML colors follow it.
+        # v2.0.27: push the resolved theme to the widget-style token store so
+        # chat/HTML colors follow it.
+        #
+        # ARCH-ENG-192: this was `from app import ui`. That module lived in the
+        # SERVICE layer and imported 39 PySide6 names at module level -- all of
+        # them unused -- which broke the documented rule that `app/` is Qt-free so
+        # it can be imported headless. It declared no classes and instantiated no
+        # widgets, so it was misfiled rather than architecturally leaking, and it
+        # now lives at `gui/theme_ui_state.py` with no Qt import at all.
         try:
-            from app import ui
-            ui.set_ui_theme(theme)
-            # v2.0.34ap (H67): Animations toggle now actually gates ui particle/gear FX.
-            ui.set_effects(animations=bool(fx.animations))
+            from gui import theme_ui_state
+            theme_ui_state.set_ui_theme(theme)
+            # ARCH-ENG-192: the old comment here claimed "Animations toggle now
+            # actually gates ui particle/gear FX". It does not, and has not since
+            # the flag was introduced: `UI_ANIMATIONS` has no readers anywhere in
+            # the repository. The toggle DOES reach the renderer, but through
+            # `fx` / `app.effects.EffectSettings.animations`, applied above via
+            # `_apply_shadow_effects`. Kept for API compatibility; the false
+            # claim is what was removed.
+            theme_ui_state.set_effects(animations=bool(fx.animations))
         except Exception:
             pass
         self.log_signal.emit(f"Theme: {theme_name}")
@@ -3527,9 +3792,20 @@ if __name__ == "__main__":
                 pass
             _tb.print_exception(exc_type, exc_value, exc_tb)
         sys.excepthook = _excepthook
+        # ARCH-ENG-293 (P-01): startup_validation.py was protected, shipped,
+        # and never called. Run it once before the window exists so its
+        # warnings/errors are visible in the console and retained on the
+        # window for diagnostics, instead of being dead code.
+        from app.startup_validation import validate_startup_environment
+        _startup_report = validate_startup_environment(
+            log_fn=lambda msg: print(f"[startup] {msg}", flush=True))
         app = QApplication(sys.argv)
         app.setStyle("Fusion")
         window = MainWindow()
+        window.startup_validation_report = _startup_report
+        if _startup_report.status == "error":
+            print("[startup] validation reported errors; starting in degraded mode",
+                  flush=True)
         window.show()
         from agents.runtime.performance import telemetry
         telemetry.mark_startup_complete()

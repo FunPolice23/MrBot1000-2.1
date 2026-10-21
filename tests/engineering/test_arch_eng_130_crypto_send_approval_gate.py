@@ -23,8 +23,10 @@ and `crypto` is a recording stub.
 import os
 import sys
 import unittest
+from unittest import mock
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agents.integrations.wallet import Chain
 from agents.earning.real_crypto_operator import RealCryptoOperator
@@ -112,6 +114,14 @@ class ConfirmAndSendApprovalGateTest(unittest.TestCase):
     def setUp(self):
         HumanApprovalQueue.reset_singleton()
         self.queue = HumanApprovalQueue.instance()
+        # ARCH-ENG-281 (D-01): the crypto_operations boundary is now live, so
+        # these gate tests opt in explicitly. Without this the operator would
+        # correctly fail closed as "disabled" and the approval gate would not
+        # be the thing under test.
+        self._crypto_flag = mock.patch.dict(
+            os.environ, {"MRBOT_ENABLE_CRYPTO": "1"})
+        self._crypto_flag.start()
+        self.addCleanup(self._crypto_flag.stop)
         # Bypass __init__ so the real CryptoPayments (and its SDK checks / the
         # human_approval_required flag) never runs; the gate under test is in
         # confirm_and_send, and crypto is the recording stub.
@@ -178,13 +188,21 @@ class ConfirmAndSendApprovalGateTest(unittest.TestCase):
 
     # ── propose_payment enqueues the scoped approval the gate requires ─────
     def test_propose_payment_enqueues_scoped_approval(self):
+        # ARCH-ENG-237: propose_payment now validates recipients at its entry
+        # boundary (BB-01), so a shape-valid dummy is used here. The plumbing
+        # under test is the scoping, not the address content.
         self.op.safety_guard = _StubGuard()
         res = self.op.propose_payment(
-            "0xfrom", "0xto", 5.0, "USDC", Chain.ETHEREUM, memo="test")
+            "0x" + "9" * 40, "0x" + "ef47" * 10, 5.0, "USDC",
+            Chain.ETHEREUM, memo="test")
         self.assertTrue(res["ok"])
         self.assertEqual(res["status"], "awaiting_approval")
         approval_id = res.get("approval_id")
         self.assertTrue(approval_id, "propose_payment must return an approval_id")
+        # The reject creates nothing, so make the stub request carry the same
+        # recipient the approval was scoped to (the stub's create_payment
+        # returns the module-default request, still addressed to "0xto").
+        self.op.crypto._requests["req-1"].to_address = "0x" + "ef47" * 10
         # The enqueued item must be the one confirm_and_send accepts.
         pending = self.queue.pending()
         self.assertEqual(len(pending), 1)

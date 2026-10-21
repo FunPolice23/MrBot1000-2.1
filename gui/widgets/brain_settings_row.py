@@ -179,6 +179,16 @@ class BrainSettingsRow(QWidget):
         """Seed the controls from a ``BrainConfig`` (blocks signals during fill)."""
         try:
             self.role = config.role.value if hasattr(config.role, "value") else str(config.role)
+            # ARCH-ENG-298 (L-01): surface the per-model llama.cpp guidance
+            # that was previously dead data. The operator sees it on the row
+            # they are editing; nothing is applied without their action.
+            try:
+                model = getattr(config, "model", "") or ""
+                if model:
+                    from agents.providers.model_recommendations import summary
+                    self.header.setToolTip(summary(model))
+            except Exception:
+                pass
             for w in (self.ctx_spin, self.gpu_layers_spin, self.threads_spin,
                       self.batch_spin, self.kv_combo, self.split_combo, self.temp_spin):
                 w.blockSignals(True)

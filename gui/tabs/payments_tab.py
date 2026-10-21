@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QColor
 from gui.builders.refresh_coordinator import refresh_coordinator
+from agents.integrations.wallet import WalletManager
 
 
 class PaymentsTab(QWidget):
@@ -25,7 +26,11 @@ class PaymentsTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.wallet_manager = None
+        # ARCH-ENG-154: the shared store, not a private one.
+        # `EarningTab._get_wallet_manager` reads `main_window.payments_tab.wallet_manager`,
+        # so a per-instance WalletManager here would be invisible to every other
+        # wallet surface (it was hardcoded None, which killed all of them).
+        self.wallet_manager = WalletManager.shared()
         self.x402 = None
         self.escrow_manager = None
         self.automated_payout = None

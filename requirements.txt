@@ -23,7 +23,23 @@ ddgs==9.14.4
 # installed versions.
 openai==2.24.0          # brains' OpenAI-compatible client (llama-server/cloud)
 psutil==7.2.2           # hardware detection (device_registry / hardware_plan)
+# ARCH-ENG-160: also missing from this curated set, and NOT optional. Both
+# `agents/integrations/wallet_crypto.py` and `agents/platforms/credential_vault.py`
+# import Fernet at module level, so on a fresh clone `CredentialVault.__init__`
+# raises RuntimeError("cryptography is required for wallet encryption") and every
+# wallet/platform-secret path is dead. This is the same gap ARCH-ENG-108 closed
+# for openai/psutil; it recurred because the curated set is reviewed by hand and
+# nothing asserts that every third-party import in the tree appears here.
+cryptography==50.0.0    # Fernet — wallet.key + platform_vault.json encryption
 # Optional: headless-browser escalation for JS/bot-walled pages (web_eyes /
 # WebController). The app degrades to text-only fetch without it, but install
 # for full web-read capability. Also needs `playwright install chromium`.
 playwright==1.55.0
+
+# Optional capability sets are NOT in this file — install them explicitly so a
+# default install stays small:
+#   python -m pip install -r requirements-cloud.txt   (Anthropic)
+#   python -m pip install -r requirements-live.txt    (CCXT exchange adapters)
+#
+# ARCH-ENG-160: both files existed only as README references; neither was ever
+# written, so both documented install commands failed with a pip path error.

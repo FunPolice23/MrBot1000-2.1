@@ -18,7 +18,6 @@ import threading
 from typing import Any, List, Dict, Optional, Callable
 from dataclasses import dataclass, field
 
-from agents.core.feature_flags import feature_enabled
 from agents.earning.opportunity_lifecycle import OpportunityLifecycleTracker
 from app.earning_memory import EarningMemory
 from agents.brains.base_worker import _normalize_keep_alive
@@ -106,7 +105,13 @@ class PipelineResult:
 
 
 class EarningPipeline:
-    """Main earning pipeline engine with integrated memory system."""
+    """Main earning pipeline engine with integrated memory system.
+
+    ARCH-ENG-254 (W-04): six accessors with zero callers --
+    `get_opportunity_stats`, `_db_execute`, `load_memory`,
+    `build_workflow_plan`, `_legacy_to_canonical` and
+    `get_platform_reputations` -- were deleted here. Nothing read them.
+    """
 
     def __init__(self, db_path: str = DB_PATH,
                  memory_path: str = None,
@@ -160,13 +165,18 @@ class EarningPipeline:
             config=SchedulerConfig(),
         )
         # v2.0.36i: Generalized Task Executor (14-step pipeline with validators + human gates)
+        # ARCH-ENG-158: the evidence store is wired in because steps 12/14 of that
+        # pipeline decide whether an opportunity is PAID. Without it they can only
+        # fail closed — which is the correct default, but it would mean the
+        # pipeline could never observe a real payout.
         from agents.earning.executor import TaskExecutor
         from agents.earning.validator import CapabilityValidator
         from agents.safety.gates import HumanGateManager
         self.task_executor = TaskExecutor(
             portfolio=self.portfolio,
-            capability_validator=CapabilityValidator(self.memory),
+            capability_validator=CapabilityValidator(),
             human_gate_manager=HumanGateManager(),
+            evidence_store=self.evidence_store,
         )
         # v2.0.36j: Unified Economic Accounting Layer
         from agents.earning.economic_accounting import EconomicAccounting
@@ -253,15 +263,6 @@ class EarningPipeline:
         conn.commit()
         conn.close()
 
-    def _db_execute(self, sql, params=(), commit=False):
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.execute(sql, params)
-            if commit:
-                conn.commit()
-            conn.close()
-            return cursor
-
     # ── Stage 1: DISCOVER ──────────────────────────────────
 
     def discover(self, sources: List[str] = None,
@@ -279,12 +280,50 @@ class EarningPipeline:
         *query* (optional) drives the generic web source's real provider search
         so a scan can be targeted instead of only using the fixed seed feeds.
         """
-        return self.discovery_service.discover(
+        opportunities = self.discovery_service.discover(
             sources=sources,
             on_found=on_found,
             page=page,
             query=query,
         )
+        # ARCH-ENG-224: REPORT WHAT THE SCAN ACTUALLY PRODUCED.
+        #
+        # The DiscoveryScheduler decides what to search next from per-source
+        # reliability, and it is the only reader of that data
+        # (`_source_quality`). But nothing on the live path ever told it: the
+        # scan stats were discarded inside `EarningDiscoveryService.discover`,
+        # and `record_outcome` was only ever called from `run_task`, which lives
+        # in `run_discovery_cycle` -- a method with no callers.
+        #
+        # So the scheduler selected tasks using a reliability table that stayed
+        # empty forever, and `strategy_memory` / `search_strategy` /
+        # `learning_history` were empty in the live database while discovery ran
+        # continuously. Discovery worked; nothing it learned was ever kept.
+        #
+        # Recording outcomes here closes the loop with real per-source numbers
+        # rather than a guess. A source that errored is recorded as an error so
+        # its backoff grows; a source that returned results is recorded as a
+        # clean run. `success` stays False because finding an opportunity is not
+        # the same as earning from it -- that signal arrives later through the
+        # opportunity lifecycle, which already writes to memory directly.
+        try:
+            stats = getattr(self.discovery_service, "last_stats", None)
+            if stats is not None:
+                by_source = dict(getattr(stats, "by_source", {}) or {})
+                for name, count in by_source.items():
+                    self.discovery_scheduler.record_outcome(
+                        name, f"scan:{name}", success=False, revenue=0.0,
+                        error=False)
+                for name, _err in (getattr(stats, "errors", {}) or {}).items():
+                    self.discovery_scheduler.record_outcome(
+                        name, f"scan:{name}", success=False, revenue=0.0,
+                        error=True)
+                by_category = dict(getattr(stats, "by_category", {}) or {})
+                for cat in by_category:
+                    self.discovery_scheduler.mark_searched(cat)
+        except Exception as exc:      # never fail a scan over telemetry
+            self._log(f"[Discover] scheduler feedback skipped: {exc}")
+        return opportunities
 
     def run_discovery_cycle(self, sources: Optional[List[str]] = None,
                              now: Optional[float] = None) -> dict:
@@ -300,9 +339,10 @@ class EarningPipeline:
         """
         requested = sources or [
             "social", "upwork", "fiverr", "airdrop",
-            "defi", "microtask", "ugig", "web", "dynamic",
+            "defi", "microtask", "ugig", "moltbook", "web", "dynamic",
         ]
         from agents.discovery.discovery_sources import all_builtin_sources
+        from agents.earning.opportunity_models import OpportunityDeduplicator
         by_name = {s.name: s for s in all_builtin_sources()}
         valid = [n for n in requested if n in by_name]
 
@@ -326,9 +366,36 @@ class EarningPipeline:
                 return []
 
         stats = self.discovery_scheduler.tick(discover_fn, sources=valid, now=now)
+
+        # ARCH-ENG-282 (F-01): TURN THE SCHEDULER'S READ SIDE INTO THE LIVE
+        # DISCOVERY STAGE.
+        #
+        # `tick()` ran the selected tasks and then returned only counts, and
+        # `run_discovery_cycle` was the sole caller -- so even its counts went
+        # nowhere. The pipeline's live `run_full_cycle` called the separate
+        # `discover()` path, and the scheduler could never decide what to
+        # search next from results the live cycle actually produced.
+        #
+        # The scheduler now returns the canonical opportunities it found. They
+        # are deduplicated with the same identity contract the DiscoveryEngine
+        # uses, persisted through the one `remember_and_adapt` helper (so
+        # provenance/history is identical to a manual scan), and returned as
+        # the legacy shape the evaluate/filter stages consume.
+        canonical_found = stats.get("found") or []
+        deduped = OpportunityDeduplicator().filter(list(canonical_found))
+        legacy_found = []
+        for canonical in deduped:
+            try:
+                adapted = self.discovery_service.remember_and_adapt(canonical)
+            except Exception as exc:  # one malformed record must not abort a cycle
+                self._log(f"[Scheduler] adapt skipped: {exc}")
+                continue
+            legacy_found.append(adapted)
+        stats["found"] = legacy_found
         self._log(f"[Scheduler] tick: {stats['tasks']} tasks, "
                   f"{stats['opportunities']} opps "
-                  f"(explore {stats['exploration']}/exploit {stats['exploitation']})")
+                  f"(explore {stats['exploration']}/exploit {stats['exploitation']}), "
+                  f"{len(legacy_found)} new")
         return stats
 
     def _record_strategy_outcome(self, opportunity_id: str, outcome_state: str, *,
@@ -349,18 +416,30 @@ class EarningPipeline:
             return
         hist = self.memory.get_opportunity_history(opportunity_id) or {}
 
+        # ARCH-ENG-243 (BD-01): every finalized outcome is a typed earning
+        # event -- the live reporter the Insights panel's outcomes table and
+        # event feed read (it consumes `earning` events' details:
+        # platform/revenue/status). Effective values arrive from the
+        # lifecycle: a payment verified down is recorded with revenue 0, so
+        # the panel can never show a win the ledger refused. Guarded:
+        # telemetry must never break the learning feed.
+        try:
+            from agents.core.event_logger import StructuredEventLogger
+            _state = (outcome_state or "").lower()
+            StructuredEventLogger.instance().earning_event(
+                action=f"finalized:{_state}",
+                revenue=float(revenue or 0.0), cost=float(cost or 0.0),
+                platform=str(hist.get("platform", "") or ""),
+                success=_state in ("accepted", "completed", "paid", "submitted"))
+        except Exception:
+            pass
+
         # 2) SelfImprovementEngine — verified-outcome learning (Phase C).
         self._feed_self_improvement(opportunity_id, outcome_state, hist,
                                     revenue=revenue, cost=cost,
                                     effort_hours=effort_hours)
 
-        prov = hist.get("provenance", "") or ""
-        # provenance may be "src::strategy:<id>" or "strategy:<id>"
-        sid = None
-        for token in prov.split("::"):
-            if token.startswith("strategy:"):
-                sid = token.split(":", 1)[1]
-                break
+        sid = self._strategy_id_from_provenance(hist.get("provenance", ""))
         if not sid:
             return
         os_ = (outcome_state or "").lower()
@@ -373,6 +452,14 @@ class EarningPipeline:
             accepted=1 if accepted else 0, completed=1 if completed else 0,
             paid=1 if paid else 0, net_revenue=max(0.0, float(revenue) - float(cost)),
             effort_hours=float(effort_hours))
+
+    @staticmethod
+    def _strategy_id_from_provenance(provenance: str) -> str:
+        """Extract `strategy:<id>` from a provenance string ('' when absent)."""
+        for token in str(provenance or "").split("::"):
+            if token.startswith("strategy:"):
+                return token.split(":", 1)[1].strip()
+        return ""
 
     def _feed_self_improvement(self, opportunity_id: str, outcome_state: str,
                                hist: dict, *, revenue: float, cost: float,
@@ -400,9 +487,24 @@ class EarningPipeline:
             except Exception:
                 evidence_ids = []
             verified = bool(os_ == "paid" and evidence_ids)
+            # ARCH-ENG-280 (A-01): the read side needs keys that actually exist
+            # in the discovery history. The scheduler tags provenance with
+            # `strategy:<id>` (it never writes a "strategy" key), and discovery
+            # records category/task_type rather than a "tags" list -- so the
+            # old `hist.get("strategy", "")` and `hist.get("tags", [])` made
+            # every learned key empty and the getters always returned defaults.
+            strategy = self._strategy_id_from_provenance(hist.get("provenance", ""))
+            if not strategy:
+                strategy = str(hist.get("task_type", "")
+                               or hist.get("category", "") or "")
+            tags = list(hist.get("tags", []) or [])
+            for key in ("category", "task_type", "platform"):
+                value = str(hist.get(key, "") or "").strip()
+                if value and value not in tags:
+                    tags.append(value)
             record = OutcomeRecord(
                 opportunity_id=opportunity_id,
-                strategy=str(hist.get("strategy", "") or ""),
+                strategy=strategy,
                 platform=str(hist.get("platform", "") or ""),
                 outcome=Outcome.SUCCESS.value if success else Outcome.FAILURE.value,
                 revenue=float(revenue or 0.0),
@@ -410,7 +512,7 @@ class EarningPipeline:
                 effort_hours=float(effort_hours or 0.0),
                 risk_level=str(hist.get("risk_level", "unknown") or "unknown"),
                 success_probability=float(hist.get("success_probability", 0.0) or 0.0),
-                tags=list(hist.get("tags", []) or []),
+                tags=tags,
                 verified=verified,
                 evidence_ids=list(evidence_ids),
             )
@@ -427,12 +529,6 @@ class EarningPipeline:
         """
         return canonical_to_legacy(o, Opportunity)
 
-    @staticmethod
-    def _legacy_to_canonical(o) -> "CanonicalOpportunity":
-        """Adapt the pipeline's legacy Opportunity to the canonical structured model
-        so the Intelligence Engine can evaluate it (reverse of _adapt_to_legacy)."""
-        return legacy_to_canonical(o)
-
     def _intelligence_for(self, o) -> Optional["EvaluationResult"]:
         """Run the Opportunity Intelligence Engine on a legacy Opportunity.
 
@@ -448,241 +544,6 @@ class EarningPipeline:
             engine=self._intel_engine,
             log_fn=self._log,
         )
-
-    def _discover_source(self, source: str) -> List[Opportunity]:
-        """SECURE: Only valid sources allowed - no dead/external APIs."""
-        valid_sources = {
-            "social", "upwork", "fiverr", "airdrop",
-            "defi", "microtask", "content", "dynamic"
-        }
-        if source not in valid_sources:
-            self._log(f"[Discover] Invalid source '{source}' blocked")
-            return []
-        if source == "social" and not feature_enabled("social_automation"):
-            self._log("[Discover] Social automation is disabled")
-            return []
-        if source == "airdrop" and not feature_enabled("airdrop_claiming"):
-            self._log("[Discover] Airdrop scanning is disabled")
-            return []
-        if source == "defi" and not feature_enabled("defi_scanning"):
-            self._log("[Discover] DeFi scanning is disabled")
-            return []
-        
-        if source == "social":
-            return self._discover_social()
-        elif source == "upwork":
-            return self._discover_upwork()
-        elif source == "fiverr":
-            return self._discover_fiverr()
-        elif source == "airdrop":
-            return self._discover_airdrops()
-        elif source == "defi":
-            return self._discover_defi()
-        elif source == "microtask":
-            return self._discover_microtasks()
-        elif source == "content":
-            return self._discover_content()
-        elif source == "dynamic":
-            return self._discover_dynamic()
-        return []
-
-    def _discover_upwork(self) -> List[Opportunity]:
-        client_id = os.getenv("UPWORK_CLIENT_ID", "")
-        client_secret = os.getenv("UPWORK_CLIENT_SECRET", "")
-        access_token = os.getenv("UPWORK_ACCESS_TOKEN", "")
-        refresh_token = os.getenv("UPWORK_REFRESH_TOKEN", "")
-
-        if not all([client_id, client_secret, access_token,
-                    refresh_token]):
-            return []
-
-        from agents.integrations.upwork import UpworkClient
-        client = UpworkClient(
-            client_id, client_secret,
-            access_token, refresh_token,
-        )
-        gigs = client.find_gigs(q="python", limit=20)
-
-        return [
-            Opportunity(
-                id=f"upwork_{gig.id}",
-                source="upwork",
-                type="gig",
-                title=gig.title,
-                description=gig.description,
-                platform="Upwork",
-                payment_type="usd",
-                estimated_usd_value=gig.budget_usd,
-                min_amount=gig.budget_usd,
-                url=gig.url,
-                found_at=time.time(),
-            )
-            for gig in gigs
-        ]
-
-    def _discover_fiverr(self) -> List[Opportunity]:
-        from agents.integrations.fiverr import FiverrClient
-        client = FiverrClient()
-        gigs = client.find_gigs(query="python", limit=20)
-
-        return [
-            Opportunity(
-                id=f"fiverr_{gig.id}",
-                source="fiverr",
-                type="gig",
-                title=gig.title,
-                description=gig.description,
-                platform="Fiverr",
-                payment_type="usd",
-                estimated_usd_value=gig.budget_usd,
-                min_amount=gig.budget_usd,
-                url=gig.url,
-                found_at=time.time(),
-            )
-            for gig in gigs
-        ]
-
-    
-    def _discover_social(self) -> List[Opportunity]:
-        """Discover opportunities from social platforms (Reddit, Twitter, LinkedIn, etc.)."""
-        from agents.earning.social_earning_platform import SocialEarningPlatform
-        platform = SocialEarningPlatform()
-        raw_opps = platform.discover_all()
-        
-        return [
-            Opportunity(
-                id=f"social_{opp.id}",
-                source="social",
-                type=opp.type if opp.type else "gig",
-                title=opp.title,
-                description=opp.description,
-                platform=opp.platform,
-                payment_type=opp.payment_type,
-                estimated_usd_value=opp.estimated_value,
-                min_amount=opp.min_amount,
-                risk_level=opp.risk_level.lower() if opp.risk_level else "low",
-                url=opp.url,
-                found_at=opp.posted_at if opp.posted_at else time.time(),
-            )
-            for opp in raw_opps
-        ]
-
-    def _discover_airdrops(self) -> List[Opportunity]:
-        from agents.earning.airdrop_scanner import AirdropScanner
-        scanner = AirdropScanner()
-        airdrops = scanner.scan_feeds()
-
-        return [
-            Opportunity(
-                id=f"airdrop_{a.id}",
-                source="airdrop",
-                type="airdrop",
-                title=a.title,
-                description=a.description,
-                platform=a.platform,
-                payment_type="crypto",
-                payment_currency=a.token_symbol or "TOKEN",
-                estimated_usd_value=a.estimated_value_usd,
-                min_amount=a.estimated_value_usd,
-                risk_level=a.risk_level,
-                url=a.url,
-                found_at=time.time(),
-            )
-            for a in airdrops
-        ]
-
-    def _discover_defi(self) -> List[Opportunity]:
-        from agents.earning.defi_scanner import DeFiScanner
-        scanner = DeFiScanner()
-        opps = scanner.scan_all()
-        # B5: screen for rug/pull before the opps enter the pipeline. Failed screens are
-        # escalated to risk_level="high" so they're hard-declined by the A5 win-rate guard
-        # (and surfaced as rejected, never silently passed as the scanner's "low").
-        try:
-            screened, results = scanner.screen_rug_pull(opps)
-        except Exception:
-            screened, results = opps, {}
-
-        return [
-            Opportunity(
-                id=f"defi_{opp.id}",
-                source="defi",
-                type=opp.type,
-                title=f"{opp.protocol} {opp.type} — {opp.token_symbol}",
-                description=(
-                    f"{opp.protocol} {opp.type} "
-                    f"with {opp.apy_percent}% APY"
-                ),
-                platform=opp.protocol,
-                payment_type="crypto",
-                payment_currency=opp.token_symbol,
-                estimated_usd_value=opp.tvl_usd
-                * (opp.apy_percent / 100) * 0.01,
-                min_amount=0.01,
-                risk_level=results.get(opp.id, None).risk_level
-                            if results.get(opp.id) is not None else opp.risk_level,
-                url=opp.url,
-                found_at=time.time(),
-            )
-            for opp in screened
-        ]
-
-    def _discover_microtasks(self) -> List[Opportunity]:
-        from agents.integrations.microtask import MicrotaskClient
-        client = MicrotaskClient()
-        gigs = client.find_gigs(platform="all", query="ai ml data")
-
-        return [
-            Opportunity(
-                id=f"microtask_{gig.id}",
-                source="microtask",
-                type="microtask",
-                title=gig.title,
-                description=gig.description,
-                platform=gig.platform,
-                payment_type="usd",
-                estimated_usd_value=gig.payout_usd,
-                min_amount=gig.payout_usd,
-                url=gig.url,
-                found_at=time.time(),
-            )
-            for gig in gigs
-        ]
-
-    def _discover_content(self) -> List[Opportunity]:
-        """LEGACY: previously returned 3 hardcoded static entries (Mirror.xyz,
-        Hive, Gitcoin) with fixed $5 — fabricated, never discovered, identical
-        every run (the 'repeating hardcoded results' bug). Real content-platform
-        opportunities now come through WebDiscoverySource (human-review-gated) or
-        the DynamicSource. This path is kept only so nothing imports it by name
-        and breaks; it yields nothing."""
-        return []
-
-    def _discover_dynamic(self) -> List[Opportunity]:
-        from agents.earning.discoverer import EarningDiscoverer
-        discoverer = EarningDiscoverer()
-        raw_opps = discoverer.discover_all()
-
-        return [
-            Opportunity(
-                id=opp.id,
-                source=opp.source,
-                type="referral" if "referral" in opp.platform.lower()
-                       else ("faucet" if "faucet" in opp.title.lower()
-                       else "airdrop"),
-                title=opp.title,
-                description=opp.description,
-                platform=opp.platform,
-                payment_type="usd" if opp.payment_type == "usd"
-                             else "crypto",
-                estimated_usd_value=opp.min_amount,
-                min_amount=opp.min_amount,
-                risk_level=opp.risk_level,
-                url=opp.url,
-                found_at=time.time(),
-            )
-            for opp in raw_opps
-        ]
 
     # ── Stage 2: EVALUATE ──────────────────────────────────
 
@@ -859,7 +720,11 @@ class EarningPipeline:
 
             # Apply memory-based boosts and penalties
             self._apply_memory_boost(opp, platform_reps)
-            
+            # ARCH-ENG-280 (A-01): verified-outcome learning now reaches the
+            # live ranking decision. This is a bounded nudge, not a replacement
+            # for the deterministic risk/value gates above.
+            self._apply_self_improvement(opp)
+
             filtered.append(opp)
 
         # Sort by value * skill_match / effort.
@@ -904,6 +769,78 @@ class EarningPipeline:
         )
         if pattern_conf > 0.7:
             opp.skill_match = min(1.0, opp.skill_match + 0.1)
+
+    def _apply_self_improvement(self, opp) -> None:
+        """ARCH-ENG-280 (A-01): let verified-outcome learning adjust ranking.
+
+        `SelfImprovementEngine` had three read methods (`get_strategy_weights`,
+        `get_platform_reliability`, `get_tag_success_rate`) with ZERO callers.
+        It learned into a file and nothing in a live decision ever read the
+        result. This is the read side: platform reliability, tag success, and
+        the learned strategy weight are blended into one bounded signal that
+        nudges `skill_match`/`effort_score` before the sort.
+
+        Cold start is neutral: below `MIN_OUTCOMES` the engine's own guidance
+        says not to adjust, so the opportunity is returned untouched. Any
+        failure is logged and the deterministic ranking is used unchanged.
+        """
+        engine = self.self_improvement
+        if engine is None:
+            return
+        try:
+            if engine.state.total_outcomes < engine.MIN_OUTCOMES:
+                return
+            hist = self.memory.get_opportunity_history(opp.id) or {}
+            strategy = self._strategy_id_from_provenance(
+                hist.get("provenance", ""))
+            if not strategy:
+                strategy = str(hist.get("task_type", "")
+                               or hist.get("category", "")
+                               or getattr(opp, "type", "") or "")
+            tags = list(hist.get("tags", []) or [])
+            for key in ("category", "task_type", "platform"):
+                value = str(hist.get(key, "") or "").strip()
+                if value and value not in tags:
+                    tags.append(value)
+
+            platform = str(hist.get("platform", "")
+                           or getattr(opp, "platform", "") or "")
+            platform_rel = float(engine.get_platform_reliability(platform))
+            rates = [float(engine.get_tag_success_rate(t)) for t in tags]
+            tag_rate = sum(rates) / len(rates) if rates else 0.5
+            strategy_score = float(engine.score_strategy(strategy))
+
+            # All three reads are centred on their neutral 0.5 so an engine at
+            # rest produces exactly zero adjustment.
+            signal = (0.5 * (platform_rel - 0.5)
+                      + 0.3 * (tag_rate - 0.5)
+                      + 0.2 * (strategy_score - 0.5))
+            signal = max(-0.5, min(0.5, signal))
+
+            skill = float(getattr(opp, "skill_match", 0.0) or 0.0)
+            effort = float(getattr(opp, "effort_score", 0.5) or 0.5)
+            if signal > 0:
+                opp.skill_match = min(1.0, skill + min(0.15, signal * 0.3))
+                opp.effort_score = max(
+                    0.1, effort * (1.0 - min(0.20, signal * 0.4)))
+            elif signal < 0:
+                opp.skill_match = max(0.0, skill + max(-0.20, signal * 0.4))
+                opp.effort_score = min(
+                    1.0, effort * (1.0 + min(0.30, -signal * 0.6)))
+
+            # Audit surface: the GUI/report can show WHY ranking moved.
+            opp.learning_signal = {
+                "outcomes": int(engine.state.total_outcomes),
+                "platform": platform,
+                "platform_reliability": round(platform_rel, 4),
+                "tags": tags,
+                "tag_success_rate": round(tag_rate, 4),
+                "strategy": strategy,
+                "strategy_score": round(strategy_score, 4),
+                "signal": round(signal, 4),
+            }
+        except Exception as exc:
+            self._log(f"[SelfImprovement] read-side adjustment skipped: {exc}")
 
     # ── Stage 4: EXECUTE ───────────────────────────────────
 
@@ -1004,130 +941,53 @@ class EarningPipeline:
             track_fn=self.track_opportunity,
             record_submission_fn=self._record_ramp_submission,
             lifecycle=getattr(self, "lifecycle", None),
+            # ARCH-ENG-249 (AF-01): the `proposals` table had a writer
+            # (`add_proposal`) and a dedup guard (`proposal_exists`) with ZERO
+            # callers anywhere in the tree, while DB Stats displayed
+            # `count_proposals()` live -- a KPI that was structurally always
+            # zero. Persist the submitted proposal here, once per
+            # title+platform, at the point the submission actually succeeded.
+            persist_proposal_fn=self._persist_submitted_proposal,
         )
 
-        # D2 (re-audit fix, v2.0.34z): plumb the A/B intro variant onto the opp so
-        # the real-outcome hook (`_record_ramp_real_outcome`) can credit the variant
-        # that was actually used. Without this, `proposal_variant` was never set and
-        # the intro A/B never learned (best_intro always None -> always round-robins).
-        # The draft already has the chosen intro prepended by the manager helper; we
-        # (re)select the same variant here so the opp carries it through to outcome.
+    def _persist_submitted_proposal(self, opp: Opportunity, draft: str) -> None:
+        """Record a SUBMITTED proposal in the proposals table (ARCH-ENG-249).
+
+        AF-01's dedup guard existed for exactly this: the job queue can
+        re-discover the same gig, and the original save path "blindly inserted
+        a new row each time". `proposal_exists` is now the guard it was
+        written to be, so a re-discovered gig cannot add a second row.
+
+        Never raises: a persistence failure must not turn a proposal that the
+        platform accepted into a reported submission failure. The submission
+        itself is already recorded by the lifecycle/ramp path.
+        """
+        title = (getattr(opp, "title", "") or "").strip()
+        platform = (getattr(opp, "platform", "") or "").strip()
+        if not title and not platform:
+            return
         try:
-            from agents.knowledge.proposal_templates import pick_intro
-            if not getattr(opp, "proposal_variant", None):
-                opp.proposal_variant = pick_intro(
-                    getattr(opp, "platform", "unknown"),
-                    memory=getattr(self, "memory", None))
+            # Local import, like the file's other AgentDB uses: app.database
+            # imports this module's types, so a module-level import would
+            # cycle. (A swallowed NameError here is exactly how the first
+            # version of this method wrote nothing.)
+            from app.database import AgentDB
+            db = AgentDB(db_path=self.db_path)
+            try:
+                if db.proposal_exists(title, platform or None):
+                    return
+                db.add_proposal(
+                    gig_title=title,
+                    platform=platform,
+                    budget_usd=float(
+                        getattr(opp, "payment_amount", 0.0) or 0.0),
+                    draft=draft or "",
+                    status="submitted",
+                )
+            finally:
+                db.close()
         except Exception:
             pass
-
-        # 1) Review gate.
-        rev = None
-        if reviewer is not None:
-            try:
-                rev = reviewer.review(opp.description or "", draft,
-                                      job_title=opp.title or "")
-            except Exception as e:
-                return PipelineResult(
-                    success=False, opportunity=opp,
-                    action_taken="review_error",
-                    message=f"Review gate error: {e}")
-        if rev is not None and not rev.can_submit:
-            self.track_opportunity(opp, "failed",
-                                   note=f"review blocked: {rev.summary}")
-            return PipelineResult(
-                success=False, opportunity=opp,
-                action_taken="review_blocked",
-                message=f"Blocked by review gate: {rev.summary}")
-
-        # 2) Human confirmation / ramp gate (fail-safe: never auto-submit
-        #    unless explicitly allowed by BOTH a confirm callback AND the
-        #    submission ramp having unlocked auto for this platform).
-        #    - If confirm_cb is callable and returns truthy => human confirmed.
-        #    - If confirm_cb is None/missing => fall back to the C2 ramp:
-        #        * ramp.requires_human(platform) True  => BLOCKED (ramp_human_required)
-        #        * ramp.requires_human False             => auto allowed
-        #      (ramp only unlocks after N submissions with a good win-rate, and
-        #       is forced human under ai_disallowed/human_only policy.)
-        summary = (f"Job: {opp.title}\nBudget: ${opp.payment_amount or opp.estimated_usd_value:.0f}\n"
-                   f"Platform: {opp.platform}\n\nCover preview:\n{draft[:600]}")
-        confirmed = False
-        if callable(confirm_cb):
-            confirmed = bool(confirm_cb(summary))
-        else:
-            from agents.earning.submission_ramp import get_ramp
-            ramp = get_ramp(getattr(self, "memory", None))
-            ai_policy = getattr(getattr(self, "trust_boundary", None),
-                                "ai_policy", "ai_allowed")
-            if ramp.requires_human(opp.platform, ai_policy=ai_policy):
-                self.track_opportunity(opp, "failed",
-                                       note="ramp requires human confirmation")
-                return PipelineResult(
-                    success=False, opportunity=opp,
-                    action_taken="ramp_human_required",
-                    message="Human confirmation required by submission ramp "
-                            "(cold-start or insufficient win-rate)")
-            confirmed = True  # ramp unlocked auto for this platform
-
-        if not confirmed:
-            self.track_opportunity(opp, "failed",
-                                   note="human declined / no confirmation")
-            return PipelineResult(
-                success=False, opportunity=opp,
-                action_taken="human_declined",
-                message="Human confirmation required and not granted")
-
-        # 3) Submit via client.
-        client = client or getattr(self, "_upwork_client", None)
-        if client is None or not getattr(client, "can_submit", lambda: False)():
-            return PipelineResult(
-                success=False, opportunity=opp,
-                action_taken="no_client",
-                message="No submit-capable Upwork client available")
-
-        self.track_opportunity(opp, "applied", note="submission in flight")
-        try:
-            from agents.earning.platform_throttle import get_throttle
-            # C1: even when human-confirmed, never burst-submit to a platform.
-            get_throttle().acquire(opp.platform)
-            result = client.submit_proposal(
-                job_id=opp.id, cover=draft,
-                budget=float(opp.payment_amount or 0.0))
-        except Exception as e:
-            self._record_ramp_submission(opp)
-            self.track_opportunity(opp, "failed", note=f"submit error: {e}")
-            return PipelineResult(
-                success=False, opportunity=opp, action_taken="submit_error",
-                message=f"Submit error: {e}")
-
-        if not result:
-            self._record_ramp_submission(opp)
-            self.track_opportunity(opp, "failed", note="empty submit response")
-            return PipelineResult(
-                success=False, opportunity=opp, action_taken="submit_failed",
-                message="Upwork returned no proposal")
-        pid = result.get("proposal_id", "")
-        # v2.0.34aq: emit platform_submission Evidence (VERIFIED when API returned a
-        # proposal id, CONFLICTED when the API errored after a local submit attempt).
-        sub_ev = None
-        try:
-            from agents.evidence.evidence_factory import from_upwork_submission
-            sub_ev = from_upwork_submission(
-                proposal_id=pid, profile_id=result.get("submitted_by", ""),
-                job_id=opp.id, subject_id=opp.id,
-                errored=bool(result.get("error")), error_text=result.get("error", ""))
-        except Exception:
-            sub_ev = None
-        self._record_ramp_submission(opp)
-        self.track_opportunity(opp, "submitted",
-                               note=f"proposal_id={pid}")
-        # Record the submission evidence on the lifecycle (gates IN_PROGRESS->SUBMITTED).
-        if sub_ev is not None and getattr(self, "lifecycle", None) is not None:
-            self.lifecycle.mark_submitted(opp.id, note=f"proposal_id={pid}", evidence=sub_ev)
-        return PipelineResult(
-            success=True, opportunity=opp, action_taken="submitted",
-            message=f"Submitted proposal {pid} for {opp.title}")
-
 
     # ── Stage 5: TRACK ─────────────────────────────────────
 
@@ -1234,8 +1094,17 @@ class EarningPipeline:
         """
         self._log("Starting full earning cycle...")
 
-        # 1. Discover
-        opps = self.discover(sources=sources)
+        # 1. Discover (ARCH-ENG-282 / F-01: scheduler-driven; the scheduler's
+        # selected tasks and their discovered opportunities are this stage's
+        # input, not a parallel dead path).
+        cycle = self.run_discovery_cycle(sources=sources)
+        opps = list(cycle.get("found") or [])
+        if not cycle.get("tasks"):
+            # Operator-triggered run outside every source's cooldown / working
+            # window: keep the explicit scan available rather than returning an
+            # empty cycle the operator cannot explain.
+            self._log("[Scheduler] no source due; running an explicit scan")
+            opps = self.discover(sources=sources)
         self._log(f"Discovered {len(opps)} opportunities")
 
         # 2. Evaluate
@@ -1258,10 +1127,40 @@ class EarningPipeline:
         total_revenue = sum(r.opportunity.min_amount
                            for r in results if r.success)
 
+        # ARCH-ENG-236 (AJ-01): the self-audit engine was constructed here but
+        # run_audit() had no production caller anywhere (11r self-audit depth
+        # pass). It runs once per full cycle and publishes its HONEST
+        # conclusion: with the ARCH-ENG-158 outcome tables empty by design,
+        # the resting state is "insufficient data" -- never a clean bill of
+        # health -- and only real findings or genuinely complete data claim
+        # anything more.
+        self.run_self_audit()
+
         return PipelineResult(
             success=len(results) > 0,
             message=f"Cycle complete: {len(results)}/{len(filtered)} succeeded",
         )
+
+    def run_self_audit(self):
+        """Run the self-audit engine once and log its honest conclusion.
+
+        ARCH-ENG-236 (AJ-01/AJ-02): this is the missing last hop between the
+        constructed engine and the live cycle. The report's ``conclusion()``
+        distinguishes "no problems found" (every audit saw a data basis and
+        none errored) from "insufficient data" (audits whose tables are
+        empty -- the designed ARCH-ENG-158 resting state). Audit errors are
+        reported as errors, not silence.
+
+        Returns the AuditReport for programmatic callers (tests, future
+        surfaces); the log line is the primary production output.
+        """
+        try:
+            report = self.self_audit.run_audit()
+        except Exception as exc:  # the audit itself must never break the cycle
+            self._log(f"[SelfAudit] engine error: {exc}")
+            return None
+        self._log(f"[SelfAudit] {report.conclusion()}")
+        return report
 
     def run_autonomous_loop(self, sources: List[str] = None,
                             max_risk: str = "medium",
@@ -1275,8 +1174,12 @@ class EarningPipeline:
         """
         self._log("Starting unified autonomous loop...")
 
-        # 1. Discover
-        opps = self.discover(sources=sources)
+        # 1. Discover (same scheduler-driven stage as run_full_cycle).
+        cycle = self.run_discovery_cycle(sources=sources)
+        opps = list(cycle.get("found") or [])
+        if not cycle.get("tasks"):
+            self._log("[Scheduler] no source due; running an explicit scan")
+            opps = self.discover(sources=sources)
         self._log(f"Discovered {len(opps)} opportunities")
 
         # 2. Evaluate
@@ -1313,14 +1216,6 @@ class EarningPipeline:
 
     # ── Memory Query API ────────────────────────────────────────
 
-    def load_memory(self, limit: int = 1000) -> List[dict]:
-        """Load all stored opportunities into cache."""
-        opportunities = []
-        for opp_type in ["gig", "airdrop", "microtask", "content", "defi", "referral"]:
-            opps = self.memory.get_opportunities_by_type(opp_type, limit)
-            opportunities.extend(opps)
-        return opportunities
-
     def get_opportunities_by_type(self, opp_type: str, limit: int = 50) -> List[dict]:
         """Get all opportunities of a specific type."""
         return self.memory.get_opportunities_by_type(opp_type, limit)
@@ -1328,10 +1223,6 @@ class EarningPipeline:
     def get_recent_outcomes(self, limit: int = 20) -> List[dict]:
         """Get most recent outcomes."""
         return self.memory.get_recent_outcomes(limit)
-
-    def get_platform_reputations(self) -> List[dict]:
-        """Get reputation for all platforms."""
-        return self.memory.get_all_reputations()
 
     def track_opportunity(self, opportunity: Opportunity, stage: str, note: str = "", amount: float = 0.0):
         """Update an opportunity's lifecycle state."""
@@ -1461,35 +1352,7 @@ class EarningPipeline:
         except Exception:
             pass  # never break the lifecycle path over bookkeeping
 
-    def build_workflow_plan(self, opportunity: Opportunity):
-        """Create a concrete execution plan for an opportunity."""
-        from agents.services.workflow_planner import WorkflowPlanner
-
-        planner = WorkflowPlanner()
-        return planner.build_plan(opportunity)
-
     def get_recent_learned(self, learning_type: str = None, limit: int = 10) -> List[dict]:
         """Get recent learned insights."""
         return self.memory.get_recent_learned(learning_type, limit)
 
-    def search_opportunities_by_keyword(self, keyword: str, limit: int = 20) -> List[dict]:
-        """Search opportunities by keyword in title/description."""
-        results = []
-        for opp_type in ["gig", "airdrop", "microtask", "content", "defi"]:
-            opps = self.memory.get_opportunities_by_type(opp_type, limit * 2)
-            for opp in opps:
-                if keyword.lower() in str(opp).lower():
-                    results.append(opp)
-                    if len(results) >= limit:
-                        return results
-        return results
-
-    def get_opportunity_stats(self) -> dict:
-        """Get statistics about discovered opportunities."""
-        summary = self.memory.get_memory_summary()
-        return {
-            "total_opportunities": summary["memory_stats"]["cached_opportunities"],
-            "platform_stats": summary["top_platforms"],
-            "skill_stats": summary["successful_skills"],
-            "learning_insights": summary["recent_learned"],
-        }

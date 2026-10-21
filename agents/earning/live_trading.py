@@ -9,6 +9,7 @@ controls.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -28,6 +29,90 @@ class PortfolioSnapshot:
     free_cash_usd: float
     balances: Dict[str, float] = field(default_factory=dict)
     fetched_at: float = field(default_factory=time.time)
+    # ARCH-ENG-289 (G-06): the first equity observation for this exchange on
+    # the current UTC day. 0.0 means "no producer configured", which keeps the
+    # daily-loss breaker inert rather than guessing a baseline.
+    day_start_equity_usd: float = 0.0
+
+
+def default_daily_equity_path() -> str:
+    """Where the durable daily-equity baseline lives.
+
+    Mirrors the app-data convention used by the Collaboration tab: never write
+    operator state into the source tree.
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "MrBot1000", "live_trading_daily_equity.json")
+
+
+class DailyEquityTracker:
+    """Persist the first equity observation per exchange and UTC day.
+
+    The daily-loss circuit breaker needs an opening balance, but the exchange
+    adapter only exposes the *current* balance. This tracker records the first
+    observation of the day and returns it for subsequent calls, so
+    ``PortfolioSnapshot.day_start_equity_usd`` has a real producer.
+
+    Best-effort by design: a missing, unreadable or unwritable state file must
+    not stop a live order assessment. In that case the current equity is used
+    as the baseline (loss 0.0), which is the same conservative result as a new
+    day -- never a fabricated loss that would block a legitimate order.
+    """
+
+    def __init__(self, path: str):
+        self.path = str(path or "")
+        self._lock = threading.Lock()
+
+    def observe(self, exchange: str, equity_usd: float,
+                now: Optional[float] = None) -> float:
+        equity = float(equity_usd or 0.0)
+        if equity <= 0 or not self.path:
+            return 0.0
+        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() if now is None else now))
+        key = str(exchange or "configured").strip().lower() or "configured"
+        with self._lock:
+            state: Dict[str, Any] = {}
+            try:
+                with open(self.path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    state = loaded
+            except (OSError, ValueError):
+                state = {}
+            entry = state.get(key)
+            if isinstance(entry, dict) and entry.get("day") == day:
+                try:
+                    opening = float(entry.get("opening_equity_usd") or 0.0)
+                except (TypeError, ValueError):
+                    opening = 0.0
+                if opening > 0:
+                    return opening
+            state[key] = {"day": day, "opening_equity_usd": equity}
+            try:
+                parent = os.path.dirname(self.path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                tmp = self.path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(state, fh, indent=2, sort_keys=True)
+                os.replace(tmp, self.path)
+            except OSError:
+                pass
+            return equity
+
+
+def compute_daily_loss_pct(opening_equity_usd: float, current_equity_usd: float) -> float:
+    """Return the non-negative fraction lost since the opening observation."""
+    try:
+        opening = float(opening_equity_usd or 0.0)
+        current = float(current_equity_usd or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if opening <= 0:
+        return 0.0
+    return max(0.0, (opening - current) / opening)
 
 
 @dataclass(frozen=True)
@@ -68,6 +153,18 @@ class TradingPolicy:
 
     ``preapproval_enabled`` allows only the low-risk tier to execute without a
     new approval item. It never bypasses blocked conditions.
+
+    ARCH-ENG-295 (G-07): the ``_pct`` suffix was ambiguous. The units are now
+    explicit and enforced at construction:
+
+    * fractions (0..1): ``max_position_pct``, ``max_daily_loss_pct``,
+      ``min_confidence``;
+    * percent points (0..100): ``max_volatility_pct``, ``max_spread_pct``,
+      ``min_expected_profit_pct``.
+
+    The historical names stay for API stability, but a mis-entered value (for
+    example ``max_daily_loss_pct=2.0`` meaning 2%) is rejected instead of
+    silently disabling the breaker.
     """
 
     preapproval_enabled: bool = False
@@ -80,6 +177,38 @@ class TradingPolicy:
     min_confidence: float = 0.70
     min_expected_profit_pct: float = 0.25
     max_market_data_age_seconds: float = 30.0
+
+    def __post_init__(self):
+        if self.max_order_usd < 0:
+            raise ValueError("max_order_usd must be non-negative")
+        if not 0.0 < self.max_position_pct <= 1.0:
+            raise ValueError(
+                "max_position_pct is a fraction (0..1), not a percent; "
+                f"got {self.max_position_pct!r}")
+        if not 0.0 < self.max_daily_loss_pct <= 1.0:
+            raise ValueError(
+                "max_daily_loss_pct is a fraction (0..1), not a percent; "
+                f"got {self.max_daily_loss_pct!r}")
+        if not 0.0 <= self.max_volatility_pct <= 100.0:
+            raise ValueError(
+                "max_volatility_pct is percent points (0..100); "
+                f"got {self.max_volatility_pct!r}")
+        if not 0.0 <= self.max_spread_pct <= 100.0:
+            raise ValueError(
+                "max_spread_pct is percent points (0..100); "
+                f"got {self.max_spread_pct!r}")
+        if self.min_liquidity_multiple < 0:
+            raise ValueError("min_liquidity_multiple must be non-negative")
+        if not 0.0 <= self.min_confidence <= 1.0:
+            raise ValueError(
+                "min_confidence is a fraction (0..1); "
+                f"got {self.min_confidence!r}")
+        if not 0.0 <= self.min_expected_profit_pct <= 100.0:
+            raise ValueError(
+                "min_expected_profit_pct is percent points (0..100); "
+                f"got {self.min_expected_profit_pct!r}")
+        if self.max_market_data_age_seconds <= 0:
+            raise ValueError("max_market_data_age_seconds must be positive")
 
 
 class CcxtExchangeAdapter:
@@ -132,14 +261,29 @@ class LiveTradingService:
     """Live account reader and guarded order executor."""
 
     def __init__(self, adapter: Any = None, policy: Optional[TradingPolicy] = None,
-                 live_enabled: Optional[bool] = None):
+                 live_enabled: Optional[bool] = None,
+                 daily_equity_path: Optional[str] = None,
+                 daily_equity_tracker: Any = None):
         self.adapter = adapter
         self.policy = policy or TradingPolicy()
-        self.live_enabled = (
-            os.getenv("MRBOT_LIVE_TRADING_ENABLED", "false").lower()
-            in {"1", "true", "yes"}
-            if live_enabled is None else bool(live_enabled)
-        )
+        # ARCH-ENG-289 (G-06): production passes a durable path; tests and
+        # embedded callers may omit it and keep the breaker inert.
+        if daily_equity_tracker is not None:
+            self._daily_equity_tracker = daily_equity_tracker
+        elif daily_equity_path:
+            self._daily_equity_tracker = DailyEquityTracker(daily_equity_path)
+        else:
+            self._daily_equity_tracker = None
+        # ARCH-ENG-283 (G-05/AO-02): the live gate read
+        # `MRBOT_LIVE_TRADING_ENABLED`, a variable nothing sets. The documented
+        # switch is `MRBOT_ENABLE_LIVE_TRADING` (and its legacy alias
+        # `ENABLE_LIVE_TRADING`), which `feature_enabled` owns. Two spellings
+        # of the same safety switch is how a disabled operator looks enabled.
+        if live_enabled is None:
+            from agents.core.feature_flags import feature_enabled
+            self.live_enabled = feature_enabled("live_trading")
+        else:
+            self.live_enabled = bool(live_enabled)
         # Approval ids already submitted. A decided item stays APPROVED
         # forever, so the ledger — not the queue status — enforces
         # once-per-approval.
@@ -168,11 +312,16 @@ class LiveTradingService:
         price_cache = {}
         total_usd = self._usd_value(raw, "total", price_cache)
         free_usd = self._usd_value(raw, "free", price_cache)
+        exchange = getattr(self.adapter, "exchange_id", "configured")
+        day_start = 0.0
+        if self._daily_equity_tracker is not None:
+            day_start = self._daily_equity_tracker.observe(exchange, total_usd)
         return PortfolioSnapshot(
-            exchange=getattr(self.adapter, "exchange_id", "configured"),
+            exchange=exchange,
             total_equity_usd=total_usd,
             free_cash_usd=free_usd,
             balances=balances,
+            day_start_equity_usd=day_start,
         )
 
     def fetch_market_snapshot(self, symbol: str) -> MarketSnapshot:
@@ -208,8 +357,18 @@ class LiveTradingService:
         )
 
     def assess_order(self, intent: TradeIntent, portfolio: PortfolioSnapshot,
-                     market: MarketSnapshot, daily_loss_pct: float = 0.0) -> RiskAssessment:
+                     market: MarketSnapshot,
+                     daily_loss_pct: Optional[float] = None) -> RiskAssessment:
         self._validate_intent(intent, market)
+        # ARCH-ENG-289 (G-06): this parameter used to default to 0.0 and no
+        # production caller supplied it, so the breaker could never trip. When
+        # omitted, derive it from the snapshot's opening balance (which
+        # sync_portfolio produces). An explicit value still wins for tests and
+        # callers that have a better baseline.
+        if daily_loss_pct is None:
+            daily_loss_pct = compute_daily_loss_pct(
+                portfolio.day_start_equity_usd, portfolio.total_equity_usd)
+        daily_loss_pct = max(0.0, float(daily_loss_pct or 0.0))
         adapter_exchange = getattr(self.adapter, "exchange_id", "")
         if adapter_exchange and intent.exchange.lower() != adapter_exchange.lower():
             raise LiveTradingError("Order exchange does not match configured adapter")

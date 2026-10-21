@@ -366,3 +366,31 @@ class TestProgressSignalThrottled:
         throttler._flush()
 
         assert captured == []
+
+
+# -- P2 terminal-marker spoof hardening -------------------------------------
+def _control_tab():
+    from gui.tabs.dialogue_tab import DialogueTab
+    tab = DialogueTab.__new__(DialogueTab)
+    tab._dialogue_control_ledger = []
+    tab._blocked_personas = set()
+    tab._blocked_states = {}
+    return tab
+
+
+def test_terminal_marker_not_triggered_by_quoted_title():
+    # A candidate title merely quoted mid-response must not trigger a false
+    # terminal-block (same P2 class as the convergence-gate hardening).
+    tab = _control_tab()
+    spoof = ('The top listing is titled "cannot proceed with this gig", '
+             'but we can move forward.')
+    assert tab._record_dialogue_control_state('Edward Hurst', spoof) is False
+    assert 'Edward Hurst' not in tab._blocked_personas
+
+
+def test_terminal_marker_detected_on_real_decision():
+    # A genuine terminal decision still stops the run.
+    tab = _control_tab()
+    assert tab._record_dialogue_control_state(
+        'Edward Hurst', 'I cannot proceed without the contract terms.') is True
+    assert 'Edward Hurst' in tab._blocked_personas

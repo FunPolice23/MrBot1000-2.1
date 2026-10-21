@@ -1,3 +1,3641 @@
+## [2.1.132] - 2026-10-21 - Dialogue turns stop claiming Graph-of-Thought
+
+### Fixed
+
+**ARCH-ENG-317 - simple back-and-forth Dialogue is no longer labelled as Graph-of-Thought.**
+Operator report: Dialogue uses Graph-of-Thought everywhere, but a simple
+discussion between the models — plain back-and-forth talk — should not have
+GoT applied. Investigation of the actual wiring showed the per-turn thought
+graph never branched at runtime (no production caller supplies branch
+candidates); what made casual chat LOOK like GoT was the pattern resolver
+keyword-matching the ENTIRE turn context. The board text routinely contains
+"options"/"compare"/"evidence", so plain conversation was regularly labelled
+`tree_of_thoughts` / `graph_of_thoughts` / `react`. Now a `dialogue_mode`
+turn without deliberately supplied branch candidates records the honest
+linear skeleton (`direct_dialogue`) in both brain adapters
+(`agents/brains/big_brain.py`, `agents/brains/small_brain.py` via
+`_start_got_turn(..., pattern=...)` and `start_brain_turn`'s existing
+pattern parameter). The inspectable graph itself stays — the turn still
+records goal/nodes/status/tool traces — only the false orchestration claim
+is gone. Turns that deliberately carry branch candidates still resolve and
+branch normally, and non-dialogue callers (analysis flows) keep the
+resolver's keyword routing unchanged.
+Regression: `tests/engineering/test_arch_eng_317_dialogue_got_routing.py`
+(dialogue turn → `direct_dialogue` despite trigger-heavy text; branch
+candidates → still `tree_of_thoughts` with branching; non-dialogue →
+resolver unchanged; explicit pattern override honoured end-to-end).
+
+## [2.1.131] - 2026-10-21 - Flags that obey being turned off, and one tier per speaker
+
+### Fixed
+
+**ARCH-ENG-314 - un-setting an advanced llama.cpp flag finally persists.**
+Operator report: in Providers & GPU → Advanced llama.cpp Flags, the small
+brain's enable/disable checkboxes (and other parts) "are not being
+remembered/saved". The `.env` writes were actually landing — the defect was
+that a control's UNSET state could never be persisted over an earlier
+value. Snapshot paths treated "unset" as "write nothing", `set_env_values`
+only ever merges, so once `SMALL_BRAIN_CPU_MOE=true` (say) existed there
+was NO way to undo it: unchecking silently reverted on every reload, and
+`(default)`/sentinel/cleared-field controls did the same. Now:
+
+- `_llama_flag_values` returns `(values, stale_keys)`; a control at its
+  "not set" sentinel names its `{prefix}_{key}` for REMOVAL instead of
+  writing nothing.
+- `set_env_values` learned `remove_keys` (comments and unknown keys are
+  preserved; an explicit rewrite beats a removal for the same key).
+- All three writer paths (`DualBrainControl._persist_settings`,
+  `ProviderLifecycleBackend._write_env_values`, the fuses between them)
+  thread the stale set through.
+- The per-control "unset" predicate became explicit widget metadata
+  (`_flag_unset`) — which also fixed `REASONING_BUDGET=-1` (unrestricted),
+  silently dropped by the old blanket "<=0 = unset" rule, and made
+  `TOP_K=0` persistable.
+
+**ARCH-ENG-315 - the "Keep X in system RAM" checkboxes now fire their
+flag.** Checking **Keep KV cache in system RAM** wrote
+`{PREFIX}_KV_OFFLOAD=true`, which the parser read as *kv offload ON* — so
+`build_llama_command` emitted NO flag and the brain kept offloading KV to
+VRAM regardless of the checkbox. Same for **Keep projector on CPU**
+(`MMPROJ_OFFLOAD=true` → no `--no-mmproj-offload`). The GUI phrase is the
+operator's wish; the parser now inverts it into the offload state the
+builder speaks (`_opt_bool_no_m`: checked → `--no-kv-offload` /
+`--no-mmproj-offload` emitted; absent → llama.cpp's default, no flag;
+`CPU_MOE` — not a negation — maps directly). The operator's existing
+`KV_OFFLOAD=true` line now behaves as intended from the next launch.
+
+**ARCH-ENG-316 - the small brain's persona prompt follows its size tier.**
+Operator follow-up on the Dialogue tab: turns generate again after
+ARCH-ENG-313, but the 1.2B navigator's replies stay poor/aimless. Cause:
+the output CONTRACT was tiny ("1-3 short sentences") but the persona
+SYSTEM prompt was built without a tier and defaulted to FULL —
+`# RESPONSE PROCESS`, tool language, the team brief — prompt weight a
+1.2B model cannot follow. `_tier_for_speaker` now resolves the same
+model-size tier the contract uses (`_tier_for_brain`) and `respond()`
+passes it into `build_system_prompt`, so a sub-2B speaker speaks from the
+tiny prompt (no tool language, no process section, no team brief — it
+keeps the "say BLOCKED or UNKNOWN" path). Two load-bearing repairs came
+with it:
+
+- The remembered honesty-note skip (`!= "tiny"`) now actually means tiny;
+  before, `_tier_for_speaker` could never return "tiny", so the 1.2B
+  navigator carried the epistemic note every turn.
+- **The VRAM read behind the ≥10 GB "full" cap was MiB misread as GB**
+  (`_brain_gpu_vram_gb` took the raw `memory.total` number; the hardened
+  `_run_nvidia_smi` returns MiB, exactly what `agents/runtime/llm.py`
+  divides by 1024). A 16 GB card read as 16311 GB, so the cap never
+  demoted anything. Now MiB → GB, matching `llm.py`.
+
+Regression: `tests/gui/test_arch_eng_314_flag_persistence.py`
+(removal beats resurrection, comments survive, widget round trip for
+box/combo/spin/sentinel/REASONING_BUDGET, snapshot carries the stale set),
+`tests/runtime/test_arch_eng_315_offload_flag_inversion.py` (`--no-kv-offload`
+and `--no-mmproj-offload` fire, uncheck fires nothing, CPU_MOE untouched),
+`tests/dialogue/test_arch_eng_316_tier_prompts.py` (tier follows the
+model, respond() wires it, the tiny prompt is actually light), refreshed
+speaker-tier pins (`test_dialogue_nbrain_resolution.py`,
+`test_dialogue_team_brief.py`, `test_convergence_plan.py` stubs) for the
+size-based tier, and the persistence-pins
+(`test_arch_eng_113_env_fallback_bypass.py`, `test_cycle_071_075.py`).
+
+## [2.1.130] - 2026-10-21 - The estimate that never paused Jacob again
+
+### Fixed
+
+**ARCH-ENG-313 - the Dialogue model-size gate is now advisory; a sub-2B
+model is never paused.** Operator symptom, verbatim:
+
+    Jacob Stanley is paused: model size below 2B (1.2B estimate).
+    Select an instruct-tuned model of at least 2B in Providers & GPU,
+    then try again.
+
+The 1.2B came from `_estimate_model_size` — a FILENAME estimate — yet the
+ARCH-ENG-279 gate wired it as a hard refusal: every turn with a small
+model was stopped with no override short of swapping models. That is the
+same failure class ARCH-ENG-310 removed from the VRAM gate: a threshold
+on an estimate overriding an explicit operator choice. The gate now
+follows the warn-only contract:
+
+- `respond()` always proceeds; the predicate was renamed
+  `_dialogue_model_blocked` → `_dialogue_model_advisory` and the refusal
+  block became `_apply_model_advisory(brain)`.
+- A sub-2B or base-model estimate emits ONE system note per
+  (speaker, reason): "Advisory for <speaker>: <reason>. Continuing
+  anyway — expect weaker output. To change models, use Providers & GPU."
+  It never rewrites `_blocked_states`, never writes `model:<reason>`,
+  never says "paused ... try again".
+- Any evaluation error remains "not flagged" — a partial or mock brain
+  can never stop a turn (that guarantee predates this change and is
+  preserved by its own test).
+
+Regression: `tests/dialogue/test_arch_eng_313_model_size_advisory.py`
+(one-time note, no blocked state, healthy models stay silent, errors
+never refuse, the old pause copy cannot return) plus reworked
+ARCH-ENG-279 tests in
+`tests/engineering/test_arch_eng_271_279_low_wires.py` (the advisory is
+consulted before the worker is built; the helper never pauses) and the
+updated predicate test in
+`tests/dialogue/test_dialogue_response_corruption.py`.
+
+## [2.1.129] - 2026-10-21 - The template that belonged to the model, and an example that worked
+
+### Fixed
+
+**ARCH-ENG-311 - the `raise_exception()` chat-template fallback is now
+opt-in, so the model keeps its own tool-call rendering.** Every launch of a
+Qwen3.5-class model logged:
+
+    INFO agents.runtime.dual_brain: Chat template for .../Qwen3.5-35B-...gguf
+    contains raise_exception(); applying fallback template (6 chars)
+
+The "6 chars" was `chatml`. The v2.1.1 workaround predated llama.cpp's Jinja
+engine, which could not run templates calling `raise_exception()`, so build_llama_command
+substituted a bare builtin by architecture. The operator's current build
+(verified against `llama-server --help`: `--jinja` default-enabled; its
+builtin list is modern) runs the model's OWN embedded template through the
+minja Jinja evaluator, which implements `raise_exception()` itself. The
+substitution was therefore actively harmful: it replaced the embedded
+Qwen3.5 template — which carries tool-call rendering and thinking
+delimiters — with a 6-char chatml alias, and the Dialogue tab's tool
+calling (`agents/dialogue/chat_completion.py` sends `tools` +
+`tool_choice=auto` to llama-server, and brains pass
+`chat_template_kwargs.enable_thinking`) depends on exactly that embedded
+template. Now the template ships to the server untouched; the detection
+logs one INFO naming the model and the reason. Old llama.cpp builds whose
+Jinja cannot run these templates restore the legacy substitution with
+`MRBOT_LEGACY_CHAT_TEMPLATE_FALLBACK=1` (the substitution logic itself,
+including the Gemma-4 "never substitute" rule, is unchanged; `--chat-template`
+is only emitted behind the opt-in).
+
+**ARCH-ENG-312 - `.env.example` no longer ships placeholders that abort the
+app at import.** `agents/brains/base_worker.py` reads
+`MAX_TOKENS` with an unguarded `int(os.getenv("MAX_TOKENS", 2048))` at MODULE
+IMPORT; worker_budget.py and the dialogue budget keys parse ints the same
+way. The example carried `MAX_TOKENS=your-max-tokens-here`,
+`BIG/SMALL_BRAIN_MAX_TOKENS=your-...-here`,
+`MAIN/CHAT_CONTEXT_TOKENS=your-...-here` — so a new operator copying
+`.env.example` to `.env` got a `ValueError` and a dead app before any window.
+Those five keys now carry working integers (4096 / 8192 / 4096 / 128000 /
+128000), `BIG_BRAIN_BATCH=2049` is corrected to `2048`, and the
+`MRBOT_LEGACY_CHAT_TEMPLATE_FALLBACK` rescue knob is documented (commented
+out) in the advanced-flags block.
+
+Regression: `tests/engineering/test_arch_eng_312_env_example.py` (the file
+parses as UTF-8; every int-parsed key is a real integer; the legacy toggle
+is documented but commented out) and the reworked ARCH-ENG-270 tests in
+`tests/engineering/test_arch_eng_263_270_low_fixes.py` (default: no
+`--chat-template`, jinja keeps the model's rendering; opt-in restores the
+substitution; missing legacy fallback still warns; clean templates add
+nothing).
+
+## [2.1.128] - 2026-10-21 - The launch that never refuses
+
+### Changed
+
+**ARCH-ENG-310 - the VRAM contention gate is warn-only; a model larger than
+the card is allowed to load.** The operator's launch report:
+
+    Big Brain REFUSED: VRAM: NVIDIA GeForce RTX 5060 Ti has ~15.9 GB free,
+    needs ~22.1 GB (+0 GB margin) — lower context, offload fewer layers, or
+    use a smaller model. ... Override with MRBOT_ALLOW_RISKY_LAUNCH=1 ...
+
+ARCH-ENG-231 wired `brain_contention.can_add_brain` into the launch path as a
+fail-closed gate that REFUSED when the VRAM estimate outran free VRAM by a
+severe threshold (`_SEVERE_OVERRUN_GB`, 4 GB originally, relaxed to 6 GB in
+`c7ac5fe` after the first override). That is a threshold on an ESTIMATE, and it
+fired on a real workload: on the 16 GB card a ~22 GB big brain sits ~6.2 GB
+over — over the line twice. Both times the operator overrode the refusal and
+the model worked (slower, with the excess spilling to system RAM).
+
+The operator's decision is now the policy itself: **the gate never refuses.
+An over-budget model loads, with a warning about being slower.** The gate
+(`BrainLaunchPrepWorker._contention_gate`) always returns "" so `run()`
+proceeds; when `can_add_brain` says the footprint does NOT fit (and CAN
+establish it), the gate appends a merged warning to `_warn` that names the
+resource, the shortfall, and the fix, and states that the model will load
+anyway with slower generation:
+
+    ⚠️ Big Brain VRAM contention: needs ~22.1 GB with only ~15.9 GB free
+    (short ~6.2 GB: VRAM ...) — the model will load anyway and generation
+    will be slower (the excess spills to system RAM). Lower the context,
+    offload fewer layers, or pick a smaller model for full speed.
+
+Kept unchanged: the early warn-only checks (step 2 VRAM-RISK, step 2b
+system-RAM contention) — the gate's warning now MERGES into `_warn` instead
+of clobbering them; an unestablishable footprint (cloud providers,
+name-referenced models, missing files) stays silent rather than adding
+noise; any exception inside the gate leaves the launch untouched — the gate
+must never become a NEW reason for a launch to fail. `MRBOT_ALLOW_RISKY_LAUNCH=1`
+survives as an opt-out from the warning itself for operators who do not want
+the note. `can_add_brain` keeps its production caller, so the multi-model
+accounting layer stays reachable (the original ARCH-ENG-231 defect).
+
+Regression: `tests/engineering/test_arch_eng_231_contention_gate_wired.py`
+rewritten to pin the warn-only contract — the impossible launch proceeds
+with a named-resource/named-shortfall warning that says "load anyway" and
+"slower" and never grows a refusal back in; models that fit warn nothing;
+unknown footprints warn nothing; the legacy override silences the warning.
+
+## [2.1.127] - 2026-10-21 - One model-selection surface, not two
+
+### Removed
+
+**ARCH-ENG-309 - the N-Brain Roster panel in the Providers_GPU tab.** Between
+Compute Devices and Provider Control the tab rendered "Big Brains" and
+"Small Brains" group boxes, each with a count spinner plus an editable
+provider/model/device/enabled row per slot. That was a second model-selection
+surface edited in parallel with Provider Control: two editors could disagree
+about which model a slot launches, and the count spinners created slot rows
+that had no visible counterpart in Provider Control. Provider Control -- one
+row per runtime slot, rebuilt from the enabled device policy -- is the single
+place model selection and per-slot settings are edited, so the parallel
+editor is removed.
+
+Removed is the panel as an editing surface only:
+
+* The roster DATA (`settings.json`) still drives extra slots at launch;
+  nothing about launch resolution changed.
+* `DualBrainControl.cleanup()` still calls `flush_pending_roster_edit` -- a
+  safe no-op with no panel, and structurally pinned by the ARCH-ENG-153
+  guard (`test_teardown_also_flushes_the_pending_roster_edit`), which stays
+  green untouched.
+* `gui/widgets/brain_roster_panel.py` keeps its standalone unit tests
+  (`tests/gui/test_brain_roster_ui.py`,
+  `tests/engineering/test_arch_eng_153_roster_debounce_launch_read.py`),
+  which construct the panel headless and never touched the tab.
+* The save/flush call sites (`_persist_brain_roster`, `main.save_settings`,
+  the lifecycle backend's launch read) already used
+  `getattr(self, "brain_roster_panel", None)` and no-op with no panel.
+
+Regression: `tests/gui/test_arch_eng_309_roster_panel_removed.py`
+(construction builds no roster panel; Provider Control rows still render;
+the tab source never instantiates `BrainRosterPanel` again).
+
+## [2.1.126] - 2026-10-21 - The VRAM note that lied, and the $0 that wasn't a finding
+
+### Fixed
+
+**ARCH-ENG-307 - the context-clamp note described a clamp that never landed,
+and it lied five times.** Every launch printed five identical lines:
+
+    INFO agents.runtime.dual_brain: [small] context model not measurable;
+    6.0 GB VRAM tier allows 16384 at 1-byte KV, not 32768
+
+Three defects shared that one line. First, it was *wrong*: `SMALL_BRAIN_CONTEXT`
+is set explicitly in `.env`, and the ARCH-ENG-222 contract says an explicit
+value wins untouched -- so the brain actually ran 32768 while the note claimed
+the tier allows only 16384. The clamp narrows the DEFAULT; build_config logs
+the default-clamp's reason before the env override is applied, so the note
+described a path the built config never took. Second, it was *repeated*:
+build_config runs several times during startup (fresh lookups, roster syncs,
+settings reloads) and every run re-emitted the identical line. Third, the
+tier-table fallback didn't say *why* it ran -- "model not measurable" named
+the symptom but not whether a model path was even configured, which is what
+the operator needs to judge the number (and what leads to the operator's
+correct observation that a 1-3B model fits a 6 GB card with q8_0 KV; the
+measured path verifies exactly that when it is handed a real GGUF).
+
+Now: with an explicit `{PREFIX}_CONTEXT` override, the clamp is neither
+computed nor logged (there is nothing to note -- the operator set the value);
+without one, each distinct note is logged once per process via a
+`(role, reason)` dedupe set; and the fallback note names the model path it
+failed to measure, or states plainly that none was configured.
+
+**ARCH-ENG-308 - `$0` is not an unsupported monetary value.** In the Dialogue
+tab, Jacob Stanley wrote "All listed opportunities have $0 expected USD value
+or are unpaid" and the numeric evidence check reported `Evidence check: Jacob
+Stanley cited $0, which does not appear in the context that turn was shown
+... verify it against a source before treating it as earnings.` Asking the
+operator to verify zero earnings is noise: a zero cannot be fabricated
+earnings, it can only understate them. `agents/evidence/numeric_evidence.py`
+now exempts exact zero from `unsupported_values` (so also from
+`has_unsupported_values`); every nonzero value is checked exactly as before,
+and the check remains a reporter, never a gate.
+
+Regression: `tests/engineering/test_arch_eng_307_308_vram_note_and_zero.py`
+(override skips clamp and note; dedupe logs once, a changed reason still
+logs; the fallback note names the path; zero exempt, mixed turns report only
+nonzero, the exemption does not disable the check).
+
+## [2.1.125] - 2026-10-19 - The second cognition system is deleted
+
+### Removed
+
+
+**ARCH-ENG-233 - the entire `CognitionRecord` cluster never had a production
+consumer, and it executed on every run.** `agents/cognition/graph.py` contained
+two cognition systems. The live one -- `ThoughtGraph`, `measure_support`,
+`rank_options` and their six names -- is the support propagation behind
+`brain_got.py` branch scoring and `earning/got.py` option ranking. The dead one
+-- 11 dataclasses from `InformationItem` through `CognitionRecord`, plus the
+`ledger.py` / `state.py` / `memory_promotion.py` / `contradictions.py`
+satellites (~315 lines) -- was loaded on every run because
+`agents/cognition/__init__.py` re-exported it, constructed by nothing, and
+consumed by nothing outside `agents/cognition/`. It is the package-facade
+camouflage shape: the module looks alive because it loads; nothing calls it.
+
+The cluster was fully tested -- six test modules, an observability module among
+them, all green -- and none of it ran in the product. In particular
+`CognitionRecord.validate()` was a genuine 23-line contract validator enforcing
+precisely the "no claim advances without evidence" invariant this tree has been
+hardening everywhere else, and no production path ever called it.
+
+Deleted with the cluster: `tests/dialogue/test_cognition.py`,
+`tests/dialogue/test_cognition_observability.py`,
+`tests/dialogue/test_memory_promotion.py`,
+`tests/dialogue/test_contradictions.py`, and
+`tests/runtime/test_collaboration_failures.py` (whose live half -- the
+`BoundedDiscussion` budget test -- is relocated to
+`tests/dialogue/test_discussion.py`, ARCH-ENG-233-tagged). The one
+`CognitionRecord` touch inside `tests/dialogue/test_thought_graph.py` is removed;
+its `ThoughtGraph` tests stay.
+
+**This deletion also resolves BG-02 by removing it.** The cluster expressed the
+evidence gate four times in two shapes with two strictnesses, and the three dead
+predicates (`Claim.can_support_action`, `Outcome.can_update_learning`,
+`Lesson.can_be_promoted`) were the looser ones. Had the cluster been wired
+instead, the newly-wired gate would have been the permissive one -- the
+ARCH-ENG-211 shape. The strict live gate `SupportMeasure.action_eligible` is
+untouched.
+
+Deliberately **not** deleted, verified live separately: `fact_ledger.py`
+(which exports a DIFFERENT, live `Claim` consumed by `dialogue_honesty` and the
+dialogue tab), `MessageType.COGNITION_UPDATE` (published by
+`agents/runtime/agent.py`), and `BG-03`'s `ThoughtGraph.measure_all` (diagnostic,
+part of the live half -- recorded, not fixed).
+
+Vacuity probes in
+`tests/engineering/test_arch_eng_233_cognition_island_removed.py`: the surface
+and module-absence assertions fail against the pre-fix tree; the live-half probe
+fails if the deletion had removed the thought-graph machinery with it.
+
+### Fixed
+
+**ARCH-ENG-236 - the self-audit engine was constructed but never run, and had
+it been run it would have reported a clean bill on empty tables.**
+`agents/services/self_audit.py` is the Self-Audit & Continuous-Improvement
+Layer (v2.0.36j-T4): 15 methods, ~460 lines. `SelfAuditEngine` was constructed
+exactly once (`EarningPipeline.__init__`) and the `self_audit` attribute was
+never read again anywhere in production -- `run_audit()`, the engine's only
+public entry point, had no caller, so all fourteen `_audit_*` methods were
+dead by transitivity (AJ-01, high; 11r).
+
+Wiring it was not enough, and would have made things worse (AJ-02, high after
+11s's amendment): twelve of the fourteen audits read outcome tables that hold
+zero rows *by design* -- ARCH-ENG-158 fails closed on unverified payments, so
+the empty tables are the system's resting state, not a fault. A newly-live
+audit returning zero findings reads as a clean bill of health while
+`outcome_memory_v2` sits empty: asserting a clean state that has not been
+confirmed, the exact failure mode ARCH-ENG-115/158/159 exist to prevent.
+
+Both halves fixed, in that order:
+
+1. **Every audit now declares the data basis it actually saw**
+   (`AuditReport.basis`, by category: rows examined, or 1 when a gated
+   in-memory/on-disk source is present -- zero failed wallet operations is a
+   real verdict, not starvation). A category with zero basis runs as
+   INSUFFICIENT. `AuditReport.conclusion()` refuses to claim "no problems
+   found" while any audit is data-starved or errored, and `to_dict` carries
+   the basis, the errors, and the honest conclusion. Run-level guards record
+   engine errors instead of letting a raising audit fail silently clean.
+   No threshold or finding rule changed; only the honesty layer was added.
+2. **`EarningPipeline.run_full_cycle` calls `run_self_audit()`** once per
+   live cycle and logs `[SelfAudit] <conclusion>` through the pipeline's own
+   log channel -- the missing last hop. `run_full_cycle` is the live loop
+   (`main.py:337` drives it), so the engine is reachable from now on. The
+   `run_discovery_cycle` route was rejected: it has no callers itself.
+
+On this tree `agents/IMPROVEMENTS.md` is absent, so the 14th audit
+(`documentation_drift`) is permanently source-gated: a fully-populated
+database still reads "INSUFFICIENT DATA (1 of 14)" -- recorded absence, never
+papered over.
+
+Regression tests in
+`tests/earning/test_arch_eng_236_self_audit_honest_and_running.py`; against
+the pre-fix tree, 8 of 8 fail (the honest fields do not exist, and the
+`[SelfAudit]` line never appears).
+
+**ARCH-ENG-237 - the earning tab's payment button proposed a transfer to a
+hardcoded placeholder address, and the approver confirmed it as a real
+payment.** `_on_propose_payment` fabricated its recipient
+(`to_address = "0x" + "A" * 40`, comment: "placeholder to_address") and fed it
+into `RealCryptoOperator.propose_payment`, whose scoped approval (ARCH-ENG-130)
+then asked the human, perfectly legibly: "Send {amount} {currency} on {chain}
+to 0xAAAA…". ARCH-ENG-130 scoping guarantees the operator approves precisely
+what was requested -- and what was requested was nonsense -- so every check was
+present, strong, and faithfully enforced over content that should never have
+been supplied (BB-01, 11K; winner of the sweep's "correct mechanism, wrong
+input" class). Zero recipient-validation sites existed in the entire tree.
+
+The tab even HAD the missing input: a "To address" line edit, built four lines
+above the button -- a throwaway local, never stored, never read. Fixed on both
+halves:
+
+1. The tab reads `self.pay_recipient` (the field that always existed) and
+   refuses honestly when it is empty: no recipient, no proposal, no
+   placeholder substitution. Approving a placeholder would authorize a real
+   transfer to it; the refusal says exactly that.
+2. `propose_payment` validates the recipient BEFORE creating a request or
+   enqueueing an approval -- chain-aware shape (EVM `0x`+40 hex / Solana 32-44
+   base58) plus the all-identical-digits dummy class (no real key ever lands on
+   42 identical characters). Rejections return
+   `{"ok": False, "status": "invalid_recipient"}` and create nothing: the
+   content check sits at the boundary where the recipient ENTERS the payment
+   machinery, so every current and future caller is protected -- the
+   `_step12_verify` / `_stated_usd` lesson applied at the money boundary.
+
+Two governed tests updated in step with the contract
+(`test_arch_eng_154`'s gate test now supplies a real recipient from the field;
+`test_arch_eng_130`'s scoped-approval test uses a shape-valid dummy). New
+regression tests `tests/engineering/test_arch_eng_237_recipient_not_placeholder.py`
+-- against the pre-fix sources the file cannot even import the validator (it
+does not exist to be right), and the tab-level probe reaches the fabricated
+approval instead of the refusal.
+
+**ARCH-ENG-238 - `=1` rendered the self-improvement checkbox UNCHECKED while
+the agent was PERMITTED to modify its own code.** `create_settings_tab` read
+`PIPELINE_ALLOW_SELF_IMPROVE` with the inline `.lower() == "true"`;
+`app/action_pipeline.py:384` reads the SAME variable through
+`app.effects.env_bool` (ARCH-ENG-203's one canonical parser, which accepts
+`1`/`yes`/`on`/`True`). A hand-edited `.env` with the natural `=1` spelling:
+enforcement open, display closed -- AW-02 (11D), the last standing member of
+the ARCH-ENG-203 parser family and `11v`'s AO-03 shape. The checkbox now reads
+through `env_bool` too; the write side (`stateChanged` -> "true"/"false") is
+unchanged, and every parser reads those two tokens. `PIPELINE_ALLOW_WRITE`
+keeps its inline parse deliberately: no other module parses that variable, so
+there is no counterparty to disagree with. Recorded by AST over
+`create_settings_tab` (the 200-document precedent for the ~1800-line method)
+plus a pairing contract that ties both readers of the variable into one test,
+so fixing one side again can never pass without the other being noticed.
+Vacuity: 2 of 3 fail against the pre-fix source.
+
+**ARCH-ENG-239 - four live think-block strippers, four different answers to
+"Is this private reasoning?"** The same `<think>…</think>` match existed four
+times in live code with four DIFFERENT case rules: `response.py:173`
+(case-insensitive -- the main dialogue path, tolerant by luck rather than
+design), `response.py`'s `enable_thinking_param` branch (inline `re.sub`,
+lowercase only), `chat_tab.py` pattern 3 (inline compile, lowercase only),
+and `agents/brains/worker_thinking.split_thinking` (exact substring,
+lowercase only). A model emitting `<THINK>` or `<Think>` had its private
+reasoning stripped on one path and printed to the operator on the other three
+(BE-01, 11N -- the live version of the ARCH-ENG-211 parallel-copies family).
+The canonical compiled matcher now lives in `agents/brains/worker_thinking`
+(dependency-light, no import cycles), with `strip_think_blocks` and
+`split_think_blocks` as its two legitimate policies; response.py's alias
+delegates (kept for the `agents.safety` re-export), the `channel_thought`
+marker branch is untouched (BE-02 territory), and the worker's legacy
+unclosed-block policy is deliberately preserved -- an unclosed block is an
+in-progress stream, all of it thinking, never shown as the answer. GUI,
+safety, and brains paths all now answer the question identically. Regression
+tests `tests/engineering/test_arch_eng_239_think_block_matcher_shared.py`
+(11 tests; vacuity: the canonical functions do not exist pre-fix).
+
+**ARCH-ENG-240 - the skill index dropped the alphabetically-last skills and
+never named them.** `skill_index_prompt` sorts entries alphabetically and
+drops from the end under budget pressure, so the entries the model could
+never see were exactly the alphabetically LAST skills; at the measured
+state those included `pptx` and `xlsx` -- the two an operator reaches for
+when a task mentions a deck or a spreadsheet (AT-01, 11A). Its only notice
+was `"...and 8 more; call list_skills() for the full index"`, which did not
+identify them. The prompt now names the dropped skills in the tail (the
+name list itself is trimmed inside the same bound, marked with a
+continuation `…`, and degrades to the plain count only when the budget
+cannot hold even one name) -- a prompt that hides its tools must at least
+name what it hides. The framing-first bound is unchanged: framing,
+entries, and the naming tail all still count against the budget; tests
+`tests/engineering/test_arch_eng_240_skill_index_names_what_it_drops.py`
+(9 tests + real-index probes; vacuity: 4 fail against the pre-fix module,
+where the dropped names never appear).
+
+**ARCH-ENG-241 - the help catalog had drifted from the UI and nothing
+detected it.** `help_catalog.FEATURES` is a hand-maintained transcription
+of the UI (BC-01, 11L -- the seventh and first mechanism-less instance of
+the "surface describes content it was never fed" class): it carried "Browse
+Root / file browser tab" while the real tab has always been labelled
+"Web Browser" (`tab_specs` in main.py), omitted **14 of the 24** real tab
+labels (Model Library, Approvals, Registration, Insights, Opportunities,
+Social Activity, Self-Improvement, Autonomous Learning, Live Portfolio,
+Strategy Simulator, Analytics, Reputation, Data Explorer -- almost exactly
+the flag-gated ones, where an operator most needs to learn why a tab is
+hidden), and the docstring's grounding list cited **four paths that do not
+exist** (`gui/tab_builders.py`, `gui/chat_tab.py`, `gui/model_switcher.py`,
+`agents/personas.py`). Zero tests referenced the catalog, so its own claim
+-- "Every entry is grounded in the real code" -- was an assertion, not a
+check: *a hand-maintained mirror with no executable check is a claim, not a
+mirror.* The wrong entry is corrected, all 24 real tab labels are now
+covered (each optional tab's entry names its canonical env key, e.g.
+`MRBOT_ENABLE_SOCIAL_AUTOMATION`, and the Approvals entry finally exists --
+11H's fully wired surface that help could not describe), the grounding
+citations point at real files (`agents/cognition/personas.py`,
+`gui/builders/tab_feature_builders.py`, `gui/tabs/chat_tab.py`, ...), and
+`tests/engineering/test_arch_eng_241_help_catalog_tracks_main_tabs.py`
+parses main.py's `tab_specs`/`optional_tabs` as ground truth and fails on
+any future drift; the standalone-importability contract is asserted too
+(7 tests; vacuity: 4 fail against the pre-fix catalog). BC-02 (Approvals
+entry) is incorporated; BC-03 (substring lookup without word boundaries)
+remains recorded-only as info.
+
+**ARCH-ENG-242 -- the Collaboration / Run Monitor tab is now reachable**
+(AW-01, 11D). `create_collaboration_tab` built and wired
+`CollaborationTab` -- a panel bound to the shared `DualBrainCoordinator`,
+with bidirectional goal bridges to Dialogue -- but appeared in no
+`tab_specs` and had no other production caller; only a smoke test asserted
+it *exists*. Nothing its docstring promised was reachable. (10s had
+recorded TWO unwired tabs; the other, Diagnostics, was resolved
+deliberately -- its surface moved into DB Stats and the old builder is a
+documented shim -- while Collaboration sat complete and dead.) It is wired
+now (label "Collaboration", after Dialogue), and the ARCH-ENG-241
+catalog-drift check immediately pulled its weight: wiring the tab without
+a catalog entry fails the suite, so the catalog gained the Collaboration
+entry in the same change.
+`tests/engineering/test_arch_eng_242_collaboration_tab_reachable.py`
+(6 tests; vacuity: the tab-spec assertion fails against pre-fix main.py);
+the real GUI smoke suite constructs the window with all 25 tabs green.
+
+**ARCH-ENG-243 - the typed event emitters are now live, and the legacy
+heartbeat one is gone** (BD-01 + BD-02, 11M). All four typed emitters
+(`earning_event`, `safety_event`, `llm_spend_event`, `heartbeat_event`)
+were dead while everything that reads their output was live: the Insights
+panel's spend KPI, "Safety incidents" counter and outcomes table queried a
+log nothing wrote, and the alerting engine's default set filtered event
+types no code produced. Operators chose wiring for the three live
+subsystems and REMOVAL for the heartbeat reporter (the legacy manager
+heartbeat was already retired from the runtime). Wired: `llm_spend_event`
+at LLM-call completion in both brain adapters and the worker mixin, using
+the shared `estimate_call_cost` pricer and only for billable (`est_usd >
+0`) calls -- matching the panel's "Cloud API cost only" note, with the
+full call identity remaining in `llm_calls`; `safety_event` at the
+CostGuard's single trip decision (`enforcement_skip_decision`, feeding
+both brain adapters) and every `safe_write_file` refusal (one
+`_blocked_signal` helper reporting both the operator BLOCKED signal and
+the typed event, guarded so telemetry can never alter the gate);
+`earning_event` at the earning pipeline's finalize step, receiving the
+lifecycle's EFFECTIVE values so a payment verified down can never display
+as a win. With spend events real, the cloud-spend threshold rule
+(`llm_spend_threshold_rule`, BD-02's other half) can actually fire now.
+Removed with `heartbeat_event`: the `EventType.HEARTBEAT` member, the
+Insights panel's tier/heartbeat rows and reader, and the
+`survival_tier_change_rule` -- whose construction crashed the alert
+engine's startup path once the enum member went, proving the coupling was
+live and the deletion was load-bearing. Tests:
+`tests/engineering/test_arch_eng_243_typed_events_wired.py` (18 tests:
+source scans closing the dead-emitter class + behavioral refusal/trip
+probes) and `tests/gui/test_earning_insights_kpi_wiring.py` updated for
+the removed rows (vacuity: 16 collection errors against the pre-fix
+sources). BF-03's recorded field-name seam (goal system reads
+`amount_usd`, the emitter's contract says `revenue`) stays open -- the
+wired emission follows the emitter's own contract.
+
+**ARCH-ENG-244 - the entire GoalTracker is now live, and its two money
+decisions were resolved into one guarded path** (BF-01 + BF-02 + BF-03's
+seam, 11Q). The tracker (20 methods, SQLite persistence, evidence rows) was
+unreachable -- zero external references, only its own smoke test saying
+`hasattr` was true. Worse, while it sat dead, its money handling disagreed
+with itself: `add_evidence` (dead) guarded credits behind
+`verified and amount_usd > 0`, while `add_earnings` (the increment the
+class actually used) claimed "Add verified earnings to a goal" in its
+docstring but was a bare SQL UPDATE with no guard -- the guard and the
+unguarded duplicate of the same money statement sat 35 lines apart. And
+`process_event` ran auto-matching onto a vocabulary no production code ever
+emitted (`earning.freelance`, `details['amount_usd']`) -- BF-03's recorded
+seam. Operator disposition: FULL WIRING. In 11Q's own dependency order,
+BF-02 first: `add_earnings` is deleted -- `add_evidence` is the single
+credit path, so a credit exists if and only if an evidence row is verified
+and its amount is positive, and `process_event` carries no SQL of its own.
+`process_event` is rewritten to the REAL production contract
+(ARCH-ENG-243's typed earning event: `event_type "earning"`,
+`details.revenue/platform/success`, action `finalized:<state>`), where
+`revenue` is the lifecycle's verified-effective value -- a payment the
+ledger refused arrives as revenue 0 and can never credit a cent. Goal-bound
+outcomes are always recorded as evidence rows and credit (verified=True)
+only when the effective state is `paid`; `_auto_match_event` is deleted --
+the tracker refuses to guess what an unbound amount belongs to. Binding is
+explicit (`details.goal_id` / a `goal:<id>` tag) or operator-declared
+(`metadata.platforms` on a goal: a paid finalize on a declared platform
+credits the first active goal that declared it). `main.py`'s event-logger
+hook forwards every logged event to the tracker through the same guarded
+seam that feeds the alert engine, and the Management tab gained an Earning
+Goals card -- create (title/path/target/platforms), pause/resume (whose
+rebuild preserves the selection), delete behind a confirmation, a progress
+table and summary line, and a 20 s auto-refresh. Paused goals are excluded
+by `list_active()` and cannot be credited. `help_catalog` gained the
+"Earning Goals" entry carrying the only-verified-credits rule.
+Tests: `tests/engineering/test_arch_eng_244_goals_wired.py` (source scans
+closing the single-credit-path and dead-vocabulary classes, the wired seam,
+the card + catalog presence; behavioral offscreen roundtrip create ->
+platform-bound credit -> pause/resume -> confirm-gated delete) and
+`tests/earning/test_goal_system.py` rebased onto the live contract
+(vacuity: 9 failures against the pre-fix sources). Also updated
+`tests/gui/test_section_e.py`'s tab census, whose `ungated` list predated
+ARCH-ENG-242's Collaboration tab (asserted 22, found 23).
+
+**ARCH-ENG-245 - the workshop's template subsystem is deleted, with its
+empty directory** (AY-02, 11G). `get_template` (80 lines, the largest dead
+method in the depth pass) returned four hardcoded skeleton strings
+(proposal/application/research_note/invoice) from an in-memory dict and
+never read the workshop's `templates/` directory; `save_template` wrote
+`templates/template_<name>.md` files that nothing could read back -- not
+`get_template`, not any tool, not any GUI surface. The pair was never
+connected: a saved template was unreadable by construction, and nothing
+wrote or read either half (22 dead of 52 methods). Worse, the `templates`
+entry in `PATHS` made every `Workshop.__init__` create an empty directory
+on the operator's disk, indefinitely, for no writer and no reader.
+Operator rule for this item: verify superseded -> delete, else wire.
+Verification: proposal copy is served by the LIVE data-driven A/B
+mechanism (`agents/knowledge/proposal_templates.py` -- intro rotation with
+win-rate biasing -- wired at `agents/earning/proposal.py:25`), strictly
+better than a static skeleton; `workflow_planner.platform_templates`
+already owns the per-platform steps domain; and the remaining document
+skeletons are what an LLM persona generates natively. Deleted: both
+methods, the section, and the `PATHS` key (with WHY-notes at both sites).
+`tests/knowledge/test_arch_eng_215_workshop_write_honesty.py`'s creator
+set drops to six. The deletion is pinned executably per 11G's own AY-04:
+`tests/engineering/test_arch_eng_245_templates_removed.py` asserts the
+methods are gone, the registry key cannot return (AST-level, comments
+exempt), init creates no `templates/` directory, and the replacing A/B
+mechanism stays live and wired (vacuity: 2 failures against the pre-fix
+sources).
+
+**ARCH-ENG-246 - the Collaboration tab's message log no longer lives in
+the source tree** (introduced by ARCH-ENG-242; caught by ARCH-ENG-167).
+The tab's construction path computed its MessageLog path from `__file__`:
+`gui/dual_brain_messages.db`. The first GUI build -- any smoke or
+full-window test -- created a live SQLite store inside the checkout, and
+the root-hygiene audit failed three governed tests on the undeclared store
+(`discover_undeclared_stores` -> `gui\dual_brain_messages.db`). Fixed by
+declaring the store's home rather than exempting it: the path is now a
+module-level helper (`_dual_brain_message_log_path`) resolving to
+`%LOCALAPPDATA%\MrBot1000\dual_brain_messages.db`, the same app-data
+directory as `goals.db` and the event log, with the documented
+unset-environment fallback and a guarded `makedirs`. The stray store was
+quarantined to `.mrbot_backups/`, not deleted. Tests:
+`tests/engineering/test_arch_eng_246_msglog_store.py` (AST scan: no
+`__file__`-derived store path; behavioral: the helper lands in app data,
+not in the checkout; the hygiene audit itself reports zero undeclared
+stores, so no exemption was smuggled in). Vacuity: 2 failures against the
+pre-fix source.
+
+**ARCH-ENG-247 - bus cancellation is wired and honoured; the Collaboration
+run is its first consumer** (AN-02, 11u). The finding: `publish(msg,
+token=...)` stored a token, `_prune` bounded the maps, `cancel()` looked
+them up, and `CancellationToken` offered `cancel`/`wait`/`cancelled` -- but
+no production call site ever passed `token=`, `get_token` was dead, and,
+the deeper defect, `_deliver` never READ the token at all. `cancel()`
+could return a token and change nothing; the module docstring advertised a
+feature that was both unreachable and inert. Operator disposition: wire
+it, do not delete it. Three things were needed, and all three now exist.
+(1) A publisher: the dual-brain coordinator's docstring claimed every
+stage "publishes a typed REQUEST then a typed RESULT on the EventBus", but
+`_record` only wrote its local MessageLog -- the bus had zero production
+publishers, so its one subscriber (`QtEventBridge`) and every token had
+nothing to read. `_record` now publishes, guarded so bus delivery can
+never break orchestration. (2) A token owner: each run gets
+`bus.get_token(correlation_id)` and every stage message is published with
+it. (3) A consumer that pulls it, and delivery that honours it: `_deliver`
+consults the token before and between handlers, marks the message
+CANCELLED and counts the refusal in a new `cancelled_drops` snapshot
+field; `collaborate` checks the token at every stage boundary and after
+the loop (a cancel during the final stage is a cancellation, not a DONE);
+and the Collaboration tab grew a Stop button wired to
+`cancel_active_run`, so a stopped run makes no further model calls and its
+remaining stage deliveries are refused -- while the terminal run update is
+published OUTSIDE the token, because an operator who stops a run still
+needs to see it stopped. Delivery order became subscription order (it was
+`list(set(...))`, i.e. arbitrary) so the cooperative contract is
+deterministic: a guard that subscribes first gets the veto. `_is_cancelled`
+is keyed by message_id only -- falling back to the correlation token
+swallowed exactly the updates published to report the cancellation.
+Scope is documented in code: cancellation is cooperative at safe points; a
+synchronous model call is never interrupted mid-call. Tests:
+`tests/engineering/test_arch_eng_247_cancellation_wired.py` (8 tests:
+source scans for the token consult, the publish, the Stop wiring; and
+behavioral proofs that a cancelled chain does not reach later handlers,
+that a pre-cancelled token delivers nothing, that Stop between stages
+leaves exactly one stage run and status CANCELLED, that the cancellation
+update still arrives, and that cancelling with no active run is a no-op).
+`tests/runtime/test_dual_brain_coordinator.py`'s loop-safety test was
+rebased: the coordinator's requests now legitimately occupy the bus's
+loop-prevention edge set, so "fresh" means a fresh correlation. Vacuity:
+8 failures against the pre-fix sources.
+
+**ARCH-ENG-248 - the workshop's typed surface is wired, end to end**
+(AY-01, 11G). The finding: `workshop.py` could create structured
+documents -- proposal, research, script, application, deliverable, note,
+account, payment -- but a persona could not read any of them back through
+the same contract. Twelve typed methods were dead (`get_proposal`,
+`list_proposals`, `update_proposal_status`, `get_account`,
+`remove_account`, `read_research`, `list_research`, `read_script`,
+`list_scripts`, `list_applications`, `list_deliverables`, `list_notes`),
+and five typed writers (`add_research`, `create_script`,
+`create_application`, `add_deliverable`, `add_note`) were never exposed
+either. The generic `workshop_list`/`workshop_read` tools could reach the
+files, but the typed contract -- status transitions, structured listings, a
+safe account view -- did not exist. Operator disposition: wire the FULL
+typed surface. Added 13 read tools and 7 write tools (schemas, handlers,
+dispatch, gate classification), and declared `workshop_account` /
+`workshop_payment`, which were dispatchable and gated but missing from the
+model-facing registry -- so no model could ever call them. The typed
+readers call the typed methods (not `read_file`), carry the ARCH-ENG-134
+guards, and an account record never hands the model its stored password:
+the raw store is a refused secret file, so a reader returning the dict
+verbatim would have re-opened that boundary. Passwords are masked, and
+free-text notes/memos pass `redact_secrets`. Writes remain
+NEEDS_APPROVAL. ARCH-ENG-214's anti-drift guard did its job and forced
+every new failure prefix into `_NOT_EXECUTED_MARKERS` (the
+`[Workshop <area> error]` family, explicit refusals, and "nothing stored"
+answers), with the successes asserted as executed. Tests:
+`tests/engineering/test_arch_eng_248_workshop_typed_tools.py` (10 tests:
+every AY-01 method reachable from a handler; every tool dispatched and
+declared; gate classification both ways; the previously invisible writers
+declared; and behavioral round trips through the tool layer against a temp
+workshop root -- proposal create/list/read/re-status, research, script,
+application, deliverable and note, account enumeration without the
+password, account removal, payment listing). Vacuity: the schema, dispatch
+and every behavioral assertion fail against the pre-fix sources.
+
+**ARCH-ENG-249 - the proposals table gets its writer, its dedup guard, and
+an honest count** (AF-01, 11m). 11m recorded that `proposal_exists` was
+dead and assumed the proposal write path was live. Verification found it
+was worse: `add_proposal` had ZERO callers anywhere (main, app, agents,
+gui, tests), `get_proposals` was dead too, and the `proposals` table was
+never written -- while `count_proposals()` is read LIVE by DB Stats
+(main.py:2088). The operator was shown a proposal count that was
+structurally always zero. Operator disposition: wire, do not delete the
+table or the KPI. `agents/earning/proposal.py` gained an optional
+`persist_proposal_fn`; the pipeline passes `_persist_submitted_proposal`,
+which writes one row per title+platform with `status="submitted"`, only on
+the success path (after the platform accepted the proposal), and uses
+`proposal_exists` as the guard AF-01's docstring described ("the old save
+path blindly inserted a new row each time"). A persistence failure is
+swallowed by design -- it must not turn an accepted proposal into a
+reported submission failure. The fix also removed 121 lines of
+unreachable code that sat after `EarningPipeline.submit_gig_proposal`'s
+`return submit_proposal_service(...)`: a second, silently stale copy of
+the very submission flow being wired, which is how the old assumptions
+about this path survived. Tests:
+`tests/engineering/test_arch_eng_249_proposal_dedup.py` (8 tests: one
+persisted row after a submission; a re-discovered gig submits twice but
+inserts once; declined and review-blocked proposals persist nothing; a
+pre-existing row still dedups; an unwritable DB is non-fatal; AST check
+that the service delegation is the whole function body; the service calls
+the hook). Vacuity: 4 failures against the pre-fix sources (the
+double-submission dedup, the persisted row, the stale-copy scan and the
+hook scan).
+
+**ARCH-ENG-250 - `main._format_ago` is deleted** (U-03, 11a). A
+seconds-to-"5h 3m ago" formatter with no caller and no test. It was the only
+genuinely dead member in `main.py` that was neither part of a dead island nor a
+documented stub. No behaviour changes; the module's AST no longer defines it.
+
+**ARCH-ENG-251 - `main._run_http` is deleted** (U-04, 11a). A leftover of the
+removed review-queue feature that sat immediately after `_review_selected`; it
+belonged to no reachable path and had no caller. Deleted with its import-only
+dependencies untouched.
+
+**ARCH-ENG-252 - the temperature-preset handler is deleted** (V-01, 11b).
+`provider_lifecycle_backend._on_temp_preset` mapped a six-entry preset table
+onto a `QDoubleSpinBox`, but no UI ever offered the presets. The spin box is
+the operator's control; the unreachable table is gone.
+
+**ARCH-ENG-253 - the dead llama model probe is deleted** (V-02, 11b).
+`_get_llama_model` queried `/v1/models` with a ten-second timeout, preferred a
+named model, and failed soft -- but nothing called it. The live model selection
+goes through the provider lifecycle; the duplicate probe is gone.
+
+**ARCH-ENG-254 - six unused earning-pipeline accessors are deleted**
+(W-04, 11c). `get_opportunity_stats`, `_db_execute`, `load_memory`,
+`build_workflow_plan`, `_legacy_to_canonical` and `get_platform_reputations`
+each had zero callers. `build_workflow_plan` was the last shim for the
+never-imported `workflow_planner` module, which is also deleted (pinned by
+ARCH-ENG-206/207's removal test). Nothing reads these paths.
+
+**ARCH-ENG-255 - `autonomous_loop._get_opp_from_facts` is deleted** (Y-02,
+11e). The file's last method, zero references. Discovery facts flow through
+the live loop path, not through this accessor.
+
+**ARCH-ENG-256 - `opportunity_lifecycle.get_top_opportunities` is deleted**
+(Z-03, 11f). Its only reference was its own definition. The lifecycle exposes
+ranking through the paths the modules actually call.
+
+**ARCH-ENG-257 - the guard's four runtime list mutators are deleted**
+(AE-01, 11k). `add_to_denylist`, `add_to_allowlist`, `remove_from_denylist`
+and `remove_from_allowlist` were fixed at construction from settings and had
+no callers; the lists are config-driven and the mutators were unreachable
+surface that implied a runtime editing capability the system does not have.
+
+**ARCH-ENG-258 - `guard.set_approval_callback` is deleted** (AE-03, 11k).
+`self._callback` was set to `None` and never assigned; the layer enqueues
+directly into the shared `HumanApprovalQueue` instead. Keeping the setter
+suggested a second approval path that does not exist.
+
+**ARCH-ENG-259 - `check_and_raise` and `RateLimiterLayer.get_remaining` are
+deleted** (AE-04, 11k). A raising convenience wrapper and a quota query, both
+with zero callers and zero tests.
+
+**ARCH-ENG-262 - the superseded thinking extractor is gone, and the comment
+that replaced it no longer claims a delegation** (BE-02, 11n).
+`model_profile.extract_thinking_from_content` was a copy of the logic already
+inlined in `agents/safety/response.py` -- and a *less tolerant* copy (no
+whitespace allowance around the `<|channel>` markers). `response.py`'s
+docstring now records that the logic is inlined deliberately. The live
+stripper is pinned by a behavioural test.
+
+Tests for 250-262: `tests/engineering/test_arch_eng_250_262_dead_members_removed.py`
+(6 tests, 2,577 subtests) -- AST absence for every member, a production-wide
+identifier scan proving no caller survived the deletion, and two behavioural
+checks on the living stripper. Vacuity: against the pre-fix sources every one
+of the 20 absence subtests fails, because every member is still defined.
+
+**ARCH-ENG-263 - skill matching uses word boundaries on both heuristic paths**
+(AU-01 11B + AX-03 11F). `FreelanceFinder._extract_skills` and
+`evaluation.evaluate_opportunity`'s fallback both tested `skill in text`. Short
+entries therefore fired inside unrelated words -- "ai" in *email*, "sql" in
+*MySQL*, "ios" in *opinions*, "data" in *metadata* -- and a gig inherited
+skills it never mentioned. That inflation landed hardest on the fallback path,
+i.e. exactly when the LLM evaluation had failed and the heuristic was all that
+was left. Both now match with `\b` anchors; phrase entries ("data analysis")
+still match as phrases and "node" still matches "Node.js".
+
+**ARCH-ENG-264 - the lead-routine prompt is no longer shell-escaped**
+(AI-01, 11q). `run_lead_routine.py` ran
+`prompt.replace("'", "'\\''")`, which is POSIX shell escaping, but the command
+is passed to `subprocess.run` as an argument list with no shell. Nothing
+interpreted the escaping, so every apostrophe in the prompt reached `hermes`
+as the literal four-character sequence. The prompt is now passed unchanged.
+
+**ARCH-ENG-265 - approval-log persistence is atomic and its failures are
+announced** (AM-02, 11t). `_maybe_persist` used `open(..., "w")` + `json.dump`,
+which truncates the live record before writing, and swallowed every failure
+with `except Exception: pass`. A crash mid-write left `_load()` nothing to
+restore; a read-only path left the operator believing human decisions were
+durable when they were memory-only. The write now goes to a temp file and is
+`os.replace`d, and any failure logs a warning that states the decisions will
+not survive a restart.
+
+**ARCH-ENG-266 - discovery reports through logging and announces switched-off
+features** (AP-01, 11w). `agents/earning/discoverer.py` had 15 bare `print()`
+calls and no logging import, so per-source yields and fetch failures were
+invisible outside a console. Worse, the "opt-in disabled" lines were the only
+place the operator was told referral and faucet discovery exist at all. Counts
+and failures now use the module logger, and the two opt-in states raise a
+one-per-process `NotificationService` notice naming the enabling variable.
+
+**ARCH-ENG-267 - the CLI docstring names the module that exists** (AR-01,
+11y). Every documented invocation used `python -m agents.mrbot_cli`, but the
+module lives at `agents/services/mrbot_cli.py`, so all six examples died with
+`ModuleNotFoundError`. The examples now use `agents.services.mrbot_cli`, and
+the docstring also documents the new `opportunities` command. A test asserts
+every documented invocation and every documented subcommand resolves.
+
+**ARCH-ENG-268 - the handler capability convention is pinned** (AA-01, 11g).
+`_tool_propose_code_patch` is the one mutating handler that does not declare
+the dispatch `authorization` kwarg -- correctly, because it routes through
+`CodePatchService`, which owns its approval. That exception was a comment
+rather than a contract. A structural test now requires every `MUTATING_TOOL_NAMES`
+handler (except that one) to declare the keyword-only capability and call
+`_require_mutation_capability`, and every `READONLY_TOOL_NAMES` handler not to.
+No production change: the convention already held.
+
+**ARCH-ENG-269 - "approved but not routed" is visible** (AZ-01, 11h).
+`SafetyTab._route_decision` reached the executor through a duck-typed
+`getattr(self.parent(), "_on_approval_decided", None)` and returned silently
+when no handler was attached or when re-reading the queue failed -- the worst
+state an approval can be in: the human clicked Approve, the row left the
+pending list, and nothing will execute. Both paths (and a raised routing
+error) now call `_report_unrouted`, which logs a warning and raises a
+`NotificationService` warning naming the approval id and the reason. The
+fail-safe behaviour is unchanged: it never crashes mid-click and never loses
+the recorded decision.
+
+**ARCH-ENG-270 - the chat-template fallback decision is logged when it is
+applied** (X-01, 11d). `BrainConfig.get_template_info` existed "for logging
+purposes" and had no caller; the live mechanism that appends
+`--chat-template` when a GGUF's template contains `raise_exception` was
+silent. That wrapper is deleted and `build_llama_command` now logs at the
+point the fallback is actually applied -- an info line naming the model and
+the template length, or a warning when no fallback exists and the server may
+reject every request.
+
+Tests for 263-270: `tests/engineering/test_arch_eng_263_270_low_fixes.py`
+(26 tests) -- word-boundary behaviour on both heuristic paths, argv inspection
+for the lead routine, atomic-write and failure-visibility checks with
+`assertLogs`, a no-`print` scan plus a notification-once test, docstring
+resolution against `SUBCOMMANDS`, the handler capability convention, the
+unrouted-approval notice, and the template fallback's info/warning lines.
+Vacuity: 20 failures against the pre-fix sources, including every behavioural
+pin.
+
+**ARCH-ENG-271 - the file cache is wired into research reads** (AF-02, 11m).
+`get_cached_file` / `save_file_to_cache` had no callers at all, so
+`file_cache` was permanently empty while DB Stats and the Clear button treated
+it as live. `WorkerFilesystemMixin._cached_read` now serves both the root scan
+and the research-folder scan in `research_all`, and `read_specific_files`, with
+mtime validation: a hit returns the stored content, a stale or missing row
+reads the file and writes the row back. Any cache error degrades to a direct
+read, so a broken cache can never drop research files.
+
+**ARCH-ENG-272 - the research snapshot is written, published, and the rescan
+button runs the scan** (AF-03, 11m). `research_all` now persists its payload
+with `save_research_cache` and publishes it through
+`get_shared_context().update_research_snapshot(...)`, so the reader that
+consumes the snapshot finally has a producer. `main.force_research_rescan`
+used to tell the operator to run the Dialogue tab; it now calls
+`worker.research_all()` and falls back to `load_latest_research_cache(folder)`
+(the last good snapshot) if the scan fails, instead of losing the view.
+
+**ARCH-ENG-273 - the dialogue-turn log is written through a testable seam**
+(AV-02, 11C). `_append_dialogue_log` (the JSONL writer) had a reader and a
+repaired test but no production call. The seam now points at the writer
+(`self._append_dialogue_log = _append_dialogue_log`, not the UI append that
+made every patching test vacuously pass), and both turn sites -- the human
+send and the persona response -- call `_log_dialogue_turn`, which records
+speaker, outcome, model, VRAM-capped tier, phase, goal, mode, retry counters
+and the response text. The writer is best-effort and cannot break a turn.
+
+**ARCH-ENG-274 - keyword search is reachable from the CLI** (W-03, 11c).
+`EarningPipeline.search_opportunities_by_keyword` had zero callers, so the
+only keyword-driven view of discovered opportunities did not exist. The
+capability is now a read-only CLI command,
+`mrbot-cli opportunities <keyword>`, which performs a `LIKE` over
+`earning_memory.db`'s `opportunity_memory` table (no pipeline, model, or
+network), prints type/title/amount/URL defensively, and supports `--limit` and
+`--json`. The dead pipeline wrapper is deleted rather than left as a second
+implementation.
+
+**ARCH-ENG-275 - the hidden Ollama box is retired, not guarded** (AB-01, 11h).
+ARCH-ENG-196 documented two writers of `OLLAMA_MAIN_MODEL` /
+`OLLAMA_CHAT_MODEL` and made the persisted value win; the second writer was a
+hidden `ollama_box` with hidden model combos, a hidden role selector and a
+hidden hide toggle, whose refresh/populate methods also ran on the save path.
+The whole box and its methods are deleted. `ProviderConfigWidget` (which
+persists each model as the operator changes it) and `.env` are the single
+writer, and `MainWindow._active_ollama_models()` reads
+`OLLAMA_MAIN_MODEL` / `OLLAMA_CHAT_MODEL` with the first-run `OLLAMA_MODEL`
+fallback. `test_api_connection`'s role is env-derived. No hidden widget can
+overwrite a visible choice because there is no hidden widget.
+
+**ARCH-ENG-276 - the modify path now backs up, replaces atomically, verifies,
+and reverts** (AQ-02, 11x). Beside ARCH-ENG-227's approved `CodePatchService`
+sat a weaker implementation: `_exec_modify_file` wrote `<target>.bak` next to
+the file at apply time, never used it, and wrote the new content in place. A
+failed or half-written save left the target broken with a stray `.bak` in the
+operator's tree. The modify path now follows 227's contract: read the exact
+original bytes, write a byte-exact backup under
+`.mrbot_backups/action_pipeline/` (no mutation if the backup fails), replace
+via temp file + `os.replace`, `py_compile`-check `.py` targets, and restore the
+original bytes on any write or verification failure. Line endings survive
+because everything is bytes end to end.
+
+**ARCH-ENG-277 - `chat_with_tools` is an orchestrator over phase helpers**
+(AG-01, 11n). The 525-line function with nine return points became
+`_build_chat_messages`, `_run_generation`, `_log_empty_visible`,
+`_gate_tool_call`, `_record_tool`, `_text_tool_result`, `_run_function_calls`
+and `_final_answer`, with `chat_with_tools` under 100 lines and at most four
+terminal returns. The duplicated safety-gate and tool-trace blocks in the
+text-call and function-call branches are now one implementation, so a fix can
+no longer land in one branch and miss the other. Behaviour and wording are
+unchanged; the existing ARCH-ENG-110/173/180 characterization tests were kept
+alive and widened to read the helpers they now cover.
+
+**ARCH-ENG-278 - `create_settings_tab` is split into twelve section builders**
+(AW-03, 11D). The 870-line method (997 before AB-01's removal) built the
+registration group, the cloud/local/llama.cpp provider boxes, performance,
+LLM parameters, provider rates, model info, security, features, pipeline,
+payouts, appearance and the cache control in one body. It is now 98 lines that
+build the scroll surface, the provider widget and the save buttons, then call
+`_build_registration_group`, `_build_provider_sections`,
+`_build_performance_group`, `_build_llm_group`, `_build_rate_group`,
+`_build_model_info_group`, `_build_security_group`, `_build_feature_group`,
+`_build_pipeline_group`, `_build_payout_group`,
+`_build_appearance_group` and `_build_cache_group`. The widgets keep their
+names and construction order, so `save_settings` is untouched. A structural
+test asserts the orchestrator length, the exact call order, the survival of a
+representative widget surface, and that no section was copied instead of moved.
+
+**ARCH-ENG-279 - the dialogue capacity gate is consulted before a turn runs**
+(AV-03, 11C). `_dialogue_model_blocked` explained the realistic mistake on the
+operator's hardware -- a sub-2B model or a base (non-instruct) checkpoint --
+and had no caller. `respond()` now asks it before building the worker and, on
+a refusal, records the state and states the reason and the fix (choose an
+instruct-tuned model of at least 2B in Providers & GPU) instead of producing an
+unusable turn. The gate is defensive: the model name is coerced to text and
+any evaluation error means "not blocked", so a partial or mock brain cannot
+turn a guard rail into a new failure mode.
+
+Tests for 271-279: `tests/engineering/test_arch_eng_271_279_low_wires.py`
+(36 tests, 46 subtests) -- cache writes, a cache hit proven by making the
+direct read impossible, mtime invalidation, snapshot persistence and
+publication, the rescan handler, the dialogue-log seam and both call sites,
+the CLI search against a crafted earning-memory DB, the hidden-widget
+retirement and `_active_ollama_models`, modify-path backup/verify/revert with
+a refused-backup case, the chat orchestrator shape and a streamed answer, the
+settings split and the capacity gate. Vacuity: the probe reverted all 32
+modified files to HEAD and every one of these groups failed (10 visible
+failures in this file, including all four cache tests and the rescan handler);
+the probe then restored the post-fix copies and all 36 passed.
+
+### Tests
+
+
+**ARCH-ENG-234 - the ARCH-ENG-229 equivalence check was tighter than the float
+mechanism can meet, so it flapped with the clock.** The N+1 rewrite's
+equivalence tests compared every aggregated field with
+`assertAlmostEqual(places=12)` -- absolute 5e-13. But `_seeded_memory` stamps
+every seeded record with `time.time()`, so the recency weights behind both
+aggregation paths are fresh from the clock on every run, and the two paths sum
+the same weighted values in different association order. The residue is
+float-association noise: measured at ~2e-12 to 1.8e-11 during this fix, proven
+time-dependent (two bare-code runs 90s apart moved both the compared values and
+the error magnitudes), and it crossed the 5e-13 boundary during the day the
+tests were written -- green that morning, red by afternoon, with no code change
+between.
+
+The fix keeps the contract's own wording, "equal to within float tolerance":
+`math.isclose(rel_tol=1e-9, abs_tol=1e-12)` through a shared helper
+(`_assert_same_metric`). The teeth are unchanged in substance -- a genuinely
+reordered recency weighting moves a weighted mean at ~1e-3 scale, ten orders
+beyond what this accepts -- while association noise no longer decides the
+verdict. `places=12` did not leave slack for a real defect; it left slack
+for nothing.
+
+**ARCH-ENG-235 - the PyYAML environment probe asserted about the machine, and
+the machine moved.** ARCH-ENG-199/160's test (`test_no_pyyaml_dependency`)
+asserted both that `skill_index.py` never imports yaml AND that PyYAML was not
+installed in the current environment. The first half is the repo's decision and
+stays strict (now also covering `from yaml`). The second half was an assertion
+about the operator's site-packages -- which now contains PyYAML while the code
+still never imports it, so the probe failed a decision nobody had made. The
+environment half becomes a documented `skipTest` when yaml is present; the
+code-level invariant is unchanged.
+
+### Fixed (high-tier reconciliation, ARCH-ENG-280..287)
+
+**ARCH-ENG-280 (A-01) - the learning engine was fed verified outcomes and no
+live decision ever read them.** `SelfImprovementEngine`'s platform, tag and
+strategy getters had zero production callers, so every paid outcome was written,
+persisted, and then ignored. The read side is now `score_strategy()` plus
+`EarningPipeline._apply_self_improvement()` inside `filter()`: platform
+reliability (50%), tag success rate (30%) and learned strategy weight (20%) are
+blended into one bounded signal that nudges `skill_match`/`effort_score` before
+the sort, and records a `learning_signal` dict on the opportunity so the GUI can
+show why a listing moved. The adjustment is neutral below
+`SelfImprovementEngine.MIN_OUTCOMES` (cold start) and any failure falls back to
+the deterministic ranking. The write side now reads keys discovery actually
+writes: strategy from `provenance` (`strategy:<id>`), tags from
+category/task_type/platform, because the old `hist["strategy"]` /
+`hist["tags"]` lookups were always empty. `_adjust_weights()` seeds a
+`StrategyWeights` entry for every strategy it learns from, which is what makes
+the getter return anything other than the default.
+
+**ARCH-ENG-281 (D-01) - "Enable crypto operations" gated nothing.** The flag
+was defined, persisted, shown in Settings, and read by no crypto entry point, so
+a disabled operator could still create payment requests and enqueue approvals.
+`RealCryptoOperator.propose_payment()` and `confirm_and_send()` now fail closed
+at entry with `feature_enabled("crypto_operations")` (canonical
+`MRBOT_ENABLE_CRYPTO`) before any request, approval, or chain call exists. A
+refusal reports `status: "disabled"` and names the variable; organic validation
+errors (bad recipient, missing approval) keep their own statuses, so the gate is
+not masking a different refusal.
+
+**ARCH-ENG-282 (F-01) - the scheduler's read side was live code behind a method
+with no production caller.** `DiscoveryScheduler.tick()` ran the selected tasks
+and returned only counts; `run_discovery_cycle()` was its only caller and
+`run_full_cycle()`/`run_autonomous_loop()` bypassed it entirely. `tick()` now
+returns the discovered opportunities under `found`; `run_discovery_cycle()`
+dedupes that list, persists/adapts each row through
+`EarningDiscoveryService.remember_and_adapt()`, and returns the legacy
+opportunities as the cycle's input. `run_full_cycle()` and
+`run_autonomous_loop()` now use that path, with an explicit `discover()` scan
+only when the scheduler has no due tasks (an operator-triggered run outside every
+cooldown/working window). `moltbook` is in the default source list because the
+live `MoltbookSource` exists and was missing from the scheduler's requested set.
+
+**ARCH-ENG-283 (G-05, and AO-02 folded in) - the entire live-trading execution
+path had no production caller, and its flag was read under the wrong name.**
+`LiveTradingService.execute_order()` and `assess_order()` were test-only.
+The Live Portfolio tab now has an order request form (exchange, symbol, side,
+quantity, order type, limit) and a `LiveOrderProposalWorker` that fetches the
+portfolio/market snapshot and calls `propose_order()` off the GUI thread; the
+proposal enqueues an approval with `requested_by="live_trading"` and the exact
+`TradeIntent` in its payload. `MainWindow._on_approval_decided()` routes those
+approvals to the new synchronous `_execute_approved_live_order()`, which
+reconstructs the intent (via `agents/services/live_order_execution.py`, keeping
+the optional ccxt adapter out of the application bootstrap), re-assesses against
+live state inside `execute_order()`, and marks `_executed_approval_ids` only
+after success so a re-delivered approval cannot submit twice. The service's gate now reads
+`feature_enabled("live_trading")` (canonical `MRBOT_ENABLE_LIVE_TRADING`); the
+old `MRBOT_LIVE_TRADING_ENABLED` spelling is no longer consulted.
+
+**ARCH-ENG-284 (U-01) - quarantined instructions had no operator review
+surface.** `InstructionGate` accumulated pending `SKILL.md`/playbook rows, but
+`MainWindow._refresh_review_queue()`/`_review_selected()` referenced
+`review_list`/`review_counts_label` widgets that were never created and were
+called by nothing, so a pending instruction could never be approved. The Safety
+tab now has a fourth sub-tab ("Quarantine Review") that lists pending rows with
+source/kind/title/hash, shows pending/allowed/blocked counts, and sends
+Approve/Blacklist decisions to the same gate the adapters use. The dead
+MainWindow methods are deleted rather than left as a second review path.
+
+**ARCH-ENG-285 (W-01) - the 262-line parallel discovery island was deleted.**
+`_discover_source` and its eight `_discover_*` handlers were a complete,
+transitively dead second discovery implementation; the live path is
+`discover()` -> `EarningDiscoveryService` -> `DiscoveryEngine` ->
+`agents/discovery/`. Reviving it would have duplicated orchestration, so the
+island was removed and its three feature gates were moved to the live source
+classes (see 286). `run_discovery_cycle()` is now the single scheduler-driven
+discovery stage.
+
+**ARCH-ENG-286 (W-02) - `social_automation`, `airdrop_claiming` and
+`defi_scanning` gated only dead code.** All three `feature_enabled()` calls sat
+inside W-01's island, so the operator could enable social automation or disable
+airdrops/DeFi and the live `SocialSource`/`AirdropSource`/`DefiSource` would
+still run. Each live source now implements `is_enabled()` with its own flag
+(canonical `MRBOT_ENABLE_SOCIAL_AUTOMATION`, `MRBOT_ENABLE_AIRDROPS`,
+`MRBOT_ENABLE_DEFI`), and `DiscoveryEngine`/`run_discovery_cycle` already
+consult `is_enabled()` before calling `discover()`. The sources fail closed: an
+unset or false flag means no scan.
+
+**ARCH-ENG-287 (Z-01) - the only financial reconciliation path was dead.**
+`OpportunityLifecycleTracker.reconcile_evidence()` and the
+`evidence_policy.reconcile()` it delegates to had no production caller, so a
+disputed or manual payment could never be promoted to independent verification.
+The Management tab now has an operator-initiated "Reconcile Evidence" action
+(evidence id, method, note) that emits `request_reconcile_paid`;
+`MainWindow._reconcile_paid_evidence()` validates that the evidence belongs to
+the opportunity, restricts the method to the
+`_INDEPENDENT_RECONCILIATION_METHODS` allow-list (never a manual/local
+re-assertion), selects the latest unresolved payment when the id is blank,
+records the reconciled evidence, reports refusal reasons, and lets the existing
+lifecycle policy book `paid` only when submission/completion/payment all remain
+eligible. It also credits the payout ramp on success.
+
+Tests for 280-287: `tests/engineering/test_arch_eng_280_287_high_wires.py`
+(28 tests). The suite covers the scheduler `found` result and the
+scheduler -> dedupe -> persist -> legacy hand-off, the `run_full_cycle` route and
+its no-due-task fallback, the absence of the legacy island with a live-method
+vacuity probe, each source gate off/on plus a disabled source never being
+called, cold-start neutrality versus a learned ranking nudge and the
+provenance/tag write side, crypto propose/send disabled versus enabled,
+quarantine list/approve/blacklist through the real gate, independent payment
+reconciliation plus refusal of a manual method and foreign evidence, and the
+live-order flag/worker/approval/duplicate path. Vacuity probes include the
+enabled flag (so "disabled" is not a hardcoded refusal), the cold-start engine
+(so a boost is not unconditional), the ordinary approval (so the live branch is
+not the only route), the duplicate delivery (so a second submit is observable),
+the non-independent method (so reconciliation is not a rubber stamp), and an
+unknown explicit evidence id (so a mistyped id cannot silently substitute a
+different record). The
+ARCH-ENG-212 DeFi structural test was retargeted from the deleted pipeline
+island to the live `DefiSource`, keeping the forbidden-expression scan over
+both files.
+
+### Medium-tier reconciliation — ARCH-ENG-288..293
+
+**ARCH-ENG-288 (B-01/B-02) — the code-patch service skipped the protection the
+other source-write paths enforce.** `agents/safety/filesystem.py` and
+`agents/services/coder.py` both refuse a basename in
+`PROTECTED_SOURCE_FILES`, but `CodePatchService._assert_patchable()` checked
+only target presence, containment and extension. The self-improvement path
+could therefore edit `main.py`, the approval gate, the authorization
+dispatcher, or the patch service itself. The protected set now names the trust
+boundary (`approval.py`, `authorization.py`, `calling.py`,
+`code_patch_service.py`, `composition_root.py`, `dispatch.py`,
+`filesystem.py`, `gate.py`, `handlers.py`, `instructions.py`, `tools.py`,
+`worker_safety.py`), and `_assert_patchable()` refuses both that set and
+`FILENAME_BLOCKLIST` by basename. The ordinary patch path is unchanged.
+
+**ARCH-ENG-289 (G-06) — the daily-loss breaker had no producer.** The
+`assess_order()` parameter defaulted to `0.0`, and no production caller
+supplied it, so `0.0 >= max_daily_loss_pct` could never be true. `PortfolioSnapshot`
+now carries `day_start_equity_usd`; `DailyEquityTracker` persists the first
+equity observation per exchange and UTC day under the app-data directory;
+`sync_portfolio()` populates the baseline; and `assess_order()` derives
+`daily_loss_pct` from it when the caller omits one. The Live Portfolio tab
+passes the production path, and execution-time re-assessment uses the same
+producer. A missing/unwritable baseline yields 0.0 rather than a fabricated
+loss.
+
+**ARCH-ENG-290 (I-01) — the SSRF guard stopped at the tool boundary.** The
+three functions that actually fetch pages —
+`WebController.read_page()`, `WebController.scrape()` and `WebEyes.read_page()`
+— now call `InstructionGate._is_safe_fetch_url()` before any `requests` or
+Playwright call and return an explicit `ssrf_blocked` refusal for private,
+loopback, link-local, reserved or unresolvable targets. The handler-level guard
+remains as the first line; every direct caller now inherits the second.
+
+**ARCH-ENG-291 (M-03) — the VRAM fallback ignored the KV width it was handed.**
+When no GGUF can be measured, `_vram_safe_context()` used the f16-calibrated
+tier table unchanged, so a q8_0 operator received an f16-sized context
+allowance. `_tier_context_for()` now scales the tier by
+`2.0 / kv_type_bytes`, rounds to 256 tokens, floors at 4096, and is still
+capped by the configured default. The reason string names the KV width.
+
+**ARCH-ENG-292 (N-01) — two public `get_all_tools()` registries returned
+different tool sets.** `agents/earning/router.py` re-exported
+`legacy_tools.TOOL_DEFS` while `agents.safety.tools` is the canonical registry
+the model-facing loop actually consumes. The earning duplicate is deleted from
+the router and from `agents.earning.__all__`; the canonical function is now the
+only public `get_all_tools`. `get_tools_for_task()` remains for the legacy
+`BigBrain` worker loop, which is task-scoped rather than a whole-registry
+alternative.
+
+**ARCH-ENG-293 (P-01) — `startup_validation.py` was protected, published and
+never called.** The `__main__` entrypoint now runs
+`validate_startup_environment()` before constructing `MainWindow()`, prints its
+warnings/errors, attaches the report to the window as
+`startup_validation_report`, and reports degraded mode when the validator
+returns errors. A configured runtime still starts normally.
+
+Tests for 288-293: `tests/engineering/test_arch_eng_288_293_medium_wires.py`
+(17 tests, 19 subtests). Each class carries a vacuity probe: an ordinary patch
+still passes while protected/blocklisted targets are refused, a missing
+daily-equity baseline does not fabricate a loss, a public page is still read
+after the private targets are refused, the KV tier scaling is not a constant,
+the task-scoped tool selector still works after the duplicate registry is
+deleted, and a configured runtime is not reported broken by startup
+validation. F-02 is closed by the same wiring as 282: the scheduler tick is
+live, so `compute_all_metrics()` really is called from it.
+
+### Medium-tier reconciliation — ARCH-ENG-294..296
+
+**ARCH-ENG-294 (O-02) — the pre-submission gate's analyst half was never
+wired.** `ProposalReviewer(analyst=None)` documented an optional `AnalystWorker`
+for quality scoring, and `MainWindow._build_reviewer()` constructed the reviewer
+with no analyst. The reviewer's quality score was therefore always zero. The
+builder now constructs `AnalystWorker` and passes it in; its proposal analysis
+is deterministic and works with an empty model key. If construction fails, the
+reviewer falls back to the rule-based path, so the gate never disappears.
+
+**ARCH-ENG-295 (G-07) — `TradingPolicy` mixed fractions and percent points
+under one `_pct` suffix.** `max_position_pct`, `max_daily_loss_pct` and
+`min_confidence` are fractions; `max_volatility_pct`, `max_spread_pct` and
+`min_expected_profit_pct` are percent points. The dataclass now documents that
+contract and `__post_init__` rejects an out-of-range value (for example
+`max_daily_loss_pct=2.0` meaning 2%), which previously disabled the breaker
+without an error. Existing field names are kept for API stability.
+
+**ARCH-ENG-296 (J-04/J-05) — the prompt sanitiser and the pre-submission gate
+had no executable tests.** `tests/engineering/test_arch_eng_294_296_medium_wires.py`
+now proves that injection markers are neutralised and wrapped while plain text
+survives, that a thin proposal is blocked and a complete one passes, that the
+analyst changes the quality score, and that the trading-policy units behave as
+documented. The analyst test also exercises the newly wired path from 294.
+
+### Medium-tier reconciliation — ARCH-ENG-302..306
+
+**ARCH-ENG-302 (D-02) — dead core modules removed; the useful checker moved.**
+`agents/core/recovery.py` and `agents/core/account_profile.py` had no
+production caller and are deleted with their test. The architecture-boundary
+checker was useful only to tests, so it moved to
+`tests/support/architecture_boundaries.py`; the boundary test still executes it.
+
+**ARCH-ENG-303 (E-01/E-02) — `ChatRouter` deleted, `BoundedDiscussion` kept.**
+The live chat path is `chat_completion.py`; `chat_router.py` existed only for
+its own tests and a stale protected-file entry. Both are removed.
+`BoundedDiscussion` remains as the evidence-aware protocol with its executable
+tests.
+
+**ARCH-ENG-304 (O-01) — CoderWorker is now a live producer.**
+`propose_code_patch` accepts a defect without complete replacement content and
+asks `CoderWorker` to draft one. The worker's `_submit_edit` routes through the
+same `CodePatchService` approval/backup/verify/rollback gate; proposal time
+writes nothing.
+
+**ARCH-ENG-305 (R-02) — settings failures are no longer silent.**
+The ten `pass`/`continue` handlers in `save_settings` now call
+`gui.error_collector.record_gui_error()` with stable section names. Saving still
+continues past one bad control, but the failure is logged and queryable through
+`gui_error_snapshot()`.
+
+**ARCH-ENG-306 (P-02) — the learning analytics are wired.**
+`EarningMemory.learning_dashboard()` calls every read-only aggregation, and the
+Self-Improvement tab renders the snapshot. A single broken aggregation returns
+an error entry instead of hiding the rest.
+
+### Medium-tier reconciliation — ARCH-ENG-297..301
+
+**ARCH-ENG-297 (J-01) — freshness-aware memory retrieval was dead.**
+`KnowledgeContext.build_context()` now retrieves through
+`LayeredMemoryRetriever`, so expired, quarantined and low-confidence entries are
+excluded and the working/episodic/semantic/procedural/policy layers are
+available to the prompt. It is no longer a raw `MemoryDatabase` scan.
+
+**ARCH-ENG-298 (L-01) — model recommendations were never shown.**
+`BrainSettingsRow.bind()` now surfaces `model_recommendations.summary(model)` on
+the row's header tooltip. The guidance is visible where the operator edits
+llama.cpp settings; nothing is auto-applied.
+
+**ARCH-ENG-299 (H-01) — the pre-submission quality gate was demo-only.**
+`TaskWorkspace.submit()` now runs `QualityController.pre_submit_check()` over
+the actual deliverables before promoting the workspace to `submitted`. A failed
+or unreadable check blocks submission and returns the quality detail.
+
+**ARCH-ENG-300 (G-01) — the dead earning capability executor is deleted.**
+`agents/earning/capability.py`, its re-exports and its tests are gone. The
+autonomy CLI now runs the live `EarningPipeline`; the earning tab no longer
+imports a non-existent `EarningCapability`. The previous imports were broken,
+so this removes a dead surface rather than a working feature.
+
+**ARCH-ENG-301 (M-01) — the superseded hardware planner is deleted.**
+`agents/runtime/hardware_plan.py` and its test are removed;
+`device_registry.py` plus `brain_roster.py` remain the live hardware path.
+
+A-02/A-03 are recorded as decided: the evidence gate stays, and the second
+learning loop is merged into the same `EarningMemory`/self-improvement path
+rather than kept as a separate store.
+
+## [2.1.124] - 2026-10-19 - A rejected dialogue turn stays rejected
+
+### Fixed
+
+
+**ARCH-ENG-232 - a rejected dialogue response could still enter the shared
+transcript.** `DialogueWorker.run()` validates each model turn with
+`_is_bad_dialogue_response(response) or _is_repetitive(response)` and, on a
+hit, retries up to `max_retries` times. Two holes, both in the same block:
+
+1. The retry loop's exit test re-checked ONLY
+   `_is_bad_dialogue_response`. The entry test is a disjunction and the exit
+   test was not, so a retry that fixed the "bad" defect but kept the
+   repetitive shape was accepted as a successful recovery.
+
+2. When every attempt was rejected, the `for` loop simply fell out with the
+   REJECTED text still bound to `response`, and the two emits at the end of
+   the block wrote it into the shared transcript. The verdict the validator
+   had just computed was discarded on the exhaust path -- so the validator's
+   own docstring ("rejected before it can enter the shared transcript") was
+   false on exactly the path that needed it. With `max_retries == 0` the
+   rejected FIRST response reached the emit with no retry at all.
+
+The second half is why this was worth a high rather than a medium: the
+rejected text is model-identity boilerplate, an unclosed `<think>` block, or
+a token loop, and it lands in a history that later turns read. A turn that
+says "I am an open-weights model with no internet access" becomes context.
+
+The mechanism to fix it with already existed and was never called.
+`DialogueWorker._safe_fallback_response` -- docstring: *"Return a bounded,
+phase-aware fallback when retries are exhausted"* -- had **three tests and
+zero production callers**. All three called the helper directly and asserted
+on its text; none drove `run()`. That is the whole reason a green suite sat
+next to a missing caller: the tests pinned the text generator and left the
+call site untested. The fix wires it, and closes the exit test to cover both
+halves of the entry test.
+
+Regression tests in
+`tests/dialogue/test_arch_eng_232_rejected_response_not_transcribed.py`
+drive `run()` for the first time -- no prior test did. Against the pre-fix
+file, 5 of its 8 tests fail; the 3 that pass are the fixture self-checks, the
+recovery case, and the vacuity probe
+(`test_good_response_is_not_replaced_by_fallback`), which exists precisely so
+that a fix implemented as "always emit the fallback" cannot satisfy the rest
+of the class.
+
+
+
+**ARCH-ENG-226 - seven production subprocess calls decoded with the console code
+page.** All passed `text=True` with no `encoding`, so Python decoded the child's
+output using `locale.getpreferredencoding(False)` -- cp1252 on this machine. Any
+byte outside it raised `UnicodeDecodeError`, and because the decode happens on
+`subprocess._readerthread` it surfaced as an unhandled thread warning rather
+than a normal exception.
+
+The exposed calls are the ones with non-ASCII output: `nvidia-smi` queries,
+`powershell Get-CimInstance Win32_Process` (whose `CommandLine` carries whatever
+the operator typed), `netstat`, `taskkill`.
+
+Beyond test hygiene this is a correctness problem. A decode failure in the
+reader thread means the caller sees truncated or absent output while believing
+the probe succeeded -- a launch preflight that silently reads an empty VRAM
+figure is worse than one that raised. All now pass
+`encoding="utf-8", errors="replace"`; `errors` is the load-bearing half, so a
+malformed byte cannot kill a probe that is trying to answer a question.
+
+This warning was visible in earlier full-suite output and was misattributed for
+several runs. It was not fixed by the change it appeared to call for: one source
+was a test I had added earlier in the same session, and the other seven were
+these. A recurring warning is not an understood one.
+
+## [2.1.123] - 2026-10-18 - The OOM gate, reached at last
+
+
+One ticket, ARCH-ENG-231. The last item in the performance and audit pass.
+
+### Fixed
+
+**ARCH-ENG-231 - the fail-closed OOM gate was never consulted.**
+`agents/runtime/brain_contention.py` is the only component in this codebase
+that reasons about VRAM, system RAM **and** CPU cores together, across all
+committed placements, and it fails closed on an unestablishable footprint. Its
+docstring promises its reasons "ALWAYS name the exhausted resource (never
+generic), so the GUI can show *why* 'add brain' is disabled".
+
+It had **zero production callers**. `can_add_brain` and `device_headroom` were
+called only by each other and by their own tests.
+
+The real launch path is `BrainLaunchPrepWorker.run`, and it did its own
+accounting -- a VRAM estimate and a system-RAM contention check, both
+**warn-only**. The code's own comment says why warn-only is not enough:
+
+> "a large over-allocation makes the CUDA allocator fail hard, which on Windows
+> routinely triggers a TDR driver reset -> full crash/reboot"
+
+So the launch path computed the risk, described the exact shortfall and the fix,
+and then proceeded anyway. A warning is not a guard against a reboot.
+
+The launch path now asks the gate. The blocking rule is deliberately narrow,
+because "block on every no" would break legitimate launches:
+
+- **BLOCK** when the footprint can be established and the request exceeds what is
+  free by more than 4 GB, or by more than the free amount itself. That is the
+  territory where the CUDA allocator fails hard.
+- **WARN-ONLY** otherwise, including when the footprint cannot be established.
+  `can_add_brain` fails closed on unknown size, and applying that here would
+  block every cloud provider and every model named rather than pathed. "Refuse
+  to crash the driver" is a different decision from "refuse to start a server
+  whose cost cannot be measured".
+- **Never** a new reason for a launch to fail: any exception inside the gate is
+  swallowed, because a guard that can crash the thing it guards is worse than no
+  guard.
+- `MRBOT_ALLOW_RISKY_LAUNCH=1` overrides, checked before any work is done.
+
+### What it caught immediately
+
+Wiring the gate in surfaced a real gap in ARCH-ENG-222. On this machine, the
+10.36 GB DeepSeek-Coder model at the clamped default of 32768 context needs
+**21.2 GB** on the 16 GB RTX 5060 Ti -- still impossible. ARCH-ENG-222's clamp
+uses a VRAM tier table when no `*_MODEL_PATH` is configured, and `.env` does
+not set one, so it fell back to "16 GB card, 32768 is fine" when it was not.
+
+Setting `BIG_BRAIN_MODEL_PATH` makes the clamp measure the real file (it drops to
+4608 for this model). Until then the launch gate is what stands between the
+operator and a driver reset -- which is the defence in depth working, and also a
+clear signal that the tier fallback is the weaker of the two.
+
+## [2.1.122] - 2026-10-18 - Repaint work that repeated forever, and a search that crashed
+
+One ticket, ARCH-ENG-230.
+
+### Fixed
+
+**ARCH-ENG-230a - eight style re-polishes every four seconds, forever.**
+`EarningInsightsPanel._refresh` applied a `setStyleSheet` to eight KPI labels
+every 4 s. That is not a plain assignment: it invalidates the widget style,
+re-runs the polish, and relayouts the label and its ancestors. The colour is
+the only thing these stylesheets vary on and it rarely changes, so nearly every
+one of those wrote the identical string. Now applied only when the value
+differs. The same guard went into `DualBrainControl._set_gpu_bar` and
+`_set_gpu_status`, which rebuilt a stylesheet for three bars per GPU every 2 s
+from one of a handful of colours.
+
+**ARCH-ENG-230b - a 4-second timer that never stopped.** The insights panel
+started its timer in `__init__`, so it ran for the whole process lifetime. It
+now starts in `showEvent` and stops in `hideEvent` -- specifically not
+`__init__`, because a widget that is never shown never receives `hideEvent`.
+
+**ARCH-ENG-230c - `pause_background` did not pause the status timer.** It only
+slowed `gpu_worker`; the 4 s `_status_timer` driving `_refresh_provider_status`
+kept firing, and each tick spawned a probe thread that expands into one thread
+per visible GPU row plus a `settings.json` read. It is now slowed to 20 s rather
+than stopped, because the liveness check is what makes a brain that died on its
+own show as stopped rather than frozen at "Running" (ARCH-ENG-073).
+
+An earlier draft of this ticket added a **second** `resume_background`, which
+silently shadowed the real one and restored 4000 ms instead of the 2000 ms
+default. Python keeps the last definition without a word, so this would have
+shipped silently. There is now a test asserting there is exactly one of each.
+
+**ARCH-ENG-230d - a set of every event index, on every query.**
+`StructuredEventLogger.query` began with `set(range(len(self._events)))`,
+allocating a set the size of the whole event log on every call -- including the
+common unfiltered case, where the answer is just the most recent `limit`
+events. The unfiltered case now short-circuits before any set is built, and the
+filtered cases start from the narrowest available index.
+
+### Two bugs found while verifying the above
+
+**A pre-existing crash in event search.** `candidates &= s` intersected a set
+with a **list**, because `_free_text_index.get(w, [])` returns a list. The first
+search word was wrapped in `set(...)` and the rest were not -- so every
+single-word search worked and every **multi-word search raised**
+`TypeError: unsupported operand type(s) for &=: 'set' and 'list'`. It was found
+only because the shortcut-equivalence test forced that branch to execute; it
+was in code this ticket did not touch.
+
+**The shortcut changed the result order, twice.** The general path iterates
+`sorted(candidates, reverse=True)`, so results come back newest-first. A first
+draft returned them oldest-first -- the same rows, opposite order, which breaks
+any caller reading the head of the result. A second draft took `limit + offset`
+newest events, which is the *intuitive* pagination and is **not** this
+function's behaviour: the original collects only `limit` and then slices, so
+`offset >= limit` yields an empty list. The shortcut reproduces that exactly
+rather than quietly fixing it -- changing `offset` semantics is a caller's
+decision, not something to smuggle into a performance ticket.
+
+`test_the_shortcut_is_equivalent_to_the_general_path` re-implements the original
+algorithm and compares 15 query shapes against it, order and offset included.
+
+## [2.1.121] - 2026-10-18 - Two N+1s, and a weighted mean that was not one
+
+One ticket, ARCH-ENG-229.
+
+### Fixed
+
+**ARCH-ENG-229a - `compute_all_metrics` scanned the table once per distinct
+value.** It listed the DISTINCT values of a dimension, then called
+`compute_opportunity_metrics` once per value -- and each of those runs an
+**unbounded** `SELECT ... FROM outcome_memory_v2 WHERE <dim> = ?`. So the cost
+was *distinct values x full table scan*, plus a fresh connection per call.
+
+This was not an occasional report. `DiscoveryScheduler` calls it on every tick
+to decide where to search next -- the very thing ARCH-ENG-224 had just
+reconnected. The learning loop was being made live on top of an N x full-scan.
+Now one grouped query; the per-value metrics are derived in Python from the same
+rows, so the aggregation is unchanged rather than re-implemented in SQL.
+
+**ARCH-ENG-229b - `get_task_type_history_all` did the same thing.** SELECT
+DISTINCT, then one `get_task_type_history(k)` per key, each opening its own
+connection, to produce N rows.
+
+**ARCH-ENG-229c - a recency-weighted mean that was not one.**
+`compute_opportunity_metrics` summed the weights twice: once for the numerator,
+and again for the denominator via
+`sum_w = sum(recency_weight(ts, now) for ... in rows)`. `recency_weight(ts, None)`
+resolves `now` to `time.time()` *at the moment of the call* -- so the ratio was
+of two DIFFERENT weighted sums, microseconds apart. Not a weighted mean, only a
+very close approximation of one. The weights are now collected once.
+
+**ARCH-ENG-229d - and every value in a tick had its own "now".** The same
+mechanism meant `compute_all_metrics` weighted each dimension value against a
+slightly different instant, so the grouped form and the per-value form could
+never agree exactly (~1e-10 relative drift). A scheduler comparing them would
+have been comparing two different measurement instants. `compute_all_metrics`
+now takes an explicit `now`, which also makes the result reproducible.
+
+### How the rewrite was checked
+
+Not "should be equivalent" -- **is** equivalent. For every dimension value, every
+field of the resulting `LearningMetrics` is compared against what the original
+per-value implementation produced, to 12 decimal places, at a fixed reference
+instant. 164 subtests. A faster aggregator that quietly reorders a recency
+weight would change what the scheduler decides, which is worse than the N+1.
+
+Two of this ticket's own tests were wrong on first run and were corrected
+rather than worked around: one compared a hand-picked key list instead of
+every key the grouped read returns, and one assumed a dimension was empty after
+the seed data grew.
+
+## [2.1.120] - 2026-10-18 - Two dicts that grew for the life of the process
+
+One ticket, ARCH-ENG-228.
+
+### Fixed
+
+**ARCH-ENG-228 - unbounded memory and an unbounded scan.**
+`EarningMemory` kept two dicts that only ever grew.
+
+`self._cache`, keyed `opp_<id>`, written by `remember_opportunity` on every
+discovery and by `get_opportunity_history` on any miss. The only prune in the
+file, `clear_expired`, deletes rows from the `opportunity_memory` TABLE -- and
+had zero callers besides. Even if it had been called, it never touched this
+dict, so the two disagreed permanently after the first call: the table said an
+entry was gone and `get_opportunity_history` kept serving it from memory.
+
+`self._stats`, keyed by skill name and `tag_<tag>`, each holding a
+`skills_matched` set. Nothing ever removed a key. This one costs more than
+memory, because of what reads it: `periodic_decay` iterates ALL of `_stats`,
+and `get_memory_summary` calls `periodic_decay` -- so every insight refresh was
+an O(n) pass over a dict whose n only ever grew.
+
+Both are now bounded LRUs. `OrderedDict` + `move_to_end` means the entries
+actually in use survive and cold ones are evicted first, rather than the cache
+becoming useless the moment it fills.
+
+`_stats` is no longer a `defaultdict`, which mattered: a defaultdict inserts on
+a bare READ, so it could not be bounded at the write sites without every read
+site also bounding it. `_stats_touch` now owns creation, so every creation is
+bounded by construction.
+
+`clear_expired` drops the matching cache entries, so the table and the cache
+cannot drift. It still has no callers -- pruning on a schedule is a product
+decision, not something to smuggle into a correctness fix -- but it is now
+correct if something calls it.
+
+`get_memory_summary` counted with `len([k for k in ...])`, allocating a list
+over the whole cache to take its length. It did that in TWO places, not one;
+the first fix caught only the one named in the ticket.
+
+### Note on the test
+
+The guard for the `len([...])` fix first grepped the source for the old
+expression and failed against **its own explanatory comment**, which quotes the
+old code to say what changed. Rewritten against the AST, where a comment cannot
+appear. The AST version then found the second `len([...])` that the grep-based
+one had been masking by failing early.
+
+## [2.1.119] - 2026-10-18 - The self-improvement loop can finally be entered
+
+One ticket, ARCH-ENG-227. The approve/decline/apply/rollback chain was already
+built, already gated, and could never be started.
+
+### Fixed
+
+**ARCH-ENG-227a - the propose hop did not exist.** `CoderWorker` was the only
+class that could ever call `propose_code_patch`, and it had **zero callers
+anywhere** -- not in production, not in the lazy exports, not via importlib. The
+only producer of a proposal was `monitor_applied`'s own self-heal, which
+requires an applied patch, which requires an approval. Closed and empty.
+
+`propose_code_patch` is now an agent tool. Classified **MUTATING**, not
+READONLY: READONLY would let the SafetyGate allow it with no human in the loop,
+which is exactly the wrong default for a tool aimed at the program's own source.
+It changes nothing on its own -- the schema says so to the model, because the
+description is the model's only warning.
+
+**ARCH-ENG-227b - the deferral machinery was unreachable.** `register_module`
+had zero callers, so `_module_to_file` was permanently empty and
+`_resolve_for_inuse` returned `None` for every dotted name. `_in_use_files`
+therefore stayed empty, and both deferral guards -- in `apply_approved` and in
+`drain` -- begin with `... and self._in_use_files and ...`, so both were
+unreachable. And `drain()` had zero callers, so even a queued patch would have
+sat forever: an approved change the operator reasonably believed had landed.
+
+Dotted names now resolve through `importlib`, **contained to the repo** (an
+earlier draft resolved `json` to the stdlib copy -- a path the patch service
+can never write to; a test caught it). Drain is wired into the approval path
+and the self-improvement monitor tick.
+
+`mark_free` deliberately still does *not* drain. An earlier draft folded the two
+together; the pre-existing tests caught it, because a caller that frees a file
+and then drains -- the documented pattern -- would find the queue already
+emptied.
+
+**ARCH-ENG-227c - a rehearsal, because `verify` only proves syntax.**
+`CodePatchService.verify` runs `py_compile` and nothing else, deliberately. So
+a patch could compile cleanly and still be wrong, and a human would be asked to
+approve a change proven only to be syntactically valid.
+
+`PatchSandbox` applies the patch to a copy under the workshop's practice folder
+and verifies the copy first. Three properties, all tested: the real target is
+never touched; the practice copy is **kept** so the approver can inspect exactly
+what was rehearsed; and a failed rehearsal is a **refusal**, not a warning --
+no proposal is created. The backup is now taken at **propose** time rather than
+apply time, so a revert path exists from the moment the human is asked.
+
+**ARCH-ENG-227d - the tool would have been invisible in two places.** Handlers
+are re-exported through `agents/safety/calling.py`, and `dispatch` reaches them
+as `runtime._tool_*` on *that* module. Registering the schema without the
+re-export yields an ImportError-free, schema-visible, entirely dead tool. The
+service now also self-registers on construction, so a handler with no MainWindow
+can reach the instance the composition root built -- there is no global
+`get_root()`, and inventing one would have been a second way to build the
+object graph.
+
+The ARCH-ENG-214 anti-drift guard caught the new `[Patch refused` prefix and
+refused to let it classify as "executed" for a refusal that executed nothing.
+
+## [2.1.118] - 2026-10-18 - Learning that never learned, and a thread that never stopped
+
+Two tickets, ARCH-ENG-224 and ARCH-ENG-225. Priorities 4, 5 and 6 of the
+performance pass: self-improvement, autonomous learning, and the Web Browser.
+
+### Fixed
+
+**ARCH-ENG-224a - autonomous learning fed nothing back.**
+`EarningDiscoveryService.discover` bound the scan statistics to `_stats` -- the
+conventional name for a value you do not intend to use -- and threw them away.
+Those statistics (`by_source`, `errors`, `by_category`) are the only
+per-source attribution anywhere in the system, and `DiscoveryScheduler._source_
+quality` reads exactly those facts to decide what to search next.
+
+So the scheduler selected tasks from a reliability table that stayed empty
+forever, and `record_outcome` was only ever called from `run_task`, inside
+`run_discovery_cycle` -- a method with no callers anywhere. The live path was
+`EarningPipeline.discover`, which bypassed the scheduler entirely.
+
+Live database evidence: `opportunity_memory` held 195 rows while `search_
+strategy`, `strategy_memory`, `learning_history` and `outcome_memory_v2` were
+all **zero**. Discovery ran constantly and nothing it learned was ever kept.
+
+The stats are now retained, and `discover` reports each source to the scheduler:
+a source that errored is recorded as an error so its backoff grows, one that
+returned results as a clean run, and each searched category is marked.
+`success` stays False on purpose -- finding an opportunity is not earning from
+it, and that signal already arrives through the opportunity lifecycle. A
+scheduler failure can no longer break a scan.
+
+**ARCH-ENG-224b - `web_check` was the only agent URL fetch with no visibility.**
+`web_search` and `web_read` both call `_announce_agent_web`, which surfaces the
+fetch in the Web Browser tab. `web_check` did not, and it issues a real HEAD
+request to whatever URL it is given. It is SSRF-guarded, and it is READONLY so
+the SafetyGate allows it with no approval -- so an agent could probe hosts and
+leave no trace in the UI. All three tools now announce.
+
+**ARCH-ENG-225 - a 2-second polling thread was started and never stopped.**
+`ProviderHotReload.start_monitoring()` runs at `main.py:543`.
+`stop_monitoring()` had **zero callers in the entire codebase**. The daemon
+thread ran for the life of the process and was only ever ended by the
+interpreter killing it during finalisation.
+
+This is not theoretical. A full-suite run on this machine terminated with:
+
+    Windows fatal exception: access violation
+    Thread 0x00006b28: agents/providers/provider_hot_reload.py, line 69, _monitor_loop
+
+`MainWindow.shutdown` already documents this exact hazard for the tab-owned
+threads it stops -- "Leaving them running leaks threads and crashes PySide6 at
+process exit" -- and this thread was simply missing from that list.
+
+Three fixes: the loop now waits on an Event instead of `time.sleep`, so a stop
+returns in 0.1 ms rather than waiting out a 2 s poll interval; `stop_monitoring`
+is idempotent and optionally drops the registered callbacks, which are bound
+methods of the main window and therefore keep the whole window alive in this
+process-wide singleton; and `shutdown` now calls it.
+
+## [2.1.117] - 2026-10-18 - A context default that could not fit the card, and timers that never stopped
+
+Two tickets, ARCH-ENG-222 and ARCH-ENG-223. The theme: a scheduled thing that
+was never told to stop, and a default that was never checked against the
+hardware it would run on.
+
+### Fixed
+
+**ARCH-ENG-222 - the default context could not fit a 6 GB card.**
+`ROLE_DEFAULTS` ships `context: 64768` (big) and `32768` (small) with
+`kv_cache: "f16"`, and `build_config` only ever reduced it for `gpu_layers == 0`.
+Nothing consulted the VRAM of the device the brain would actually run on.
+
+For an 8B-class model (36 layers, 8 KV heads, 128 head dim) at 64768 tokens:
+
+    2 * 36 * 8 * 128 * 2 bytes * 64768 tokens  =  9.55 GB of KV cache
+
+before a single weight is loaded. On the GTX 1660 Super that is not a slow
+context, it is a hard allocation failure: CUDA OOM, Windows TDR, driver reset.
+On the RTX 5060 Ti it leaves almost nothing for weights.
+
+`build_config` now clamps the default to what the device can hold, measured
+against the real GGUF via the already-cached `estimate_vram_gb`, falling back to
+a VRAM tier table when there is no file to measure. Four properties are pinned
+by tests:
+
+- An explicit `BIG_BRAIN_CONTEXT` / `SMALL_BRAIN_CONTEXT` still wins untouched.
+  Only the DEFAULT is made safe; a deliberate operator setting is not
+  second-guessed.
+- The clamp never returns MORE than the default. It narrows a risky default; it
+  does not expand one.
+- An undeterminable device leaves the default alone and says why. No guessing.
+- `q8_0` KV yields an equal-or-larger context than `f16`, because it halves KV
+  memory. If that ever fails, the byte width is being ignored.
+
+`ROLE_DEFAULTS` itself is NOT mutated -- `default_role_settings()` feeds the
+Settings UI, and editing the dict would make the screen display a value the
+operator never configured.
+
+Caching `detect_devices` (ARCH-ENG-221c) exposed a second defect this ticket
+closes: `_LAST_DETECT_ERROR` is module-global state written by `_detect_gpus`
+and read by `dual_brain_control.py:800` to show the reboot hint. A cache hit
+returned a device list from probe N alongside an error string from probe N+1 --
+two observations from two moments presented as one, which is the ARCH-ENG-179 /
+185 / 188 defect in a new place. The error is now stored and restored WITH its
+devices.
+
+**ARCH-ENG-223a - `_schedule_slot_reprobe` probed llama-server on the GUI
+thread.** `check_llama_server` defaults to `timeout=10`, and this ran directly
+from a `QTimer.singleShot`, 2 s x 90 attempts -- up to 3 minutes of GUI-thread
+blocking HTTP. The case the loop exists for is precisely the case that times
+out: a just-launched server accepts the socket but cannot answer until the model
+is in VRAM, so the slow path is the NORMAL path. Now a daemon thread per probe,
+skipping while the previous is alive, with the reschedule armed before the
+thread starts. Measured: 0.81 ms of GUI-thread time for an 80 ms probe.
+
+Moving it introduced a second-order bug, also pinned: the original RETURNED
+once the server answered. A naive port that only re-arms the timer would keep
+probing for the full 90 attempts after success -- trading one defect for
+another. The done-flag is now read on the next tick.
+
+**ARCH-ENG-223b - a constant table was rebuilt every tick.** `SafetyTab.
+_refresh_layers` is six hard-coded rows. It ran `setRowCount(0)` then 6 x
+`insertRow` + 24 x `QTableWidgetItem` twice a second while visible and every
+15 s while hidden, to redraw six strings that never change.
+
+**ARCH-ENG-223c - a 10 Hz timer ran for the whole process lifetime.**
+`opp_scan_drain_timer` woke the Qt event loop ten times a second with an empty
+queue and a hidden tab. Now armed with the scan, stopped on the "done" event
+and on every failure path.
+
+**ARCH-ENG-223d - every log line resized its row, visible or not.**
+`_append_log_to_table` ran `insertRow` + 6 `setItem` + `resizeRowToContents`
+per line for every bus event and worker log. `resizeRowToContents` invalidates
+the view layout and forces a size-hint pass -- the canonical Qt table trap.
+2000 lines: **1.81 ms hidden, 301.85 ms visible.** Deferring is safe because
+`_log_emit` already appends every entry to `_log_buffer`, and both
+`_replay_log_buffer` and `_do_apply_log_filter` rebuild from it.
+
+Full suite: **3070 passed, 12 skipped, 666 subtests, 0 failures.**
+
+## [2.1.116] - 2026-10-18 - Costs that were being paid on every request
+
+Two tickets, ARCH-ENG-221 plus a flaky-test fix. The theme is work that was
+repeated per request because nothing had ever asked how expensive it was.
+
+### Fixed
+
+**ARCH-ENG-221a - allocation tracing ran for the entire process lifetime.**
+`agents/runtime/performance.py` called `tracemalloc.start()` at module import,
+unconditionally. `agents/runtime/__init__.py` re-exports from that module, so
+merely importing anything under `agents.runtime` - including `device_registry`,
+which every chat turn touches - switched tracing on for the whole process.
+tracemalloc records every allocation and free in its own hash table: typically
+a 2-4x slowdown on allocation-bound work, growing without bound. This app streams
+tokens and churns tens of thousands of table items per minute across six or more
+threads on a 6-core CPU. It was paying that continuously to serve one diagnostic.
+Now opt-in via `MRBOT_TRACE_MEMORY=1`, and `snapshot()` reports
+`memory_traced` explicitly - `get_traced_memory()` returns `(0, 0)` when tracing
+never ran, and a panel showing "0 bytes used" is a false claim.
+
+**ARCH-ENG-221b - the GGUF header was re-read on every chat turn.** 3672 ms cold
+on a 10.36 GB model, for both brains, via `model_profile._read_gguf_metadata`.
+Its siblings were already cached; this one was missed. `dual_brain.py:420` even
+carries a comment describing the materialisation problem. Now cached on
+(path, mtime, size): **3672.6 ms -> 0.213 ms, 17,267x**.
+
+The first draft of that cache named its key `key` - which the surrounding parse
+loop already binds to each metadata key *string*. The entry was stored under
+whatever string was read last, every tuple lookup missed, and the cache silently
+did nothing while appearing to be populated. `test_arch_eng_221` pins it, and
+pins that the pin can itself fail.
+
+**ARCH-ENG-221c - `nvidia-smi` was spawned once per prompt.** `_hardware_line`
+in both brains calls `detect_devices()` to build one line of the system prompt.
+192 ms cold / 0.005 ms warm after caching, keyed on `include_cpu` as well as
+time - caching on time alone would hand a `include_cpu=False` caller a list
+containing the CPU pool. `_detect_gpus` is deliberately left uncached: tests
+patch it directly, and a cache there serves one test's mock to another.
+
+**ARCH-ENG-221d - a 10 s health-cache TTL was being defeated on a 5 s timer.**
+`refresh_diagnostics` passed `refresh_health=True` unconditionally, forcing two
+blocking `urlopen(timeout=3)` calls per role on the GUI thread every 5 seconds.
+The TTL was added by ARCH-ENG-188 for exactly this. Same defect class as
+ARCH-ENG-179/185/188, inverted: those cached an observation and presented it as
+current fact; this discarded the expiry built to stop it. The explicit Refresh
+button still forces. A test previously *asserted* the buggy behaviour.
+
+**ARCH-ENG-221e - the DB-stats 5 s timer was never visibility-gated.** It ran for
+the whole process lifetime whether or not the tab was on screen, doing three
+unindexed full-table aggregates over the append-only `llm_calls` table (written
+once per LLM call, never pruned) plus ~400 `QTableWidgetItem` allocations on the
+GUI thread. Now stopped while hidden, and the aggregate is cached for 30 s with
+invalidation on write - so the panel never shows stale numbers for the operator's
+own activity.
+
+**ARCH-ENG-221f - an external HTTP call on the GUI thread every 60 seconds.**
+`AnalyticsTab._fetch_price` ran `urlopen(api.coingecko.com, timeout=10)` directly
+in the timer slot, for the life of the process, hidden or not - a multi-second
+frozen window every minute on a flaky connection. Now on a worker thread with a
+queued result, with a re-entrancy guard and no fetch stacking. The timer is
+started in `showEvent`, not `__init__`: a widget that is never shown never
+receives `hideEvent`, so starting in `__init__` left it running forever.
+
+**ARCH-ENG-221g - a full recursive tree walk on every workshop write.**
+`_can_write` -> `storage_stats` -> `Path.rglob("*")` plus a stat per file, from
+both `write_file` and `append_file`. 50 `storage_stats()` calls: 50 walks -> 1.
+Invalidated by all four mutators - a TTL alone would let a burst of writes exceed
+the quota.
+
+**ARCH-ENG-221h - uncapped workshop reads.** `read_file` did a bare `f.read()` and
+its result flows to `redact_secrets()` and then into the model's context window;
+with the old 10 GiB quota one call could try to pull 10 GiB into a prompt. Now
+capped at 256 KiB with an explicit truncation marker, so the model can see it is
+looking at a fragment instead of believing it read the whole file. `search_files`
+had the same uncapped read, plus `results[:20]` applied *after* the walk had
+already read every file - the cap saved the caller rows and the machine nothing.
+The walk now stops when the cap is reached.
+
+**ARCH-ENG-221i - the workshop quota was 10 GiB on a 32 GiB machine.** A third of
+the entire memory budget, as disk, starving the page-cache and swap headroom a
+locally-hosted GGUF depends on. Now 2 GiB; still overridable.
+
+### Tests
+
+`tests/runtime/test_brain_prompt_hardware.py` asserted against whatever the host
+machine happened to have. ARCH-ENG-115 had fixed the product defect but left the
+test live, so the suite's signal depended on the operator's GPU. Now injects a
+registry and pins both paths deterministically: a registry containing the
+configured device names *that* device, and a registry with no match omits the
+section and still builds the prompt. It also pins that the `ROLE_DEFAULTS`
+placeholder `"(detected hardware)"` never reaches a prompt - the exact string
+ARCH-ENG-115 removed, which nothing was checking for. One live check survives
+deliberately: `detect_devices()` must *succeed*, asserting nothing about which
+devices exist. Verified deterministic over 5 consecutive runs.
+
+Full suite: **3037 passed, 12 skipped, 666 subtests, 0 failures.**
+
+## [2.1.115] - 2026-10-18 - One source of truth for safety controls, and a gate on agent source edits
+
+Eight tickets, ARCH-ENG-200 through ARCH-ENG-207. The theme is duplicated
+authority: a value written for one purpose and read on a different one, or read
+by two readers that disagree. Six of the eight were found by auditing a dead-code
+report that was itself mostly wrong.
+
+### Fixed
+
+**ARCH-ENG-200 - four phantom top-level windows in the Settings tab.**
+`create_settings_tab` builds four group boxes and adds none of them to a layout.
+An unparented QWidget in Qt is a *top-level window*, so these were four live
+entries in the window list - and because `QGroupBox.title()` is not
+`QWidget.windowTitle()`, they appeared blank in the taskbar, which is why nobody
+noticed. Only one had a `hide()` guard. Re-homed under a single hidden,
+parented container; every attribute the save path reads still resolves.
+
+**ARCH-ENG-201 - a security blocklist that silently ignored edits.**
+`base_worker.py` defined the blocklist at line 107, then re-imported it from
+`worker_safety` 146 lines later, silently replacing it. Both copies agreed, so
+nothing looked wrong. Editing the literal would have produced no error, no test
+failure and no behaviour change - a defence that *looks* maintained while
+ignoring edits.
+
+**ARCH-ENG-202 - the blocklist setting was display-only, and making it live
+would have been dangerous.** It appeared in Settings and persisted to `.env`,
+but nothing read it: the runtime enforced 14 filenames while the screen showed 4.
+`.env` line 141 already held the narrowed 4-entry value, inert only because
+nothing read it. The setting is now a FLOOR - `effective = FLOOR | configured` -
+so subtraction is structurally impossible. Blocking more is always allowed;
+blocking less is not reachable through configuration. Fail-secure as well: no
+`.env` means the floor still applies.
+
+**ARCH-ENG-203 - four parsers for the same booleans, disagreeing.** Two sat four
+lines apart in the same function and were complements (`== "true"` and
+`!= "false"`), so every value outside {true, false} split them.
+`MRBOT_FX_ANTIALIASING=1` enabled antialiasing while the neighbouring checkbox
+showed unchecked. The same defect was found on a *safety gate*:
+`feature_enabled("self_improvement")` and `action_pipeline.py` read the same
+`PIPELINE_ALLOW_SELF_IMPROVE` with different parsers, leaving self-improvement
+permitted on one path and blocked on the other. Now one `env_bool`, three-state,
+where an unrecognised value falls back to the documented default rather than
+switching a feature off.
+
+**ARCH-ENG-204 - the one component that wrote source without a backup gate.**
+`CodePatchService` already implemented backup -> approval -> write -> verify ->
+rollback, and was fully wired. `CoderWorker` was the single holdout: all three
+write methods called `safe_write_file` directly. Separately, a *failed* backup
+used to log "Backup skipped" and write anyway, returning True so the caller
+reported "Created safely" - a safety mechanism that degrades silently and
+claims success. A failed or zero-byte backup now blocks the write.
+
+### Removed
+
+**ARCH-ENG-205 - 1,103 lines of unreachable platform adapters.** All five
+adapters plus the registry had zero references outside
+`agents/platforms/__init__.py`. Python runs `__init__` before any submodule, so
+importing `credential_vault` dragged all 1,103 lines in on every registration
+panel build. This is the trap that made two independent dead-code sweeps
+contradict themselves: the modules were *reachable* and their contents
+*unreferenced*, and neither fact implies the other. `credential_vault` and
+`registration` are live and kept.
+
+**ARCH-ENG-206 - 859 lines of genuinely dead code.** `workflow_engine.py` and
+`cost_tracker.py` (both superseded), `agents/polish/` (its `cli_interface.py`
+has a `main()` but no `__name__` guard, so the `python -m` command its own
+docstring advertises silently no-ops), seven workshop shims, and two unused
+event-logger callbacks. The workshop report said "8 shims"; two were live -
+`get_workshop` has 11 callers - and were kept.
+
+**ARCH-ENG-207 - `DEADCODE_REPORT.md` deleted.** It recommended deleting the
+whole `agents/platforms` package, which would have broken a safety test and the
+registration panel, and justified keeping `agents/earning` by reference to a
+file that no longer exists. A stale deletion list is worse than none: the
+resulting failure points at the safety suite, not at the document.
+
+### Notes for the next maintainer
+
+An AST dead-code sweep is necessary but never sufficient. Absence of an importer
+must be checked against eight traps before deleting anything - recorded in
+ARCHITECTURE_MAP.md. The expensive ones: Qt slots connected by name, eager
+package `__init__` re-exports, and methods called only from sibling methods.
+
+Suite: 2873 passed, 12 skipped, 487 subtests, 0 failures.
+
+## [2.1.114] - 2026-10-17 - The GUI reported states the machine was not in
+
+A deep audit of the Dialogue tab and the Providers & GPU panel, commissioned
+because those are the two places where the operator reads the app's opinion of
+itself. Thirty-two defects and features, ARCH-ENG-168 through ARCH-ENG-199. The recurring theme
+is that almost none of them were logic errors — they were places where the code
+produced a claim the operator would read as a fact, and the claim was wrong.
+
+### Fixed
+
+**ARCH-ENG-168 — `DialogueWorker.finished` shadowed `QThread.finished`.**
+`finished = Signal(str, str)` rebound an inherited zero-argument Qt signal, so
+Qt's own thread-completion emission resolved to a two-argument slot. The
+standard `worker.finished.connect(worker.deleteLater)` idiom breaks on an arity
+mismatch. Not theoretical: the first run after the rename raised
+`TypeError: finished() only accepts 0 argument(s), 2 given!` on the error path.
+Renamed `response_ready` — it carries a response, so it was never "finished" in
+the Qt sense — and the real `QThread.finished` now drives `deleteLater`.
+
+**ARCH-ENG-169 — `requestInterruption()` was a no-op and workers were never
+freed.** `cancel()` set only a private flag; nothing ever polled
+`isInterruptionRequested()`, so the shutdown path's interruption request had no
+effect. `deleteLater()` appeared nowhere in the file and `_retired_workers` was
+appended to on every stop/reset/cleanup and never pruned. `cancel()` now raises
+both mechanisms, `run()` polls both, and the retirement list is capped.
+
+**ARCH-ENG-170 — a wired button called a method that did not exist.**
+`force_forward()` called `self._run_single_turn()`, defined nowhere in the
+repository. The operator clicked it and got an `AttributeError`.
+
+**ARCH-ENG-171 — Stop on a brain killed *any* process on its port.** No
+image-name check at all, so the port was treated as proof of ownership. It is
+not: LM Studio's default is `127.0.0.1:1234`, which *is* the Big Brain port, so
+an operator running LM Studio had it force-killed by pressing Stop. It also ran
+for servers the app had explicitly adopted and promised not to manage. A PID is
+now killed only if it is a llama.cpp server; anything else is reported and left
+running.
+
+**ARCH-ENG-172 — `settings.json` could be truncated, or lose a key.**
+`merge_settings_file` and `save_policy` each did their own unsynchronized
+read-merge-write, so an interleaving pair silently dropped one writer's key —
+ARCH-ENG-070's own docstring ("every writer must go through this function") was
+false. Worse, both used `<path>.tmp-<pid>`, and a PID is per-*process*, so every
+thread in one process shared one temp file: two threads truncated each other's
+output mid-`json.dump` and published a truncated file, which the next read
+quarantines as corrupt — every per-device model, role and tuning value gone.
+Both now share one locked helper with a per-writer temp name.
+
+**ARCH-ENG-173 — a tool that never ran was reported as one.** The tool-result
+classifier was an inline three-way substring test that missed
+`"[Approval unavailable: ...]"`. The UI then set `real_evidence = True`, reset
+the progress guard, and printed `[TOOL] actual tool call: ...` for *every* event
+regardless of status — so a blocked tool silenced the "you are not making
+progress" nudge, and a persona could stall indefinitely behind a tool that could
+never succeed. Now a deny-list, checked first.
+
+**ARCH-ENG-174 — Reset did not reset.** It cleared the transcript but left
+`_generation_id` alone, so in-flight workers still matched the current
+generation and their replies were appended to the freshly cleared chat. The
+operator pressed Reset and then watched a persona answer a question they had
+just erased.
+
+**ARCH-ENG-175 — two GUI-thread stalls, every turn.** `with sqlite3.connect(...)`
+does not close the handle (three leaked per turn) and the 5-second default busy
+timeout across three live databases could freeze the window for ~15 s; and
+`nvidia-smi` was forked from inside the Qt event loop with a 5-second timeout.
+Both now bounded, explicitly closed, and cached.
+
+**ARCH-ENG-176 — model output was not HTML-escaped.** `_markdown_to_html` fed
+raw persona text into a rich-text sink, so `<img src="http://...">` made Qt
+fetch that resource on the GUI thread. Escaping now happens before the markdown
+substitutions, so the generated tags are the only HTML.
+
+**ARCH-ENG-177 — the multi-GPU panel was silently N=2.** `_create_gpu_widget`
+had a hard `if index == 0 / else`, so every non-zero index assigned `gpu1_*`, and
+every setter used `gpu0_ if idx == 0 else gpu1_`. On a 3-GPU box, GPU 2's
+telemetry was written onto GPU 1's panel and GPU 2 showed nothing — in an app
+built explicitly for an N-device roster. Every index now resolves its own
+widgets, and an unregistered index renders nothing rather than falling back.
+
+**ARCH-ENG-178 — a brain could become permanently un-startable.** The
+re-entrancy guard's own comment said it was cleared on every terminal path; it
+was not. Disable the brain in Settings, start it again, and every later Start
+click was ignored for the rest of the session.
+
+**ARCH-ENG-179 — provider status could never be reported as stopped.** The
+merge re-applied the *previous* snapshot's status over the result of the fresh
+probe. Since `provider_config_widget` sets `RUNNING` optimistically with no
+probe at all, that fiction persisted forever — a server that died minutes ago
+was still listed as running. Every real detector sets a status on both paths, so
+a carried-forward status is never "the detector had no opinion"; it is a stale
+claim. The probe now wins for `status` and `last_error`; operator choices still
+survive.
+
+**ARCH-ENG-180 — raw chain-of-thought was returned as the persona's answer.** When
+a reasoning model exhausted its budget mid-thought, the `reasoning` channel was
+substituted for the answer — becoming the visible turn, part of
+`conversation_history`, and persisted to the dialogue log as something the
+persona "said". This is the class ARCH-ENG-056/102/110 closed from a new
+direction, and worse than either: raw CoT is unreadable and misattributed. An
+empty answer channel is an empty response, and the tab already has a
+deterministic handler for it.
+
+**ARCH-ENG-181 — `DualBrainControl.cleanup` shadowed the backend's teardown.**
+`DualBrainControl(ProviderLifecycleBackend, QWidget)` mixes the backend in as a
+base class; the widget's `cleanup` never called `super()`, so the careful
+ordered teardown never ran for the widget — the only case that matters. The prep
+workers and the extra devices' per-slot launch workers had no teardown at all.
+
+**ARCH-ENG-182 — `QTimer.singleShot` from a raw `threading.Thread`.** The thread
+has no event loop, so the callback may never fire and the brain row stays stuck
+at "Loading…" with no error anywhere. Replaced with a Qt signal, which Qt
+queues onto the GUI thread.
+
+**ARCH-ENG-183 — one `N/A` row erased every GPU from the panel.** nvidia-smi
+routinely emits `N/A` for an idle field; the resulting `ValueError` was caught
+by the *outer* handler, so the function returned an empty list. Row parsing is
+now per-row. The poller also used `capture_output=True`, the ARCH-ENG-116-broken
+form.
+
+**ARCH-ENG-184 — "ready" was emitted before any readiness check.** `_proc_alive()`
+is true on the first iteration, so it returned immediately and the `check_fn`
+probe — and the 120-second retry loop — were unreachable dead code. A server that
+crashed two seconds later on an incompatible GGUF was reported as "ready on
+:1234". The intent behind the early return was sound (never terminate a busy
+server), so the fix is to report honestly: probe first, and if the process is
+alive but silent, say "LAUNCHED but not yet answering" instead of "ready".
+
+**ARCH-ENG-185 — a blocked persona was blocked forever, and history was
+unbounded.** `_blocked_personas` was add-only but read by the live prompt, so
+one terminal BLOCK told every persona not to proceed for the rest of the
+session. `_history_limit = 20` was declared and never used, so
+`conversation_history` grew without bound while every turn walked all of it.
+
+**ARCH-ENG-186 — the nvidia-smi exit-code check was silently dropped.**
+ARCH-ENG-166 collapsed three copies of the query into one helper that ignores
+the return code; the two redirected callers each used to check
+`result.returncode == 0` themselves. A failed query was indistinguishable from
+one that printed nothing.
+
+**ARCH-ENG-187 — two copies of "is that our server?", already disagreeing.**
+`DualBrainControl` and `ProviderStatusChecker.check_llama_process` each had their
+own port-to-process enumeration, and they had drifted. `check_llama_process`
+filtered `IMAGENAME eq llama.exe` while the app spawns `llama-server.exe`, so on
+a machine running four llama-servers it returned **False**; it also accepted a
+`port` argument and ignored it entirely; it used the ARCH-ENG-116-broken
+`capture_output` form; and it had **zero call sites**, so it read as a working
+safety check that nothing happened to use yet. A dormant broken check is the
+hardest kind to notice, because no failure ever surfaces. `is_llama_server_image`,
+`process_image_name`, `pids_listening_on` and `llama_server_pids_on` now live
+once in `device_registry` and both callers delegate — so the probe that reports
+and the killer that terminates now use the *same* predicate for "ours" and
+cannot disagree about which processes the app may stop.
+
+**ARCH-ENG-188 — two more instances of one recurring mistake.**
+`DualBrainRuntime._health_cache` recorded a `checked_at` timestamp that **nothing
+ever read**. Once a role was cached, `list_models` returned that snapshot forever
+unless the caller passed `refresh=True` — and the only in-tree caller is
+`health(refresh=refresh_health)`, whose `refresh_health` defaults to False. A
+server that died kept reporting `reachable: True` with its full model list,
+indefinitely, while the panel showed it as running. The cache now honours a
+`DUAL_BRAIN_HEALTH_TTL` (default 10s); `0` disables it outright, which is tested
+explicitly because Windows' 15 ms clock granularity would otherwise let
+`age <= 0` serve a hit to an operator who explicitly asked for no caching.
+
+Separately, `OllamaAdapter`'s `ThreadPoolExecutor(max_workers=2)` could be wedged
+permanently. `complete()` waits with `_fut.result(timeout=...)`; on timeout it
+raised, but the future kept *running* — Python cannot interrupt a thread already
+executing — so the worker stayed pinned until `ollama.chat` returned. Two slow
+calls exhausted the pool and every subsequent request queued behind them forever,
+so the operator saw the provider **hang** instead of the timeout they had been
+told to expect. A timeout that leaves the system less able to report the *next*
+timeout is worse than no timeout at all: it converts a clear failure into a
+silent one. The pool now has configurable headroom, and a timed-out call cancels
+its future so a queued burst is released rather than each waiting out the full
+timeout in turn.
+
+**ARCH-ENG-189 -- the Progress panel could never show anything.**
+`progress_list` was created, placed in the sidebar between Tasks and Goals, and
+cleared alongside them on reset -- and nothing ever added an item to it. Not one
+call site in the file. Three panels in a row, two populated, and no way for the
+operator to tell "no progress yet" from "this feature is broken". The lifecycle
+phases *are* the progress, and `_next_phase()` is the single choke point every
+autonomous turn passes through, so each phase is now recorded there exactly once,
+for every entry point, bounded to 50 rows.
+
+**ARCH-ENG-190 -- the semantic-duplicate loop-breaker was dead code.**
+`_dialogue_decisions` was declared and *read* by the semantic-duplicate check and
+never written, so `semantic_dup` was permanently `False` and its entire 34-line
+recovery branch was unreachable. Its own comment described two independent
+budgets -- "repeated *text* (1 recovery shot) vs repeated *decision signature*
+(3 recovery shots)" -- and only the textual one existed. A persona repeating the
+same decision in *reworded* form was not caught at all, so the loop it was
+written to stop ran unbounded. The missing writer now sits on the accept path, so
+a duplicate is never recorded, transport errors and malformed fallbacks return
+above it, and every entry point flows through it. Reset clears the history too --
+otherwise the first turn of a new session could be rejected as a repeat of a
+decision the operator had just erased.
+
+**ARCH-ENG-191 -- one hostile row could delete a whole prompt section.**
+`chat_router` sorted the opportunity board with a bare
+`float(item.get("last_amount"))`. That field is operator- and model-written, so
+`"N/A"`, `"pending"` and `"$250"` are all reachable, and any of them raised inside
+`sorted()` -- before a single line was emitted, so one bad row discarded the
+entire report. The display path twenty-five lines below already guarded with
+`isinstance(amount, (int, float))`: the author knew the field might be
+non-numeric and defended one of the two places it is read. Both read sites now go
+through one total sort key. This mattered more than it looks despite the module
+having no production callers: all three call sites sit inside
+`try/except Exception: pass`, so the failure was not a crash but the silent
+disappearance of the opportunity board from the chat prompt.
+
+**ARCH-ENG-192 -- `app/` was not Qt-free, and not because it used Qt.**
+`app/ui.py` imported 39 PySide6 names at module level while declaring zero
+classes and instantiating zero widgets. Every import was unused. It broke the
+documented rule that `app/` is Qt-free so the service layer can be tested
+headless, for 39 names serving no purpose. It was misfiled rather than
+architecturally leaking -- one importer, `main.py`'s `apply_theme`, wrapped in
+`try/except` -- so it is now `gui/theme_ui_state.py` with no Qt import at all, and
+a guard asserts no module under `app/` imports PySide6 at module scope. It also
+carried a false claim: `UI_ANIMATIONS` has *no readers anywhere*, yet its comment
+asserted "the toggle now actually does something". The operator's toggle does
+reach the renderer, but through `app.effects.EffectSettings.animations`. The false
+comment was removed; the flag is kept for API compatibility. (`app/effects.py` was
+audited alongside and is already compliant.)
+
+**ARCH-ENG-193 -- a call that could never succeed, hidden by a bare `except`.**
+`create_settings_tab` called `WorkerAgent._ollama_model_names_static()`, which
+does not exist anywhere; a bare `except Exception: pass` swallowed the
+AttributeError on every Settings-tab build, so the model combo always fell through
+to its hardcoded list. It was *not* a typo to be "fixed": the real method is
+`_ollama_model_names(self)`, a blocking `requests.get(timeout=3)`, and
+`populate_ollama_model_combos()` already does the job on a background thread
+precisely because the inline version froze the Settings tab. The dead attempt is
+deleted with that warning attached, and a structural sweep now rejects any call to
+a method that does not exist.
+
+**ARCH-ENG-194 ? the backend mixin contract, declared instead of discovered.**
+`DualBrainControl(ProviderLifecycleBackend, QWidget)` mixes a backend in as a base
+class, and the coupling was knowable only by grepping both files. Measured: 64
+methods on the backend, 104 on the widget, only two shared names -- a clean
+horizontal split, not a fork. But the backend reads 115 distinct `self.<attr>`
+and defines only 48; the other 67 live on the widget. The backend now declares
+what it needs (`HOST_METHODS`, `HOST_ATTRS`, a `ProviderLifecycleHost` Protocol,
+`host_contract_satisfied()`) and a guard asserts the facade provides all of it, so
+a rename fails a test instead of raising `AttributeError` when the operator clicks
+Start. Composition was deliberately NOT done: passing the widget as `self` is
+semantically identical to the mixin, so it would be a rename, not a refactor --
+~180 sites rewritten for zero architectural gain. The guard then found two real
+crashes: `_apply_hardware_tensor_options` is called from `__init__` but reads
+combo attributes that only exist once brain rows are built, so on a machine with
+no detected rows construction raised `AttributeError`; and the summary loop below
+it read the same dict by direct index, raising `KeyError`.
+
+**ARCH-ENG-195/196/197 ? settings the operator edited that never persisted.**
+Three defects, all reported as "Save All doesn't fully work". `save_settings`
+called `set_env_values(values)` and then inserted nine more keys into that same
+dict ~55 lines later -- a dict handed to a writer is a snapshot, so they never
+reached `.env`. Six were lost outright (`MAX_TOKENS`, `LLM_TEMPERATURE`,
+`LLM_TOP_P` never even reached `os.environ`, and the three `DIALOGUE_*` keys were
+clobbered by `load_dotenv(override=True)` on the next line); nine more controls
+were never read on any path, including `FILENAME_BLOCKLIST`, `BLOCKED_MIME_TYPES`,
+`LLM_DAILY_BUDGET_USD` and `WINRATE_DECLINE_BELOW`. Separately, Save All reverted
+the *visible* Ollama model choice, because `ProviderConfigWidget` and
+`save_settings` both wrote `OLLAMA_MAIN_MODEL`/`OLLAMA_CHAT_MODEL` and the second
+read them from a `hide()`n group box holding its build-time seed -- both writers
+reported success. And a llama setting edited before device detection finished was
+dropped entirely, because the handler returned early when `runtime is None`,
+before both the apply and the persist.
+
+**ARCH-ENG-198 ? the workshop was built, gated, and never announced.**
+`agents/knowledge/workshop.py` is 889 lines with proposals, research, scripts,
+applications, accounts, payment methods, deliverables, templates, notes and
+search; it is exposed as approval-gated tools and hardened against secret leakage
+(ARCH-ENG-134). But `get_workspace_summary()` had **zero callers**. The personas
+had no way to learn their workshop existed unless the operator happened to ask,
+and reasoned from an empty model while their own prior work sat unused. It is now
+a bounded context block that states the material is the operator's OWN prior work
+and **NOT verified earnings** -- because a summary listing 13 past proposals reads
+to a model as 13 completed jobs, which is the fabrication class this release has
+closed six times. Under a tight budget the framing survives and the summary is
+trimmed.
+
+**ARCH-ENG-199 ? a 25-skill library on disk that nothing could find.**
+17 `SKILL.md` files in the workshop (canvas-design, docx, pdf, pptx, xlsx,
+mcp-builder, skill-creator, claude-api, webapp-testing, ...) and 8 more in the
+repository, none of it readable by the application. The prompt now receives a
+bounded index -- name plus when-to-use, ~5.7 KB measured -- with bodies
+retrievable on demand, because the bodies total 183 KB and a model handed
+twenty-five full documents applies none of them well. Two schemas are handled: the
+workshop format carries `description`, the repository format carries a `Trigger:`
+line instead, and a loader understanding only the first would have found the
+document skills and missed the eight the earning pipeline depends on. No PyYAML:
+it is in the lock file, imported nowhere, and installed nowhere. Skill text is
+framed as untrusted instruction that grants no permissions, and `read_skill`
+looks skills up by name rather than by path.
+
+### Two recurring failure modes worth naming
+
+**A dispatch that assumed only two values existed.** Five of these defects were
+the same mistake in different clothes, in an application built explicitly for an
+N-device roster: every GPU panel setter, every widget-creation branch, and the
+provider-status merge each enumerated exactly two cases. When a subsystem is
+N-way by design, every branch on an index is a place to enumerate the cases that
+exist and refuse the ones that do not — which is what the new guards assert.
+
+**An observation cached and then presented as current fact.** Three more
+(ARCH-ENG-179, 185, 188) were all the same shape: a probe result, a persona's
+blocked state, a server's reachability — recorded, never re-derived, and read as
+current. In the health-cache case the author had *already written* the
+`checked_at` field the expiry was meant to be based on, and simply never
+consulted it. That is the reliable tell, and it is worth a standing rule: **a
+field written for exactly one purpose and never read on the consuming path means
+the code that should use it is missing.** Each of the three is now closed by
+reading what was already being written.
+
+### Tests
+
+Fourteen new guard suites; the structural assertions now strip docstrings before
+matching, so a guard no longer reads its own documentation — the first draft of
+one immediately failed by matching the prose that documented the very pattern it
+was checking for. Suite: 2801 passed, 12 skipped, 379 subtests, 0 failures.
+
+## [2.1.113] - 2026-10-17 - The earning executor asserted payments it could not verify
+
+A code review against the repo's own stated invariants. Every defect below was an
+invariant that was ALREADY documented elsewhere in this repository and had simply
+never reached the module in question — which is why the self-audit passes kept
+finding the same class of bug in new places.
+
+### Fixed
+
+- **ARCH-ENG-158 — the 14-step executor marked work PAID with no evidence.**
+  `agents/earning/executor.py` steps 12 and 14 were:
+  `ctx.step_results[12] = {"verified": True}` as a LITERAL, then
+  `transition_work_status(..., WorkStatus.PAID)` unconditionally. Every task
+  reaching step 11 — i.e. every task with no human gate — was reported as a
+  completed, paid opportunity. That is precisely the shape
+  `handlers._is_approved` and `OpportunityLifecycleTracker._is_verified_evidence`
+  were hardened to refuse (ARCH-ENG-064/118/119/121). `TaskExecutor` is live: it
+  is constructed in `app/earning_pipeline.py` and reached via
+  `AutonomousLoop._stage_execute`.
+  Steps 12/14 now resolve real `Evidence` through an injected `EvidenceStore`,
+  apply `evidence_policy.is_transition_eligible` for `SUBMITTED->PAID` /
+  `CLAIMED->REVENUE_REALIZED` plus the L3_EXTERNAL_SOURCE floor, and FAIL CLOSED
+  on a missing store, a query error, or an empty result. Step 13 no longer
+  fabricates an evidence-shaped dict. `ExecutionResult` gained
+  `paid` / `evidence` / `payment_status`.
+  The surviving test `test_full_pipeline_pass` **asserted** `final_status ==
+  "paid"` for a task with no payment evidence anywhere — the defect was encoded
+  as the expected value, which is why no self-audit pass could find it. Updated,
+  and a genuine L3 payout is now proven still to book, so the floor is a floor
+  and not a wall.
+
+- **ARCH-ENG-159 — the lifecycle gate still honoured the laundering shape.**
+  ARCH-ENG-121 decided the policy was FAIL CLOSED and
+  `handlers._evidence_meets_l3` closed the legacy `{"verified": True}` branch,
+  but the defence sat only at the CALLER. Two places in
+  `OpportunityLifecycleTracker` still took the laundering path: the
+  `_is_verified_evidence` gate returned `bool(ev.get("verified"))` when no status
+  was present, AND `mark_paid_verified` had its own no-store branch that read
+  `evidence.get("verified")` and called `_mark_paid` directly. Both closed.
+  The second mattered more than it looks: with only the gate fixed, such a state
+  would still read `status == "paid"` with `last_amount` set on nothing but a
+  self-asserted boolean — a split truth on exactly the invariant `Agent.md`
+  declares, even though `verified_revenue_usd()` correctly reported 0.
+  This cannot reject a genuine record: `Evidence.to_dict()` always emits `status`
+  and `verification_level`. Two gates answer "is this proof of payment?" in
+  different trust contexts — `handlers._evidence_meets_l3` checks a live tool
+  argument and can demand an `Evidence` object; the lifecycle gate checks a
+  persisted record, which after a restart is necessarily a dict. That divergence
+  on a fabricated status+level dict is asserted and documented rather than
+  papered over.
+
+- **ARCH-ENG-160 — a fresh clone could not encrypt a credential.**
+  `cryptography` was absent from `requirements.txt` — the curated set a fresh
+  install actually reads — while `agents/integrations/wallet_crypto.py` imports
+  Fernet at module scope. `CredentialVault.__init__` therefore raised
+  `RuntimeError("cryptography is required for wallet encryption")` and every
+  wallet and platform-secret path was dead on arrival. The package WAS in
+  `requirements.lock.txt`, so the two manifests disagreed and nothing noticed.
+  `ccxt` appeared in NEITHER, and `requirements-cloud.txt` /
+  `requirements-live.txt` were referenced by README.md but had never been
+  written: both documented install commands failed with a pip path error.
+  This is the gap ARCH-ENG-108 closed for `openai`/`psutil`, recurring because
+  the curated set is maintained by convention. Both manifests added, `cryptography`
+  pinned, and a suite now AST-scans the tree so "keep the manifests in sync" is
+  a check rather than a habit.
+
+- **ARCH-ENG-161 — v2.1.112 shipped a real fix with no ARCH-ENG id.**
+  The 2.1.112 entry named a fix but carried no ticket, so the ARCH-ENG-150
+  guard ("a recorded fix must be present in HEAD") had nothing to verify and
+  `test_top_entry_names_at_least_one_fix` failed. Both halves of the fix
+  (`provider_manager._detect_gpus`, `dual_brain_control.setup_ui`) are now
+  tagged, with the regression test the guard requires.
+
+- **ARCH-ENG-162 — lifecycle `_persist` could lose authoritative state.**
+  It rewrites the whole state file from `_states` on every `_append`, with no
+  lock and a FIXED temp path, while `AutonomousLoop.run` explicitly supports
+  concurrent runs. Two threads sharing one temp file could publish a truncated
+  file, which `_recover_from_disk` silently swallows into a fresh start.
+  Separately measured on this machine: ~11k concurrent reads against 4 writers
+  produced 0 corrupted reads but 322 `PermissionError(13)` — and because
+  `_persist` swallowed every exception, each was a silently dropped lifecycle
+  update. Now locked, per-writer temp name, `fsync`, cleanup on failure, and a
+  bounded retry on the Windows sharing violation.
+
+- **ARCH-ENG-163 — the persistence contract was never binding on the real tree.**
+  `validate_store_paths` only checks the paths it is HANDED, so it could not see
+  a store nobody passed in, a shadow copy, or a schema overlap. Measured: 7
+  declared authorities but only 4 checked at startup; `agent.db` and
+  `earning.db` sharing 15 real tables **including `evidence`**, with `decisions`
+  in three stores; and 9 stray `.db` files under `agents/`, `data/` and `gui/`,
+  four of them named exactly like an authority. A relative-path bug would open a
+  shadow copy and write real records into a file no report reads.
+  Added `discover_undeclared_stores` / `find_schema_overlaps` / `audit_stores`
+  and a suite that asserts against the FILESYSTEM, so the contract has a subject
+  independent of whoever called it. Overlaps are split into populated-in-both
+  (a defect) and empty-in-both (a schema artifact of the shared `AgentDB` DDL),
+  because reporting all 14 empty overlaps as defects would make the guard noise.
+  The 9 strays are quarantined in `.mrbot_backups/arch_eng_163_orphan_stores/`
+  with a README, not deleted. One finding is deliberately left for the operator:
+  `agent.db` holds a VERIFIED L5 `onchain_balance_delta` row the earning path
+  cannot see — operator data is not this code's to relocate, so it is baselined
+  and stays visible in the audit.
+
+- **ARCH-ENG-164 — `legacy_tools` was a second, ungated tool dispatcher.**
+  It executed `write_file` and `run_command` with no SafetyGate, beside the one
+  authorized boundary in `dispatch.execute_tool`. Not an active exploit — its only
+  caller gated first — but a public unguarded API whose `TOOL_DEFS` were
+  advertised to model-facing callers by `agents/earning/router.py`, which is how
+  the second dispatcher came to exist. Mutating tools now require the same
+  `_DISPATCH_CAPABILITY` token the hardened handlers require. Also removed a dead
+  `from hermes_tools import web_search`: `hermes_tools` appears in no
+  requirements file, so that branch raised ImportError on every stock install and
+  degraded to a "[Tool error: ...]" string.
+
+- **ARCH-ENG-165 — `approved=True` authorized nothing.**
+  `AuthorizedActionDispatcher.authorize` upgraded `NEEDS_APPROVAL` to `ALLOWED` on
+  a bare boolean, never consulting the queue or `assert_approval_covers`. The
+  HIGH-TRUST handlers re-check themselves and were never exposed, but
+  `file_write` / `run_command` / `workshop_payment` executed on the caller's
+  assertion alone. `dispatch.execute_tool` now accepts an `approval_id` and
+  VERIFIES it against the shared queue, binding the approval to this exact tool
+  and these exact arguments; `main.py` passes it. The no-id path is unchanged for
+  compatibility, but its reason now reads UNVERIFIED so it cannot be mistaken
+  for the verified path.
+
+- **ARCH-ENG-166 — three shared-state defects with no owner.**
+  `HumanApprovalQueue` locked its WRITES but not its reads, and `_items` is also
+  truncated by the history bound; `find_by_id` is what every irreversible-action
+  consumer uses to confirm a human decision, so a torn read there is a
+  financial-integrity bug. `decide()` was worse — `_find()` and the PENDING check
+  ran BEFORE the lock, so two threads could both decide the same irreversible
+  action. `EventBus` retention maps (`_inflight`, `_delivered`, `_edges`,
+  `_tokens`, `_tokens_by_corr`) were cleared only by `reset()` and grew for the
+  life of the process; now bounded FIFO, exempting IN_FLIGHT messages so a live
+  correlation chain is never truncated out from under `_prior_sources`. And
+  there were THREE independent copies of the `nvidia-smi` query, two of them the
+  `capture_output=True` form that ARCH-ENG-116 showed raises WinError 50 on
+  Windows under a reconfigured stdout pipe — so GPU detection and VRAM sizing
+  silently reported "no GPU". All three now share the hardened temp-file
+  invocation.
+
+- **ARCH-ENG-167 — the source root accumulated one-shot debris with no owner.**
+  Eight one-shot restructuring scripts sat in the source root beside `main.py`:
+  `_migrate_agents.py`, `_migrate_app.py`, `_migrate_gui.py`, `_migrate_tests.py`,
+  `_dbg3.py`, `_dbg4.py`, `_fix_mgmt.py`, `_verify_arch_eng_143.py`. Each was a
+  completed migration, and together they encode the PRE-restructure layout — so
+  leaving them there is an invitation to re-run a migration that already
+  happened. Also a 0-byte `NUL` (which Windows refuses to delete through the
+  normal path, because `NUL` is a reserved device name — which is precisely why
+  it survived every earlier tidy-up), `_routine_output.log`, and — in `scripts/` —
+  `github_upload.pyc` / `sync_github_upload.pyc`, stale bytecode for
+  `tools/github_publish/` modules sitting in a directory with no `.py` source at
+  all. Every one was git-ignored, which is exactly why they accumulated
+  unnoticed: `git status` never showed them.
+  Quarantined under `.mrbot_backups/arch_eng_167_root_debris/` (moved, not
+  deleted); the orphan bytecode removed. The suite also closes the last
+  documentation gap by asserting that every `requirements-*.txt` the README
+  references actually exists.
+
+### Changed
+
+- The coinbase adapter test now SKIPS when the optional `ccxt` dependency is
+  absent instead of failing, and a new test asserts the adapter fails CLOSED
+  without ccxt rather than stubbing an empty portfolio that would read as
+  "no holdings" instead of "cannot tell".
+- `ARCHITECTURE_MAP.md` was largely a record of superseded Phase 1-9 work: its
+  complexity table listed five files that no longer exist at those paths
+  (`gui/dual_brain_control.py`, `gui/tab_builders.py`, `manager.py`,
+  `agents/base_worker.py`, `agents/tool_calling.py`) and its executive
+  assessment counted 158 modules under `agents/` (now 227) and 23 under `gui/`
+  (now 37). Replaced with a current map; the historical detail lives in git.
+
+### Suite
+
+2437 passed, 11 skipped, 265 subtests. The 11 failures present on 2.1.112 were 7
+missing-dependency, 3 release-record and 1 version-drift; all are addressed, and
+each is now covered by a test that fails if the invariant regresses.
+
+## [2.1.112] - 2026-10-15 - Phantom/duplicate GPU rows in the Providers & GPU status panel
+
+### Fixed
+- **The GPU Status panel rendered empty placeholder panels that looked like a
+  duplicated device.** Right after a GPU is recovered (or mid driver re-init)
+  `nvidia-smi` can emit a phantom row — an empty name with 0 MB — or repeat an
+  index. `ProviderManager._detect_gpus` accepted every row, so the cache held
+  both the phantom and the real entry for the same index. `setup_ui` then looped
+  over the list and `addWidget`-ed one panel **per row** while
+  `self.gpu_widgets[gpu.index]` (a dict keyed by index) kept only the last — so
+  the operator saw 4 panels (2 empty + 2 real) for 2 GPUs, and the real panel's
+  live refresh was orphaned. Reproduced by execution: injecting a phantom +
+  duplicate list produced **4 panels created / 2 tracked**.
+- Two fixes, source and render:
+  1. `agents/providers/provider_manager.py:_detect_gpus` now validates each row
+     (index ≥ 0, non-empty name, memory > 0) and dedupes by index before it
+     enters the cache — a phantom never becomes a device.
+  2. `gui/widgets/dual_brain_control.py:setup_ui` dedupes by index and skips
+     unusable rows before rendering, so an empty panel can never appear even if a
+     phantom slips through. Colour assignment now follows the *shown* count, so
+     the surviving panels keep the intended palette order.
+- Verified: the same phantom+duplicate injection now yields **2 panels created /
+  2 tracked**, both real GPUs.
+
+### Tests
+- `tests/providers` 60 passed / 1 skipped / 15 subtests.
+- `tests/gui` 211 passed / 1 skipped.
+
+## [2.1.111] - 2026-10-15 - Providers & GPU start check crash + wrong CPU/RAM label on the 2nd GPU
+
+### Fixed
+- **`name 'DualBrainRuntime' is not defined` broke both brain Start buttons.**
+  `ProviderLifecycleBackend._runtime_from_settings()` (added in ARCH-ENG-153)
+  called `DualBrainRuntime.from_settings()` with no import of its own; every
+  *caller* imported it locally, so the helper raised `NameError` on first use and
+  the bare `except` in `_probe_before_start` surfaced it as
+  "❌ Small/Big Brain start check failed: name 'DualBrainRuntime' is not defined".
+  Added the function-local import. (`gui/workers/provider_lifecycle_backend.py`)
+- **A restored 2nd GPU rendered as a duplicate "CPU / System RAM" row.**
+  `BrainConfig.__post_init__` seeded `gpu_label` from `ROLE_DEFAULTS`, whose SMALL
+  entry was the hardcoded legacy literal `"CPU / System RAM"` — so a small brain
+  targeting a real GPU stayed mislabeled until the GUI overwrote it, making the
+  panel look like it showed the CPU twice. The label now derives from the config's
+  own `device` (`GPU {n}` / `CPU / System RAM`); no hardcoded card assumption.
+  `apply_hardware_fallback` now also corrects the label unconditionally when the
+  target GPU is genuinely absent (previously gated on `gpu_layers != 0`, so an
+  already-zero config kept the wrong text). (`agents/runtime/dual_brain.py`)
+
+### Tests
+- `tests/runtime` 255 passed / 11 subtests; `tests/brains` + `tests/dialogue`
+  399 passed / 3 skipped / 32 subtests.
+
+## [2.1.110] - 2026-10-15 - The monetary-evidence check that ran on every turn and told the operator nothing (ARCH-ENG-157)
+
+### ARCH-ENG-157 — `check_numeric_support` ran, found the fabrication, and had no reader (P1, honesty + observability)
+
+ARCH-ENG-156 wired `DialogueHonestyService.check_numeric_support` into every
+dialogue turn and proved the wiring non-vacuous with source-level mutation
+tests. It stopped one level too early: **the check's finding had no consumer.**
+
+The call site in `DialogueTab._on_response_ready` invoked the check and
+discarded its return value. `numeric_gaps()`, `has_numeric_gaps()` and
+`to_dict()["numeric_gap_count"]` had **no caller anywhere outside the test
+suite** — OBSERVED by a repo-wide grep for `numeric_gap` / `numeric_gap_count`
+returning only `dialogue_honesty.py` itself and two test files.
+
+So the deterministic detector did its job on every turn, recorded
+`values: ["$9,999.00"]` for a persona that was never shown such a figure, and
+told nobody. The operator's fabrication-cascade report — *"a persona can state a
+dollar figure with no evidence behind it"* — was still true, and the project had
+already shipped the fix twice: once in the check (156) and once in the
+accounting layer that never imports it (155). A guard that cannot be seen is
+not a guard, and it is the same "silently dead" class as an unwired one.
+
+**Fixed by giving the finding a reader.** `_report_numeric_gaps(speaker, gaps)`
+emits one operator-visible system line through the same channel the live
+progress guard already uses (`append_system`), naming the persona, the
+unsupported values, and what to do about it.
+
+The contract deliberately preserves the ARCH-ENG-156 reporter-not-gate shape:
+
+- **Nothing is suppressed or blocked.** The turn is already committed to the
+  transcript by the time the check runs; the notice is additive, not a verdict.
+- **It never declares a value false.** A number the model derived arithmetically
+  from its context is legitimate and this method cannot know which, so the
+  wording says *"does not appear in the context that turn was shown"* and asks
+  the operator to **verify** — never "fabricated", never "false".
+- **It is not financial truth.** Verified revenue still comes only from payment
+  evidence; nothing here books, records, or contributes a dollar amount.
+- **Untrusted text is escaped.** The values are model output entering an HTML
+  sink, so every one is `html.escape`d. OBSERVED: `$<script>alert(1)</script>`
+  renders as `$&lt;script&gt;alert(1)&lt;/script&gt;`.
+- **A display failure cannot cost the operator the turn.** The caller is wrapped,
+  and `append_system` raising leaves the reply in the transcript.
+
+### Verification
+
+- **Mutation-tested, not asserted.** `test_reporting_line_deletion_is_caught`
+  copies the repo to a temp dir, deletes the `self._report_numeric_gaps(...)`
+  line on disk, runs a probe in a fresh interpreter, and requires it to fail
+  with *"the operator was never told"*. Deleting the reader is now detectable,
+  which is the property ARCH-ENG-156's own tests were missing.
+- **OBSERVED by execution** through the real `_on_response_ready`: fabricated
+  value → 1 notice, `numeric_gap_count: 1`; value the model *was* shown → 0
+  notices; no request context → 0 notices; `append_system` raising → turn still
+  lands; 12 gaps → 1 notice with `(+7 more)`.
+- **Full suite:** `python -m pytest tests/ -q
+  --ignore=tests/engineering/test_cycle_071_075.py` → **2300 passed, 5 skipped,
+  265 subtests passed** (was 2290/5/265), 353s. Zero regressions.
+
+### The lesson, which is the third instance of one shape
+
+ARCH-ENG-155 (`economic_policy`), 156 (`numeric_evidence`) and now 157 are the
+same defect wearing different clothes: **a complete, deterministic, tested
+mechanism with no production path that behaves differently because of it.**
+
+155: the gate existed, nothing imported it.
+156: the gate was imported, but read a context that had already been poisoned.
+157: the gate ran correctly and its result was dropped on the floor.
+
+The general rule this cycle adds to the maintenance skill: *after wiring a
+detector, grep for the reader of its output.* A `*_count` accessor, a
+`has_*()` predicate, or a `to_dict()` field with no caller is the signature —
+and `to_dict()` fields are the easiest to leave unconsumed, because writing one
+feels like finishing the work.
+
+
+## [2.1.109] - 2026-10-15 - The monetary-evidence check that could not see a fabricated dollar figure, and the test run that wrote invented earnings into the operator's memory (ARCH-ENG-156)
+
+### ARCH-ENG-156 — `numeric_evidence` was a complete deterministic gate imported by nothing (P1, financial integrity + honesty)
+
+A repo-wide orphan sweep over `agents/`, `gui/` and `main.py` (every module
+with no non-test importer) returned two hits. One was the same defect as
+ARCH-ENG-155: **`agents/evidence/numeric_evidence.py` — the deterministic check
+that catches a monetary value a model cites which appears nowhere in the context
+it was shown — had 13 passing unit tests in
+`tests/dialogue/test_honesty_stack.py` and was imported by nothing in
+production.** Its functions were reachable only through the lazy
+`agents/__init__.py` export table, which nothing called either.
+
+So a persona could reply *"I earned $9,999.00 on Upwork today."* to an operator
+who was shown no such figure, and the honesty stack — FactLedger, OperatorOverride,
+EpistemicCalibration, all wired and live in the Dialogue tab — would record the
+*sentence* as a PROPOSED claim and never notice the number inside it had no
+evidence. The check existed, was deterministic, and could not be argued out of a
+finding by anything inside the untrusted text it inspects. It simply never ran.
+
+Fixed on both sides:
+
+- **The check now runs on every dialogue turn.** `DialogueHonestyService` gained
+  `check_numeric_support(response_text, context_text)`, `numeric_gaps()` and
+  `has_numeric_gaps()`, and `to_dict()` reports `numeric_gap_count`. The call
+  sits next to the existing `record_claims` call in `_on_response_ready` — the
+  only `record_claims` call site in the repo, so no consumer is silently left
+  unchecked.
+- **It is a reporter, never a gate.** A value the model legitimately derived
+  arithmetically is surfaced, not suppressed; the check's return value is
+  discarded at the call site and cannot block or abort a turn. Revenue is still
+  realized ONLY from verified payment evidence — this changes what the operator
+  can *see*, never what the system books.
+- **The context is captured at REQUEST time.** The reply is appended to
+  `conversation_history` *before* the honesty call, so re-reading the context
+  there would contain the reply's own `$9,999.00` and report zero gaps — a
+  self-poisoning vacuous guard, the exact ARCH-ENG-152 lesson. `respond()` now
+  stores `self._last_request_context` and the check uses it. OBSERVED by
+  execution: request-time context → `['$9,999.00']`; post-reply context → `[]`.
+
+### The tests that claimed to protect it were themselves vacuous — twice
+
+Independent review caught this, and it is the more important half of the entry.
+
+**Round 1.** The first 15 tests built a `DialogueHonestyService` directly, so
+reverting the wiring to a post-reply re-read left every test green. Fixed by
+adding `tests/dialogue/test_numeric_support_wiring.py`, which drives the real
+`DialogueTab._on_response_ready`.
+
+**Round 2.** Review then found the *capture* half was still vacuous: the fixture
+injected `_last_request_context` by hand, so **deleting the production capture
+line left the whole suite green** — a silently dead check with a passing run.
+Fixed by driving the real `respond()` (stub worker, Qt signals stubbed) and by
+`test_capture_line_deletion_is_caught`, a real source-level mutation test that
+deletes the capture line on disk, asserts the capture test fails in a fresh
+subprocess, then restores byte-for-byte.
+
+**Mutation-tested, not asserted.** Both mutations were run by the implementer and
+independently re-run by the Reviewer:
+
+| Mutation at the wiring | Suite result |
+|---|---|
+| call site re-reads `get_dialogue_context()` post-reply | **FAILED** |
+| call site passes `""` (context never captured) | **FAILED** |
+| capture line deleted from `respond()` | **FAILED** (was green before this fix) |
+
+### ARCH-ENG-156b — the test run wrote fabricated earnings into the operator's LIVE memory
+
+Review round 3 found the fix's own tests were committing the defect they existed
+to prevent. `_on_response_ready` calls `_persist_dialogue_turn` →
+`get_database()` → `MemoryDatabase()`, and `DB_PATH` had **no override**, so the
+wiring tests wrote **120 invented persona turns** — `"I earned $9,999.00 on
+Upwork today."` ×24 and four siblings — into the operator's real
+`dual_brain.db` conversation memory. The 120 rows were deleted and the file
+verified intact afterwards.
+
+This is the third instance of the same class: ARCH-ENG-049 (`.env`) and
+ARCH-ENG-057 (`settings.json`) were each fixed with an env-var redirect plus a
+session guard. The memory DB had neither.
+
+- **`MRBOT_DUAL_BRAIN_DB_PATH` redirects `DB_PATH`.** Production resolves to
+  `<repo>/dual_brain.db` exactly as before; only the env var moves it.
+  `MemoryDatabase`'s default follows it, so `get_database()` is isolated too.
+- **`tests/conftest.py` sets the redirect** to a throwaway temp file, purged at
+  start and at exit, and `<repo>/dual_brain.db` was added to the
+  `_operator_env_is_untouched` session guard.
+- **The guard is proven non-vacuous.** `tests/test_memory_db_isolation.py`
+  asserts the production path is unchanged, that the redirect is honoured by
+  `MemoryDatabase`'s default, that conftest sets it, and — via a subprocess that
+  writes the live DB with the redirect removed — that the session guard actually
+  fails. OBSERVED: `AssertionError: the test suite modified
+  D:\MrBot1000_2.0\dual_brain.db`.
+
+**Verified:** `python -m pytest tests/ -q
+--ignore=tests/engineering/test_cycle_071_075.py` → **2290 passed, 5 skipped,
+265 subtests passed**, and the full run leaves `dual_brain.db` **byte-identical**
+(sha256 before == after, 558 conversations, `PRAGMA integrity_check` = ok).
+
+### Two follow-on defects the fresh-clone gate caught in this very fix
+
+The mandatory fresh-clone gate (a clone has none of the gitignored live files,
+so a test that depends on them fails shipped even though it passes locally)
+earned its place twice more in this cycle:
+
+1. **The session guard failed every fresh clone.** `dual_brain.db` and
+   `settings.json` are gitignored, so a clone starts without them. The guard
+   snapshotted `None` and then failed when a test legitimately created the file
+   — 76 passed, 1 error on every clone run, which would have made the gate
+   useless exactly where it matters most. `absent_at_start` now distinguishes
+   "did not exist" from "was modified": a file created during the run is
+   accepted and removed so the tree is left as found; a file that already
+   existed must still be byte-identical.
+2. **The mutation test rewrote the whole file's line endings.** It read and
+   wrote `dialogue_tab.py` in text mode, so the restore normalised CRLF→LF and
+   left the file byte-different — the guard then reported a spurious
+   modification of a file the test only borrowed. Binary I/O on both paths, and
+   a binary compare for the byte-exact check (the old text-mode compare would
+   have normalised away the very difference it existed to catch).
+
+**Fresh-clone gate, final:** `python -m pytest tests/ -q
+--ignore=tests/engineering/test_cycle_071_075.py` in a clean clone →
+**2279 passed, 16 skipped, 265 subtests passed**, `git status --porcelain`
+empty afterwards (the 16 skips are the tests that require the operator's
+gitignored live files).
+
+
+
+## [2.1.108] - 2026-10-15 - The autonomous loop could not reject an unprofitable opportunity, and the deterministic gate layer that would have said so was imported by nothing (ARCH-ENG-155)
+
+### ARCH-ENG-155 — `check_economics` computed the hourly return and then threw it away (P1, earning autonomy + financial integrity)
+
+`AutonomousLoop._stage_check_economics` computed `estimated_hourly`, appended a
+`StageResult` with `status=COMPLETED`, and **returned nothing**. `_run` called it
+as a bare statement, so there was no verdict to act on. OBSERVED by execution
+against the real stage: an opportunity with `advertised_amount=5`,
+`estimated_net_value=-500`, `estimated_effort=200` produced
+`estimated_hourly: -2.5` and `status: completed` — and the loop went on to plan,
+**execute**, submit and account work that loses money on every axis.
+
+**The logic to prevent this already existed and ran only in its own tests.**
+`agents/earning/economic_policy.py` is a complete deterministic gate layer —
+`EconomicPrediction` (validated inputs, derived net value / productive hours /
+risk-adjusted return, staleness), `DecisionPolicy` (minimum net value, minimum
+risk-adjusted hourly return, payment delay, confidence, risk penalty,
+productive hours, autonomy level) and `evaluate_prediction` (the
+legality/capability/identity/evidence hard gates) — with 7 passing unit tests.
+OBSERVED: a repo-wide grep for an import of `economic_policy` outside `tests/`
+returned **0 hits**, and no production file referenced `EconomicPrediction`,
+`DecisionPolicy` or `DecisionAction`. The gates were dead code; the loop's own
+economics stage was a recorder, not a gate.
+
+Fixed on both sides:
+
+- **The stage is now a gate.** It builds an `EconomicPrediction` from what the
+  opportunity actually carries, evaluates it against the operator's policy, and
+  **returns False on DEFER/REJECT** — the loop's existing stage-failed contract
+  (the one `_stage_deduplicate` and `_stage_validate` already use), so `_run`
+  finalizes as a **reject that never reaches `execute`**. A reject is a
+  decision, not a failure claim, and the reason names the verdict:
+  `Economic policy did not select this opportunity: expected_net_value_below_policy`.
+  The stage data now carries `policy_action`, `policy_version`, `policy_reasons`,
+  `policy_expected_net_value` and `policy_risk_adjusted_hourly`, so the
+  ExplanationBuilder and the run ledger show *why*.
+- **The thresholds are operator data, not literals.** New
+  `economic_policy.load_policy()` reads them from `settings.json` under
+  `"economic_policy"`, honoring `MRBOT_DEVICE_SETTINGS_PATH` so a test can never
+  read (or clobber) the operator's live settings. Every value is validated
+  through the same `DecisionPolicy.__post_init__` a hand-built policy passes, so
+  an out-of-range setting keeps the default rather than inverting a gate
+  mid-run; a `bool` is rejected as a number; a key that does not match a
+  `DecisionPolicy` field cannot configure anything.
+
+**The prediction reproduces the estimate the loop already trusts.**
+`EconomicPrediction.expected_net_value` is *derived* (`payout × p_success ×
+p_payment − costs`), so leaving the probabilities at their `0.0` defaults made
+the derived value `−startup_cost` regardless of the opportunity's own estimate —
+every opportunity would have been declined for the wrong reason (caught by
+`test_policy_net_value_reproduces_the_opportunity_estimate` during
+implementation, which is why the two prior cycles' `test_loop_requests_approval_for_high_value`
+failures appeared and were then correctly resolved). Probabilities are now fixed
+at `1.0` and the whole advertised-vs-estimated gap is carried as `startup_cost`,
+so the arithmetic reproduces the opportunity's estimate **exactly**: OBSERVED
+`policy_expected_net_value: -500.0` for the `-500` opportunity.
+
+**Fail-open on an uncomputable gate, never on a broken policy.** A prediction the
+policy layer refuses (e.g. an illegal `confidence`) is caught, recorded on
+`result.errors` as `Economic policy error: ...`, and keeps the pre-existing
+COMPLETED behaviour — a policy bug must not halt the autonomous loop. But a
+corrupt or absent `settings.json` does **not** disable the gate: `load_policy`
+returns the shipped defaults, so OBSERVED the opportunity is still declined
+(verified by `test_corrupt_settings_still_declines`).
+
+### Verification (all by execution, not inspection)
+
+- New `tests/engineering/test_arch_eng_155_economic_policy_gate.py`: **16 passed**
+  with the fix — the reject, the reason string, the stage status, the
+  net-value fidelity, the fail-open path, the corrupt-settings path, and 9
+  `load_policy` contract tests (defaults, applied threshold, out-of-range
+  fallback, non-numeric, bool, corrupt file, missing file, unknown key, and an
+  operator threshold changing the verdict end-to-end).
+- **Teeth proven in a throwaway clone** with `autonomous_loop.py` reverted to
+  `de0396a` (the loader left in place so the module imports): **7 failed / 9
+  passed** on unfixed source; 16 passed with the fix. The 9 that pass both ways
+  are the `load_policy` contract tests, which are correctly independent of the
+  loop.
+- Regression sweep: `tests/earning` + `tests/engineering` **954 passed / 65
+  subtests**; `tests/gui` **211 passed / 1 skipped**. No regressions.
+- `git status --porcelain` reviewed before staging (staged by filename, never
+  `-A`); the operator's `settings.json` and `.env` verified byte-untouched.
+
+## [2.1.107] - 2026-10-15 - Every wallet surface in the Earnings tab was dead, and fixing the wiring would have booked a wallet BALANCE as revenue (ARCH-ENG-154)
+
+### ARCH-ENG-154 — Add Wallet, Propose Payment and the crypto wallets table could not work (P1, GUI + runtime correctness)
+
+`EarningTab._get_wallet_manager()` guarded
+`hasattr(self.main_window, "payments_tab")`. `create_payments_tab()`
+(`gui/builders/tab_feature_builders.py:562`) stores the tab as
+`self._payments_tab`, and `MainWindow` exposes **no** `payments_tab` attribute
+or property anywhere in the repo. OBSERVED by execution against the real
+MainWindow shape: `hasattr(main, "payments_tab")` -> **False**,
+`hasattr(main, "_payments_tab")` -> **True**. The guard was permanently False,
+the method always returned `None`, and **all five** call sites were dead:
+
+| surface | pre-fix behaviour (reproduced) |
+|---|---|
+| Add Wallet | `critical: 'NoneType' object has no attribute 'add_wallet'` |
+| Propose Payment | `critical: 'NoneType' object has no attribute 'get_wallet'` |
+| crypto wallets table | 0 rows, always |
+| `get_summary()` | wallet contribution never ran |
+
+A second dead link sat behind the first: `PaymentsTab.wallet_manager` was
+hardcoded `None` and never assigned, so even a correct attribute read would
+have handed back `None`. A third: `RealCryptoOperator` was constructed with
+`None` as its wallet manager, so `CryptoPayments.create_payment` raised on the
+same click.
+
+Fixed on all three, with **one shared store** so a wallet added on either
+surface is visible on both — `WalletManager.shared()` in
+`agents/integrations/wallet.py`, consumed by `PaymentsTab`, `EarningTab` and
+the crypto operator. `_get_wallet_manager()` now reads `payments_tab` **or**
+`_payments_tab` (so it holds if MainWindow ever grows the public name) and
+falls back to the shared store rather than `None`.
+
+Verified by execution: Add Wallet writes to the store with no error dialog,
+Propose Payment now reaches the **human-approval gate**
+(`status: awaiting_approval`, `approval_id` returned — the ARCH-ENG-130 scoped
+gate, not a bypass), and the crypto wallets table renders rows.
+
+**Second pass found the hazard one step later, in the worse direction.**
+`get_summary()` added every **USD wallet balance** to `earned`. It never ran
+while the wiring was broken — and *fixing* the wiring would have ACTIVATED it.
+Reproduced with the fix in place: one wallet, `currency="USD"`,
+`balance=500.0`, **zero** verified payments -> `get_summary()` returned
+`earned=500.0`, which the Insights panel renders as
+`💰 Earned: $500.00`. Same bug class as `PayoutVerifier.verify_crypto`'s
+`observed_usd = current` — a balance is not revenue. A wallet can hold funds the
+agent never earned (a transfer in, an airdrop, an operator top-up) and nothing
+here attributes any of it to completed work.
+
+Removed rather than repaired: the honest `earned` comes from verified payment
+evidence (`economic_accounting`, L3+), which this tab cannot reach. Reporting a
+wallet total under an "Earned" label is a fabrication at any wiring state. The
+wallet **list** still renders in the table, which the wiring fix did make work.
+
+### Verification (all by execution, not inspection)
+
+- New `tests/gui/test_arch_eng_154_wallet_wiring.py`: **10 passed** with the fix.
+- **Teeth proven in a throwaway clone** with all three production files reverted
+  to HEAD: **9 failed / 1 passed**. The single pass is
+  `test_main_window_shape_really_has_no_public_payments_tab`, which asserts the
+  reproduction's premise and correctly holds on both sides.
+- One pre-existing test asserted the defect itself —
+  `tests/gui/test_earning_gui.py:24` asserted
+  `_get_wallet_manager() is None  # parent-less`, i.e. that the bug was the
+  contract. Updated to `is not None`, with the reason recorded at the site.
+- Regression sweep after the fix: `tests/gui tests/earning tests/engineering`
+  **1149 passed / 1 skipped / 65 subtests** (was 1 failed against the stale
+  assertion). The `.env` / `settings.json` / `wallets.json` operator files are
+  untouched by the source change.
+
+### OPEN FINDING (carried forward)
+
+- **[test-integrity][P2] A shared singleton under test writes the operator's
+  real state file.** Making `WalletManager.shared()` the single store gave every
+  tab constructor a real on-disk handle, and the new tests then wrote **11 fake
+  wallets** into `~/.mrbot1000/wallets.json` — a file that did not exist before
+  the run — including one with `currency="USD", balance=500.0`, which the
+  Payments tab rendered as `Total Balance: USD: 500.0000`. Fixed in the same
+  commit: `_IsolatedWalletStore` points `_SHARED` at a temp dir for the test's
+  duration and restores the prior value. It is **shape-tolerant**
+  (`getattr(..., "<absent>")`) so the pre-fix class is exercised for behaviour
+  rather than dying in `setUp` — a negative control that fails in the fixture
+  proves nothing. **Rule: any singleton that resolves to a real file in
+  `__init__` needs this guard before it is used by a test.**
+
+- **[architecture][P2] Two wallet stores, one wallet concept.**
+  `agents/integrations/wallet.py::WalletManager` (address-keyed, plaintext
+  balances, `~/.mrbot1000/wallets.json`) and
+  `agents/integrations/wallet_manager.py::WalletManager` (name-keyed, Fernet-
+  encrypted, `resolve_wallet_root`) are separate classes with separate files.
+  The payout verifier and `main.py`'s payout path use the encrypted one; the
+  Payments/Earnings tabs and `RealCryptoOperator` use the plaintext one. A
+  wallet added in the GUI is invisible to `verify_crypto`, so a GUI-proposed
+  payout cannot be verified against the wallet the operator just added. Not
+  fixed here: merging them is an architecture decision, and the shared instance
+  only unifies each side with itself.
+
+## [2.1.106] - 2026-10-15 - A debounced roster edit lost the race to the launch that reads it, the last 46 hardcoded repo roots are swept, and eight landed commits are finally recorded (ARCH-ENG-151/153)
+
+### ARCH-ENG-153 — a debounced roster edit launched the PREVIOUS model (P1, GUI + runtime correctness)
+
+`f345698` debounced `BrainRosterPanel._on_changed` behind a 400 ms timer to
+stop the `settings.json` fsync storm. The write was correct. What was missed
+is that the **launch path reads the roster back from disk** —
+`_probe_before_start` → `DualBrainRuntime.from_settings()` →
+`BrainRoster.load_or_none(root)` → `settings.json` — and reaches none of the
+save handlers, so nothing flushed between the edit and the read. Edit the
+Big-brain model field, click Start inside the window, and llama-server starts
+the model the operator just replaced. No error, no log line.
+
+Reproduced by execution against the real panel + real roster + real runtime:
+
+| step | `settings.json` Big-brain model |
+|---|---|
+| after the operator's edit (write still pending) | `models/OLD-BIG.gguf` |
+| after `flush_pending_roster_edit(panel)` | `models/NEW-BIG.gguf` |
+| what the launch path then reads | `models/NEW-BIG.gguf` |
+
+Fixed on the **read** side, not the write side: `flush_pending_roster_edit()`
+in `gui/widgets/brain_roster_panel.py`, called from a new
+`_runtime_from_settings()` helper that replaces all **7** direct
+`from_settings()` call sites in `gui/workers/provider_lifecycle_backend.py`.
+One helper rather than seven edits, so a future call site cannot reintroduce
+the lag. It writes nothing when no edit is pending — no-op on hot paths, so
+the fsync storm `f345698` closed stays closed — and never raises, so a failed
+flush cannot abort a brain start.
+
+Verified: **5 FAILED** with the fix stashed, **5 passed** with it;
+`tests/engineering tests/gui tests/runtime tests/brains` **828 passed /
+1 skipped / 71 subtests**. Pre-debounce behaviour is the fallback (write on
+keystroke), so this restores the ordering the debounce accidentally removed.
+
+**Second pass found the same hazard one path later, in the worse direction.**
+`DualBrainControl.cleanup()` runs on window close, but the roster panel
+exposes no `cleanup()` of its own — so teardown never flushed it. The panel's
+only writer is the 400 ms timer, and closing the window stops the event loop
+before it fires: an edit made in the last moments was silently **discarded on
+every exit**, not merely applied late. Verified by execution (after a real
+combo edit, `panel.roster` holds `models/NEW-BIG.gguf` while `settings.json`
+still holds `models/OLD-BIG.gguf` and the timer is active), then fixed by
+flushing first in `cleanup()`, before it stops the status poller and joins
+workers. Teeth: `test_teardown_also_flushes_the_pending_roster_edit` FAILED
+with the fix stashed, passed with it.
+
+Final regression sweep: `tests/engineering tests/gui tests/runtime tests/brains
+tests/dialogue tests/cognition tests/providers` **1276 passed / 5 skipped /
+118 subtests**; `tests/safety tests/platforms tests/integrations tests/earning`
+**830 passed / 147 subtests**.
+
+### ARCH-ENG-151 — the last 46 hardcoded repo roots are swept, and a guard terminates the loop (P2, test integrity / fresh-clone)
+
+Closes the open finding recorded under v2.1.105. The literal
+`D:\MrBot1000_2.0` in a test module is only wrong in a fresh clone, and wrong
+*silently*: the import resolves to the **live** repo, so conftest's
+`import main` runs `load_dotenv(..., override=True)` against the operator's
+real `.env` and pushes `BIG/SMALL_BRAIN_PROVIDER` into `os.environ` — the
+suite then asserts against operator config instead of the release (the
+ARCH-ENG-149 reproduction). ARCH-ENG-148/149 fixed three files; **46 more
+carried the literal**, and one-at-a-time fixes cannot converge because each
+fix is invisible to the next investigator.
+
+- 46 test modules now derive the root from `Path(__file__).resolve().parents[2]`.
+- New `tests/engineering/test_arch_eng_151_no_hardcoded_repo_root.py` fails if
+  any test module reintroduces the literal in executable code. Four per-file
+  exemptions, each re-asserted (an exempt file that later uses the literal in
+  real code fails), plus an anti-vacuity probe and a sweep-regression list.
+
+Verified by execution: the guard **1 failed** on HEAD before the sweep and
+**4 passed** after. Fresh clone at `ada3e53`, no `.env`:
+`tests/engineering` **355 passed / 60 subtests**; `tests/brains
+tests/cognition tests/dialogue tests/engineering tests/providers
+tests/runtime` **1068 passed / 4 skipped / 118 subtests** — byte-identical to
+the same run in the real tree (**1068 / 4 / 118**), which is the point: the
+clone now measures the release, not the operator's machine.
+
+### Recorded late: eight commits that landed after v2.1.105 with no version touch
+
+Sibling agents landed these between cycles. Each was verified present and
+sound in HEAD by execution before being recorded here — no entry claims work
+that is absent from this release.
+
+- `f3f21dd` / `10bae19` — frozen GUI KPI labels. LLM Spend / Tier / Heartbeat
+  / Uptime rendered at placeholders whose setters had no callers, so they read
+  as real facts forever; now derived from the event log (`llm_spend.est_usd`
+  summed, heartbeat tier + recency, session-elapsed uptime). The interim fix
+  shows an honest em-dash rather than `$0.00`/`stopped`. Teeth:
+  `tests/gui/test_earning_insights_kpi_wiring.py` **7 passed**.
+- `62bb866` / `70463b3` — provider status probe. `_probe_providers` emitted one
+  entry per `runtime.slots()` while the GUI renders per visible row, so
+  `_apply_slot_statuses` (index-matched) left extra rows stuck at
+  `Checking...`; now per visible row. `urlopen(timeout=N)` is a *per-operation*
+  timeout, so a trickling llama-server kept the read alive past N and blocked
+  the whole refresh; now a hard 2 s deadline per check via
+  `_probe_with_deadline`. Closed the last red test in the file —
+  `test_slot_lifecycle.py::test_per_slot_probe_updates_all_rows`, **23 passed**.
+- `f345698` — roster save debounce (the fix ARCH-ENG-153 then corrected).
+- `b9bb790` / `f007f44` / `25170ff` / `d5c2456` / `592e717` — dead-code removal
+  across `performance.py`, `dual_brain_control.py`, `dialogue_tab.py`,
+  `brain_control_row.py`. Verified by `git grep` on HEAD: **0 remaining
+  references** for every removed symbol.
+
+### Process note (carried from v2.1.105, now acted on)
+
+The previous entry recommended the cron take the version bump at end of cycle
+for whatever is on HEAD, rather than each fix deciding whether it deserves
+one. This entry is that mechanism running: the bump covers eight sibling
+commits plus this cycle's two fixes.
+
+## [2.1.105] - 2026-10-15 - The changelog claimed two fixes that were not in the release, the provider config applied nothing, the autonomous loop could not execute, and a fresh clone could not pass its own suite (ARCH-ENG-143/144 landed, 146/147/148)
+
+Three defects on the earning/autonomy path, each reproduced by execution before
+the fix and re-verified against the real objects afterwards.
+
+### ARCH-ENG-143/144 — v2.1.104 recorded work that was not in the release (P0/P1, process + financial)
+
+The v2.1.104 entry described ARCH-ENG-143 (a verified payment discarded) and
+ARCH-ENG-144 (a fail-open win-rate guard) as released. They were not. Verified
+against `git show` on each of the four commits that entry named: only
+ARCH-ENG-145 (`6335ed4`, `cost.py`) had landed — `HEAD:app/earning_memory.py`
+contained no `platform_key`, and `HEAD:agents/services/autonomous_loop.py`
+carried no `payment_evidence` capture. The code existed only in the working
+tree, so the documented release was a record of work a fresh clone would not
+contain.
+
+Landed in `6e4028b` and teeth-proven in a throwaway clone of the parent commit
+`e9dbc07`: `test_arch_eng_143_144_145.py` → **8 FAILED, 9 passed** on the
+pre-fix source, **17 passed** with the fixes. No version bump was taken for that
+commit — v2.1.104 was already the authority, and the commit makes the existing
+entry true rather than adding a second one.
+
+### ARCH-ENG-146 — editing provider config announced "changes applied" and applied nothing (P1)
+
+`ProviderHotReload.apply_changes` is the only code that pushes new `.env` values
+into `os.environ`, and it had **zero callers**. `main.py`'s
+`_on_provider_config_changed` re-detected providers from the unchanged
+`os.environ` and then hit a literal `pass` where the UI refresh belonged — so a
+runtime config edit was detected, logged, and applied to nothing.
+
+Verified by execution against the real singletons:
+
+| step | `os.environ` has the key |
+|---|---|
+| PRE-FIX (re-detect only — what used to run) | `False` |
+| POST-FIX `apply_changes({KEY: "sk-simulated"})` | `True`, value pushed |
+| `apply_changes({KEY: ""})` | key removed, not blanked |
+
+The singleton-identity P0 (`f98dd98`) is asserted in the same file, since a
+broken `instance()` makes every call site bind the class. New regression test
+`tests/providers/test_provider_hot_reload_applied.py` covers the contract, the
+env push, the clear-on-blank path, and the GUI wiring itself, so a future
+refactor cannot re-detach the applier.
+
+### ARCH-ENG-147 — the autonomous loop could not execute a task at all (P1)
+
+`AutonomousLoop._stage_execute` guarded on
+`hasattr(self.task_executor, 'run')` and called `self.task_executor.run(task)`.
+`TaskExecutor` defines `execute(self, task, entry)` and no `run`. OBSERVED:
+`hasattr(TaskExecutor, 'run')` is **False**, `hasattr(..., 'execute')` is
+**True** — so the guard was permanently False, every run reported
+`no_task_executor`, and the loop finalized "Task execution was not completed"
+for a component that IS constructed and wired at `app/earning_pipeline.py:166-170`.
+
+The message named a **missing** component that was present, which is why this
+read as an infrastructure gap rather than a wiring bug, and why no earlier
+cycle traced it back to the loop. The existing test fakes had encoded the same
+buggy shape (`FakeTaskExecutor.run(task)` plus an empty portfolio), which is
+precisely why the defect shipped green.
+
+Two shape rules had to be satisfied, so a naive rename would not have worked:
+`execute` needs **two** positionals (task **and** the portfolio entry, resolved
+through the new `_portfolio_entry()` helper shared with `_stage_rerank`), and it
+treats `task` as a **dict** (`task.get("task_type")` at step 1) where the stage
+had built a `Task` spec object.
+
+It fails **closed**: no portfolio, or no row for this id, yields
+`no_portfolio_entry` and `False` — the loop never fabricates an entry to claim
+an execution it did not perform. `_stage_validate`'s twin probe was switched to
+`execute` too, so validation and execution can no longer disagree about the
+executor's surface.
+
+Teeth-proof (throwaway clone of the pre-fix commit `e9dbc07`, real repo never
+written by the proof): `test_arch_eng_147_task_executor_seam.py` → **2 FAILED,
+3 passed** on unfixed source; **5 passed** with the fix.
+`tests/earning` + `tests/engineering` + `tests/runtime` + `tests/brains` +
+`tests/providers` → **1247 passed / 1 skipped / 91 subtests**;
+`tests/gui` → **200 passed / 1 skipped**.
+
+### ARCH-ENG-148 — a fresh clone could not pass its own suite (P2, test integrity)
+
+Both files that failed **only in a fresh clone** — the shipped-vs-local hazard
+the gate exists to catch — are now hermetic, so the gate reports a true result:
+
+- `test_arch_eng_113_env_fallback_bypass.py`: `REPO` was a hardcoded
+  `D:\MrBot1000_2.0`, so in a clone the tests probed the **original** repo's
+  `.env` (which exists) instead of the clone's (which does not) — `read_bytes()`
+  succeeded against the wrong tree and `os.chdir(REPO)` pointed somewhere the
+  guard never treats as the repo root. Now `__file__`-derived, and the autouse
+  fixture creates a sentinel `.env` when the tree has none and removes it after.
+  An existing operator `.env` is still snapshotted and restored byte-for-byte —
+  the guard against detecting a regression by causing it.
+- `test_github_publish_sync.py`: the path was already `__file__`-derived; the
+  real cause is that `tools/github_publish/` is gitignored **on purpose**
+  (`.gitignore:104`, personal publishing tooling), so its subject is absent from
+  every clone. These tests guard a real invariant — secrets and operator state
+  never reach the public mirror — but they cannot run where the guarded file was
+  never shipped, so they skip with an explicit reason instead of erroring.
+
+Verified by execution: `.env` guard **2 FAILED → 6 passed** in a clone (6 passed
+in the real tree, `.env` byte-identical); mirror-safety suite **9 passed** in the
+real tree (still enforced, **not** skipped) and **9 skipped** in a clone (was 9
+errors). The fresh-clone gate now runs with no false alarms.
+
+### ARCH-ENG-149 — the brain adapter legacy-default tests were not hermetic (P2, test integrity)
+
+Same defect family as ARCH-ENG-148 (a hardcoded `D:\MrBot1000_2.0` path), in a
+file the 148 sweep did not cover. `tests/brains/test_adapter_config.py:17` did
+`sys.path.insert(0, r"D:\MrBot1000_2.0")`, so a fresh clone imported the **live**
+repo's modules; conftest's session-scoped `import main` then ran `load_dotenv`
+against the operator's real `.env` and pushed `BIG_BRAIN_PROVIDER` /
+`SMALL_BRAIN_PROVIDER = lmstudio` into `os.environ`. The module's `_Isolate`
+redirected config **writes** (`MRBOT_ENV_PATH`) but never the `os.environ`
+**reads** `build_config` performs, so `test_no_config_*_is_legacy` asserted
+"no config → legacy defaults" against the operator's live config, not the
+defaults. Reproduced by execution with an `os.environ` mutation tracer: the
+`lmstudio` write originates in `main.py:218`'s `load_dotenv(..., override=True)`,
+reached through the session fixture, and it happens in a clone too because the
+hardcoded path points the import back at the live tree.
+
+Fixed test-only, no production code touched: the repo root is now
+`Path(__file__).resolve().parents[2]`, and `_Isolate` neutralises the two
+provider env reads for the test's duration, restoring them byte-for-byte (the
+same snapshot-and-restore discipline the ARCH-ENG-049/057 guards enforce).
+
+Verified: `tests/brains/test_adapter_config.py` **2 FAILED → 7 passed** in the
+real tree; **7 passed** in a fresh clone with no `.env`; full `tests/brains` +
+`tests/earning` + `tests/engineering` **932 passed / 65 subtests** in the real
+tree and `tests/brains` **12 passed** in the clone. Operator `.env`/`settings.json`
+untouched.
+
+### ARCH-ENG-150/152 — a recorded fix can no longer be absent from the release, and its guard cannot poison itself (P2, process + test integrity)
+
+`test_arch_eng_150_recorded_fix_present.py` closes the v2.1.104-class hole
+mechanically: every `ARCH-ENG-nnn` named in the **top** CHANGELOG entry must
+be findable in HEAD's tracked code **and** in a tracked test file. The guard
+reads HEAD via `git grep`, so a dirty working tree cannot make an absent fix
+look present — the exact condition v2.1.104 got wrong. Older entries are
+measured, not failed: seven legacy ids (071, 076–080, 131) carry no tag
+comment but are pinned by a symbol-existence check so the allowlist cannot
+quietly grow.
+
+ARCH-ENG-152: the anti-vacuity probe grepped HEAD for a hardcoded all-nines
+probe tag — and once the suite is committed, that literal lives in the test's
+own source, so the probe reported "present" for a tag that is certainly
+absent. 26a0d1e shipped this test red. The probe tag is now constructed at
+runtime (`"ARCH-ENG-" + "9"*8`), so the literal exists in no tracked file and
+a grep match can only be a real regression; a self-check asserts the literal
+is absent from the file so a reintroduction fails loudly. Id renumbered
+151 → 152: a sibling agent claimed 151 for the hardcoded-repo-root sweep
+(now `test_arch_eng_151_no_hardcoded_repo_root.py`).
+
+Verified: the suite **7 passed** on HEAD after the fix (was 6 passed /
+1 failed).
+
+### Not yet recorded (open findings from this cycle)
+
+- **[process][P2] Version-drift, confirmed twice.** Sibling agents landed
+  `f007f44`/`b9bb790` between this cycle's commits with no version/changelog
+  touch. Recommendation: the cron takes the version bump at end of cycle for
+  whatever is on HEAD, rather than each fix deciding whether it deserves one.
+- **[process][P1] Nothing checks that a recorded fix is present in HEAD** —
+  v2.1.104 shipped a record of work that was not in the release. Recommendation:
+  a guard asserting each `ARCH-ENG-nnn` named in a CHANGELOG entry has its code
+  at that commit, in the same shape as the version-authority test.
+- **[test-quality][P2] Test doubles encode the caller's bug.** ARCH-ENG-147's
+  fakes mirrored the wrong method name, which is why the defect shipped green.
+  Recommendation: assert every fake defines the surface the real class defines.
+- **[test-integrity][P2] The hardcoded-`D:\MrBot1000_2.0` path is not fully
+  swept.** ARCH-ENG-148 fixed two files and ARCH-ENG-149 fixed
+  `test_adapter_config.py`, but ~20 more test modules still carry the literal
+  (`sys.path.insert(0, r"D:\MrBot1000_2.0")` or `Path(r"D:\...")`) across
+  `tests/cognition`, `tests/dialogue`, `tests/discovery`, `tests/earning`,
+  `tests/engineering`. They pass in the real tree, so this is a latent
+  fresh-clone hazard, not a live failure — but the next one to import `main`
+  under a clone will leak operator `.env` into `os.environ` exactly as 149 did.
+  Recommendation: a one-line repo-wide sweep replacing the literal with
+  `Path(__file__).resolve().parents[2]`, gated by a guard test that fails if any
+  test file contains the hardcoded path.
+
+## [2.1.104] - 2026-10-14 - The free local brain was skipped when the budget ran out, and the roster reached only half the runtime (ARCH-ENG-143/144/145 + N-brain Phases 2–4)
+
+Records four commits that landed after v2.1.103 without a changelog entry
+(`de98352`, `05a8a27`, `6335ed4`, `ccfdfb3`). Every defect below was reproduced
+by execution before the fix, and the corrected behaviour was re-verified this
+cycle against the real objects, not the docstrings.
+
+### ARCH-ENG-143 — a fully-verified payment was computed and then discarded (P0, financial)
+
+`AutonomousLoop._stage_verify` established `verified=True` and a real
+`payment_amount`, then called `mark_paid_verified(id, amount=...)` **with no
+evidence**. That lands in the lifecycle's fail-closed tail
+(`opportunity_lifecycle.py:438`, "no evidence attached" → stays `submitted`), and
+the line right below overwrites the stage's `verified` with `status != "paid"`.
+So the money was proven and then thrown away.
+
+Reproduced this cycle against the real `OpportunityLifecycleTracker` + real
+`EvidenceStore` with an L5-CRYPTOGRAPHIC `balance_delta` of $750:
+
+| call | stage | amount |
+|---|---|---|
+| `mark_paid_verified(id, amount=750.0)` — pre-fix | `submitted` | 0.0 |
+| `mark_paid_verified(id, amount=750.0, evidence=ev)` — post-fix | **`paid`** | **750.0** |
+
+Passing the Evidence re-enters the policy-gated path, which is exactly the
+transition contract the stage had already checked, so the lifecycle reaches
+`paid` on the *same* evidence rather than on the caller's assertion.
+
+**Fail-closed direction verified too** — the fix is not a widened gate: an
+UNVERIFIED / L1-SELF-REPORTED $5000 claim still resolves to `submitted` /
+amount `0.0`. Only evidence that independently satisfies
+`is_transition_eligible` reaches `paid`.
+
+### ARCH-ENG-144 — the win-rate guard read a different spelling than the recorder wrote (P1)
+
+`SubmissionRamp._platform_key` normalised with `.title()` while every *reader*
+(`EarningPipeline.filter`, `OpportunityIntelligence`, `AutonomousLoop`,
+`SelfAudit`, `DiscoveryScheduler`) passed the raw opportunity string. The ramp
+stored `"Upwork"`, the guard read `"upwork"`, got `total=0`, and
+`WinRateGuard.should_decline` reported `insufficient_data` — a **fail-OPEN**
+guard that let a proven 0%-win-rate platform through, so the bot kept spending
+proposals and LLM budget on platforms it had already proven to be losers.
+
+Fixed with ONE canonical `EarningMemory.platform_key()` used by every writer and
+every reader, so the guard reads back exactly what the outcome recorder stored.
+`.title()` (not `.lower()`) is canonical because existing rows were written that
+way — re-keying would orphan live history.
+
+Verified end-to-end against a real `EarningMemory` DB: 8 losses recorded through
+the ramp path now read back `total=8, success_rate=0.00`, and the guard
+returns `should_decline: True` instead of `insufficient_data`.
+
+### ARCH-ENG-145 — the project's own primary local brain was classified billable (P0, spend)
+
+The spelling-robust squash in `is_local_provider` dropped `-`/`_`/space but not
+the **dot**, so the operator-facing spelling `llama.cpp` (offered verbatim in the
+Settings dropdown) squashed to `llama.cpp` and missed `LOCAL_PROVIDERS`'s
+`llamacpp`. The local dual-brain was therefore classified CLOUD: it took the
+billable tier (1.0/sec, 500 calls/day) and became `$`-skippable by `CostGuard`.
+
+Verified across the real classifier: `llama.cpp`, `llamacpp`, `ollama`, `vllm`,
+`lmstudio` → local; `openai`, `nvidia_nim` → cloud; and the cloud-escape cases
+stay cloud (`llama-cloud`, `localstack-cloud`), so the dot fix did not widen the
+local set into a vendor namespace.
+
+### N-brain Phases 2–4 — the roster now reaches the adapters
+
+Three commits built the roster path end to end:
+
+- **Phase 3** (`agents/runtime/brain_roster.py`): `BrainRoster` of up to 10 Big +
+  10 Small slots in `settings.json`, emitting placements in the *same* dict shape
+  `device_registry.brain_placements` produces. Persistence routes through
+  `merge_settings_file` (ARCH-ENG-070), verified this cycle to preserve sibling
+  top-level keys — a roster write leaves an existing `devices` block and
+  unrelated keys byte-identical.
+- **Phase 4 runtime** (`05a8a27`): `build_config(role, env, roster=...)` plus
+  `DualBrainRuntime.from_roster` / `from_settings`, with endpoint resolution
+  extracted into one `_resolve_provider_endpoint` shared by the legacy and roster
+  paths. `roster=None` keeps the legacy env path byte-identical.
+- **Phase 2 adapters** (`ccfdfb3`): `BigBrainAdapter`/`SmallBrainAdapter` accept a
+  per-slot `BrainConfig`; `_get_client` already resolves the key from
+  `self.provider`, so a cloud slot gets the vault-resolved key and a local slot
+  the `local` sentinel. No `config=` → legacy env path, byte-identical.
+
+Verified this cycle: a cloud `BrainConfig` seeds `provider=openai`,
+`base_url=https://api.openai.com/v1`, `model=gpt-x`, `context=8192`; an explicit
+`model` argument still overrides `config.model`.
+
+### Not yet recorded (open work in the tree, deliberately not claimed as done)
+
+The Phase 4 Settings UI (`gui/widgets/brain_roster_panel.py`, the two-handler
+roster save) is implemented and its 25 tests pass, but it is **uncommitted** and
+carries no changelog entry. It is not part of this release line.
+
+## [2.1.103] - 2026-10-14 - A capital-loss gate that could not block, and a backtest that could not trade (ARCH-ENG-141/142)
+
+Three reachable defects on the real-money path, each reproduced by execution before
+the fix and locked by a new test whose teeth were proven by revert (revert each fix
+→ the new test fails; 9 of 10 reverts caught, the 10th being a change proven
+behaviorally equivalent — see the corrected claim below).
+
+### ARCH-ENG-141 — the rug screen's two hard fails were unreachable (P0, capital loss)
+
+`agents/earning/rug_screen.py` gates whether the agent commits capital to a DeFi
+protocol. Its only two HARD fails — `honeypot detected` and
+`contract_age_days < 30` — were keyword-only, and **both** production callers
+(`agents/discovery/discovery_sources.py:195`, `app/earning_pipeline.py:602`)
+invoke `screen_rug_pull(opps)` with no signals at all, so neither could ever
+fire. Reproduced by execution: a 2-day-old honeypot farm at 50000% APY screened
+`risk=medium, passed=True` and survived `filter_by_risk("medium")` — i.e. the
+gate read as enforced while nothing it enforced was reachable.
+
+- **An unknown contract age now FAILS CLOSED** for any protocol outside
+  `TRUSTED_PROTOCOLS`. On a capital-loss gate "unknown" must not mean "pass":
+  a protocol whose deployment date cannot be verified is indistinguishable from
+  a 2-day-old farm. It previously only raised a soft flag.
+- `TRUSTED_PROTOCOLS` is the operator's own **hardcoded** 3-entry allowlist —
+  not a field any external API can set — so it is the only exemption, and it is
+  what keeps the one protocol that can actually emit today (Lido) discoverable.
+  Blast radius measured: Lido still screens `passed=True, risk=low`; the only
+  behaviour that changes is that an unverifiable protocol is declined instead of
+  admitted. A test asserts the set cannot be mutated from code.
+- Propagation verified end-to-end: `risk_level="high"` is genuinely enforced
+  downstream (`earning_pipeline.filter:831` drops it,
+  `opportunity_intelligence.py:418` marks it unsafe), so a fail-closed result
+  really does stop capital.
+
+### ARCH-ENG-142 — the backtest engine could not open a position (P1)
+
+`agents/earning/backtesting.py`. Buy sizing was `quantity = balance / price`,
+which made `cost = quantity*price + fees = balance*(1 + fee_pct) > balance`
+**structurally always true** — so at the default `fee_pct=0.001` the engine could
+never fill. Reproduced: an always-BUY strategy over 5 bars produced 0 trades.
+The GUI's only caller (`gui/tabs/analytics_tab.py:194`) uses that default, so
+the shipped analytics backtest always reported zero trades.
+
+- Position sizing now reserves the fee out of the balance first
+  (`spendable = balance / (1 + fee_pct)`), so a fill is affordable at any
+  `fee_pct`, and the affordability check carries a 1e-9 epsilon (at exact
+  break-even `qty*price` can land 1 ulp above the balance and silently refuse a
+  fill the strategy could afford).
+- `ZeroDivisionError` on `close: 0.0`, on a bar with neither `close` nor
+  `price`, and on `initial_balance=0` crashed the GUI tab instead of degrading
+  to "backtest unavailable". All three now return a safe zero result.
+- A zero/negative price can no longer liquidate a position for $0.
+- PnL now tracks the open position's entry price explicitly
+  (`_entry_price`). **Corrected claim:** the pre-fix `trades[-1].price`
+  expression was NOT a reachable bug — a SELL only runs while `position > 0`,
+  and after a SELL `position = 0`, so the next SELL cannot fire until a BUY
+  appends a trade, meaning `trades[-1]` at any SELL is always the buy that
+  opened the position (verified over 6 alternating round trips: 0 sells preceded
+  by a non-buy). The explicit tracking is retained for clarity, not as a fix.
+
+### ARCH-ENG-141 — the N-brain roster stacked two servers on one GPU (P2, latent)
+
+`agents/runtime/brain_roster.py` (Phase 3; no production caller yet, so this is
+a landmine fixed before Phase 4 wires it).
+
+- `_auto_device`'s tier branch was dead — `if tier=="big" and gpus: return
+  gpus[0]` immediately followed by `if gpus: return gpus[0]` — so a 1-big +
+  1-small roster placed **both** brains on the SAME GPU (two llama.cpp servers
+  on one card: the VRAM collision the device registry exists to prevent). It
+  also ignored `capability_class()`, so a big brain could land on a device the
+  registry itself classifies `small`. Now: already-placed devices are excluded,
+  a big slot prefers a big-capability GPU, a small slot takes a different GPU
+  then the CPU pool.
+- `BrainSlot.port` was parsed by `from_dict` and then silently ignored by
+  `to_placements` (a pin of 8080 became 1234). An operator-pinned port now wins.
+
+### Version authority
+
+`main.py`'s last-resort version literal carried a stale `2.1.99` while
+`app/version.py` (the single authority) was `2.1.102` — a pre-existing failure
+of `tests/engineering/test_arch_eng_117_version_authority.py`, confirmed failing
+on clean HEAD `b031dd3`. Corrected to `2.1.103`; the suite is now green.
+
+Verified: full suite **2155 passed / 5 skipped / 235 subtests**; new file
+`tests/earning/test_arch_eng_141_142_real_money_gates.py` 21 passed; teeth-proof
+by revert on a throwaway clone (the real repo was never written to by the proof).
+
+## [2.1.102] - 2026-10-14 - An invisible GUI panel was rewriting .env for both brains (ARCH-ENG-140)
+
+Third discovery pass. The ledger's `[wiring][P1]` on
+`gui/widgets/dual_brain_control.py:463-465` turned out to be worse than recorded.
+
+### ARCH-ENG-140 — dead widgets with live side effects
+
+**`gui/widgets/dual_brain_control.py:451-573` [P1] — `_build_provider_panels`
+built 12+ provider QFrames, never parented them, and never added them to any
+layout.** Nothing anywhere calls `layout.addWidget(panel)` for them; only
+`provider_config_widget.py:414` adds *its own* frames. The panels were constructed
+on every detection-ready callback and discarded.
+
+But their controls were **wired**. `_on_model_changed` fired on
+`currentTextChanged` and wrote **both** `BIG_BRAIN_MODEL` and `SMALL_BRAIN_MODEL`
+to `.env` via `set_env_values`. Reproduced by execution before removal: one
+simulated combo pick rewrote both `.env` brain-model lines. So a click on a panel
+the user cannot see persisted a config change for both brain roles — the exact
+class of silent config corruption this project treats as high severity.
+
+Two further defects in the same dead span:
+
+- The `if hasattr(self, 'provider_group'):` guard at `:463` was always False
+  (`provider_group` is only a local in other builders) and its body was a comment
+  plus a stray-indented `pass` — a syntax-legal no-op that reads like it does
+  something.
+- A **second** `_on_context_changed(self, provider_name, context_size)` at `:568`
+  was silently shadowed by the live `(self, is_big: bool)` definition later in the
+  class body. Verified by execution: `inspect.signature` returned
+  `(self, is_big: bool)`, so any signal wired to the dead signature would have
+  mis-bound its arguments. Two methods, one name, one winner, no warning.
+
+**Fix:** removed the whole dead span (126 lines): `_build_provider_panels`,
+`_create_provider_panel`, `_on_model_changed`, `_on_gpu_assignment_changed`, the
+shadowed `_on_context_changed`, and the `_provider_panels_built` flag. The live
+path is `ProviderConfigWidget` (`tab_feature_builders.py:1910`) and was left
+untouched. Verified no dangling references repo-wide.
+
+### Verification
+
+- `tests/gui/test_no_dead_provider_panels.py` (new, 10 tests) — the four dead
+  constructors stay gone; exactly ONE `_on_context_changed` definition exists and
+  it has the live `(self, is_big)` signature; no orphan `provider_panels`
+  attribute; and the live `ProviderConfigWidget._on_model_changed` /
+  `ProviderLifecycleBackend._sync_adapter_model` paths still exist, so this was
+  dead-code removal and not a capability regression.
+- **Teeth proven by revert:** restoring HEAD's version of the file fails 6 of
+  those 10; removed, all 10 pass.
+- No regression: `tests/gui` **194 passed, 1 skipped**;
+  `tests/dialogue` + `tests/runtime` + `tests/providers` + `tests/safety`
+  **873 passed, 4 skipped, 178 subtests**.
+
+No financial, approval, or evidence-gate behaviour was changed. This removal
+eliminates a path that silently rewrote persisted configuration; it adds nothing.
+
+---
+
+## [2.1.101] - 2026-10-14 - The adapter-model sync guarded a method that did not exist (ARCH-ENG-139)
+
+Second discovery pass after v2.1.100. `gui/tabs/dialogue_tab.py` guarded on
+`hasattr(self, "_sync_adapter_models")` in two places and the method was defined
+**nowhere in the repository**.
+
+### ARCH-ENG-139 — a per-turn sync that has never once run
+
+**`gui/tabs/dialogue_tab.py:487` + `:1215-1216` [P1] — both guards are permanently
+False.** The construction-time `_sync_and_check_capabilities` and the per-turn
+"Sync adapter models from GUI selection before responding" step both test for a
+method that does not exist, so the sync is a silent no-op on every turn. Verified
+by execution: `grep -rn "def _sync_adapter_models"` over the whole tree returns
+nothing. The real implementation is singular and lives on a *different* class
+(`ProviderLifecycleBackend._sync_adapter_model(small)`, `:943`), which a plain
+`QWidget` has no way to call.
+
+Why it matters: an adapter's `.model` is the id sent in the chat request. When the
+GUI selection and the adapter disagree, the server rejects the stale name. This is
+the exact mechanism `reports/reality-check-2026-09-17.md:101` recorded as the cause
+of the 400-model-not-found dialogue errors — marked "Not yet resolved" there.
+
+**Fix:** implemented `_sync_adapter_models` on `DialogueTab`. It re-reads the
+canonical runtime (`DualBrainRuntime.from_env()`) each call, so a selection made in
+Providers & GPU is picked up without a restart, and writes each role's model onto
+its adapter through the adapters' own `set_model` entry point (falling back to
+direct assignment for an adapter predating it). Guards chosen for a GUI-thread
+caller: a blank selection never erases a working model (that would cause the very
+400s this prevents), a runtime failure never raises, a missing brain is tolerated,
+and one bad slot cannot leave the healthy one stale. No network probe — this runs
+from a combo signal.
+
+### Verification
+
+- `tests/gui/test_dialogue_adapter_model_sync.py` (new, 9 tests) — the method
+  exists on the class; the exact `hasattr`/`callable` expression from `:1215` is
+  now True; the selection reaches both adapters; `set_model` is the path used; a
+  legacy adapter is still updated; a blank config does not erase a model; runtime
+  failure, missing brain, and per-brain failure are all non-fatal.
+- **Teeth proven by revert:** with the method removed, all 9 fail; restored, all
+  9 pass. `TestSyncMethodExists::test_the_per_turn_guard_is_satisfied` asserts the
+  literal guard expression, so a future deletion breaks the build.
+- No regression: `tests/dialogue` 354 passed, 3 skipped, 32 subtests.
+- The masking test that hid this defect (`tests/dialogue/test_dialogue_live_mode_issues.py:78`
+  injected a `MagicMock` for the missing method) is now redundant rather than
+  wrong — the real method exists and the new suite covers it directly. Left in
+  place: it isolates a different code path and removing it would reduce coverage.
+
+No financial, approval, or evidence-gate behaviour was changed.
+
+---
+
+## [2.1.100] - 2026-10-14 - The cloud-provider path was wired to the wrong names (ARCH-ENG-137/138)
+
+Phase 1 of the N-brain roadmap (`5bb8144`, `0b4c7d0`) added cloud providers to the
+runtime: `provider_keys.resolve_provider_api_key` resolves a key, and the adapters
+feed it to an OpenAI-compatible client. This cycle audited the **consumers** of
+that seam — the same discipline that found the four credential leaks in v2.1.99 —
+and found that every one of its three name lookups was a name nothing in the repo
+ever writes. A correctly-configured cloud brain failed closed, silently.
+
+Every claim below was reproduced by executing the real function before and after
+the change. Nothing is inferred from reading.
+
+Full engineering record: `docs/ARCH_ENG_137_138_CLOUD_PROVIDER_NAMING.md`.
+
+### The lesson
+
+**A resolver that checks three names and matches none of them is indistinguishable
+from a resolver that has no keys.** `provider_keys` looked in the encrypted vault →
+`PROVIDER_API_KEY_<PROVIDER>` → `<ROLE>_API_KEY`. Nothing in the repository writes
+the last two. The Settings GUI persists the standard `<PROVIDER>_API_KEY` spelling
+(`main.py:2705`), and provider detection keys off that same spelling
+(`provider_manager.py` `key_env`). So the resolver's env steps were dead by
+construction, and a real key in `.env` resolved to `""`.
+
+`OPENAI_API_KEY=sk-…` in the environment, before:
+
+```
+resolve_provider_api_key("openai", "BIG")   -> ''
+resolve_provider_api_key("nvidia_nim", "BIG") -> ''
+```
+
+### ARCH-ENG-137 — three misclassified or unread provider names
+
+**`agents/runtime/provider_keys.py:75` [P1] — the resolver never read the env vars
+the app actually writes.** Added `<PROVIDER>_API_KEY` to the chain, ahead of the
+generic role fallback so a provider-specific key always wins over a role one.
+Verified after: `OPENAI_API_KEY` now resolves for `openai`.
+
+**`agents/runtime/provider_keys.py` [P1] — the NIM spelling diverged.** The runtime's
+cloud table keys the provider `nvidia_nim`; provider detection, configuration and
+the Settings GUI all key it `nvidia`. A role set to either spelling matched no
+`*_API_KEY` convention. Added a one-entry alias table (`nvidia_nim`/`nvidia` →
+`NVIDIA_API_KEY`), which also closes the ledger's `[enhancement]` note on
+provider-name spellings for the only cloud provider where it changed behaviour.
+
+**`agents/safety/cost.py:16` [P1] — the budget guard inverted itself for the
+dual-brain.** `is_local_provider` recognised only `ollama`/`local*`, so the adapter
+names the workers actually pass (`big-brain`, `small-brain`) — plus
+`llamacpp`/`lmstudio`/`vllm`/`koboldcpp` — classified as **BILLABLE**. With
+`LLM_DAILY_BUDGET_USD > 0` and the cap hit, `CostGuard.should_skip` skipped the
+**free** local brain and fell back to a paid cloud provider: the guard spent the
+real money it exists to prevent. It now recognises the on-machine set (reusing
+`provider_keys.LOCAL_PROVIDERS` as the single authority, spelling-normalised) plus
+any `-brain` adapter.
+
+**`agents/safety/provider_rate_limiter.py:33` [P2] — the free brain was throttled
+like a paid API.** `_LOCAL_MARKERS` had no `brain` entry, so `big-brain` got the
+cloud tier: 1.0 calls/sec and a 500-calls/day ceiling the 5060 Ti can outrun. A
+local brain is now `(2.0, 0)` — uncapped, as hardware-bound providers should be.
+
+### ARCH-ENG-138 — the cloud brain could not authenticate or start
+
+**`agents/providers/provider_lifecycle.py:40` [P1] — the cloud probe sent no
+`Authorization` header.** `check_endpoint` built a bare
+`urllib.request.Request(url)`, so a cloud `/v1/models` probe got a 401 and the
+Providers & GPU row showed "Stopped" forever even with a valid key. It now derives
+a Bearer header through `provider_keys` (one credential authority, never logged)
+and both `check_endpoint` call sites pass the provider so the header is actually
+sent. A local provider still probes unauthenticated — sending a token to
+127.0.0.1 would be wrong.
+
+**`agents/providers/provider_lifecycle.py:83` + `:97` [P1] — "Start" on a cloud
+brain always failed.** `load_provider_model`/`unload_provider_model` returned
+`(False, "<provider> does not expose a model-load API")` for anything but
+lmstudio/ollama, and `_start_external_brain` routes every non-llamacpp role
+through that path — so a cloud brain could never reach Running. A cloud model *is*
+available (remotely), so load/unload are now a truthful no-op success. Scoped to
+the known cloud vendor set only: an unrecognised provider keeps its explicit
+failure rather than silently becoming a fake success.
+
+### Verification
+
+- `tests/providers/test_cloud_provider_lifecycle.py` (new, 10 tests) — auth header
+  presence/absence, header reaching urllib, key never printed, cloud load/unload
+  no-op with **no network call at all**, unknown provider still failing
+  explicitly, lmstudio still POSTing.
+- `tests/runtime/test_provider_keys.py` (+5 tests) — the standard spelling
+  resolving for five providers, the NIM alias, provider-key-beats-role-key
+  precedence, and that the new step did **not** weaken fail-closed.
+- `tests/safety/test_cost_guard_local_classification.py` (new, 6 tests / 34
+  subtests) — local never skipped past the cap, billable skipped past the cap.
+- `tests/safety/test_provider_rate_limiter.py` (+1) — brain adapters get the local
+  tier.
+- **Teeth proven by revert:** with all three fixes reverted, 29 of those tests
+  fail (14 on the cost-guard revert alone); restored, all pass. This is not a
+  re-derived formula asserted against itself.
+- Reproduced before/after by execution: the `OPENAI_API_KEY` resolution table, the
+  cloud load/unload returns, and the auth-header dict are quoted above.
+- No regression: `tests/runtime` + `tests/providers` + `tests/safety` 519 passed,
+  1 skipped, 146 subtests. GUI board/rate-settings suites green.
+
+No financial, approval, or evidence-gate behaviour was changed. The fix moves
+exactly one thing: a credential that was already configured now reaches the client
+that needed it, and the guards stop spending the money they were written to save.
+
+---
+
 ## [2.1.99] - 2026-10-14 - The model-context boundary leaked credentials through four more doors (ARCH-ENG-133/134/135/136)
 
 v2.1.98 hardened exactly one function, `_tool_file_read`. This cycle audited the

@@ -128,15 +128,26 @@ class M2DedupStateAware(unittest.TestCase):
 
 # --------------------------------------------------------------------------- M-3
 class M3ContentDiscoveryStableIds(unittest.TestCase):
-    def test_ids_are_platform_keyed_not_positional(self):
-        stub = type("S", (), {})()
-        opps = EarningPipeline._discover_content(stub)
-        ids = [o.id for o in opps]
-        self.assertFalse(any(i.startswith("content_") and i.split("_")[-1].isdigit()
-                             for i in ids), "positional content_{i} id found")
-        self.assertEqual(len(ids), len(set(ids)))
-        opps2 = EarningPipeline._discover_content(stub)
-        self.assertEqual([o.id for o in opps2], ids)
+    """ARCH-ENG-285 (W-01): the legacy discovery island is deleted.
+
+    M-3 originally pinned the legacy `_discover_content` handler to stable,
+    platform-keyed ids. That handler was part of the 289-line parallel
+    discovery implementation that had no production caller; the live path is
+    the pluggable `DiscoveryEngine`/`DiscoveryScheduler` sources. Keeping a
+    test for the deleted copy would keep the dead code alive, so the assertion
+    is now that the island cannot come back by accident.
+    """
+
+    def test_legacy_discovery_island_is_gone(self):
+        for name in (
+            "_discover_source", "_discover_upwork", "_discover_fiverr",
+            "_discover_social", "_discover_airdrops", "_discover_defi",
+            "_discover_microtasks", "_discover_content", "_discover_dynamic",
+        ):
+            self.assertFalse(
+                hasattr(EarningPipeline, name),
+                f"dead legacy discovery handler {name} reappeared; the live "
+                "path is DiscoveryScheduler + built-in sources")
 
 
 # --------------------------------------------------------------------------- M-4

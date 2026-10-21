@@ -7,21 +7,24 @@ them (v2.1 fix: Management was sharing Providers_GPU's brain controls).
 
 Sections:
   1. Earnings Pipeline        — run cycle, status, recent outcomes
-  2. Research                 — folder selection, force rescan
-  3. Gig Proposals (Upwork)   — review gate + human-confirmed submit
-  4. Payout Verification      — verify then mark paid
-  5. System Actions           — force self-improvement, clear cache
+  2. Earning Goals            — create/pause/delete goals; verified earning
+                                events credit them automatically (ARCH-ENG-244)
+  3. Research                 — folder selection, force rescan
+  4. Gig Proposals (Upwork)   — review gate + human-confirmed submit
+  5. Payout Verification      — verify then mark paid
+  6. System Actions           — force self-improvement, clear cache
 """
 
 from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QGroupBox, QGridLayout, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QPlainTextEdit, QListWidget, QWidget, QMessageBox,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QComboBox,
 )
 
 
@@ -36,6 +39,7 @@ class ManagementTab(QWidget):
       - request_review_proposal(job_id, job_desc, draft)
       - request_submit_proposal(job_id, job_desc, draft)
       - request_verify_paid(opp_id, amount, wallet, ref)
+      - request_reconcile_paid(opp_id, evidence_id, method, note)
     """
     
     request_run_cycle = Signal()
@@ -45,6 +49,9 @@ class ManagementTab(QWidget):
     request_review_proposal = Signal(str, str, str)  # job_id, job_desc, draft
     request_submit_proposal = Signal(str, str, str)  # job_id, job_desc, draft
     request_verify_paid = Signal(str, str, str, str)  # opp_id, amount, wallet, ref
+    # ARCH-ENG-287 (Z-01): opp_id, evidence_id (blank = latest unresolved),
+    # independent reconciliation method, note/reference.
+    request_reconcile_paid = Signal(str, str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,7 +145,7 @@ class ManagementTab(QWidget):
         run_cycle_btn.clicked.connect(self.request_run_cycle.emit)
         pipe_ctrl.addWidget(run_cycle_btn)
 
-        self.pipeline_status_label = QLabel("Status: Idle")
+        self.pipeline_status_label = QLabel("Status: —")
         self.pipeline_status_label.setStyleSheet("color: #888; font-size: 11px;")
         pipe_ctrl.addWidget(self.pipeline_status_label, 1)
 
@@ -151,6 +158,99 @@ class ManagementTab(QWidget):
         pipeline_layout.addWidget(self.outcomes_list)
 
         layout.addWidget(pipeline_group)
+
+        # ── Section 2: Earning Goals (ARCH-ENG-244) ───────────────────────
+        # The operator surface for the (now live) GoalTracker: create,
+        # pause/resume, delete and view goals. Verified earning events
+        # credit goals automatically via the tracker's binding (an explicit
+        # details.goal_id, or the platforms declared on the goal here).
+        goals_group = QGroupBox("Earning Goals")
+        goals_group.setStyleSheet("""
+            QGroupBox {
+                background: #1a1a1a;
+                border: 2px solid #44aaff;
+                border-radius: 8px;
+                padding: 12px;
+                font-weight: bold;
+            }
+        """)
+        goals_layout = QVBoxLayout(goals_group)
+        goals_layout.setSpacing(8)
+
+        self.goals_table = QTableWidget(0, 6)
+        self.goals_table.setHorizontalHeaderLabels(
+            ["Title", "Path", "Current $", "Target $", "Progress", "Status"])
+        self.goals_table.horizontalHeader().setStretchLastSection(True)
+        self.goals_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.goals_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.goals_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.goals_table.verticalHeader().setVisible(False)
+        self.goals_table.setMaximumHeight(140)
+        goals_layout.addWidget(self.goals_table)
+
+        goal_form = QGridLayout()
+        goal_form.setSpacing(8)
+        self.goal_title_edit = QLineEdit()
+        self.goal_title_edit.setPlaceholderText(
+            "Goal title (e.g. 'Earn $100 on Upwork this week')")
+        goal_form.addWidget(self.goal_title_edit, 0, 0, 1, 3)
+
+        goal_form.addWidget(QLabel("Path:"), 1, 0)
+        self.goal_path_combo = QComboBox()
+        try:
+            from agents.earning.goal_system import GoalPath
+            self.goal_path_combo.addItems([p.value for p in GoalPath])
+        except Exception:
+            self.goal_path_combo.addItems(
+                ["freelance", "microtask", "crypto", "bounty", "trading",
+                 "content", "other"])
+        goal_form.addWidget(self.goal_path_combo, 1, 1)
+
+        self.goal_target_edit = QLineEdit()
+        self.goal_target_edit.setPlaceholderText("Target (USD, e.g. 100)")
+        goal_form.addWidget(self.goal_target_edit, 1, 2)
+
+        self.goal_platforms_edit = QLineEdit()
+        self.goal_platforms_edit.setPlaceholderText(
+            "Platforms that count toward this goal (comma-sep, e.g. upwork, "
+            "prolific). Only VERIFIED payouts credit a goal — the tracker "
+            "never credits an unverified dollar.")
+        goal_form.addWidget(self.goal_platforms_edit, 2, 0, 1, 3)
+        goals_layout.addLayout(goal_form)
+
+        goal_btns = QHBoxLayout()
+        create_goal_btn = QPushButton("➕ Create Goal")
+        create_goal_btn.clicked.connect(self._on_goal_create)
+        goal_btns.addWidget(create_goal_btn)
+
+        goal_pause_btn = QPushButton("⏯ Pause / Resume")
+        goal_pause_btn.clicked.connect(self._on_goal_pause_resume)
+        goal_btns.addWidget(goal_pause_btn)
+
+        goal_delete_btn = QPushButton("🗑 Delete")
+        goal_delete_btn.clicked.connect(self._on_goal_delete)
+        goal_btns.addWidget(goal_delete_btn)
+
+        goal_refresh_btn = QPushButton("🔄 Refresh")
+        goal_refresh_btn.clicked.connect(self.refresh_goals)
+        goal_btns.addWidget(goal_refresh_btn)
+        goals_layout.addLayout(goal_btns)
+
+        self.goals_status = QLabel("Goals: —")
+        self.goals_status.setStyleSheet("font-size: 11px; color: #888;")
+        goals_layout.addWidget(self.goals_status)
+
+        layout.addWidget(goals_group)
+        # Initial populate, deferred so construction never blocks on I/O
+        # (tests swap the tracker singleton before this timer fires).
+        QTimer.singleShot(0, self.refresh_goals)
+        # And follow the app's polling convention (Insights refreshes every
+        # 4 s): a credit that lands while the operator is reading shows up
+        # without a manual Refresh.
+        self._goal_poll = QTimer(self)
+        self._goal_poll.setInterval(20000)
+        self._goal_poll.timeout.connect(self.refresh_goals)
+        self._goal_poll.start()
 
         # ── Section 2: Research ───────────────────────────────────────────
         research_group = QGroupBox("Research")
@@ -217,7 +317,7 @@ class ManagementTab(QWidget):
         submit_btn.clicked.connect(self._on_submit_proposal)
         prop_layout.addWidget(submit_btn, 3, 1)
 
-        self.proposal_status = QLabel("Proposal: idle")
+        self.proposal_status = QLabel("Proposal: —")
         self.proposal_status.setStyleSheet("font-size: 11px; color: #888;")
         prop_layout.addWidget(self.proposal_status, 4, 0, 1, 2)
 
@@ -261,9 +361,33 @@ class ManagementTab(QWidget):
         verify_pay_btn.clicked.connect(self._on_verify_paid)
         pay_layout.addWidget(verify_pay_btn, 2, 0, 1, 2)
 
-        self.pay_status = QLabel("Payout: idle")
+        # ARCH-ENG-287 (Z-01): the only path that may promote a
+        # non-affirmative payment record to independently verified. The method
+        # list is the evidence policy's allow-list -- manual/local re-assertion
+        # cannot reconcile, so it is deliberately not offered here.
+        self.pay_evidence_id = QLineEdit()
+        self.pay_evidence_id.setPlaceholderText(
+            "Evidence id (blank = latest unresolved)")
+        pay_layout.addWidget(self.pay_evidence_id, 3, 0)
+
+        self.pay_reconcile_method = QComboBox()
+        self.pay_reconcile_method.addItems([
+            "external_reconciliation",
+            "authenticated_api_response",
+            "platform_transaction",
+            "blockchain_transaction_receipt",
+            "blockchain_balance_delta",
+        ])
+        pay_layout.addWidget(self.pay_reconcile_method, 3, 1)
+
+        reconcile_pay_btn = QPushButton(
+            "🔗 Reconcile Evidence (independent source)")
+        reconcile_pay_btn.clicked.connect(self._on_reconcile_paid)
+        pay_layout.addWidget(reconcile_pay_btn, 4, 0, 1, 2)
+
+        self.pay_status = QLabel("Payout: —")
         self.pay_status.setStyleSheet("font-size: 11px; color: #888;")
-        pay_layout.addWidget(self.pay_status, 3, 0, 1, 2)
+        pay_layout.addWidget(self.pay_status, 5, 0, 1, 2)
 
         layout.addWidget(pay_group)
 
@@ -292,6 +416,132 @@ class ManagementTab(QWidget):
         layout.addWidget(system_group)
 
         layout.addStretch()
+
+    # ── Earning Goals (ARCH-ENG-244) ──────────────────────────────────────
+
+    def _goal_tracker(self):
+        """The goal tracker singleton, or None (the card degrades to a
+        read-only table; a tracker failure must never break the tab)."""
+        try:
+            from agents.earning.goal_system import GoalTracker
+            return GoalTracker.instance()
+        except Exception:
+            return None
+
+    def refresh_goals(self):
+        tracker = self._goal_tracker()
+        if tracker is None:
+            self.goals_status.setText("Goals: tracker unavailable")
+            return
+        keep_id = self._selected_goal_id()
+        self.goals_table.setRowCount(0)
+        for g in tracker.list_all():
+            row = self.goals_table.rowCount()
+            self.goals_table.insertRow(row)
+            pct = (g.current_usd / g.target_usd * 100.0) if g.target_usd > 0 else 0.0
+            values = [
+                g.title, g.path, f"{g.current_usd:,.2f}",
+                f"{g.target_usd:,.2f}", f"{pct:.1f}%", g.status,
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                if col == 0:
+                    item.setData(Qt.UserRole, g.id)
+                self.goals_table.setItem(row, col, item)
+        # Re-select the goal that was selected before the rebuild: a
+        # pause/resume must not drop the operator's selection mid-review
+        # (they would have to re-find their row between every toggle).
+        if keep_id:
+            for row in range(self.goals_table.rowCount()):
+                item = self.goals_table.item(row, 0)
+                if item is not None and item.data(Qt.UserRole) == keep_id:
+                    self.goals_table.setCurrentCell(row, 0)
+                    break
+        s = tracker.summary()
+        self.goals_status.setText(
+            f"Goals: {s['active_goals']} active / {s['completed_goals']} "
+            f"completed — earned ${s['total_earned']:,.2f} of "
+            f"${s['total_target']:,.2f} ({s['overall_progress']:.1f}%). "
+            f"Only VERIFIED payouts credit a goal.")
+
+    def _selected_goal_id(self):
+        row = self.goals_table.currentRow()
+        if row < 0:
+            return None
+        item = self.goals_table.item(row, 0)
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def _on_goal_create(self):
+        tracker = self._goal_tracker()
+        if tracker is None:
+            return
+        title = self.goal_title_edit.text().strip()
+        if not title:
+            QMessageBox.information(self, "Earning Goals",
+                                    "A goal needs a title.")
+            return
+        try:
+            target = abs(float(self.goal_target_edit.text().strip() or "0"))
+        except ValueError:
+            QMessageBox.information(self, "Earning Goals",
+                                    "Target must be a number (USD).")
+            return
+        platforms = [p.strip() for p in
+                     self.goal_platforms_edit.text().split(",") if p.strip()]
+        metadata = {"platforms": platforms} if platforms else {}
+        from agents.earning.goal_system import Goal
+        goal = Goal(title=title, path=self.goal_path_combo.currentText(),
+                    target_usd=target, metadata=metadata)
+        tracker.create(goal)
+        self.goal_title_edit.clear()
+        self.goal_target_edit.clear()
+        self.goal_platforms_edit.clear()
+        self.goals_status.setText(
+            f"Goal created ({goal.id[:8]}). Verified payouts on its declared "
+            f"platforms credit it automatically; an event binding "
+            f"(details.goal_id) routes a single goal instead.")
+        self.refresh_goals()
+
+    def _on_goal_pause_resume(self):
+        tracker = self._goal_tracker()
+        if tracker is None:
+            return
+        goal_id = self._selected_goal_id()
+        if goal_id is None:
+            QMessageBox.information(self, "Earning Goals",
+                                    "Select a goal first.")
+            return
+        g = tracker.get(goal_id)
+        if g is None:
+            return
+        from agents.earning.goal_system import GoalStatus
+        if g.status == GoalStatus.ACTIVE.value:
+            g.status = GoalStatus.PAUSED.value
+        elif g.status == GoalStatus.PAUSED.value:
+            g.status = GoalStatus.ACTIVE.value
+        tracker.update(g)
+        self.refresh_goals()
+
+    def _on_goal_delete(self):
+        tracker = self._goal_tracker()
+        if tracker is None:
+            return
+        goal_id = self._selected_goal_id()
+        if goal_id is None:
+            QMessageBox.information(self, "Earning Goals",
+                                    "Select a goal first.")
+            return
+        g = tracker.get(goal_id)
+        if g is None:
+            return
+        ret = QMessageBox.question(
+            self, "Delete goal",
+            f"Delete goal '{g.title}' and all of its evidence?\n"
+            f"This cannot be undone.")
+        if ret != QMessageBox.Yes:
+            return
+        tracker.delete(goal_id)
+        self.refresh_goals()
 
     def _persist_persona_name(self, key: str, widget: QLineEdit):
         """Persist a display name while retaining stable internal role keys."""
@@ -369,6 +619,24 @@ class ManagementTab(QWidget):
             QMessageBox.warning(self, "Missing Data", "Please enter an opportunity id and amount.")
             return
         self.request_verify_paid.emit(opp_id, amount, wallet, ref)
+
+    def _on_reconcile_paid(self):
+        """ARCH-ENG-287 (Z-01): request independent reconciliation.
+
+        Deliberately no modal: the decision is asynchronous and its outcome is
+        reported in `pay_status`/the log, so an offscreen or headless run is
+        never blocked by a dialog.
+        """
+        opp_id = self.pay_opp_id.text().strip()
+        evidence_id = self.pay_evidence_id.text().strip()
+        method = self.pay_reconcile_method.currentText().strip()
+        note = self.pay_ref.text().strip()
+        if not opp_id:
+            self.pay_status.setText("Reconcile: opportunity id required")
+            return
+        self.pay_status.setText(
+            f"Reconcile: requested via {method} (awaiting external check)")
+        self.request_reconcile_paid.emit(opp_id, evidence_id, method, note)
 
     def _on_clear_cache(self):
         reply = QMessageBox.question(

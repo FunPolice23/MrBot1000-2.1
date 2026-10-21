@@ -31,7 +31,8 @@ import types
 import unittest
 from unittest import mock
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 def _fake_feedparser(entries):
@@ -139,7 +140,7 @@ class TestRedditScanNeverFabricates(unittest.TestCase):
         """Structurally pin the fix: the `else 50.0` fallback is gone."""
         import ast
 
-        path = os.path.join(r"D:\MrBot1000_2.0", "agents", "earning",
+        path = os.path.join(str(Path(__file__).resolve().parents[2]), "agents", "earning",
                             "social_earning_platform.py")
         with open(path, "r", encoding="utf-8") as fh:
             tree = ast.parse(fh.read())
@@ -232,7 +233,7 @@ class TestGithubBountyNeverFabricates(unittest.TestCase):
         """Structurally pin the fix: both `10.0` fallbacks are gone."""
         import ast
 
-        path = os.path.join(r"D:\MrBot1000_2.0", "agents", "earning", "discoverer.py")
+        path = os.path.join(str(Path(__file__).resolve().parents[2]), "agents", "earning", "discoverer.py")
         with open(path, "r", encoding="utf-8") as fh:
             tree = ast.parse(fh.read())
 

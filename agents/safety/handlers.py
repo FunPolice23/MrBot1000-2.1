@@ -1,10 +1,17 @@
-"""Domain tool handlers used by the authorized dispatcher."""
+"""Domain tool handlers used by the authorized dispatcher.
+
+ARCH-ENG-268 (AA-01): every handler whose tool is in `MUTATING_TOOL_NAMES`
+declares `*, authorization` and calls `_require_mutation_capability`. The
+single exception is `_tool_propose_code_patch`, which routes through
+`CodePatchService` and owns its approval path. Read-only handlers take only
+`args`. `test_arch_eng_263_270_low_fixes.py` pins the convention.
+"""
 
 import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 
 from agents.evidence.evidence import Evidence, VerificationLevel
 from agents.safety.calling import (
@@ -61,11 +68,68 @@ def _tool_web_search(args: Dict[str, Any]) -> str:
         return f"[Search error: {e}]"
 
 
+def require_safe_fetch_url(url: str) -> str:
+    """Refuse a URL that resolves to a private, loopback or link-local address.
+
+    ARCH-ENG-213: `web_read` and `web_check` previously consulted NO URL guard.
+
+    `InstructionGate._is_safe_fetch_url` is a real SSRF guard -- it checks the
+    scheme, rejects a literal host blocklist, RESOLVES the hostname, and refuses
+    any private, loopback, link-local, reserved or multicast result. But it was
+    reachable only from `InstructionGate.fetch_instruction`, and `web_read`
+    reached that path only when `_is_skill_document(url)` was true.
+
+    Every other URL went straight to `web_eyes.read_page(url)`:
+        web_read  -> requests.get(...)
+        web_check -> requests.head(...)
+
+    And `web_read` is classified READONLY, so the SafetyGate ALLOWS it
+    automatically. No human ever saw the request. A model that was told to read
+    `http://169.254.169.254/latest/meta-data/iam/security-credentials/<role>`
+    would have had the credentials returned into its context -- reachable by
+    prompt injection from any page it was asked to read, since the attacker does
+    not need to persuade the model, only to supply the URL.
+
+    The skill branch also ran the content through `sanitize_external_text`; this
+    branch returned the body verbatim. So the one branch with a guard was the
+    one branch that sanitised, and the branch without a guard did not.
+
+    Public URLs are unaffected -- the Web Browser tab, discovery, and ordinary
+    research all continue to work. Only private/loopback/link-local targets are
+    refused, which is exactly what the guard is for.
+
+    Returns an empty string when the URL is clear, else a refusal string.
+    """
+    from agents.safety.instructions import InstructionGate
+
+    if not url or not isinstance(url, str):
+        return "[Fetch refused: no URL was provided]"
+    if InstructionGate._is_safe_fetch_url(url):
+        return ""
+    return (
+        "[Fetch refused: the URL does not resolve to a public address. "
+        "Private, loopback and link-local targets (including cloud metadata "
+        "endpoints such as 169.254.169.254) are not fetched by an agent. "
+        "Provide a public http/https URL, or ask the operator to open it.]")
+
+
 def _tool_web_read(args: Dict[str, Any]) -> str:
     """Read a web page."""
     try:
         url = args["url"]
         if _is_skill_document(url):
+            # ARCH-ENG-213: the skill branch is NOT re-guarded here on purpose.
+            # It already validates through `fetch_instruction` ->
+            # `_is_safe_fetch_url`, and it must keep doing so, because it is the
+            # one branch that records the content for an explicit human
+            # allow/deny decision.
+            #
+            # An earlier draft placed `require_safe_fetch_url` BEFORE this
+            # branch, intending one gate for every url. That broke the quarantine
+            # workflow: an unresolvable host fails the guard, so the request was
+            # refused outright and never reached the human-review path. The
+            # branch was already protected; re-guarding it only moved the point
+            # of failure. The gate belongs on the branch that lacked one.
             # A remote SKILL.md is data for review, never executable authority.
             # The gate also blocks private/loopback URLs and records the content
             # for an explicit human allow/deny decision.
@@ -104,11 +168,26 @@ def _tool_web_read(args: Dict[str, Any]) -> str:
                     content[:12000], source="platform skill.md"),
             }, indent=2)
         from agents.integrations.web_eyes import get_web_eyes
+        from agents.knowledge.prompt_sanitize import sanitize_external_text
         eyes = get_web_eyes()
+        # ARCH-ENG-213: THE GATE FOR EVERY NON-SKILL URL.
+        #
+        # This is the branch that had none. `read_page` issues a real
+        # `requests.get`, `web_read` is READONLY (so the SafetyGate ALLOWS it
+        # with no human in the loop), and the response body was returned
+        # verbatim -- unsanitised -- straight into model context.
+        refusal = require_safe_fetch_url(url)
+        if refusal:
+            return refusal
         # Surface the read in the Web Browser tab (real page load) — ARCH-ENG-105.
         _announce_agent_web(url, "agent web_read", {"kind": "read", "url": url})
         page = eyes.read_page(url)
-        return eyes.format_page_summary(page)
+        summary = eyes.format_page_summary(page)
+        # ARCH-ENG-213: the skill branch sanitised the body before returning it;
+        # this branch did not, so fetched text could carry instructions into
+        # model context unmarked. Sanitisation is applied to the SUMMARY, which
+        # is the part that reaches the model.
+        return sanitize_external_text(summary, source=f"web page {url}")
     except Exception as e:
         return f"[Read error: {e}]"
 
@@ -116,15 +195,195 @@ def _tool_web_read(args: Dict[str, Any]) -> str:
 def _tool_web_check(args: Dict[str, Any]) -> str:
     """Check website status."""
     try:
+        # ARCH-ENG-213: guarded for the same reason as web_read. `check_website_
+        # status` issues a real HEAD request, so it reaches internal services
+        # too -- it is quieter than a body read, not safer.
+        refusal = require_safe_fetch_url(args.get("url", ""))
+        if refusal:
+            return refusal
+        url = args.get("url", "")
+        # ARCH-ENG-224: THIS WAS THE ONLY AGENT URL FETCH WITH NO VISIBILITY.
+        #
+        # `web_search` (:52) and `web_read` (:176) both call
+        # `_announce_agent_web`, which pushes into the Web Browser tab's activity
+        # log so the operator can see what an agent reached for. `web_check` did
+        # not -- and it issues a real HEAD request to whatever URL it is given.
+        # It is guarded by `require_safe_fetch_url`, and it is READONLY so the
+        # SafetyGate allows it with no approval, which means an agent could probe
+        # hosts and leave no trace anywhere in the UI.
+        #
+        # The three tools are otherwise identical from the operator's point of
+        # view: an agent fetched a URL. All three now announce.
+        _announce_agent_web(url, "agent web_check", {"kind": "check", "url": url})
         from agents.integrations.web_eyes import get_web_eyes
         eyes = get_web_eyes()
-        status = eyes.check_website_status(args["url"])
+        status = eyes.check_website_status(url)
         if status.get("online"):
             return f"Online ({status.get('status_code')}) in {status.get('response_time')}s"
         else:
             return f"Offline: {status.get('error', 'unknown error')}"
     except Exception as e:
         return f"[Check error: {e}]"
+
+
+# ── Code Patch Tool ───────────────────────────────────────────
+
+def _tool_propose_code_patch(args: Dict[str, Any]) -> str:
+    """Rehearse a patch on a copy, then queue it for human approval.
+
+    ARCH-ENG-227. This is the propose hop that was missing.
+
+    `CoderWorker` -- the only class that could ever call
+    `self_improvement_commands.propose_code_patch` -- had zero callers
+    anywhere in the codebase. So the Self-Improvement tab's whole chain
+    (propose -> approve -> apply -> verify -> rollback -> post-apply
+    monitor) was fully built, fully gated, and could never be entered:
+    the only producer of a proposal was `monitor_applied`'s own self-heal,
+    which requires an applied patch, which requires an approval. The loop
+    was closed and empty.
+
+    The order of operations below is the whole design, and each step exists
+    because skipping it is a specific failure:
+
+    1. BACKUP FIRST, before anything else. If the target exists, it is copied
+       into the backup directory now -- at PROPOSE time, not at apply time.
+       That way a revert path exists from the moment the human is asked to
+       approve, so a patch that goes wrong later has something to go back to
+       even if the backup step at apply time never gets that far.
+
+    2. REHEARSE ON A COPY. `CodePatchService.verify` only runs `py_compile`,
+       which proves a patch is syntactically valid and nothing more. The new
+       content is applied to a copy under the workshop's practice folder and
+       verified there. A failure is a REFUSAL: no proposal is created.
+
+    3. ONLY THEN PROPOSE. The rehearsal is recorded on the patch so the
+       approver can see where to look.
+
+    4/5. Approval, backup-on-apply, atomic replace, verify, rollback and the
+       deferred-apply queue are all unchanged -- they were already correct.
+
+    What this does NOT do: change anything in the running program. Nothing
+    here writes to the target. The only writes are to the backup directory and
+    the practice folder.
+    """
+    import os
+
+    target = args.get("target") or ""
+    new_content = args.get("new_content")
+    motivation = (args.get("motivation") or "").strip()
+    authored_by = (args.get("authored_by") or "agent").strip()
+
+    if not target:
+        return "[Patch refused: no target path given]"
+    if not motivation:
+        return "[Patch refused: motivation is required. State what defect this "
+        "fixes and why the change addresses it.]"
+
+    try:
+        # The service announces itself on construction, so a tool handler with no
+        # MainWindow can still reach the instance the composition root built.
+        from agents.services.code_patch_service import get_code_patch_service
+        service = get_code_patch_service()
+    except Exception:
+        service = None
+    if service is None:
+        return ("[Patch refused: no code patch service is available. Self "
+                "improvement is disabled or not wired in this process.]")
+
+    # ARCH-ENG-302 (O-01): CoderWorker was the missing live producer. When the
+    # caller supplies a defect but no complete replacement, CoderWorker reads
+    # the file and drafts one. Its `_submit_edit` routes through the same
+    # CodePatchService approval gate as this tool -- nothing is written here.
+    if not isinstance(new_content, str) or not new_content.strip():
+        api_key = next((os.getenv(k, "").strip() for k in (
+            "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY", "GROQ_API_KEY",
+        ) if os.getenv(k, "").strip()), "")
+        if not api_key:
+            return ("[Patch refused: no new_content was supplied and no model "
+                    "API key is configured for CoderWorker.]")
+        from agents.services.coder import CoderWorker
+        abs_target = (target if os.path.isabs(target)
+                      else os.path.join(service.root_dir, target))
+        coder = CoderWorker(api_key, patch_service=service)
+        result = coder.analyze_and_fix(
+            abs_target, (args.get("issue") or motivation).strip())
+        if result.get("success"):
+            return (
+                f"[CoderWorker proposed a patch; nothing was written yet]\n"
+                f"Target:        {abs_target}\n"
+                f"Patch id:      {result.get('patch_id', '')}\n"
+                f"Status:        {result.get('status', 'pending_approval')}\n"
+                f"Notes:         {result.get('notes', '')}\n"
+                f"Approve it in the Self-Improvement tab; approval backs up, "
+                f"applies, verifies and rolls back on failure."
+            )
+        return (f"[Patch refused: CoderWorker did not propose a patch: "
+                f"{result.get('notes') or 'unknown reason'}]")
+
+    repo_root = getattr(service, "root_dir", None) or os.getcwd()
+
+    # -- Step 1: back up BEFORE proposing ------------------------------------
+    abs_target = (target if os.path.isabs(target)
+                  else os.path.join(repo_root, target))
+    backup_path = ""
+    if os.path.isfile(abs_target):
+        try:
+            backup_path = service.backup(abs_target)
+        except Exception as exc:
+            return (f"[Patch refused: could not back up {target} ({exc}). "
+                    f"No proposal was created and nothing was changed.]")
+
+    # -- Step 2: rehearse on a copy ------------------------------------------
+    try:
+        from agents.services.patch_sandbox import PatchSandbox, SandboxError
+        sandbox = PatchSandbox(repo_root)
+        rehearsal = sandbox.rehearse(target, new_content)
+    except Exception as exc:
+        return (f"[Patch refused: could not rehearse the change ({exc}). "
+                f"Nothing was changed.]")
+
+    if not rehearsal.get("ok"):
+        # A rehearsal that ran and failed is a refusal, not a warning.
+        where = rehearsal.get("practice_path", "(unavailable)")
+        return (f"[Patch refused: the rehearsed copy did not pass verification.\n"
+                f"Target:  {target}\n"
+                f"Reason:  {rehearsal.get('detail')}\n"
+                f"Practice copy kept for inspection at: {where}\n"
+                f"No proposal was created. The real file was NOT modified.]")
+
+    # -- Step 3: propose ------------------------------------------------------
+    try:
+        from agents.services.code_patch_service import CodePatch
+        detail = (
+            f"Rehearsed on a copy before this proposal was raised.\n"
+            f"Practice copy: {rehearsal.get('practice_path')}\n"
+            f"Verification: {rehearsal.get('detail')}"
+        )
+        if backup_path:
+            detail += f"\nBackup taken at propose time: {backup_path}"
+        patch = CodePatch(
+            target_path=abs_target,
+            authored_by=authored_by,
+            motivation=motivation,
+            detail=detail,
+            patch_text=new_content,
+            validation=rehearsal.get("validation", "py_compile"),
+        )
+        proposed = service.propose(patch)
+    except Exception as exc:
+        return (f"[Patch refused: {exc}. The real file was NOT modified.]")
+
+    return (
+        f"Patch PROPOSED for human approval -- nothing has been changed yet.\n"
+        f"Target:        {target}\n"
+        f"Rehearsed on:  {rehearsal.get('practice_path')}\n"
+        f"Verification:  {rehearsal.get('detail')}\n"
+        f"Approval id:   {getattr(proposed, 'patch_id', '')}\n"
+        f"Show this to the human in the Self-Improvement tab. Only after they "
+        f"approve will the file be backed up, written and verified; it can be "
+        f"reverted from that backup."
+    )
 
 
 # ── Workshop Tool Implementations ─────────────────────────────────────────
@@ -270,6 +529,327 @@ def _tool_workshop_payment(
         return f"[Payment method added: {args['method']} ({args['identifier']})]"
     except Exception as e:
         return f"[Payment error: {e}]"
+
+
+# ── Workshop Typed Surface (ARCH-ENG-248, 11G's AY-01) ────────────────────
+# The workshop could WRITE structured documents through tools (proposal,
+# account, payment) but had no way to read any of them back: get_proposal,
+# list_proposals, update_proposal_status, read/list_research, read/list_scripts,
+# list_applications, get_account, remove_account, list_deliverables and
+# list_notes were all dead, and the matching typed writers (research, script,
+# application, deliverable, note) were never exposed either. The generic
+# `workshop_list`/`workshop_read` could reach the files, but not the typed
+# contract: no status transitions, no account enumeration that is safe to
+# show, no structured listing. This block wires the full typed surface.
+#
+# Two invariants carried over from ARCH-ENG-134:
+#   * file content read through a typed reader passes the same secret-path
+#     refusal and `redact_secrets` as `workshop_read`;
+#   * an account record never hands the model its stored PASSWORD -- the raw
+#     store is a refused secret file, so a typed reader that returned the dict
+#     verbatim would have re-opened that boundary. Passwords are masked and
+#     free-text notes/memos are redacted.
+
+
+def _workshop_json(payload: Any) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True,
+                          default=str)
+    except Exception:
+        return str(payload)
+
+
+def _workshop_redact(value: Any) -> Any:
+    """Redact secret-looking substrings in free text (ARCH-ENG-134)."""
+    if not isinstance(value, str):
+        return value
+    try:
+        from agents.integrations.wallet_crypto import redact_secrets
+        return redact_secrets(value)
+    except Exception:
+        return value
+
+
+def _mask_workshop_account(account: Dict[str, Any]) -> Dict[str, Any]:
+    masked = dict(account or {})
+    if masked.get("password"):
+        masked["password"] = "***"
+    if "notes" in masked:
+        masked["notes"] = _workshop_redact(masked.get("notes"))
+    return masked
+
+
+def _mask_workshop_payment(payment: Dict[str, Any]) -> Dict[str, Any]:
+    masked = dict(payment or {})
+    if "memo" in masked:
+        masked["memo"] = _workshop_redact(masked.get("memo"))
+    return masked
+
+
+def _read_workshop_typed(relative: str, read) -> str:
+    """Read a typed workshop document with the workshop_read guards.
+
+    ``read`` is the typed reader itself (`get_proposal`, `read_research`,
+    `read_script`) -- wiring the method, not bypassing it with a raw
+    `read_file`, so the typed contract is what the tool actually exercises.
+    """
+    if _is_workshop_secret_path(relative):
+        return "[Refused: that path is a secret store]"
+    return _workshop_redact(read())
+
+
+def _tool_workshop_proposal_list(args: Dict[str, Any]) -> str:
+    """List proposal documents."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        return _workshop_json(get_workshop().list_proposals())
+    except Exception as e:
+        return f"[Workshop proposal list error: {e}]"
+
+
+def _tool_workshop_proposal_get(args: Dict[str, Any]) -> str:
+    """Read one proposal document."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        ws = get_workshop()
+        filename = str(args["filename"])
+        return _read_workshop_typed(
+            os.path.join("proposals", filename),
+            lambda: ws.get_proposal(filename))
+    except Exception as e:
+        return f"[Workshop proposal error: {e}]"
+
+
+def _tool_workshop_proposal_status(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Update a proposal's status line."""
+    blocked = _require_mutation_capability(
+        authorization, "workshop_proposal_status")
+    if blocked:
+        return blocked
+    try:
+        from agents.knowledge.workshop import get_workshop
+        ok = get_workshop().update_proposal_status(
+            args["filename"], args["status"])
+        if not ok:
+            return f"[Proposal status not updated: {args['filename']}]"
+        return f"[Proposal status: {args['filename']} -> {args['status']}]"
+    except Exception as e:
+        return f"[Workshop proposal status error: {e}]"
+
+
+def _tool_workshop_research(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Add a research note."""
+    blocked = _require_mutation_capability(authorization, "workshop_research")
+    if blocked:
+        return blocked
+    try:
+        from agents.knowledge.workshop import get_workshop
+        tags = args.get("tags") or None
+        filepath = get_workshop().add_research(
+            args["title"], args["content"], tags)
+        return f"[Research note created: {filepath}]"
+    except Exception as e:
+        return f"[Workshop research error: {e}]"
+
+
+def _tool_workshop_research_read(args: Dict[str, Any]) -> str:
+    """Read one research note."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        ws = get_workshop()
+        filename = str(args["filename"])
+        return _read_workshop_typed(
+            os.path.join("research", filename),
+            lambda: ws.read_research(filename))
+    except Exception as e:
+        return f"[Workshop research error: {e}]"
+
+
+def _tool_workshop_research_list(args: Dict[str, Any]) -> str:
+    """List research notes."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        return _workshop_json(get_workshop().list_research())
+    except Exception as e:
+        return f"[Workshop research list error: {e}]"
+
+
+def _tool_workshop_script(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Create a script document."""
+    blocked = _require_mutation_capability(authorization, "workshop_script")
+    if blocked:
+        return blocked
+    try:
+        from agents.knowledge.workshop import get_workshop
+        filepath = get_workshop().create_script(
+            args["name"], args["language"], args.get("description", ""),
+            args["code"])
+        return f"[Script created: {filepath}]"
+    except Exception as e:
+        return f"[Workshop script error: {e}]"
+
+
+def _tool_workshop_script_read(args: Dict[str, Any]) -> str:
+    """Read one script document."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        ws = get_workshop()
+        filename = str(args["filename"])
+        return _read_workshop_typed(
+            os.path.join("scripts", filename),
+            lambda: ws.read_script(filename))
+    except Exception as e:
+        return f"[Workshop script error: {e}]"
+
+
+def _tool_workshop_script_list(args: Dict[str, Any]) -> str:
+    """List script documents."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        return _workshop_json(get_workshop().list_scripts())
+    except Exception as e:
+        return f"[Workshop script list error: {e}]"
+
+
+def _tool_workshop_application(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Create a job-application document."""
+    blocked = _require_mutation_capability(
+        authorization, "workshop_application")
+    if blocked:
+        return blocked
+    try:
+        from agents.knowledge.workshop import get_workshop
+        details = {str(k): str(v) for k, v in (args.get("details") or {}).items()}
+        filepath = get_workshop().create_application(
+            args["platform"], args.get("job_type", ""), details)
+        return f"[Application created: {filepath}]"
+    except Exception as e:
+        return f"[Workshop application error: {e}]"
+
+
+def _tool_workshop_application_list(args: Dict[str, Any]) -> str:
+    """List job-application documents."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        return _workshop_json(get_workshop().list_applications())
+    except Exception as e:
+        return f"[Workshop application list error: {e}]"
+
+
+def _tool_workshop_account_get(args: Dict[str, Any]) -> str:
+    """Show one stored account with its password masked."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        account = get_workshop().get_account(args["platform"])
+        if not account:
+            return f"[No account stored for platform: {args['platform']}]"
+        return _workshop_json(_mask_workshop_account(account))
+    except Exception as e:
+        return f"[Workshop account error: {e}]"
+
+
+def _tool_workshop_account_list(args: Dict[str, Any]) -> str:
+    """List stored accounts with passwords masked."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        accounts = get_workshop().list_accounts()
+        return _workshop_json([_mask_workshop_account(a) for a in accounts])
+    except Exception as e:
+        return f"[Workshop account list error: {e}]"
+
+
+def _tool_workshop_account_remove(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Remove a stored account."""
+    blocked = _require_mutation_capability(
+        authorization, "workshop_account_remove")
+    if blocked:
+        return blocked
+    try:
+        from agents.knowledge.workshop import get_workshop
+        ok = get_workshop().remove_account(args["platform"])
+        if not ok:
+            return f"[Account not removed: {args['platform']}]"
+        return f"[Account removed: {args['platform']}]"
+    except Exception as e:
+        return f"[Workshop account remove error: {e}]"
+
+
+def _tool_workshop_payment_get(args: Dict[str, Any]) -> str:
+    """Show one stored payment method."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        payment = get_workshop().get_payment_method(args["method"])
+        if not payment:
+            return f"[No payment method stored: {args['method']}]"
+        return _workshop_json(_mask_workshop_payment(payment))
+    except Exception as e:
+        return f"[Workshop payment error: {e}]"
+
+
+def _tool_workshop_payment_list(args: Dict[str, Any]) -> str:
+    """List stored payment methods."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        payments = get_workshop().list_payment_methods()
+        return _workshop_json([_mask_workshop_payment(p) for p in payments])
+    except Exception as e:
+        return f"[Workshop payment list error: {e}]"
+
+
+def _tool_workshop_deliverable(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Add a deliverable document."""
+    blocked = _require_mutation_capability(
+        authorization, "workshop_deliverable")
+    if blocked:
+        return blocked
+    try:
+        from agents.knowledge.workshop import get_workshop
+        filepath = get_workshop().add_deliverable(
+            args["title"], args["content"], args.get("client", ""),
+            args.get("platform", ""))
+        return f"[Deliverable added: {filepath}]"
+    except Exception as e:
+        return f"[Workshop deliverable error: {e}]"
+
+
+def _tool_workshop_deliverable_list(args: Dict[str, Any]) -> str:
+    """List deliverable documents."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        return _workshop_json(get_workshop().list_deliverables())
+    except Exception as e:
+        return f"[Workshop deliverable list error: {e}]"
+
+
+def _tool_workshop_note(
+    args: Dict[str, Any], *, authorization: object | None = None) -> str:
+    """Add a note."""
+    blocked = _require_mutation_capability(authorization, "workshop_note")
+    if blocked:
+        return blocked
+    try:
+        from agents.knowledge.workshop import get_workshop
+        tags = args.get("tags") or None
+        filepath = get_workshop().add_note(
+            args["title"], args["content"], tags)
+        return f"[Note added: {filepath}]"
+    except Exception as e:
+        return f"[Workshop note error: {e}]"
+
+
+def _tool_workshop_note_list(args: Dict[str, Any]) -> str:
+    """List notes."""
+    try:
+        from agents.knowledge.workshop import get_workshop
+        return _workshop_json(get_workshop().list_notes())
+    except Exception as e:
+        return f"[Workshop note list error: {e}]"
 
 
 # ── File Tool Implementations ─────────────────────────────────────────────
@@ -661,6 +1241,34 @@ def _tool_social_post(
 
 # ── System Tool Implementations ───────────────────────────────────────────
 
+def refuse_secret_argv(argv: Sequence[str]) -> str:
+    """Refuse a command whose argv names a credential/key store.
+
+    ARCH-ENG-211: this is now the ONE implementation.
+
+    `legacy_tools._run_command` had this scan (ARCH-ENG-133) and
+    `_tool_run_command` here did not. So the two dispatchers disagreed about
+    the same setting in opposite directions, and the hardened path was strictly
+    MORE PERMISSIVE than the path it replaced: `run_command("type .env")` was
+    refused via the Big Brain tool loop and executed via dispatch.
+
+    ARCH-ENG-133's own comment demanded "one blocklist, not two that can drift".
+    The blocklist was one (`_is_secret_file`, which lives in this module); what
+    drifted was whether each dispatcher consulted it at all.
+
+    Returns an empty string when the command is clear, else a refusal string.
+    Refusal, not raise: the handlers return strings by contract.
+    """
+    for token in argv:
+        name = Path(token).name
+        if name and _is_secret_file(Path(name)):
+            return (
+                f"[Command refused: the command names a credential/key store "
+                f"('{token}'). Read .env.example for the key names and ask the "
+                "operator for any value.]")
+    return ""
+
+
 def _tool_run_command(
     args: Dict[str, Any], *, authorization: object | None = None) -> str:
     """Run a shell command."""
@@ -668,14 +1276,23 @@ def _tool_run_command(
     if blocked:
         return blocked
     try:
+        argv = command_argv(args["command"])
+    except ValueError as e:
+        # Same message the pre-fix code produced for unparseable commands.
+        return f"[Command error: {e}]"
+    refusal = refuse_secret_argv(argv)
+    if refusal:
+        return refusal
+    try:
         result = subprocess.run(
-            command_argv(args["command"]),
+            argv,
             shell=False,
             cwd=str(resolve_command_cwd(args.get("cwd"))),
             capture_output=True,
             text=True,
             timeout=int(args.get("timeout", 30)),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            encoding="utf-8", errors="replace",
         )
         out = result.stdout.strip()
         err = result.stderr.strip()

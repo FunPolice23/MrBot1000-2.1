@@ -220,7 +220,8 @@ class TestGuiTabs(unittest.TestCase):
         # Count must equal the ungated tabs plus the enabled gated tabs
         # (live_trading gates two tabs).
         ungated = ["Management", "Providers & GPU", "Model Library", "Safety & Tools",
-                   "Chat", "Dialogue", "Approvals", "Registration", "Web Browser",
+                   "Chat", "Dialogue", "Collaboration", "Approvals", "Registration",
+                   "Web Browser",
                    "Payments", "Earnings", "Insights", "Opportunities", "Analytics",
                    "Reputation", "Data Explorer", "Settings", "Live Logs", "DB Stats"]
         expected = len(ungated) + sum(1 for f in gated.values() if feature_enabled(f))
@@ -264,10 +265,28 @@ class TestGuiTabs(unittest.TestCase):
         self.assertTrue(hasattr(self.mw, "_stats_timer"))
         self.assertGreater(self.mw._stats_timer.interval(), 0)
 
-    def test_provider_status_override_persists_after_redetect(self):
+    def test_provider_status_override_is_visible_until_the_next_probe(self):
+        """ARCH-ENG-179 — an operator's Stop is shown immediately, then yields to the probe.
+
+        `set_provider_status` is how the UI reflects the operator pressing Stop or
+        Start, so its result must be visible immediately — the operator should
+        not have to wait for a refresh to see their own action.
+
+        What it must NOT do is survive a subsequent PROBE. Every real detector
+        (`_detect_ollama` and friends) sets an explicit status on both paths —
+        RUNNING on success, STOPPED on failure — so a previous status carried
+        forward is never "the detector had no opinion"; it is a stale claim. The
+        old merge re-applied the PRE-detect status over the fresh probe result,
+        which meant a provider could never be shown stopped again for the life
+        of the process — and `provider_config_widget` sets RUNNING optimistically
+        with no probe at all, so that fiction persisted forever.
+
+        So: the override holds until a probe disagrees, then the world wins.
+        """
         from agents.providers.provider_manager import ProviderInfo, ProviderManager, ProviderStatus
 
         pm = ProviderManager()
+        seen_status = {"value": ProviderStatus.RUNNING.value}
 
         def fake_gpus():
             pm._gpus = []
@@ -276,7 +295,7 @@ class TestGuiTabs(unittest.TestCase):
             pm._providers["demo"] = ProviderInfo(
                 name="Demo",
                 provider_type="demo",
-                status=ProviderStatus.RUNNING.value,
+                status=seen_status["value"],
                 is_local=True,
                 is_cloud=False,
             )
@@ -288,9 +307,88 @@ class TestGuiTabs(unittest.TestCase):
         pm.detect_providers()
         self.assertEqual(pm.get_provider("demo").status, ProviderStatus.RUNNING.value)
 
+        # The operator presses Stop: visible immediately, without a re-detect.
         pm.set_provider_status("demo", ProviderStatus.STOPPED.value)
+        self.assertEqual(pm.get_provider("demo").status,
+                         ProviderStatus.STOPPED.value,
+                         "the operator's own action must be visible at once")
+
+        # A fresh probe that finds the provider UP wins over the stale override.
         pm.detect_providers()
-        self.assertEqual(pm.get_provider("demo").status, ProviderStatus.STOPPED.value)
+        self.assertEqual(pm.get_provider("demo").status,
+                         ProviderStatus.RUNNING.value,
+                         "the fresh probe result must win; a carried-forward "
+                         "status is a lie about whether the provider is up")
+
+    def test_a_stopped_probe_is_not_overwritten_by_an_old_running_status(self):
+        """ARCH-ENG-179 — THE REGRESSION.
+
+        Reproduced: once a provider was `running`, no later detect could ever
+        report it stopped, because the merge re-applied the previous status. The
+        operator watched a dead server listed as running for the rest of the
+        session.
+        """
+        from agents.providers.provider_manager import ProviderInfo, ProviderManager, ProviderStatus
+
+        pm = ProviderManager()
+        state = {"running": True}
+
+        pm._detect_gpus = lambda: setattr(pm, "_gpus", [])
+        pm._detect_cloud_providers = lambda: None
+
+        def fake_local():
+            pm._providers["demo"] = ProviderInfo(
+                name="Demo",
+                provider_type="demo",
+                status=(ProviderStatus.RUNNING.value if state["running"]
+                        else ProviderStatus.STOPPED.value),
+                is_local=True,
+                is_cloud=False,
+            )
+
+        pm._detect_local_providers = fake_local
+
+        pm.detect_providers()
+        self.assertEqual(pm.get_provider("demo").status,
+                         ProviderStatus.RUNNING.value)
+
+        # The server dies.
+        state["running"] = False
+        pm.detect_providers()
+        self.assertEqual(
+            pm.get_provider("demo").status, ProviderStatus.STOPPED.value,
+            "a provider that went down is still reported as running — the "
+            "status merge is monotone and can never report stopped")
+
+    def test_operator_choices_still_survive_a_redetect(self):
+        """ARCH-ENG-179 — the fix must not drop what the merge was FOR.
+
+        The old merge preserved the operator's selected model, GPU assignment,
+        base url and key env var. Those must still survive: they are choices,
+        not observations, so a probe genuinely has no opinion about them.
+        """
+        from agents.providers.provider_manager import ProviderInfo, ProviderManager, ProviderStatus
+
+        pm = ProviderManager()
+        pm._detect_gpus = lambda: setattr(pm, "_gpus", [])
+        pm._detect_cloud_providers = lambda: None
+        pm._detect_local_providers = lambda: pm._providers.__setitem__(
+            "demo", ProviderInfo(name="Demo", provider_type="demo",
+                                 status=ProviderStatus.RUNNING.value,
+                                 is_local=True, is_cloud=False))
+
+        pm.detect_providers()
+        provider = pm.get_provider("demo")
+        provider.selected_model = "my-model.gguf"
+        provider.gpu_index = 1
+        provider.base_url = "http://127.0.0.1:9999"
+
+        pm.detect_providers()
+        after = pm.get_provider("demo")
+        self.assertEqual(after.selected_model, "my-model.gguf",
+                         "the operator's model choice was lost on re-detect")
+        self.assertEqual(after.gpu_index, 1)
+        self.assertEqual(after.base_url, "http://127.0.0.1:9999")
 
 
 if __name__ == "__main__":

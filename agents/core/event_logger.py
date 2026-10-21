@@ -4,9 +4,12 @@ Ties together:
 - Evidence store (provenance proofs, payout records)
 - Comms (task execution, approval outcomes)
 - Safety events (cost cap, recursion, tool firewall, human gate)
-- Heartbeat ticks (tier, credits, tasks executed)
+- Earning events (finalized opportunity outcomes)
 - LLM spend events
 - System lifecycle events (agent start/stop, model switch)
+
+(ARCH-ENG-243 removed the heartbeat report: the legacy manager heartbeat
+it described was already retired from the runtime.)
 
 All events land in one rotating JSONL log + in-memory index, queryable by
 the desktop GUI (timestamp, level, source, event_type, free-text search).
@@ -48,7 +51,9 @@ class EventType(str, Enum):
     SAFETY = "safety"
     LLM_SPEND = "llm_spend"
     SYSTEM = "system"
-    HEARTBEAT = "heartbeat"
+    # ARCH-ENG-243: HEARTBEAT ("heartbeat") removed -- it reported the legacy
+    # manager heartbeat that the runtime already retired; with no emitter the
+    # enum member described a category nothing can ever produce again.
     EVIDENCE = "evidence"
     COMMUNICATION = "communication"
     NOTIFICATION = "notification"
@@ -178,16 +183,6 @@ class StructuredEventLogger:
             cls._instance = None
 
     # ── Event callbacks (Phase 6: goal tracker) ─────────────────────────────
-
-    def add_event_callback(self, callback: Callable[[Event], None]):
-        """Register a callback to be called on every logged event."""
-        if callback not in self._event_callbacks:
-            self._event_callbacks.append(callback)
-
-    def remove_event_callback(self, callback: Callable[[Event], None]):
-        """Remove a previously registered callback."""
-        if callback in self._event_callbacks:
-            self._event_callbacks.remove(callback)
 
     # ── Directory setup ──────────────────────────────────────────────────────
 
@@ -324,8 +319,58 @@ class StructuredEventLogger:
         since: Optional[float] = None,
         until: Optional[float] = None,
     ) -> List[Event]:
-        """Query the in-memory event log."""
-        candidates = set(range(len(self._events)))
+        """Query the in-memory event log.
+
+        ARCH-ENG-230: THIS MATERIALISED A SET OF EVERY EVENT INDEX, EVERY QUERY.
+
+        `set(range(len(self._events)))` builds a set of N integers on every
+        call, for ANY query -- including the common case where no filter at all
+        is applied and the answer is simply the most recent `limit` events.
+
+        The Earnings Insights tab queries `llm_spend` every 4 seconds, so this
+        was allocating a set the size of the entire event log four times a
+        minute, for the life of the process. The log only ever grows.
+
+        The unfiltered case now short-circuits before any set is built. The
+        filtered cases still need candidate sets, but they start from the
+        NARROWEST index available rather than from "every index" intersected
+        with a filter -- which is both cheaper and produces the same set.
+        """
+        n_events = len(self._events)
+        if not event_type and not level and not source and not search \
+                and not (since or until):
+            # ARCH-ENG-230: ORDER MATTERS, so this had to match the general path
+            # exactly. The general path iterates `sorted(candidates,
+            # reverse=True)` -- NEWEST INDEX FIRST -- collects `limit` results,
+            # then returns `results[offset:offset + limit]`.
+            #
+            # So the answer is: take the newest `limit` events, drop the first
+            # `offset`, return the rest NEWEST FIRST.
+            #
+            # Two earlier drafts of this shortcut got it wrong in ways that
+            # looked fine. One returned them oldest-first -- the same rows in
+            # the opposite order, which breaks any caller taking the head of the
+            # result. The other took `limit + offset` newest and sliced, which
+            # is the INTUITIVE pagination semantics but not this function's:
+            # the original collects only `limit` and then slices, so
+            # `offset >= limit` yields an empty list. Matching the original
+            # exactly matters more than matching what pagination ought to do.
+            window = self._events[max(0, n_events - limit):] if limit else []
+            window = list(reversed(window))
+            return window[offset:offset + limit]
+
+        # ARCH-ENG-230: start from the narrowest index that can satisfy the
+        # filters, rather than from the full event id space.
+        narrowest = None
+        for index in (self._index.get(event_type) if event_type else None,
+                      self._level_index.get(level) if level else None,
+                      self._source_index.get(source) if source else None):
+            if index is not None and (narrowest is None or len(index) < len(narrowest)):
+                narrowest = index
+        if narrowest is not None:
+            candidates = set(narrowest)
+        else:
+            candidates = set(range(n_events))
 
         if event_type:
             candidates &= set(self._index.get(event_type, []))
@@ -336,9 +381,19 @@ class StructuredEventLogger:
         if search:
             words = search.lower().split()
             if words:
-                idx_sets = [self._free_text_index.get(w, []) for w in words]
-                candidates &= set(idx_sets[0]) if idx_sets else set()
-                for s in idx_sets[1:]:
+                # ARCH-ENG-230: `candidates &= s` WHERE `s` IS A LIST.
+                #
+                # `_free_text_index.get(w, [])` returns a list, and `set &= list`
+                # raises `TypeError: unsupported operand type(s) for &=: 'set'
+                # and 'list'`. The first word was wrapped in `set(...)` and the
+                # rest were not, so every single-word search worked and every
+                # MULTI-word search crashed.
+                #
+                # Found by the equivalence test added for the shortcut above --
+                # the shortcut itself was fine, but comparing it against the
+                # general path forced execution of this branch.
+                idx_sets = [set(self._free_text_index.get(w, [])) for w in words]
+                for s in idx_sets:
                     candidates &= s
 
         results = []
@@ -444,6 +499,14 @@ class StructuredEventLogger:
         return self.log(ev)
 
     # ── Domain-specific helpers ──────────────────────────────────────────────
+    # ARCH-ENG-243 (BD-01): earning_event, safety_event and llm_spend_event
+    # are LIVE reporters -- wired at their production points (the earning
+    # pipeline's finalize step, the CostGuard trip, the filesystem write
+    # gate, and the brain adapters'/worker's LLM-call completion). See each
+    # call site. `heartbeat_event` was REMOVED: it reported the legacy
+    # manager heartbeat that was already retired from the runtime (main.py
+    # keeps only a no-op stub), and a reporter an Insights KPI read proved
+    # that nothing had verified the removal downstream.
 
     def earning_event(self, action: str, revenue: float = 0.0,
                       cost: float = 0.0, platform: str = "",
@@ -482,19 +545,6 @@ class StructuredEventLogger:
             details={"model": model, "provider": provider,
                      "tokens": tokens, "est_usd": est_usd},
             tags=["llm_spend", model],
-            **kw,
-        ))
-
-    def heartbeat_event(self, tier: str, credits: float,
-                        tasks_run: int, errors: int, **kw):
-        return self.log(Event(
-            event_type=EventType.HEARTBEAT.value,
-            level=EventLevel.INFO.value,
-            message=f"heartbeat:tier={tier}",
-            source="heartbeat",
-            details={"tier": tier, "credits": credits,
-                     "tasks_run": tasks_run, "errors": errors},
-            tags=["heartbeat", tier],
             **kw,
         ))
 

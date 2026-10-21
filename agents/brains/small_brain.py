@@ -24,16 +24,23 @@ from agents.cognition.personas import DRIVER, NAVIGATOR
 class SmallBrainAdapter:
     """Interface to the fast chat model through the active provider."""
     
-    def __init__(self, model=None, base_url=None):
+    def __init__(self, model=None, base_url=None, config=None):
         # Canonical runtime owns the role→endpoint/model/device contract.
+        # Phase 2: a per-slot ``config`` (roster-driven) seeds the adapter; no
+        # config -> the legacy env path, byte-identical.
         from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-        _cfg = DualBrainRuntime.from_env().config(BrainRole.SMALL)
-        legacy_url = os.getenv("SMALL_BRAIN_URL") if _cfg.provider == "llamacpp" else ""
+        if config is not None:
+            _cfg = config
+            legacy_url = ""
+        else:
+            _cfg = DualBrainRuntime.from_env().config(BrainRole.SMALL)
+            legacy_url = os.getenv("SMALL_BRAIN_URL") if _cfg.provider == "llamacpp" else ""
         self.base_url = base_url or legacy_url or _cfg.endpoint
         self.provider = _cfg.provider
         self.device = _cfg.device
         self.context_length = _cfg.context
         self.decision_support_only = _cfg.decision_support_only
+        self.config = config
         
         # Knowledge and memory
         self.db = get_database()
@@ -44,7 +51,8 @@ class SmallBrainAdapter:
         # the dialogue UI may later replace this with the live server model.
         # We intentionally avoid a blocking HTTP call in __init__ so tab
         # construction stays fast even when llama-server is not yet running.
-        self.model = model or os.getenv("SMALL_BRAIN_MODEL", "").strip() or ""
+        self.model = model or (config.model if config is not None
+                               else os.getenv("SMALL_BRAIN_MODEL", "").strip()) or ""
         self.temperature = float(os.getenv("SMALL_BRAIN_TEMPERATURE", "0.5") or 0.5)
         self.last_tool_trace = []
         self.last_thought_graph = None
@@ -124,9 +132,9 @@ class SmallBrainAdapter:
         """Switch to a different model."""
         self.model = model_name
 
-    def _start_got_turn(self, prompt: str):
+    def _start_got_turn(self, prompt: str, pattern=None):
         from agents.brains.brain_got import start_brain_turn
-        return start_brain_turn("small_brain", prompt)
+        return start_brain_turn("small_brain", prompt, pattern=pattern)
 
     def _finish_got_turn(self, turn, response: str, status: str = "completed",
                          branch_candidates=None, evidence_by_id=None) -> str:
@@ -261,6 +269,29 @@ class SmallBrainAdapter:
             (Tree/Graph-of-Thoughts) turn; ignored for direct patterns.
         evidence_by_id: optional {evidence_id: Evidence} used to score branches.
         """
+        # Enforcement (Security's design): a cloud-backed brain is $-capped by the
+        # daily budget AND call-count-limited, keyed on the RESOLVED provider
+        # (self.provider), not the role label — one point covers all four GUI
+        # doors (chat_tab:414/450, dialogue_tab:3015/3055) plus any future direct
+        # caller, so enforcement can't drift. Local brains are never gated (the
+        # 2-brain local path is unchanged). Fails open on infra error, matching
+        # worker_llm_mixin. Billable-by-name, never gated on recorded cost.
+        try:
+            from agents.safety.cost import enforcement_skip_decision, is_local_provider
+            from agents.safety.provider_rate_limiter import get_provider_rate_limiter
+            _skip, _reason = enforcement_skip_decision(self.provider, self.db)
+            if _skip:
+                return (f"[{NAVIGATOR.current_name}: {_reason}. Skipping the call "
+                        f"to stay within budget.]")
+            # Call-count backstop only for BILLABLE providers (local is free and
+            # uncapped — no need to count it, and it avoids a per-call DB bump).
+            if not is_local_provider(self.provider):
+                _rl = get_provider_rate_limiter().acquire(self.provider)
+                if not _rl.get("allow", True):
+                    return (f"[{NAVIGATOR.current_name}: {_rl.get('reason') or 'rate limited'}. "
+                            f"Skipping the call.]")
+        except Exception:
+            pass
         # GUI is the source of truth for model selection
         if self.model == "unknown" or not self.model:
             return f"[{NAVIGATOR.current_name}: No model selected. Please choose a model in the Providers & GPU tab.]"
@@ -329,7 +360,20 @@ class SmallBrainAdapter:
                 {"role": "user", "content": user_message}
             ]
 
-        got_turn = self._start_got_turn(user_message)
+        # ARCH-ENG-317: a plain dialogue turn is back-and-forth talk, not an
+        # orchestration problem. The resolver keyword-matches the whole turn
+        # context (the board text contains "options"/"compare"/"evidence"),
+        # which labelled casual chat tree/graph/react even though no branching
+        # happened — see the big brain's chat() for the full rationale.
+        got_pattern = None
+        if dialogue_mode and not branch_candidates:
+            from agents.cognition.reasoning_modes import (
+                PatternSelection, ReasoningPattern)
+            got_pattern = PatternSelection(
+                ReasoningPattern.DIRECT_DIALOGUE,
+                "plain dialogue turn: back-and-forth conversation needs "
+                "no branching")
+        got_turn = self._start_got_turn(user_message, pattern=got_pattern)
         try:
             client = self._get_client()
             
@@ -442,6 +486,17 @@ class SmallBrainAdapter:
                 prompt_tokens = max(1, prompt_chars // 4)
                 completion_tokens = max(1, resp_chars // 4)
                 tps = (prompt_tokens + completion_tokens) / elapsed if elapsed > 0 else 0.0
+                # ARCH-ENG: a roster can back this brain with a cloud provider
+                # (self.provider != llamacpp). Record the REAL cost so a
+                # cloud-backed brain counts against the daily budget and
+                # CostGuard can skip it — the old hardcoded 0.0 let it bill
+                # freely. Local brains stay 0.0 (free).
+                try:
+                    from agents.safety.cost import estimate_call_cost
+                    _call_cost = estimate_call_cost(
+                        self.provider, self.model, prompt_tokens, completion_tokens)
+                except Exception:
+                    _call_cost = 0.0
                 self.db.log_llm_call(
                     model=self.model,
                     provider=getattr(self, "last_provider", "small-brain"),
@@ -453,8 +508,17 @@ class SmallBrainAdapter:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     tokens_per_second=tps,
-                    cost_usd=0.0,
+                    cost_usd=_call_cost,
                 )
+                # ARCH-ENG-243 (BD-01): the typed spend event the Insights
+                # spend KPI reads; same cost-basis discipline as big_brain.
+                if _call_cost > 0:
+                    from agents.core.event_logger import StructuredEventLogger
+                    StructuredEventLogger.instance().llm_spend_event(
+                        model=self.model,
+                        provider=getattr(self, "last_provider", "small-brain"),
+                        tokens=prompt_tokens + completion_tokens,
+                        est_usd=_call_cost)
             except Exception:
                 pass  # Stats logging must never break the response
             if not str(answer or "").strip():

@@ -11,6 +11,7 @@ Includes:
   - Automatic queued→applied transitions
 """
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable
 from pathlib import Path
@@ -99,6 +100,13 @@ class OpportunityLifecycleTracker:
         # claim PAID) - a recovery/consistency hole. We now persist to a JSON
         # file and recover() it on construction when state_path is provided.
         self._state_path = state_path
+        # ARCH-ENG-162: `_persist` rewrites the WHOLE state file from `_states`
+        # and is called from every `_append`. `AutonomousLoop.run` explicitly
+        # supports concurrent runs (`BoundedSemaphore`, default
+        # MRBOT_AUTONOMY_MAX_CONCURRENT), so two threads could serialise into
+        # `_persist` at once. The lock makes "snapshot the dict + write + replace"
+        # atomic with respect to other persists.
+        self._persist_lock = threading.RLock()
         if self._state_path:
             self._recover_from_disk()
 
@@ -254,6 +262,8 @@ class OpportunityLifecycleTracker:
 
     # ── Ranking & Prioritization ────────────────────────────────────────────
 
+    # ARCH-ENG-256 (Z-03): `get_top_opportunities` had no caller outside its
+    # own definition and was deleted; ranking is this method's job.
     def rank_by_value_effort(self, limit: int = 10) -> List[tuple]:
         """Rank opportunities by value/effort ratio. Returns [(state, score), ...]."""
         scored = []
@@ -281,11 +291,6 @@ class OpportunityLifecycleTracker:
             scored.append((state, total_score))
 
         return sorted(scored, key=lambda x: x[1], reverse=True)[:limit]
-
-    def get_top_opportunities(self, k: int = 3) -> List[OpportunityState]:
-        """Get top K opportunities by value/effort ratio."""
-        ranked = self.rank_by_value_effort(limit=k)
-        return [state for state, score in ranked]
 
     # ── State Transitions ───────────────────────────────────────────────────
 
@@ -339,7 +344,9 @@ class OpportunityLifecycleTracker:
 
         When an EvidenceStore is attached, the SUBMITTED->PAID transition is gated by
         EvidencePolicy (requires submission + completion + payment evidence at the right
-        level). Without a store, falls back to the prior behaviour: verified dict -> paid.
+        level). Without a store it falls back to the L3 external-source floor the
+        evidence dict must satisfy ON ITS OWN CREDENTIALS (ARCH-ENG-159) — a
+        missing store is a reason to be more careful, not less.
         """
         state = self._ensure(opportunity_id)
         # v2.0.34aq: the payout verifier returns a legacy `VerificationEvidence`
@@ -353,9 +360,25 @@ class OpportunityLifecycleTracker:
             except Exception:
                 evidence = None
         if evidence is not None and not hasattr(evidence, "status"):
-            if not evidence or not evidence.get("verified"):
+            # ARCH-ENG-159: this branch used to read `evidence.get("verified")`
+            # and, on a truthy value, call `_mark_paid` directly. That is the
+            # laundering shape handlers._evidence_meets_l3 refuses and the one
+            # ARCH-ENG-121 removed from the gate. A `VerificationEvidence`
+            # dataclass is converted to a real `Evidence` above, so the only
+            # things that reach here are plain dicts — which are, by the
+            # ARCH-ENG-121 argument, "itself agent-supplied": the agent can
+            # write {"verified": True} out of thin air.
+            #
+            # So the no-store fallback now applies the SAME L3 floor as every
+            # other paid path. Missing evidence store is a reason to be MORE
+            # careful, not less: without it there is nothing to corroborate a
+            # claim, so the claim must carry its own credentials.
+            if not evidence or not self._is_verified_evidence(evidence):
+                reason = (evidence.get("note", "") if isinstance(evidence, dict) and
+                          isinstance(evidence.get("note", ""), str) else "") \
+                    or "evidence does not meet the L3 external-source floor"
                 self._append(state, "submitted",
-                             f"Payment NOT verified: {evidence.get('note','no evidence') if evidence else 'no evidence'}",
+                             f"Payment NOT verified: {reason}",
                              amount=amount, source="verifier")
                 state.last_amount = max(state.last_amount, 0.0)
                 state.verification = evidence
@@ -717,19 +740,71 @@ class OpportunityLifecycleTracker:
 
     # ── v2.0.36k Group 4 (M-1): persistence ────────────────────────────────
     def _persist(self) -> None:
-        """Write all lifecycle states to the JSON state file (best-effort)."""
+        """Write all lifecycle states to the JSON state file (best-effort).
+
+        ARCH-ENG-162 — two defects, both data-loss:
+
+        1. NO LOCK. This is called from `_append`, i.e. on every state mutation,
+           and rewrites the entire state list. `AutonomousLoop.run` supports
+           concurrent runs, so two threads could snapshot `_states`, interleave
+           their writes, and have the slower one's `os.replace` publish a file
+           missing the faster one's transitions. Lifecycle state is
+           AUTHORITATIVE — the ARCH-ENG-092 comment in `mark_paid_verified`
+           records a real $750 payout vanishing from every report because of a
+           persist ordering bug.
+
+        2. A FIXED temp path (`state_path + '.tmp'`). Two concurrent writers
+           shared ONE temp file: thread B truncated the file thread A had
+           written and was about to `os.replace`, so A published B's partial
+           content — or `os.replace` raced on a file still being written. The
+           temp name now includes the thread id and pid, so each writer owns its
+           own file, and each is `fsync`ed before the replace so a crash cannot
+           publish an unflushed file.
+
+        3. ON WINDOWS, `os.replace` CAN TRANSIENTLY FAIL. Measured on this machine:
+           ~11k concurrent reads against 4 writer threads produced 0 corrupted
+           reads but 322 `PermissionError(13)`. A reader holding the file
+           without FILE_SHARE_DELETE makes `MoveFileEx` fail. Because this
+           method swallows every exception, a transient lock previously meant
+           the lifecycle update was SILENTLY DROPPED — the exact failure the
+           ARCH-ENG-092 comment describes. There is now a bounded retry.
+
+        `_states` is snapshotted INSIDE the lock so the serialised section covers
+        "read dict -> write -> replace", which is the unit that must not
+        interleave.
+        """
         if not self._state_path:
             return
-        try:
-            import json
-            data = [self.get_state(oid) for oid in self._states]
-            tmp = self._state_path + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as fh:
-                json.dump(data, fh, indent=2, default=str)
-            os.replace(tmp, self._state_path)
-        except Exception:
-            # Persistence must never break the live pipeline.
-            pass
+        import json
+        attempts = 5
+        for attempt in range(attempts):
+            tmp = None
+            try:
+                with self._persist_lock:
+                    data = [self.get_state(oid) for oid in list(self._states)]
+                    tmp = (f"{self._state_path}."
+                           f"{os.getpid()}.{threading.get_ident()}.tmp")
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(data, fh, indent=2, default=str)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp, self._state_path)
+                    tmp = None
+                return
+            except PermissionError:
+                # Windows sharing violation — back off and retry.
+                if attempt < attempts - 1:
+                    time.sleep(0.02 * (attempt + 1))
+                    continue
+            except Exception:
+                break
+            finally:
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+        # Persistence must never break the live pipeline.
 
     def _recover_from_disk(self) -> None:
         """Load previously-persisted states so a restart does not lose the
@@ -840,20 +915,42 @@ class OpportunityLifecycleTracker:
         `verified` key. The consequence was inverted trust: a genuine L5 on-chain
         payout reported `verified_revenue_usd() == 0.0` and was listed in
         `unverified_payouts()`, while a hand-written dict `{"verified": True}`
-        booked its full `expected_usd` as revenue. Trust now follows the same
+        booked its full `expected_usd` as revenue. Trust follows the same
         evidence-policy rule the lifecycle gate uses — affirmative status AND
-        verification level >= L3 external source — with the legacy `verified`
-        boolean honoured only when it carries no status/level of its own.
+        verification level >= L3 external source.
+
+        ARCH-ENG-159: the legacy `if not status: return bool(ev.get("verified"))`
+        branch was removed. ARCH-ENG-121 had already decided the policy is FAIL
+        CLOSED ("An approval authorizes an ACTION, not an AMOUNT and not a
+        VERIFICATION") and `handlers._is_approved` closed the same branch — but
+        that defence sat only at the CALLER. The gate itself still honoured the
+        shape, so any other producer of a bare `{"verified": True}` dict booked
+        straight into `verified_revenue_usd()`. One trust rule per question.
+
+        This cannot reject a genuine record: `Evidence.to_dict()` ALWAYS emits
+        `status` and `verification_level` (see `Evidence.to_dict`), so every
+        dict produced by the evidence model carries its own credentials and
+        takes the policy path below. The branch being removed is reachable ONLY
+        by a hand-built dict — which is the laundering shape, not a legacy
+        encoding of anything real.
+
+        A stored state that fails this check is not lost: it still has
+        `status == "paid"` and still appears in `unverified_payouts()`, so the
+        operator sees the discrepancy rather than it being silently booked.
         """
         if not ev:
             return False
-        status = str(ev.get("status", "") or "").upper()
-        if not status:
-            # Legacy dict shape: honour the explicit boolean only.
-            return bool(ev.get("verified"))
+        if not isinstance(ev, dict):
+            # An `Evidence` object carries its own credentials; accept it
+            # directly rather than silently downgrading it to unverified.
+            status = str(getattr(getattr(ev, "status", None), "value",
+                                 getattr(ev, "status", "")) or "").upper()
+            level = getattr(ev, "verification_level", None)
+        else:
+            status = str(ev.get("status", "") or "").upper()
+            level = ev.get("verification_level")
         if status not in ("VERIFIED", "PARTIALLY_VERIFIED"):
             return False
-        level = ev.get("verification_level")
         if level is None:
             return False
         try:

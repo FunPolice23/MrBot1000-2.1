@@ -62,6 +62,7 @@ class Speaker:
     tier: str                # "big" | "small"  (which shared skillset/prompt)
     brain: object = None     # adapter (set by the caller; registry is Qt-free)
     device_label: str = ""   # "NVIDIA GeForce RTX 5060 Ti (16 GB)"
+    brain_config: object = None  # per-slot BrainConfig (roster-driven); None = legacy
     is_primary_big: bool = False    # slot 0 big (Edward)
     is_primary_small: bool = False  # slot 1 small (Jacob)
 
@@ -154,6 +155,18 @@ def build_speakers(placements: List[Dict], brains: Optional[Dict[int, object]] =
             n += 1
         used_names.add(name.casefold())
         device_label = p.get("label") or p.get("name", "") or ""
+        # Roster-driven placement (BrainRoster.to_placements) carries the slot's
+        # provider/model; build its BrainConfig so _brain_for can seed an
+        # extra-slot adapter with the slot's own provider/model. Legacy device
+        # placements lack "provider" -> brain_config stays None (back-compat).
+        brain_config = None
+        if p.get("provider"):
+            try:
+                from agents.runtime.dual_brain import build_slot_config, BrainRole
+                _role = BrainRole.BIG if tier == "big" else BrainRole.SMALL
+                brain_config = build_slot_config(p, i, _role)
+            except Exception:
+                brain_config = None
         speakers.append(Speaker(
             slot=i,
             key=key,
@@ -161,6 +174,7 @@ def build_speakers(placements: List[Dict], brains: Optional[Dict[int, object]] =
             tier=tier,
             brain=(brains or {}).get(i),
             device_label=device_label,
+            brain_config=brain_config,
             is_primary_big=(i == 0 and tier == "big"),
             is_primary_small=(i == 1 and tier == "small"),
         ))

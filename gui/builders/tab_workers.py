@@ -21,6 +21,55 @@ class DataExplorerWorker(QThread):
         self.finished.emit(result)
 
 
+class LiveOrderProposalWorker(QThread):
+    """ARCH-ENG-283 (G-05): assess and propose one live order off the GUI thread.
+
+    Reading the exchange and computing the deterministic risk verdict are
+    network-bound. The worker only PROPOSES: with the default policy it enqueues
+    a scoped ACTION approval and returns its id. A preapproved (low-risk) order
+    is submitted through the same `execute_order` gate the approval path uses;
+    that gate re-assesses against live state and can still refuse.
+    """
+
+    finished = Signal(dict)
+
+    def __init__(self, service, intent):
+        super().__init__()
+        self.service = service
+        self.intent = intent
+
+    def run(self):
+        try:
+            portfolio = self.service.sync_portfolio()
+            market = self.service.fetch_market_snapshot(self.intent.symbol)
+            assessment = self.service.assess_order(
+                self.intent, portfolio, market)
+            proposal = self.service.propose_order(self.intent, assessment)
+            result = {
+                "ok": bool(proposal.get("ok")),
+                "status": proposal.get("status", ""),
+                "approval_id": proposal.get("approval_id", ""),
+                "decision": assessment.decision,
+                "reasons": list(assessment.reasons),
+                "factors": dict(assessment.factors),
+            }
+            if proposal.get("status") == "preapproved":
+                execution = self.service.execute_order(
+                    self.intent, assessment)
+                result["execution"] = execution
+                result["status"] = execution.get("execution_mode", "executed")
+            elif proposal.get("status") == "blocked":
+                result["error"] = "; ".join(
+                    proposal.get("reasons") or assessment.reasons)
+            self.finished.emit(result)
+        except Exception as exc:
+            self.finished.emit({
+                "ok": False,
+                "status": "error",
+                "error": str(exc),
+            })
+
+
 class LivePortfolioWorker(QThread):
     """Read a live exchange account without blocking the Qt GUI thread."""
 

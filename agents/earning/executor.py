@@ -19,6 +19,28 @@ validators decide completion.
 12 Verify outcome                PAYMENT_PENDING
 13 Record evidence               PAYMENT_PENDING
 14 Learn from result             PAYMENT_PENDING → PAID
+
+ARCH-ENG-158 — steps 12/14 could not verify a payment, so they asserted one.
+
+Steps 12 and 14 previously wrote ``step_results[12] = {"verified": True}`` as a
+literal and then transitioned the portfolio to ``WorkStatus.PAID`` at step 14 with
+no evidence of any kind. The pipeline therefore reported a completed, paid
+opportunity for any task that reached step 11 — which is every task with no human
+gate. That is precisely the shape `agents/safety/handlers.py::_is_approved` and
+`OpportunityLifecycleTracker._is_verified_evidence` were hardened to refuse
+(ARCH-ENG-064/118/119/121): the caller asserting its own claim, dressed as a
+verification.
+
+Both steps now consult a real `EvidenceStore` and the shared evidence policy. The
+portfolio only reaches PAID when a real `Evidence` satisfies the same
+`SUBMITTED->PAID` / `CLAIMED->REVENUE_REALIZED` contract that
+`AutonomousLoop._stage_verify` enforces, and the satisfying `Evidence` object is
+carried on `ExecutionResult.evidence` rather than a boolean.
+
+With no evidence store wired, or no qualifying evidence, the pipeline fails
+CLOSED: step 12 records why, step 14 leaves the entry in PAYMENT_PENDING, and the
+result reports ``final_status="payment_unverified"``. `WorkStatus.PAID` is no
+longer reachable from this module without independent proof of payment.
 """
 
 from __future__ import annotations
@@ -55,8 +77,11 @@ class ExecutionContext:
     validation_report: Optional[Any] = None
     deliverable: Optional[Dict] = None
     submission_result: Optional[Dict] = None
-    outcome: Optional[Dict] = None
-    evidence: List[Dict] = field(default_factory=list)
+    # ARCH-ENG-158: the step-12 payment verdict. Populated by `_step12_verify`;
+    # `paid` here is the sole licence for a PAID transition.
+    outcome: Optional[Dict[str, Any]] = None
+    # Real `Evidence` objects only (never hand-built dicts).
+    evidence: List[Any] = field(default_factory=list)
     current_step: int = 0
     step_results: Dict[int, Dict] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
@@ -95,11 +120,20 @@ class ExecutionResult:
     context: ExecutionContext
     errors: List[str] = field(default_factory=list)
     completed_steps: int = 0
+    # ARCH-ENG-158: True only when a real `Evidence` satisfied the payment
+    # policy. This is the ONLY field that may license `final_status == "paid"`.
+    paid: bool = False
+    # The `Evidence` object(s) that satisfied the gate. Empty when unpaid.
+    evidence: List[Any] = field(default_factory=list)
+    # Human-readable reason the payment gate was or was not satisfied.
+    payment_status: str = ""
 
     def to_dict(self) -> dict:
         return {
             "success": self.success,
             "final_status": self.final_status,
+            "paid": self.paid,
+            "payment_status": self.payment_status,
             "errors": self.errors,
             "completed_steps": self.completed_steps,
             "duration_s": (self.context.completed_at - self.context.started_at) if self.context.completed_at else 0,
@@ -112,11 +146,16 @@ class TaskExecutor:
     """Drives the 14-step execution pipeline."""
 
     def __init__(self, portfolio: Any, capability_validator: Any,
-                 human_gate_manager: Any, config: Optional[Dict] = None):
+                 human_gate_manager: Any, config: Optional[Dict] = None,
+                 evidence_store: Any = None):
         self.portfolio = portfolio
         self.capability_validator = capability_validator
         self.human_gate_manager = human_gate_manager
         self.config = config or {}
+        # ARCH-ENG-158: the source of truth for step 12. Deliberately optional so
+        # existing construction sites keep working — but a missing store can only
+        # ever produce an UNVERIFIED outcome (fail closed), never a paid one.
+        self.evidence_store = evidence_store
 
     # ── Main entry ─────────────────────────────────────────────────────────────
 
@@ -161,7 +200,15 @@ class TaskExecutor:
             self._step13_record_evidence(ctx)
             ctx.current_step = 14
             self._step14_learn(ctx)
-            return self._build_result(ctx, success=True, status="paid")
+            # ARCH-ENG-158: the terminal status is a function of what step 12
+            # actually proved, not of how far the pipeline walked. Reaching step
+            # 14 is not evidence of payment. `_step12_verify` already recorded
+            # its own status (BLOCKED / FAILED / COMPLETED); do not overwrite it.
+            if ctx.outcome and ctx.outcome.get("paid"):
+                return self._build_result(ctx, success=True, status="paid")
+            reason = (ctx.outcome or {}).get("reason", "no qualifying payment evidence")
+            return self._build_result(
+                ctx, success=True, status="payment_unverified", detail=reason)
         except Exception as e:
             ctx.errors.append(str(e))
             return self._build_result(ctx, success=False, status="failed")
@@ -305,33 +352,173 @@ class TaskExecutor:
         self._record_step(ctx, 11, StepStatus.COMPLETED, "Waiting for acceptance")
 
     def _step12_verify(self, ctx: ExecutionContext) -> None:
-        """Step 12: Verify outcome. PAYMENT_PENDING."""
-        ctx.step_results[12] = {"verified": True}
-        self._record_step(ctx, 12, StepStatus.COMPLETED, "Outcome verified")
+        """Step 12: Verify outcome. PAYMENT_PENDING.
+
+        ARCH-ENG-158: this used to write ``{"verified": True}`` unconditionally.
+        It now resolves real `Evidence` for this opportunity and applies the
+        shared evidence policy — the same `SUBMITTED->PAID` /
+        `CLAIMED->REVENUE_REALIZED` contract enforced by
+        `AutonomousLoop._stage_verify` and `evidence_policy.is_transition_eligible`.
+
+        Fails CLOSED: a missing store, a query error, or an empty result set all
+        resolve to `paid=False` with a recorded reason. Nothing here consults the
+        caller, the task dict, or the submission receipt.
+        """
+        opportunity_id = _entry_id(ctx)
+        verdict = {"paid": False, "evidence": [], "reason": "", "amount": 0.0,
+                   "opportunity_id": opportunity_id}
+
+        store = self.evidence_store
+        if store is None or not hasattr(store, "for_subject"):
+            verdict["reason"] = ("no evidence store wired to the executor; "
+                                 "payment cannot be verified")
+            ctx.outcome = verdict
+            ctx.step_results[12] = {"verified": False, "reason": verdict["reason"]}
+            self._record_step(ctx, 12, StepStatus.BLOCKED, verdict["reason"])
+            return
+
+        try:
+            from agents.evidence.evidence import EvidenceStatus, VerificationLevel
+            from agents.evidence.evidence_policy import is_transition_eligible
+            from agents.earning.payment_evidence import TRANSITION_PAYMENT_EVIDENCE_TYPES
+
+            evidence = list(store.for_subject("opportunity", opportunity_id))
+            verdict["evidence_found"] = len(evidence)
+
+            if not evidence:
+                verdict["reason"] = "no evidence recorded for this opportunity"
+                ctx.outcome = verdict
+                ctx.step_results[12] = {"verified": False, "reason": verdict["reason"]}
+                self._record_step(ctx, 12, StepStatus.FAILED, verdict["reason"])
+                return
+
+            eligible = (
+                is_transition_eligible("SUBMITTED->PAID", evidence)
+                or is_transition_eligible("CLAIMED->REVENUE_REALIZED", evidence)
+            )
+
+            qualifying = []
+            for ev in evidence:
+                # Status and level must be carried by the record itself. A dict
+                # or a bare `{"verified": True}` cannot reach here: `for_subject`
+                # only ever returns `Evidence` instances.
+                if ev.evidence_type in TRANSITION_PAYMENT_EVIDENCE_TYPES:
+                    if (ev.status == EvidenceStatus.VERIFIED
+                            and ev.verification_level >= VerificationLevel.L3_EXTERNAL_SOURCE):
+                        qualifying.append(ev)
+
+            if eligible and qualifying:
+                verdict["paid"] = True
+                verdict["evidence"] = qualifying
+                verdict["amount"] = sum(float(getattr(ev, "amount", 0) or 0)
+                                        for ev in qualifying)
+                verdict["reason"] = (
+                    f"{len(qualifying)} payment evidence record(s) at "
+                    f">=L3_EXTERNAL_SOURCE satisfied the SUBMITTED->PAID policy")
+            else:
+                if not eligible:
+                    verdict["reason"] = (
+                        "evidence exists but does not satisfy the SUBMITTED->PAID "
+                        "policy (missing/under-verified required types)")
+                else:
+                    verdict["reason"] = (
+                        "no payment evidence at VERIFIED and >=L3_EXTERNAL_SOURCE")
+                ctx.step_results[12] = {"verified": False, "reason": verdict["reason"]}
+                self._record_step(ctx, 12, StepStatus.FAILED, verdict["reason"])
+                ctx.outcome = verdict
+                return
+
+            ctx.outcome = verdict
+            ctx.step_results[12] = {
+                "verified": True,
+                "reason": verdict["reason"],
+                "amount": verdict["amount"],
+                "evidence_ids": [getattr(ev, "id", "") for ev in qualifying],
+            }
+            self._record_step(ctx, 12, StepStatus.COMPLETED, verdict["reason"])
+
+        except Exception as e:  # a policy/store error is never a successful payout
+            verdict["paid"] = False
+            verdict["reason"] = f"evidence check failed: {e}"
+            ctx.outcome = verdict
+            ctx.step_results[12] = {"verified": False, "reason": verdict["reason"]}
+            self._record_step(ctx, 12, StepStatus.FAILED, verdict["reason"])
 
     def _step13_record_evidence(self, ctx: ExecutionContext) -> None:
-        """Step 13: Record evidence. PAYMENT_PENDING."""
-        evidence = {
-            "task_id": ctx.task.get("task_id", ""),
-            "validation_report": ctx.validation_report.to_dict() if ctx.validation_report else None,
-            "submission": ctx.submission_result,
-            "recorded_at": time.time(),
-        }
-        ctx.evidence.append(evidence)
-        ctx.step_results[13] = evidence
-        self._record_step(ctx, 13, StepStatus.COMPLETED, "Evidence recorded")
+        """Step 13: Record evidence. PAYMENT_PENDING.
+
+        ARCH-ENG-158: this step used to build a hand-rolled dict
+        (``{"task_id", "validation_report", "submission", "recorded_at"}``) and
+        append it to an in-memory list that nothing ever read. It looked like
+        evidence, and a dict is exactly the shape the payment gate refuses
+        (`handlers._is_approved`: "a hand-built dict is itself agent-supplied").
+
+        It now records only real `Evidence` objects that already exist, and
+        persists anything not yet stored. It never manufactures a payment record.
+        """
+        recorded: List[Any] = []
+        try:
+            store = self.evidence_store
+            pending = [ev for ev in (ctx.evidence or [])
+                       if hasattr(ev, "evidence_type") and hasattr(ev, "dup_key")]
+            if pending and store is not None and hasattr(store, "record"):
+                for ev in pending:
+                    recorded.append(store.record(ev))
+            elif pending:
+                recorded.extend(pending)
+            ctx.evidence = recorded
+            ctx.step_results[13] = {
+                "recorded_count": len(recorded),
+                "evidence_ids": [getattr(ev, "id", "") for ev in recorded],
+                "note": ("no new evidence was produced by this run; step 12 "
+                         "resolved any pre-existing records from the store"),
+            }
+            self._record_step(ctx, 13, StepStatus.COMPLETED,
+                              f"Recorded {len(recorded)} evidence record(s)")
+        except Exception as e:
+            ctx.step_results[13] = {"recorded_count": 0, "error": str(e)}
+            self._record_step(ctx, 13, StepStatus.FAILED,
+                              f"Evidence recording failed: {e}")
 
     def _step14_learn(self, ctx: ExecutionContext) -> None:
-        """Step 14: Learn from result. PAYMENT_PENDING → PAID."""
-        ctx.step_results[14] = {"learned": True}
-        ctx.portfolio_entry = self.portfolio.transition_work_status(
-            ctx.portfolio_entry.opportunity_id, self._work_status_for_step(14))
-        self._record_step(ctx, 14, StepStatus.COMPLETED, "Learned from result")
+        """Step 14: Learn from result. PAYMENT_PENDING → PAID.
+
+        ARCH-ENG-158: the PAID transition is now conditional on step 12 having
+        proved payment with real evidence. Previously this step wrote
+        ``{"learned": True}`` and transitioned to PAID regardless, so any task
+        that reached step 11 was marked paid. An unverified outcome stays in
+        PAYMENT_PENDING, which is the truthful state.
+        """
+        outcome = ctx.outcome or {}
+        paid = bool(outcome.get("paid"))
+        ctx.step_results[14] = {
+            "learned": True,
+            "paid": paid,
+            "reason": outcome.get("reason", ""),
+        }
+        if paid:
+            ctx.portfolio_entry = self.portfolio.transition_work_status(
+                ctx.portfolio_entry.opportunity_id, WorkStatus.PAID)
+            self._record_step(ctx, 14, StepStatus.COMPLETED,
+                              f"Learned from verified payment "
+                              f"({outcome.get('amount', 0.0)})")
+        else:
+            self._record_step(
+                ctx, 14, StepStatus.COMPLETED,
+                f"Learned from unverified outcome; left in "
+                f"{WorkStatus.PAYMENT_PENDING.value} — "
+                f"{outcome.get('reason', 'payment not verified')}")
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _work_status_for_step(self, step: int) -> Any:
-        """Map pipeline step to WorkStatus."""
+        """Map pipeline step to WorkStatus.
+
+        ARCH-ENG-158: step 14 no longer maps to PAID. A blanket step→status
+        table made "the pipeline reached step 14" indistinguishable from "payment
+        was proven", so the caller could not express the difference. Step 14 now
+        picks its status from the step-12 verdict and applies PAID itself.
+        """
         mapping = {
             1: WorkStatus.EVALUATING,
             4: WorkStatus.QUALIFIED,
@@ -340,7 +527,6 @@ class TaskExecutor:
             9: WorkStatus.COMPLETED,
             10: WorkStatus.WAITING_EXTERNAL,
             11: WorkStatus.PAYMENT_PENDING,
-            14: WorkStatus.PAID,
         }
         return mapping.get(step, WorkStatus.EVALUATING)
 
@@ -355,16 +541,22 @@ class TaskExecutor:
         else:
             ctx.step_results[step] = {"status": status.value, "detail": detail}
 
-    def _build_result(self, ctx: ExecutionContext, success: bool, status: str) -> ExecutionResult:
+    def _build_result(self, ctx: ExecutionContext, success: bool, status: str,
+                      detail: str = "") -> ExecutionResult:
         ctx.completed_at = time.time()
         completed = sum(1 for s in ctx.step_results.values()
                         if isinstance(s, dict) and s.get("status") == StepStatus.COMPLETED.value)
+        outcome = ctx.outcome or {}
+        paid = bool(outcome.get("paid")) and status == "paid"
         return ExecutionResult(
             success=success,
             final_status=status,
             context=ctx,
             errors=ctx.errors,
             completed_steps=completed,
+            paid=paid,
+            evidence=list(outcome.get("evidence") or []),
+            payment_status=detail or str(outcome.get("reason", "")),
         )
 
 
@@ -372,6 +564,22 @@ class TaskExecutor:
 
 class ExecutionNotPossibleError(Exception):
     """Raised when a task cannot be executed."""
+
+
+def _entry_id(ctx: ExecutionContext) -> str:
+    """Best-effort opportunity id for the entry under execution.
+
+    The pipeline carries `opportunity_id` on the portfolio entry; the task dict is
+    only a fallback. An empty id is legitimate — it simply matches no evidence,
+    which fails closed.
+    """
+    entry = ctx.portfolio_entry
+    oid = getattr(entry, "opportunity_id", "") or ""
+    if not oid:
+        oid = str(ctx.task.get("opportunity_id", "") or "")
+    if not oid:
+        oid = str(ctx.task.get("task_id", "") or "")
+    return oid
 
 
 __all__ = [

@@ -21,7 +21,12 @@ def test_earning_tab_builds(qt_app):
     assert tab.microtask_table is not None
     assert tab.crypto_wallets_table is not None
     assert tab.autonomy_log is not None
-    assert tab._get_wallet_manager() is None  # parent-less
+    # ARCH-ENG-154: this asserted `is None  # parent-less`, which encoded the
+    # defect — a parent-less tab returning no wallet store was the bug, not the
+    # contract. Every wallet surface (Add Wallet, Propose Payment, the crypto
+    # wallets table) went through this call and was dead. It now resolves the
+    # shared store regardless of parent.
+    assert tab._get_wallet_manager() is not None
 
 
 def test_tab_builder_delegates_earning_tab():

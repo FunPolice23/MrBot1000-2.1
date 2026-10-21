@@ -127,7 +127,15 @@ class TestSharedSkillsPersona(unittest.TestCase):
         tab._speakers = _speakers()
         tab.big_brain = _FakeBrain("big-model")
         tab.small_brain = _FakeBrain("small-model")
-        # _tier_for_speaker: Rowan (big) -> full tier.
+        # ARCH-ENG-316: the tier follows the MODEL size now, so stub a brain on
+        # each speaker in addition to pinning the VRAM lookup offline.
+        for spk in tab._speakers:
+            if spk.brain is None and spk.tier == "big":
+                spk.brain = _FakeBrain("qwen3.5-32b-instruct")
+            elif spk.brain is None:
+                spk.brain = _FakeBrain("qwen2.5-7b-instruct")
+        tab._vram_cache = {True: 15.9, False: 16.0}
+        # _tier_for_speaker: Rowan (big, 32B) -> full tier.
         self.assertEqual(tab._tier_for_speaker("Rowan Vale"), "full")
         # Pip (small) -> compact tier.
         self.assertEqual(tab._tier_for_speaker("Pip Marlowe"), "compact")

@@ -81,14 +81,9 @@ class TabLifecycleMixin:
         # previously-visible tab and resume on the newly-shown one, so hidden
         # tabs stop hammering nvidia-smi / rebuilding tables (GUI perf).
         self._sync_background_tabs(index)
-        # Auto-populate the Ollama model dropdowns (silent) the first time the
-        # Settings tab is shown (v2.0.20h / v2.0.34al). Avoids requiring a manual
-        # Refresh click and avoids re-querying Ollama on every tab switch.
-        if self._ollama_autorefresh_done:
-            return
-        if index == self._settings_tab_index:
-            self._ollama_autorefresh_done = True
-            self.populate_ollama_model_combos()
+        # ARCH-ENG-275 (AB-01): the silent Ollama model refresh that ran here
+        # existed only to populate the hidden Settings combos. Those combos are
+        # gone; ProviderConfigWidget has its own per-provider Refresh control.
 
     def _find_bg_aware(self, w):
         from PySide6.QtWidgets import QScrollArea

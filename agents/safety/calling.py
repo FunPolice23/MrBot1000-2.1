@@ -151,9 +151,28 @@ from agents.safety.handlers import (
     _tool_workshop_list, _tool_workshop_read, _tool_workshop_write,
     _tool_workshop_mkdir, _tool_workshop_storage, _tool_workshop_search,
     _tool_workshop_proposal, _tool_workshop_account, _tool_workshop_payment,
+    # ARCH-ENG-248 (AY-01): typed workshop surface -- exported HERE because
+    # dispatch.py reaches handlers as `runtime._tool_*` on this module.
+    _tool_workshop_proposal_list, _tool_workshop_proposal_get,
+    _tool_workshop_proposal_status,
+    _tool_workshop_research, _tool_workshop_research_read,
+    _tool_workshop_research_list,
+    _tool_workshop_script, _tool_workshop_script_read,
+    _tool_workshop_script_list,
+    _tool_workshop_application, _tool_workshop_application_list,
+    _tool_workshop_account_get, _tool_workshop_account_list,
+    _tool_workshop_account_remove,
+    _tool_workshop_payment_get, _tool_workshop_payment_list,
+    _tool_workshop_deliverable, _tool_workshop_deliverable_list,
+    _tool_workshop_note, _tool_workshop_note_list,
     _tool_record_payment, _tool_social_post,
     _tool_file_read, _tool_file_write, _tool_file_list, _tool_run_command,
     _tool_query_db,
+    # ARCH-ENG-227: dispatch.py reaches handlers as `runtime._tool_*` on THIS
+    # module, not on handlers.py. Registering the tool in the registry without
+    # re-exporting it here means `execute_tool` raises AttributeError at
+    # dispatch time -- an ImportError-free, schema-visible, entirely dead tool.
+    _tool_propose_code_patch,
 )
 
 

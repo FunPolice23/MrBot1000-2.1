@@ -282,12 +282,29 @@ def test_diagnostics_tab_is_read_only_and_refreshes_health(qt_app):
     )
 
     widget = harness.create_diagnostics_tab()
+
+    # ARCH-ENG-221: the automatic path must NOT force a health refresh.
+    #
+    # `DualBrainRuntime.list_models` carries a 10 s TTL on its health cache,
+    # added by ARCH-ENG-188 specifically so the UI would not re-probe. The
+    # periodic refresh used to pass `refresh_health=True`, defeating that TTL on
+    # a 5 s timer -- two blocking `urlopen(timeout=3)` calls per role, on the GUI
+    # thread, every 5 seconds.
+    #
+    # This assertion previously read `assert_called_with(refresh_health=True)`,
+    # pinning the defect.
     harness.refresh_diagnostics()
-    runtime.snapshot.assert_called_with(refresh_health=True)
+    runtime.snapshot.assert_called_with()
     assert harness.diagnostics_health_table.rowCount() == 2
     assert harness.diagnostics_health_table.item(1, 4).text() == "server_unavailable"
     assert harness.diagnostics_conflict_table.rowCount() == 0
     assert "read-only" in harness.diagnostics_reconciliation_label.text()
+
+    # ...but an explicit operator request must still force a live probe.
+    runtime.snapshot.reset_mock()
+    harness.refresh_diagnostics(force=True)
+    runtime.snapshot.assert_called_with(refresh_health=True)
+    assert harness.diagnostics_health_table.rowCount() == 2
     widget.deleteLater()
 
 

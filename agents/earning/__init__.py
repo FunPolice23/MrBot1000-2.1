@@ -14,7 +14,6 @@ from .evidence import build_manual_attestation, is_affirmative_verification
 from .payment import record_realized_gas, total_realized_gas
 from .accounting import accounting_projection
 from .got import GraphBudget, OpportunityGraphPlanner, OpportunityGraphRank
-from .capability import EarningCapabilityExecutor, EarningCapabilityResult
 from .validator import CapabilityValidator
 from .validators import ValidationReport, get_validator
 from .capabilities import CapabilityCategory, CapabilityRegistry, CapabilitySpec, get_default_registry
@@ -34,7 +33,7 @@ from .executor import (
     StepStatus,
     TaskExecutor,
 )
-from .router import classify_task, get_all_tools, get_specialization_prompt, get_tools_for_task
+from .router import classify_task, get_specialization_prompt, get_tools_for_task
 
 __all__ = [
     "EarningDiscoveryService",
@@ -50,7 +49,6 @@ __all__ = [
     "record_realized_gas", "total_realized_gas",
     "accounting_projection",
     "GraphBudget", "OpportunityGraphPlanner", "OpportunityGraphRank",
-    "EarningCapabilityExecutor", "EarningCapabilityResult",
     "CapabilityValidator",
     "ValidationReport",
     "get_validator",
@@ -71,7 +69,6 @@ __all__ = [
     "StepStatus",
     "TaskExecutor",
     "classify_task",
-    "get_all_tools",
     "get_specialization_prompt",
     "get_tools_for_task",
     "canonical_to_legacy",

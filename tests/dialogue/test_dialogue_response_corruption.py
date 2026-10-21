@@ -677,19 +677,22 @@ class TestDialogueResponseCorruption(unittest.TestCase):
             self.assertEqual(DRIVER.current_name, "E. Hurst")
             self.assertEqual(NAVIGATOR.current_name, "J. Stanley")
 
-    def test_dialogue_capability_gate_rejects_tiny_and_base_models(self):
+    def test_dialogue_capability_advisory_flags_tiny_and_base_models(self):
+        # ARCH-ENG-313: the gate became an advisory (warn, never refuse).
+        # It still FLAGS the same models so the operator hears why output is
+        # weak; the refusal itself is gone (see test_arch_eng_313).
         tab = DialogueTab.__new__(DialogueTab)
-        blocked, reason = tab._dialogue_model_blocked("granite-1b-tiny")
-        self.assertTrue(blocked)
+        flagged, reason = tab._dialogue_model_advisory("granite-1b-tiny")
+        self.assertTrue(flagged)
         self.assertIn("below 2B", reason)
-        blocked, reason = tab._dialogue_model_blocked("mistralai/ministral-3-3b")
-        self.assertFalse(blocked)
+        flagged, reason = tab._dialogue_model_advisory("mistralai/ministral-3-3b")
+        self.assertFalse(flagged)
         self.assertEqual(reason, "")
-        blocked, reason = tab._dialogue_model_blocked("llama-3.1-8b-base")
-        self.assertTrue(blocked)
+        flagged, reason = tab._dialogue_model_advisory("llama-3.1-8b-base")
+        self.assertTrue(flagged)
         self.assertIn("not dialogue-tuned", reason)
-        blocked, reason = tab._dialogue_model_blocked("qwen2.5-7b-instruct")
-        self.assertFalse(blocked)
+        flagged, reason = tab._dialogue_model_advisory("qwen2.5-7b-instruct")
+        self.assertFalse(flagged)
         self.assertEqual(reason, "")
 
     def test_model_contracts_scale_output_without_inviting_topic_drift(self):

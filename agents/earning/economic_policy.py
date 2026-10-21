@@ -7,10 +7,12 @@ the same prediction reusable by different operators and runtime policies.
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping
+from typing import ClassVar, Mapping
 
 
 class DecisionAction(str, Enum):
@@ -156,6 +158,20 @@ class DecisionPolicy:
     required_autonomy_level: int = 0
     maximum_prediction_age_seconds: float = 86400.0
 
+    # ── Operator configuration ─────────────────────────────────────────────
+    #
+    # These thresholds are what turn "this opportunity loses money" into a
+    # decision instead of a number in a log line. They live here, as data on
+    # the policy object, rather than as literals inside a loop stage, so an
+    # operator can tighten them without editing the autonomous loop.
+
+    # A negative hourly return is never worth pursuing. `evaluate_prediction`
+    # already computes `risk_adjusted_return`, but until the autonomous loop
+    # actually consulted a policy there was no threshold to compare it against:
+    # `_stage_check_economics` recorded `estimated_hourly: -2.5` and returned
+    # COMPLETED (OBSERVED), so a $5 payout costing 200 hours reached execute.
+    DEFAULT_MINIMUM_HOURLY: ClassVar[float] = 0.0
+
     def __post_init__(self) -> None:
         if not 0.0 <= self.minimum_confidence <= 1.0:
             raise ValueError("minimum_confidence must be between 0 and 1")
@@ -255,10 +271,93 @@ def evaluate_prediction(
     )
 
 
+def _settings_file() -> str:
+    """Return the settings.json path, honoring the test-isolation override.
+
+    Mirrors ``device_registry.policy_path``: without
+    ``MRBOT_DEVICE_SETTINGS_PATH`` a test run would read (and a careless writer
+    would clobber) the operator's LIVE settings.json.
+    """
+    override = (os.getenv("MRBOT_DEVICE_SETTINGS_PATH") or "").strip()
+    if override:
+        return override
+    return os.path.join(os.getcwd(), "settings.json")
+
+
+# settings.json key holding the operator's economic thresholds.
+SETTINGS_KEY = "economic_policy"
+
+# The numeric thresholds an operator may set. Names match DecisionPolicy
+# fields exactly, so a settings key cannot silently configure a field that
+# does not exist (a typo would otherwise be ignored forever).
+_NUMERIC_FIELDS = (
+    "minimum_expected_net_value",
+    "minimum_risk_adjusted_hourly_return",
+    "maximum_payment_delay_hours",
+    "minimum_confidence",
+    "maximum_risk_penalty",
+    "available_productive_hours",
+    "required_autonomy_level",
+    "maximum_prediction_age_seconds",
+)
+
+
+def load_policy() -> DecisionPolicy:
+    """Build the effective DecisionPolicy from settings.json.
+
+    ARCH-ENG-155: this module was imported by NOTHING in production
+    (OBSERVED: repo-wide grep for an import of ``economic_policy`` outside
+    tests/ returned 0 hits), so the deterministic gates it defines were dead
+    code while the autonomous loop's own ``check_economics`` stage recorded
+    ``estimated_hourly: -2.5`` and returned COMPLETED. An opportunity that
+    loses money on every axis reached ``execute``.
+
+    The thresholds now come from settings.json so an operator can tighten them
+    without a code change, and every value is validated through the same
+    ``DecisionPolicy.__post_init__`` that a hand-built policy passes — so an
+    out-of-range setting raises here, at load time, rather than silently
+    inverting a gate mid-run.
+
+    Absent/partial/corrupt settings -> the module defaults, which are
+    deliberately permissive (a policy that rejects everything would stop the
+    loop from running at all). This function never raises: a broken
+    settings.json must not be able to halt the autonomous loop, so a bad value
+    falls back to the default rather than propagating.
+    """
+    overrides: dict = {}
+    try:
+        with open(_settings_file(), encoding="utf-8") as f:
+            data = json.load(f)
+        block = data.get(SETTINGS_KEY)
+        if isinstance(block, dict):
+            for name in _NUMERIC_FIELDS:
+                if name not in block:
+                    continue
+                value = block[name]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue  # a bool is an int in Python; reject both
+                # Validate through DecisionPolicy itself: an out-of-range value
+                # raises here and keeps the default, so a bad setting can never
+                # invert a gate mid-run.
+                try:
+                    DecisionPolicy(**{name: float(value)})
+                except (ValueError, TypeError):
+                    continue
+                overrides[name] = float(value)
+            version = block.get("policy_version")
+            if isinstance(version, str) and version:
+                overrides["policy_version"] = version
+    except Exception:
+        pass  # missing/corrupt/unreadable -> defaults
+    return DecisionPolicy(**overrides)
+
+
 __all__ = [
     "DecisionAction",
     "DecisionPolicy",
     "DecisionResult",
     "EconomicPrediction",
     "evaluate_prediction",
+    "load_policy",
+    "SETTINGS_KEY",
 ]

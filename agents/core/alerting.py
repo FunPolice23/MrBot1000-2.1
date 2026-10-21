@@ -28,7 +28,11 @@ logger = logging.getLogger("mrbot.alerting")
 
 class RuleKind(str, Enum):
     LLM_SPEND_THRESHOLD = "llm_spend_threshold"
-    SURVIVAL_TIER_CHANGE = "survival_tier_change"
+    # ARCH-ENG-243: SURVIVAL_TIER_CHANGE ("survival_tier_change") removed
+    # with the rule of that id -- it filtered the typed HEARTBEAT event of
+    # the legacy manager heartbeat, whose emitter was retired (the rule
+    # could no longer be CONSTRUCTED once the enum member went; startup
+    # from main.py:512 crashed proving the coupling was live).
     SAFETY_BLOCK = "safety_block"
     PENDING_APPROVAL_AGING = "pending_approval_aging"
     EARNING_MILESTONE = "earning_milestone"
@@ -156,47 +160,6 @@ def llm_spend_threshold_rule(
         on_fire=on_fire,
         state=state,
         tags=["llm_spend", "spend", "cloud"],
-    )
-
-
-def survival_tier_change_rule(
-    name: str = "Survival tier change",
-    critical_only: bool = False,
-) -> AlertRule:
-    """Fire on any survival tier change event from the event logger."""
-    def condition(ev: Event, st: Dict[str, Any]) -> bool:
-        if ev.event_type != EventType.HEARTBEAT.value:
-            return False
-        prev = st.get("last_tier")
-        cur = ev.details.get("tier", "")
-        if prev == cur:
-            return False
-        st["last_tier"] = cur
-        if critical_only:
-            return cur in ("LOW", "CRITICAL")
-        return True
-
-    def on_fire(ev: Event, st: Dict[str, Any]) -> None:
-        tier = ev.details.get("tier", "unknown")
-        notify(
-            "Survival tier changed",
-            f"Tier is now: {tier}",
-            level=NotifLevel.WARNING.value if tier in ("LOW", "CRITICAL") else NotifLevel.INFO.value,
-            source="alerting",
-            sticky=tier in ("LOW", "CRITICAL"),
-            payload={"tier": tier, "credits": ev.details.get("credits", 0.0)},
-        )
-
-    return AlertRule(
-        id="survival_tier_change",
-        name=name,
-        kind=RuleKind.SURVIVAL_TIER_CHANGE.value,
-        enabled=True,
-        event_type=EventType.HEARTBEAT.value,
-        condition=condition,
-        on_fire=on_fire,
-        state={},
-        tags=["heartbeat", "tier"],
     )
 
 
@@ -473,7 +436,6 @@ def add_default_rules():
     engine = AlertRuleEngine.instance()
     engine.add_rules([
         llm_spend_threshold_rule(max_usd=10.0),
-        survival_tier_change_rule(),
         safety_block_rule(),
         pending_approval_aging_rule(max_age_seconds=900),
         earning_milestone_rule(target_total=10.0),
@@ -487,7 +449,6 @@ __all__ = [
     "RuleKind",
     "add_default_rules",
     "llm_spend_threshold_rule",
-    "survival_tier_change_rule",
     "safety_block_rule",
     "pending_approval_aging_rule",
     "earning_milestone_rule",

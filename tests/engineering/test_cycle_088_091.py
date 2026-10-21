@@ -490,9 +490,15 @@ def test_real_adapter_submission_is_sent_once_after_approval(clean_queue, tmp_pa
 def test_failed_queue_decision_does_not_mark_the_record_approved(clean_queue):
     """approve() must not report success when the queue did not record it.
 
-    The first cut set the local record to 'approved' and fired the callback
-    before checking the queue result, so a caller that ignored the return value
-    would treat a failed write as a human approval.
+    The first cut set the local record to 'approved' (and fired the then-live
+    approval callback) before checking the queue result, so a caller that
+    ignored the return value would treat a failed write as a human approval.
+
+    ARCH-ENG-259 (AE-03): the callback seam this test used to instrument was
+    itself dead -- `HumanApprovalQueue` owns the DECISION now, and the setter
+    was never called by production code. The seam is gone; the guarantee is
+    unchanged and is asserted where the state lives (the return value and the
+    owned record), not through a callback that no longer exists.
     """
     from agents.safety.guard import SafetyGuard
 
@@ -503,12 +509,7 @@ def test_failed_queue_decision_does_not_mark_the_record_approved(clean_queue):
     # Remove the mirrored item so the queue write cannot succeed.
     clean_queue.clear_all()
 
-    fired = []
-    guard.get_layer("human_approval").set_approval_callback(
-        lambda record, ok: fired.append((record, ok)))
-
     assert guard.approve(approval_id) is False
-    assert fired == [], "callback fired despite a failed queue write"
     # The record must still be pending, not approved.
     assert guard.get_layer("human_approval")._owned[approval_id]["status"] == "pending"
 

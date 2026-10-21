@@ -32,13 +32,21 @@ def _accepts_authorization(handler: Any) -> bool:
 
 
 def execute_tool(name: str, arguments: Dict[str, Any],
-                 approved: bool = False) -> str:
+                 approved: bool = False,
+                 approval_id: str | None = None) -> str:
     """Authorize and dispatch one tool without bypassing safety policy.
 
     ``approved`` is the human's decision for a tool the gate returned as
     NEEDS_APPROVAL: the caller must have obtained it from the approval queue,
     never assume it. It only upgrades a NEEDS_APPROVAL decision; a BLOCKED tool
     stays blocked.
+
+    ARCH-ENG-165: pass ``approval_id`` as well. With an id, the approval is
+    VERIFIED against the shared queue via `assert_approval_covers`, so it must
+    name THIS tool and these exact arguments — an approval for one amount or
+    path cannot execute another. Without an id the upgrade is caller-asserted
+    and unverified; the authorization reason says so, and only the tools that
+    re-check the queue themselves are safe on that path.
     """
     from agents.safety import calling as runtime
     if not runtime.is_known_tool(name):
@@ -55,7 +63,7 @@ def execute_tool(name: str, arguments: Dict[str, Any],
     name = runtime.canonical_tool_name(name)
 
     authorization = runtime._get_action_dispatcher().authorize(
-        name, arguments, approved=approved)
+        name, arguments, approved=approved, approval_id=approval_id)
     if authorization.decision == runtime.SafetyDecision.BLOCKED:
         return f"[BLOCKED] {authorization.reason}"
 
@@ -97,6 +105,28 @@ def execute_tool(name: str, arguments: Dict[str, Any],
         "workshop_proposal": runtime._tool_workshop_proposal,
         "workshop_account": runtime._tool_workshop_account,
         "workshop_payment": runtime._tool_workshop_payment,
+        # ARCH-ENG-248 (AY-01): the typed surface was implemented and dead.
+        "workshop_proposal_list": runtime._tool_workshop_proposal_list,
+        "workshop_proposal_get": runtime._tool_workshop_proposal_get,
+        "workshop_proposal_status": runtime._tool_workshop_proposal_status,
+        "workshop_research": runtime._tool_workshop_research,
+        "workshop_research_read": runtime._tool_workshop_research_read,
+        "workshop_research_list": runtime._tool_workshop_research_list,
+        "workshop_script": runtime._tool_workshop_script,
+        "workshop_script_read": runtime._tool_workshop_script_read,
+        "workshop_script_list": runtime._tool_workshop_script_list,
+        "workshop_application": runtime._tool_workshop_application,
+        "workshop_application_list": runtime._tool_workshop_application_list,
+        "workshop_account_get": runtime._tool_workshop_account_get,
+        "workshop_account_list": runtime._tool_workshop_account_list,
+        "workshop_account_remove": runtime._tool_workshop_account_remove,
+        "workshop_payment_get": runtime._tool_workshop_payment_get,
+        "workshop_payment_list": runtime._tool_workshop_payment_list,
+        "workshop_deliverable": runtime._tool_workshop_deliverable,
+        "workshop_deliverable_list": runtime._tool_workshop_deliverable_list,
+        "workshop_note": runtime._tool_workshop_note,
+        "workshop_note_list": runtime._tool_workshop_note_list,
+        "propose_code_patch": runtime._tool_propose_code_patch,
         "file_read": runtime._tool_file_read,
         "file_write": runtime._tool_file_write,
         "file_list": runtime._tool_file_list,

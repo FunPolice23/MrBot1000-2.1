@@ -98,7 +98,18 @@ class FakeAccounting:
 
 
 class FakeTaskExecutor:
-    def run(self, task):
+    """Mirrors the REAL TaskExecutor surface (ARCH-ENG-147).
+
+    `agents/earning/executor.py` defines `execute(self, task, entry)` and no
+    `run`. This fake used to define `run(task)` — the buggy shape the loop
+    itself used to call — which masked the defect by agreeing with the caller.
+    It now matches production: `execute` takes the task dict AND the portfolio
+    entry.
+    """
+
+    def execute(self, task, entry):
+        self.last_task = task
+        self.last_entry = entry
         return SimpleNamespace(
             success=True,
             errors=[],
@@ -111,6 +122,32 @@ class FakeTaskExecutor:
                 "gives downstream stages a concrete artifact to inspect and reason about.",
             },
         )
+
+
+class FakePortfolioEntry:
+    def __init__(self, opportunity_id="opp-1"):
+        self.opportunity_id = opportunity_id
+        self.priority = 10
+        self.work_status = None
+        self.policy_score = None
+        self.explanation = None
+
+
+class FakePortfolio:
+    def __init__(self, entries=None):
+        # ARCH-ENG-147: production always has a portfolio row for the opportunity
+        # being executed (TaskExecutor step 1 dereferences
+        # ctx.portfolio_entry.opportunity_id), so the default carries one.
+        self._entries = entries if entries is not None else [FakePortfolioEntry()]
+    def load_all(self):
+        return self._entries
+    def get(self, opportunity_id):
+        for e in self._entries:
+            if getattr(e, "opportunity_id", None) == opportunity_id:
+                return e
+        return None
+    def update(self, entry):
+        return True
 
 
 class FakePipeline:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import tracemalloc
@@ -9,7 +10,28 @@ from typing import Any
 
 
 _PROCESS_START = time.perf_counter()
-tracemalloc.start()
+
+# ARCH-ENG-221: ALLOCATION TRACING IS NOW OPT-IN.
+#
+# This used to call `tracemalloc.start()` at MODULE IMPORT, unconditionally and
+# forever. `agents/runtime/__init__.py` re-exports from this module, so merely
+# importing anything under `agents.runtime` -- including `device_registry`, which
+# `_hardware_line()` touches on every chat turn -- switched allocation tracing on
+# for the entire process lifetime.
+#
+# The cost is not small and it is not local. tracemalloc records every
+# `PyObject` allocation and free in its own hash table, which typically slows an
+# allocation-bound workload by 2-4x and grows that table without bound. This
+# application streams tokens, rebuilds prompts and f-strings, and churns tens of
+# thousands of `QTableWidgetItem` objects per minute across six or more threads
+# on a 6-core CPU. It was paying that tax continuously to serve ONE diagnostic --
+# `snapshot()`'s current/peak memory figures.
+# The diagnostic is still available: set MRBOT_TRACE_MEMORY=1. It is a debugging
+# aid, not something to leave running in normal operation.
+_TRACE_MEMORY = os.environ.get("MRBOT_TRACE_MEMORY", "").strip().lower() in (
+    "1", "true", "yes", "on")
+if _TRACE_MEMORY:
+    tracemalloc.start(1)
 
 
 class PerformanceTelemetry:
@@ -64,7 +86,17 @@ class PerformanceTelemetry:
             self._gui_updates += max(0, int(count))
 
     def snapshot(self) -> dict[str, Any]:
-        current, peak = tracemalloc.get_traced_memory()
+        # ARCH-ENG-221: report whether these are real. `get_traced_memory()`
+        # returns (0, 0) when tracing was never started, which would otherwise
+        # read as "this process is using no memory" -- a false claim in a
+        # diagnostic panel, which is the exact failure mode this codebase
+        # keeps producing.
+        if _TRACE_MEMORY:
+            current, peak = tracemalloc.get_traced_memory()
+            mem_traced = True
+        else:
+            current = peak = 0
+            mem_traced = False
         wall_ms = max(1.0, (time.perf_counter() - _PROCESS_START) * 1000)
         cpu_ms = time.process_time() * 1000
         with self._lock:
@@ -75,6 +107,9 @@ class PerformanceTelemetry:
                 "model_calls": calls,
                 "model_errors": self._model_errors,
                 "retries": self._retries,
+                # ARCH-ENG-221: explicitly False when tracing is off, so the
+                # panel cannot present a 0-byte reading as a real measurement.
+                "memory_traced": mem_traced,
                 "model_error_rate": round(self._model_errors / calls, 4) if calls else 0.0,
                 "avg_model_latency_ms": round(self._model_latency_ms / calls, 1) if calls else 0.0,
                 "avg_first_token_latency_ms": (

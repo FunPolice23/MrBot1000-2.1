@@ -116,7 +116,10 @@ def get_specialization_prompt(task_type: str) -> str:
     return _SPECIALIZATION_PROMPTS.get(task_type, "")
 
 
-def get_all_tools() -> List[Dict]:
-    """Get all available tool definitions."""
-    from agents.safety.legacy_tools import TOOL_DEFS
-    return list(TOOL_DEFS)
+# ARCH-ENG-292 (N-01): `get_all_tools` used to live here and returned
+# `legacy_tools.TOOL_DEFS` -- a different list from the canonical
+# `agents.safety.tools.get_all_tools` that the model-facing loop actually uses.
+# Two public functions with the same name and different answers is how a new
+# caller inherits an unguarded tool set by accident. The canonical registry is
+# the only `get_all_tools` now; `get_tools_for_task` remains the legacy
+# worker's task-scoped selector.

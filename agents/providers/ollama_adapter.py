@@ -22,7 +22,29 @@ def _normalize_keep_alive(v: str) -> str | int:
 
 
 class OllamaAdapter:
-    _executor = ThreadPoolExecutor(max_workers=2)
+    # ARCH-ENG-188: WAS `max_workers=2`.
+    #
+    # `complete()` submits here and waits with `_fut.result(timeout=...)`. On
+    # timeout it raised, but the future kept RUNNING — Python cannot interrupt a
+    # thread already executing, so the worker stayed pinned until the underlying
+    # `ollama.chat` call finally returned.
+    #
+    # With a pool of two, two slow calls wedged the adapter permanently: every
+    # subsequent request queued behind them and never started, so the operator
+    # saw the provider hang with no error rather than the timeout they were told
+    # to expect. A timeout that leaves the system LESS able to report the next
+    # timeout is worse than no timeout at all — it converts a clear failure into
+    # a silent one.
+    #
+    # The headroom is now sized against the timeout: a stuck call costs one
+    # worker for at most OLLAMA_TIMEOUT seconds, so a pool that is only slightly
+    # wider than the number of concurrent callers keeps several healthy calls
+    # progressing while the stuck ones age out. It is still a BOUNDED pool on
+    # purpose — this is a local single-user app, and unbounded threads against a
+    # wedged daemon is its own failure mode.
+    _executor = ThreadPoolExecutor(
+        max_workers=int(os.getenv("OLLAMA_MAX_WORKERS", "4") or 4)
+    )
 
     @classmethod
     def shutdown_executor(cls):
@@ -78,6 +100,16 @@ class OllamaAdapter:
         try:
             _raw = _fut.result(timeout=ollama_timeout)
         except _TE:
+            # ARCH-ENG-188: TRY TO GIVE THE WORKER BACK.
+            #
+            # `Future.cancel()` only succeeds while a task is still QUEUED. If
+            # `ollama.chat` had already started it returns False and the worker
+            # stays pinned for the remainder of that call — which is why the
+            # pool also needed headroom. Cancelling a not-yet-started task is
+            # still worth doing: with a burst of calls, the queued majority is
+            # released immediately instead of each one waiting out the full
+            # timeout in turn.
+            _fut.cancel()
             raise RuntimeError(f"ollama call timed out after {ollama_timeout}s")
         return _raw["message"]["content"]
 
@@ -88,6 +120,7 @@ class OllamaAdapter:
                 ["ollama", "show", model], capture_output=True,
                 text=True, timeout=8,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                encoding="utf-8", errors="replace",
             ).stdout
             import re
             m = re.search(r"context length\s+(\d+)", out)

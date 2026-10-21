@@ -80,17 +80,44 @@ BACKUP_DIRNAME = ".mrbot_backups"
 # only the first 3000 chars but asks for the "complete file". safe_write_file
 # refuses to overwrite any of these basenames so a bad LLM rewrite can never
 # break the running app. For intentional dev edits, use an external editor.
+# ARCH-ENG-208: THIS LIST WAS DEFINED TWICE, AND THE SMALLER COPY WON.
+#
+# Two assignments to this name existed: 29 entries here, and 14 further down.
+# The later one won, so only 14 files were ever protected. Sixteen were silently
+# unprotected, including wallet_manager.py, opportunity_lifecycle.py,
+# fiverr_client.py, upwork_client.py and airdrop_claimer.py.
+#
+# This is ARCH-ENG-201's exact failure mode -- a security list that ignores
+# edits -- one constant away from the duplicate fixed in that ticket. The copies
+# were not nested: the winner ADDED earning_memory.py, so it was a different set
+# rather than a subset, and no review spots a difference that is not
+# "some entries missing".
+#
+# What follows is the UNION of both, so nothing either copy intended is lost.
+# Matched by Path(filename).name, so "./coder.py", "agents/coder.py" and
+# absolute paths are all caught. Add new entries HERE -- there is no second copy
+# left to drift.
+
 PROTECTED_SOURCE_FILES = {
-    "main.py", "ui.py", "theme_config.py", "library.py",
-    "database.py", "action_pipeline.py", "earning_pipeline.py",
-    "startup_validation.py", "test_earning_pipeline.py",
-    "__init__.py", "base_worker.py", "coder.py", "analyst_worker.py",
-    "fiverr_client.py", "upwork_client.py",
-    "chat_router.py", "shared_context.py",
-    "document_scanner.py", "task_workspace.py", "earning_discoverer.py",
-    "opportunity_lifecycle.py", "wallet_manager.py", "content_generator.py",
-    "workflow_planner.py", "social_earning_platform.py", "microtask_client.py",
-    "airdrop_scanner.py", "airdrop_claimer.py", "defi_scanner.py",
+    "__init__.py", "action_pipeline.py", "airdrop_claimer.py",
+    "airdrop_scanner.py", "analyst_worker.py", "base_worker.py",
+    "coder.py", "content_generator.py", "database.py",
+    "defi_scanner.py", "document_scanner.py", "earning_discoverer.py",
+    "earning_memory.py", "earning_pipeline.py", "fiverr_client.py",
+    "library.py", "main.py", "microtask_client.py",
+    "opportunity_lifecycle.py", "shared_context.py",
+    "social_earning_platform.py", "startup_validation.py",
+    "task_workspace.py", "test_earning_pipeline.py", "theme_config.py",
+    "ui.py", "upwork_client.py", "wallet_manager.py",
+    # ARCH-ENG-288 (B-01/B-02): the trust boundary itself. These are the
+    # modules that decide which tools need approval, record/consume that
+    # approval, authorize dispatch, and apply code patches. Before this, the
+    # patch service could edit the approval gate while the file-write and
+    # coder paths refused to -- defence-in-depth with a hole in its own wall.
+    "approval.py", "authorization.py", "calling.py",
+    "code_patch_service.py", "composition_root.py", "dispatch.py",
+    "filesystem.py", "gate.py", "handlers.py", "instructions.py",
+    "tools.py", "worker_safety.py",
 }
 
 # Directories excluded from project_file_tree() so the planner only sees real,
@@ -103,12 +130,20 @@ _CODEBASE_INDEX_SKIP_DIRS = WRITE_EXCLUSION_DIRS | {
 from agents.brains.worker_provider import normalize_keep_alive as _normalize_keep_alive
 
 
-# Security blocklist – filenames that should never be read/written
-FILENAME_BLOCKLIST = {
-    "config.yaml", "config.yml", ".env", "credentials.json",
-    "id_rsa", "id_dsa", ".gitconfig", ".bashrc", ".zshrc",
-    "passwd", "shadow", "sudoers", "hosts", "secure",
-}
+# ARCH-ENG-201: THE BLOCKLIST LIVES IN `worker_safety`, NOT HERE.
+#
+# This literal used to sit here, and `worker_safety` was imported 146 lines
+# later -- binding the same name and silently REPLACING it. Both copies happened
+# to agree, so nothing appeared wrong.
+#
+# That is a trap rather than a redundancy. Anyone who edited this literal would
+# see no error, no test failure and no behaviour change, because the import had
+# already won. A security blocklist that silently ignores edits is worse than
+# no blocklist at all, because it looks maintained.
+#
+# `worker_safety` is now the single definition. The name is still importable
+# from here, because callers throughout the codebase do
+# `from agents.brains.base_worker import FILENAME_BLOCKLIST`.
 
 # PROTECTED SOURCE MODULES — the app's own import-critical Python files.
 # The Coder agent MUST NEVER truncate/overwrite these. Writing a broken or
@@ -118,13 +153,6 @@ FILENAME_BLOCKLIST = {
 # This is the hard backstop: even a pathological LLM output cannot break launch.
 # Stored as BASENAMES only — safe_write_file matches by Path(filename).name so
 # "./coder.py", "agents/coder.py", and absolute paths are all caught.
-PROTECTED_SOURCE_FILES = {
-    "main.py", "action_pipeline.py", "database.py", "library.py",
-    "ui.py", "theme_config.py", "startup_validation.py", "earning_pipeline.py",
-    "earning_memory.py", "test_earning_pipeline.py",
-    "coder.py", "base_worker.py", "analyst_worker.py",
-    "__init__.py",
-}
 
 # Configuration from environment (with defaults)
 
@@ -247,8 +275,8 @@ RESEARCH_MAX_BYTES = int(os.getenv("RESEARCH_MAX_BYTES", 2 * 1024 * 1024))  # v2
 # the scan and defeats chunking. Default ~1M tokens; raise freely.
 RESEARCH_MAX_TOTAL_CHARS = int(os.getenv("RESEARCH_MAX_TOTAL_CHARS", 4000000))  # ~1M tokens safety ceiling
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", 2048))  # v2.0.24: x2 (was 1024); thinking budget overrides per-level anyway
-BLOCKED_MIME_TYPES = {"application/x-executable", "application/x-sharedlib",
-                      "application/x-object", "application/x-dosexec"}
+# ARCH-ENG-201: as above. This second copy was defined here and then
+# overwritten by the import on the next line.
 
 from agents.brains.worker_safety import (
     BLOCKED_MIME_TYPES, FILENAME_BLOCKLIST, fingerprint,

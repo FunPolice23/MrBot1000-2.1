@@ -14,6 +14,12 @@ ROOT_FOLDER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(ROOT_FOLDER, "agent.db")
 logger = logging.getLogger(__name__)
 
+# ARCH-ENG-221: how long a computed `get_llm_stats()` aggregate may be reused.
+# The cache is ALSO invalidated on every write to `llm_calls`, so this bounds
+# only the idle cost -- the panel never shows stale numbers for the operator's
+# own activity.
+_LLM_STATS_TTL_S = 30.0
+
 
 class AgentDB:
     def __init__(self, db_path: str = DB_PATH):
@@ -24,6 +30,9 @@ class AgentDB:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # ARCH-ENG-221: cached result of `get_llm_stats`. Dropped by
+        # `log_llm_call` on every write; see that method for the rationale.
+        self._llm_stats_cache: tuple[float, dict] | None = None
         self._create_tables()
 
     def _execute(self, sql, params=(), commit=False):
@@ -288,6 +297,11 @@ class AgentDB:
              prompt_tokens, completion_tokens, tokens_per_second, cost_usd),
             commit=True
         )
+        # ARCH-ENG-221: the aggregate cache must not survive a write, or the
+        # stats panel would under-report the operator's own newest calls until
+        # the TTL expired. Invalidation here, not on a timer, is what makes the
+        # cache safe to use in the first place.
+        self._llm_stats_cache = None
 
     def _get_llm_stats_basic(self) -> dict:
         """Basic LLM stats (internal use)."""
@@ -616,7 +630,43 @@ class AgentDB:
     # ── Enhanced LLM stats ─────────────────────────────────────────────────
     
     def get_llm_stats(self) -> dict:
-        """Get comprehensive LLM statistics."""
+        """Get comprehensive LLM statistics.
+
+        ARCH-ENG-221: THIS RAN THREE UNINDEXED FULL-TABLE AGGREGATES EVERY 5
+        SECONDS, ON THE GUI THREAD.
+
+        `llm_calls` is append-only -- one row per LLM call, written by
+        `log_llm_call` -- and nothing ever prunes it. Three of the five queries
+        here read the whole table:
+
+            SELECT <8 aggregates>       FROM llm_calls
+            SELECT provider, ...        FROM llm_calls GROUP BY provider
+            SELECT model, ...           FROM llm_calls GROUP BY model
+
+        (The fourth, `SELECT MIN(ts)`, was also described as a full scan. It is
+        not -- `idx_llm_calls_ts` exists at :142, so it is O(log n).)
+
+        The GUI timer at `gui/builders/tab_feature_builders.py:898` calls this
+        every 5 s for the whole process lifetime, so the cost grows without limit
+        for as long as the app is open, in a process that may be holding a 10 GB
+        model in RAM.
+
+        Fixed in the cheapest way that changes no semantics: a short TTL cache
+        plus write-invalidation. The cache is dropped the moment a new call is
+        logged, so an operator watching the panel still sees their own calls
+        appear immediately -- the TTL only bounds the idle cost.
+        """
+        now = time.time()
+        if self._llm_stats_cache is not None:
+            cached_at, cached_stats = self._llm_stats_cache
+            if now - cached_at < _LLM_STATS_TTL_S:
+                return cached_stats
+        stats = self._compute_llm_stats()
+        self._llm_stats_cache = (now, stats)
+        return stats
+
+    def _compute_llm_stats(self) -> dict:
+        """The uncached aggregates. See `get_llm_stats` for the rationale."""
         row = self._execute("""
             SELECT
                 COALESCE(COUNT(*), 0) AS total_calls,

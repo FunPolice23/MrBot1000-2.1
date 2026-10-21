@@ -61,6 +61,26 @@ def propose_code_patch(
     return {"ok": True, "status": "pending_approval", "patch_id": patch.patch_id}
 
 
+def apply_deferred(service: Any) -> list:
+    """Apply any approved patch whose target has since become free.
+
+    ARCH-ENG-227. `CodePatchService.apply_approved` queues a patch when its
+    target is currently in use rather than clobbering a live file, and
+    `drain()` applies queued patches once the target frees. But NOTHING EVER
+    CALLED `drain()` -- so an approved change could sit queued forever and the
+    operator would reasonably believe it had landed.
+
+    `mark_free` deliberately does not drain: freeing a file and applying a
+    patch are separate steps, and folding them together breaks callers that
+    free then drain. So the drain is wired here instead, at the two moments
+    deferred work should actually be picked up.
+    """
+    try:
+        return list(service.drain())
+    except Exception:
+        return []
+
+
 def approve_and_apply(service: Any, approval_id: str) -> dict[str, Any]:
     """Approve the exact approval item, then apply the patch (backup/verify/rollback).
 
@@ -82,7 +102,17 @@ def approve_and_apply(service: Any, approval_id: str) -> dict[str, Any]:
     if patch is None:
         return {"ok": False, "status": "unknown_patch",
                 "reason": f"no patch registered for {approval_id}"}
-    return service.apply_approved(patch, approval_id=approval_id)
+    result = service.apply_approved(patch, approval_id=approval_id)
+    # ARCH-ENG-227: this approval may have freed up the queue. Anything that was
+    # waiting on a now-idle target gets applied before we report back, so the
+    # operator sees one settled state rather than a partial one.
+    if result.get("status") != "queued":
+        deferred = apply_deferred(service)
+        if deferred:
+            result = dict(result)
+            result["deferred_applied"] = [
+                d.get("target") for d in deferred if isinstance(d, dict)]
+    return result
 
 
 def decline_patch(service: Any, approval_id: str, notes: str = "") -> dict[str, Any]:

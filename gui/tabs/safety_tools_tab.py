@@ -7,6 +7,7 @@
 import os
 import sys
 import json
+import logging
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -102,7 +103,10 @@ class SafetyTab(QWidget):
         
         # Approvals sub-tab
         self.sub_tabs.addTab(self._create_approvals_tab(), "📋 Approvals")
-        
+
+        # Quarantined-instruction review sub-tab (ARCH-ENG-284 / U-01)
+        self.sub_tabs.addTab(self._create_quarantine_tab(), "📥 Quarantine")
+
         # Configuration sub-tab
         self.sub_tabs.addTab(self._create_config_tab(), "⚙️ Config")
         
@@ -276,7 +280,198 @@ class SafetyTab(QWidget):
         layout.addWidget(pending_group)
         
         return widget
-    
+
+    def _create_quarantine_tab(self):
+        """ARCH-ENG-284 (U-01): the instruction-quarantine review surface.
+
+        `InstructionGate` quarantines every unknown fetched SKILL.md/playbook
+        until a human approves or blacklists it, but the MainWindow's
+        `_refresh_review_queue` / `_review_selected` methods referenced
+        `review_list` and `review_counts_label` widgets that were never
+        created. The gate's queue therefore had no review surface at all:
+        unknown instructions could only ever stay pending. This tab is the
+        surface, wired to the same gate the platform adapters use.
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        group = QGroupBox("📥 Quarantined External Instructions")
+        group.setStyleSheet("""
+            QGroupBox {
+                color: #ff8844;
+                font-weight: bold;
+                border: 2px solid #ff8844;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        group_layout = QVBoxLayout(group)
+
+        self.quarantine_counts_label = QLabel("Instruction gate unavailable")
+        self.quarantine_counts_label.setWordWrap(True)
+        group_layout.addWidget(self.quarantine_counts_label)
+
+        self.quarantine_table = QTableWidget()
+        self.quarantine_table.setColumnCount(4)
+        self.quarantine_table.setHorizontalHeaderLabels(
+            ["ID", "Title", "Kind", "URL"])
+        self.quarantine_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch)
+        self.quarantine_table.setEditTriggers(
+            QAbstractItemView.NoEditTriggers)
+        self.quarantine_table.setSelectionBehavior(
+            QAbstractItemView.SelectRows)
+        self.quarantine_table.setSelectionMode(
+            QAbstractItemView.SingleSelection)
+        self.quarantine_table.setStyleSheet("""
+            QTableWidget {
+                background: #1a1a1a;
+                color: #e0e0e0;
+                border: 1px solid #333;
+                border-radius: 4px;
+                font-size: 11px;
+            }
+            QHeaderView::section {
+                background: #2a2a2a;
+                color: #e0e0e0;
+                padding: 6px;
+                border: 1px solid #333;
+                font-weight: bold;
+            }
+        """)
+        group_layout.addWidget(self.quarantine_table)
+
+        btn_row = QHBoxLayout()
+        self.quarantine_approve_btn = QPushButton("✅ Allow")
+        self.quarantine_approve_btn.clicked.connect(
+            lambda: self._on_quarantine_decision(True))
+        btn_row.addWidget(self.quarantine_approve_btn)
+
+        self.quarantine_block_btn = QPushButton("⛔ Blacklist")
+        self.quarantine_block_btn.clicked.connect(
+            lambda: self._on_quarantine_decision(False))
+        btn_row.addWidget(self.quarantine_block_btn)
+
+        self.quarantine_refresh_btn = QPushButton("🔄 Refresh")
+        self.quarantine_refresh_btn.clicked.connect(
+            self._refresh_quarantine)
+        btn_row.addWidget(self.quarantine_refresh_btn)
+        btn_row.addStretch()
+        group_layout.addLayout(btn_row)
+
+        layout.addWidget(group)
+        return widget
+
+    def _instruction_gate(self):
+        """Resolve the gate from this tab or its MainWindow parent."""
+        gate = getattr(self, "instruction_gate", None)
+        if gate is None:
+            parent = self.parent()
+            gate = getattr(parent, "instruction_gate", None) if parent else None
+            if gate is not None:
+                self.instruction_gate = gate
+        return gate
+
+    def set_instruction_gate(self, gate):
+        """Wire the authoritative gate after the MainWindow constructs it."""
+        self.instruction_gate = gate
+        self._refresh_quarantine()
+
+    def _quarantine_log(self, message: str) -> None:
+        parent = self.parent()
+        log_signal = getattr(parent, "log_signal", None)
+        if log_signal is not None:
+            log_signal.emit(message)
+
+    def _refresh_quarantine(self):
+        gate = self._instruction_gate()
+        buttons = (
+            getattr(self, "quarantine_approve_btn", None),
+            getattr(self, "quarantine_block_btn", None),
+        )
+        if gate is None:
+            if hasattr(self, "quarantine_counts_label"):
+                self.quarantine_counts_label.setText(
+                    "Instruction gate unavailable; no quarantined "
+                    "instruction can be reviewed.")
+            if hasattr(self, "quarantine_table"):
+                self.quarantine_table.setRowCount(0)
+            for button in buttons:
+                if button is not None:
+                    button.setEnabled(False)
+            return
+        try:
+            counts = gate.counts()
+            pending = list(gate.pending(200))
+        except Exception as exc:
+            if hasattr(self, "quarantine_counts_label"):
+                self.quarantine_counts_label.setText(
+                    f"Quarantine read failed: {exc}")
+            for button in buttons:
+                if button is not None:
+                    button.setEnabled(False)
+            return
+
+        self.quarantine_counts_label.setText(
+            f"Pending: {counts.get('pending', 0)}   "
+            f"Allowed: {counts.get('allowed', 0)}   "
+            f"Blocked: {counts.get('blocked', 0)}   "
+            f"Quarantined: {counts.get('quarantined', 0)}")
+        self.quarantine_table.setRowCount(0)
+        for row, item in enumerate(pending):
+            self.quarantine_table.insertRow(row)
+            id_item = QTableWidgetItem(str(item.get("id", "")))
+            id_item.setData(Qt.UserRole, dict(item))
+            self.quarantine_table.setItem(row, 0, id_item)
+            self.quarantine_table.setItem(
+                row, 1, QTableWidgetItem(
+                    str(item.get("title") or item.get("url") or "")))
+            self.quarantine_table.setItem(
+                row, 2, QTableWidgetItem(str(item.get("kind", ""))))
+            self.quarantine_table.setItem(
+                row, 3, QTableWidgetItem(str(item.get("url", ""))))
+        for button in buttons:
+            if button is not None:
+                button.setEnabled(bool(pending))
+
+    def _on_quarantine_decision(self, approve: bool):
+        gate = self._instruction_gate()
+        if gate is None:
+            return
+        row = self.quarantine_table.currentRow()
+        if row < 0:
+            self._quarantine_log(
+                "[Review] Select a quarantined instruction first.")
+            return
+        id_item = self.quarantine_table.item(row, 0)
+        record = id_item.data(Qt.UserRole) if id_item is not None else None
+        if not isinstance(record, dict) or "id" not in record:
+            self._quarantine_log(
+                "[Review] Selected row has no quarantine record; refresh "
+                "and try again.")
+            return
+        qid = int(record["id"])
+        url = str(record.get("url", "") or "")
+        content_hash = str(record.get("content_hash", "") or "")
+        kind = str(record.get("kind", "skill.md") or "skill.md")
+        related = f"{url} | {kind} | {content_hash}"
+        try:
+            status = gate.review(
+                qid, approve, url=url, content_hash=content_hash,
+                related=related)
+            self._quarantine_log(
+                f"[Review] instruction #{qid} -> {status} "
+                f"({'APPROVED' if approve else 'BLACKLISTED'})")
+        except Exception as exc:
+            self._quarantine_log(f"[Review] error: {exc}")
+        self._refresh_quarantine()
+
     def _create_config_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -385,9 +580,28 @@ class SafetyTab(QWidget):
         """Refresh all displays."""
         self._refresh_layers()
         self._refresh_approvals()
+        self._refresh_quarantine()
     
     def _refresh_layers(self):
-        """Refresh safety layers display."""
+        """Refresh safety layers display.
+
+        ARCH-ENG-223: THIS TABLE IS A CONSTANT, AND WAS BEING REBUILT ON EVERY
+        TICK.
+
+        The six rows below never change -- they are a hard-coded list, not a
+        reading of any live state. Yet the method ran `setRowCount(0)` then
+        6 x `insertRow` + 24 x `QTableWidgetItem` every tick: twice a second
+        while the tab is visible, every 15 s while hidden, for the life of the
+        process. That is 24 item allocations plus a full relayout and repaint of
+        a styled table, roughly every tick, to redraw six unchanging strings.
+
+        Populated once. If the layer list ever becomes real state rather than a
+        constant, delete the guard -- a stale-by-design table is worse than a
+        slow one, so this is deliberately the easy change to undo.
+        """
+        if getattr(self, "_layers_populated", False):
+            return
+        self._layers_populated = True
         self.layers_table.setRowCount(0)
         
         layers = [
@@ -546,20 +760,48 @@ class SafetyTab(QWidget):
         Best-effort and fail-safe: this only notifies. It cannot execute
         anything by itself — the handler re-reads the decision from the queue,
         so a decision this tab did not actually record will not run.
+
+        ARCH-ENG-269 (AZ-01): both failure paths used to vanish — a bare
+        `return` when no handler is attached, and `except Exception: pass`
+        when routing raised. "Recorded but never routed" is the worst state
+        an approval can be in: the human clicked Approve, the row is gone
+        from the pending list, and nothing will execute. Each path now logs
+        and raises an operator warning; the fail-safe behaviour (never crash
+        mid-click, never lose the recorded decision) is unchanged.
         """
         handler = getattr(self.parent(), "_on_approval_decided", None)
         if not callable(handler):
+            self._report_unrouted(
+                approval_id,
+                "no decision handler is attached to the application")
             return
         try:
             from agents.safety.approval import ApprovalStatus
             item = self.approval_queue.find_by_id(approval_id)
             if item is None or item.status != ApprovalStatus.APPROVED:
+                self._report_unrouted(
+                    approval_id,
+                    "the decision could not be re-read as APPROVED from the "
+                    "approval queue")
                 return
             handler(approval_id, ApprovalStatus.APPROVED,
                     "Approved from Safety & Tools")
-        except Exception:
+        except Exception as exc:
             # A routing failure must not lose the recorded decision, and must
             # never surface as a crash in the middle of an approval click.
+            self._report_unrouted(approval_id, f"routing raised: {exc}")
+
+    def _report_unrouted(self, approval_id, reason):
+        """Make "approved but not executed" visible (ARCH-ENG-269)."""
+        logging.getLogger(__name__).warning(
+            "Approval %s was recorded but not routed: %s", approval_id, reason)
+        try:
+            from agents.core.notifications import NotificationService
+            NotificationService.instance().warning(
+                "Approval recorded, not executed",
+                f"Approval {approval_id} was recorded but not routed to the "
+                f"executor ({reason}). Review it before relying on it.")
+        except Exception:
             pass
 
     def _on_save_config(self):

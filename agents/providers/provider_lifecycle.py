@@ -10,6 +10,38 @@ import time
 import urllib.request
 
 
+def _is_local(provider: str) -> bool:
+    """True when ``provider`` runs on this machine and needs no auth.
+
+    Local import (not top-level) so this module stays Qt-free and import-safe
+    when ``agents.runtime`` is not yet initialised; any failure degrades to
+    ``False`` (treated as cloud -> a probe is simply sent without a header).
+    """
+    try:
+        from agents.runtime.provider_keys import is_local_provider as _f
+        return bool(_f(provider))
+    except Exception:
+        return False
+
+
+# Public alias used by the class methods below.
+is_local_provider_name = _is_local
+
+
+def _is_cloud(provider: str) -> bool:
+    """True when ``provider`` is a known REMOTE (paid) OpenAI-compatible vendor.
+
+    Local import keeps this module Qt-free and import-safe; any failure degrades
+    to ``False`` so an unknown provider keeps its existing explicit
+    "no model-load API" failure rather than silently becoming a no-op success.
+    """
+    try:
+        from agents.runtime.dual_brain import CLOUD_PROVIDER_DEFAULT_ENDPOINTS
+        return (provider or "").strip().lower() in CLOUD_PROVIDER_DEFAULT_ENDPOINTS
+    except Exception:
+        return False
+
+
 class ProviderStatusChecker:
     """Probe local and controllable provider endpoints."""
 
@@ -37,9 +69,30 @@ class ProviderStatusChecker:
         return result
 
     @staticmethod
-    def check_endpoint(url, timeout=10):
+    def _auth_headers(provider, api_key=None):
+        """Bearer header for a cloud provider probe; ``{}`` for local ones.
+
+        A cloud ``/v1/models`` probe without ``Authorization`` gets a 401, so the
+        Providers & GPU row would show "Stopped" forever even with a valid key.
+        The key is resolved through the single authority (``provider_keys``), so
+        this never invents a second credential source, and is never logged.
+        """
+        if not provider or is_local_provider_name(provider):
+            return {}
         try:
-            req = urllib.request.Request(url)
+            from agents.runtime.provider_keys import resolve_provider_api_key
+            key = (api_key or resolve_provider_api_key(provider, "")).strip()
+        except Exception:
+            key = (api_key or "").strip()
+        if not key:
+            return {}
+        return {"Authorization": f"Bearer {key}"}
+
+    @staticmethod
+    def check_endpoint(url, timeout=10, provider="", api_key=None):
+        try:
+            req = urllib.request.Request(
+                url, headers=ProviderStatusChecker._auth_headers(provider, api_key))
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
             return True, ProviderStatusChecker.extract_model_ids(data)
@@ -89,6 +142,13 @@ class ProviderStatusChecker:
                 "model": model,
                 "stream": False,
             }
+        elif _is_cloud(provider):
+            # A cloud model is served by the vendor; there is nothing to load
+            # locally. Reporting failure here made "Start" on a cloud brain log
+            # "❌ Big Brain openai does not expose a model-load API" forever, so
+            # the Providers & GPU row could never reach Running. A successful
+            # no-op is the truthful answer: the model IS available, remotely.
+            return True, f"{provider} serves {model} remotely — nothing to load"
         else:
             return False, f"{provider} does not expose a model-load API"
         return cls._post_json(url, body, timeout)
@@ -119,6 +179,10 @@ class ProviderStatusChecker:
                 {"model": model, "keep_alive": 0},
                 timeout,
             )
+        if _is_cloud(provider):
+            # Mirror of the load path: a cloud model has no local instance to
+            # release, so unload is a truthful no-op rather than a failure.
+            return True, f"{provider} model is served remotely — nothing to unload"
         return False, f"{provider} does not expose a model-unload API"
 
     @staticmethod
@@ -172,17 +236,44 @@ class ProviderStatusChecker:
 
     @staticmethod
     def check_llama_process(port=None):
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq llama.exe", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            return "llama.exe" in result.stdout
-        except Exception:
+        """Is a llama.cpp server listening on `port`?
+
+        ARCH-ENG-187 — THIS ALWAYS RETURNED False, AND IT HAS NO CALLERS.
+
+        Two independent reasons it could never be right, and the second one is
+        why it survived so long:
+
+        1. It filtered `IMAGENAME eq llama.exe`, but this application spawns
+           `llama-server.exe` (`BrainLaunchWorker`). The filter matched nothing,
+           so on a machine running four llama-servers this returned False. A
+           detector that always says "no" is worse than no detector at all,
+           because a reader cannot tell a genuine negative from a broken check.
+
+        2. It accepted a `port` argument and then ignored it entirely — it asked
+           "is any llama process running anywhere?" while appearing to answer
+           "is the server on THIS port up?". Those are different questions, and
+           only the second one is useful.
+
+        It also used `capture_output=True`, the ARCH-ENG-116-broken subprocess
+        form, and it had ZERO call sites, so it read as a working safety check
+        that nothing happened to use yet.
+
+        Both facts a caller needs — WHO is listening, and WHOSE it is — now come
+        from the one shared implementation in `device_registry`. The image-name
+        filter is `is_llama_server_image`, the SAME predicate the kill path uses
+        (ARCH-ENG-171), so a probe can never disagree with a killer about what
+        "ours" means.
+
+        Still no callers. That is recorded rather than hidden: it is a public
+        helper on a public class so it stays correct for external callers, but
+        nothing in this repository should base a decision on it.
+        """
+        if port is None:
+            # No port given: we cannot answer the question that was asked, and
+            # guessing a default would silently report on the wrong server.
             return False
+        from agents.runtime.device_registry import llama_server_pids_on
+        return bool(llama_server_pids_on(port))
 
 
 __all__ = ["ProviderStatusChecker"]

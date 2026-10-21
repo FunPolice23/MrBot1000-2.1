@@ -49,6 +49,27 @@ try:
 except OSError:
     pass
 
+# Same isolation for the memory database. `DialogueTab._persist_dialogue_turn`
+# resolves `agents.knowledge.program_knowledge.get_database()` at call time, and
+# `DB_PATH` had no override — so any test that drove `_on_response_ready` wrote
+# fabricated persona turns into the operator's LIVE conversation memory
+# (ARCH-ENG-156: 120 invented "I earned $9,999.00" rows landed in the real
+# dual_brain.db during the wiring tests). Production resolves DB_PATH to
+# <repo>/dual_brain.db exactly as before; only this env var redirects it.
+_MRBOT_TEST_DB = _Path(tempfile.gettempdir()) / "mrbot_test_dual_brain_do_not_edit.db"
+
+
+def _purge_test_db():
+    try:
+        _MRBOT_TEST_DB.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+_purge_test_db()
+os.environ["MRBOT_DUAL_BRAIN_DB_PATH"] = str(_MRBOT_TEST_DB)
+atexit.register(_purge_test_db)
+
 # Park the autonomous manager loop for the whole test session. `MainWindow`
 # starts ManagerThread, whose first cycle makes a real provider call; with no
 # llama-server listening that call blocks in TCP connect / retry-sleep and the
@@ -226,6 +247,13 @@ def _operator_env_is_untouched():
                                           only covered `.env`; GUI tests that
                                           build a `DualBrainControl` still wrote
                                           this file until ARCH-ENG-057.
+      * `<repo>/dual_brain.db`         — the operator's conversation memory.
+                                          `MRBOT_DUAL_BRAIN_DB_PATH` redirects it
+                                          for the session; a test that still
+                                          reaches the live path is a regression
+                                          (ARCH-ENG-156 wrote 120 fabricated
+                                          persona turns here before the redirect
+                                          existed).
 
     Regression: tests/test_provider_selection.py called `_persist_role_model`
     without `persist=False`, and the default of True rewrote the live `.env`
@@ -235,7 +263,10 @@ def _operator_env_is_untouched():
 
     repo_root = Path(__file__).resolve().parent.parent
     repo_env = repo_root / ".env"
-    candidates = [Path(".env"), repo_env, repo_root / "settings.json"]
+    candidates = [
+        Path(".env"), repo_env, repo_root / "settings.json",
+        repo_root / "dual_brain.db",
+    ]
 
     def _snapshot(p: Path):
         try:
@@ -244,11 +275,27 @@ def _operator_env_is_untouched():
             return f"<unreadable: {exc}>".encode()
 
     before = {p: _snapshot(p) for p in candidates}
+    # The memory DB and settings.json are gitignored, so a FRESH CLONE starts
+    # without them. Creating such a file during the run is then legitimate, not
+    # a violation — only *modifying a file that already existed* is. Recording
+    # "absent at start" as a distinct state keeps the guard meaningful in both a
+    # working tree (file present) and a fresh clone (file absent), instead of
+    # failing every clone run on the file's mere creation.
+    absent_at_start = {p: not p.exists() for p in candidates}
     yield
     for p, original in before.items():
         after = _snapshot(p)
+        if absent_at_start[p]:
+            # It did not exist when the session began. A test creating it is
+            # acceptable; remove it so the tree is left as it was found.
+            if after is not None:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            continue
         assert after == original, (
             f"the test suite modified {p} — a test wrote operator config. "
             f"Route persistence through MRBOT_ENV_PATH / "
-            f"MRBOT_DEVICE_SETTINGS_PATH instead."
+            f"MRBOT_DUAL_BRAIN_DB_PATH instead."
         )

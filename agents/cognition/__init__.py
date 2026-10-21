@@ -1,27 +1,15 @@
 """Canonical cognition contracts and bounded reasoning policies."""
 
+# ARCH-ENG-233 (BG-01): only the thought-graph artifacts are re-exported now.
+# The CognitionRecord record cluster and its ledger/state/memory_promotion/
+# contradictions satellites are deleted -- they had no production consumer.
 from .graph import (
-    ActionIntent,
-    ActionState,
-    ApprovalRequest,
-    ApprovalState,
-    Claim,
-    ClaimStatus,
-    CognitionRecord,
-    Decision,
-    InformationItem,
-    InformationKind,
-    Lesson,
-    Option,
-    Outcome,
-    OutcomeState,
     SupportMeasure,
     ThoughtEdge,
     ThoughtEdgeKind,
     ThoughtGraph,
     ThoughtNode,
     ThoughtNodeKind,
-    ToolExecution,
 )
 from .reasoning_modes import (
     ModePolicy,
@@ -31,10 +19,6 @@ from .reasoning_modes import (
     select_reasoning_mode,
     select_reasoning_pattern,
 )
-from .ledger import CognitionLedger
-from .contradictions import ContradictionCase, ContradictionStatus, open_contradiction
-from .memory_promotion import MemoryPromotionPolicy, PromotionDecision
-from .state import CanonicalCognitionState
 from .dialogue_honesty import DialogueHonestyService
 from .dialogue import DialogueIntent, DialogueTurn, NaturalDialogue
 from .coordinator import (
@@ -70,13 +54,11 @@ from .fact_ledger import (
 )
 from .operator_override import OperatorOverrideRegistry, OverrideError, OverrideRecord
 
+# ARCH-ENG-233: the CognitionRecord cluster names are removed from the
+# public surface; the graph artifacts below are the live half.
 __all__ = [
-    "ActionIntent", "ActionState", "ApprovalRequest", "ApprovalState",
-    "Claim", "ClaimStatus", "CognitionRecord", "Decision", "InformationItem",
-    "CognitionLedger",
-    "ContradictionCase", "ContradictionStatus", "open_contradiction",
-    "MemoryPromotionPolicy", "PromotionDecision",
-    "CanonicalCognitionState",
+    "ThoughtEdge", "ThoughtEdgeKind", "ThoughtGraph", "ThoughtNode",
+    "ThoughtNodeKind", "SupportMeasure",
     "DialogueHonestyService",
     "DialogueIntent", "DialogueTurn", "NaturalDialogue",
     "CollaborationStage", "DualBrainCoordinator", "RunRecord",
@@ -88,9 +70,6 @@ __all__ = [
     "IllegalTransition", "SourceKind", "UnsubstantiatedVerification",
     "source_authority",
     "OperatorOverrideRegistry", "OverrideError", "OverrideRecord",
-    "InformationKind", "Lesson", "ModePolicy", "Option", "Outcome",
-    "OutcomeState", "PatternSelection", "ReasoningMode", "ReasoningPattern",
-    "SupportMeasure", "ThoughtEdge", "ThoughtEdgeKind", "ThoughtGraph",
-    "ThoughtNode", "ThoughtNodeKind", "ToolExecution",
+    "ModePolicy", "PatternSelection", "ReasoningMode", "ReasoningPattern",
     "select_reasoning_mode", "select_reasoning_pattern",
 ]

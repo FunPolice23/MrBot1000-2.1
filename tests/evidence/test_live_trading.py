@@ -68,9 +68,53 @@ class TestLiveTrading(unittest.TestCase):
         self.assertEqual(service.status()["execution_mode"], "disabled")
 
     def test_coinbase_adapter_can_be_constructed_without_sandbox(self):
+        """ARCH-ENG-160: `ccxt` is an OPTIONAL dependency.
+
+        It is declared in `requirements-live.txt`, not `requirements.txt`,
+        because live exchange connectivity is not part of a default install.
+        A fresh clone without it has no ccxt, and this test could not run — it
+        used to fail as a hard error, which read as "live trading is broken"
+        rather than "you did not install the optional extra".
+
+        The absent-dependency branch is a REAL behaviour and is asserted
+        separately below, so nothing is lost by skipping this one.
+        """
+        try:
+            import ccxt  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest(
+                "ccxt is an optional dependency (requirements-live.txt); "
+                "install it to exercise the real adapter")
+
         from agents.earning.live_trading import CcxtExchangeAdapter
         adapter = CcxtExchangeAdapter("coinbase", sandbox=False)
         self.assertEqual(adapter.exchange_id, "coinbase")
+
+    def test_coinbase_adapter_fails_closed_without_ccxt(self):
+        """ARCH-ENG-160: a missing optional dep must raise, never stub.
+
+        Exchange connectivity is never silently faked: without ccxt the adapter
+        refuses rather than returning an empty portfolio that would read as
+        "no holdings" instead of "cannot tell".
+        """
+        from agents.earning.live_trading import CcxtExchangeAdapter, LiveTradingError
+
+        real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) \
+            else __builtins__.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "ccxt":
+                raise ImportError("No module named 'ccxt'")
+            return real_import(name, *args, **kwargs)
+
+        import builtins
+        builtins.__import__ = fake_import
+        try:
+            with self.assertRaises(LiveTradingError) as ctx:
+                CcxtExchangeAdapter("coinbase", sandbox=False)
+            self.assertIn("ccxt", str(ctx.exception))
+        finally:
+            builtins.__import__ = real_import
 
     def test_market_snapshot_uses_ticker_and_order_book(self):
         snapshot = LiveTradingService(FakeAdapter()).fetch_market_snapshot("BTC/USD")

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 class TestProviderClassification(unittest.TestCase):
@@ -18,6 +18,21 @@ class TestProviderClassification(unittest.TestCase):
         from agents.safety.provider_rate_limiter import is_local_provider
         for n in ("ollama", "Ollama", "llama.cpp", "local", "vllm", "lmstudio"):
             self.assertTrue(is_local_provider(n), n)
+
+    def test_dual_brain_adapter_names_are_local(self):
+        """ARCH-ENG-137: big-brain/small-brain run on THIS machine.
+
+        Without the "brain" marker these got the CLOUD tier (1.0/sec, 500
+        calls/day) — throttling the FREE hardware brain while a paid cloud
+        provider stayed uncapped, the inverse of the documented intent.
+        """
+        from agents.safety.provider_rate_limiter import (
+            is_local_provider, _defaults_for)
+        for n in ("big-brain", "small-brain", "Big-Brain"):
+            self.assertTrue(is_local_provider(n), n)
+            rate, cap = _defaults_for(n)
+            self.assertEqual(cap, 0, f"{n} is on-machine — no $ cap")
+            self.assertGreaterEqual(rate, 2.0, f"{n} is hardware-bound")
 
     def test_cloud_providers(self):
         from agents.safety.provider_rate_limiter import is_local_provider

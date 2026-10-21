@@ -33,17 +33,25 @@ from agents.cognition.personas import DRIVER
 class BigBrainAdapter:
     """Interface to the main reasoning model via llama-server on 5060 Ti."""
     
-    def __init__(self, model=None, base_url=None, safety_gate: SafetyGate | None = None):
+    def __init__(self, model=None, base_url=None, config=None,
+                 safety_gate: SafetyGate | None = None):
         # Canonical runtime owns the role→endpoint/model/device contract. The
         # adapter inherits its defaults from the runtime; an explicit arg or env
-        # still wins, but there is one source of truth.
+        # still wins, but there is one source of truth. Phase 2: a per-slot
+        # ``config`` (roster-driven) seeds the adapter; no config -> the legacy
+        # env path, byte-identical.
         from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-        _cfg = DualBrainRuntime.from_env().config(BrainRole.BIG)
-        legacy_url = os.getenv("BIG_BRAIN_URL") if _cfg.provider == "llamacpp" else ""
+        if config is not None:
+            _cfg = config
+            legacy_url = ""
+        else:
+            _cfg = DualBrainRuntime.from_env().config(BrainRole.BIG)
+            legacy_url = os.getenv("BIG_BRAIN_URL") if _cfg.provider == "llamacpp" else ""
         self.base_url = base_url or legacy_url or _cfg.endpoint
         self.provider = _cfg.provider
         self.device = _cfg.device
         self.context_length = _cfg.context
+        self.config = config
         
         # Knowledge and memory
         self.db = get_database()
@@ -64,7 +72,8 @@ class BigBrainAdapter:
         # the dialogue UI may later replace this with the live server model.
         # We intentionally avoid a blocking HTTP call in __init__ so tab
         # construction stays fast even when llama-server is not yet running.
-        self.model = model or os.getenv("BIG_BRAIN_MODEL", "").strip() or ""
+        self.model = model or (config.model if config is not None
+                               else os.getenv("BIG_BRAIN_MODEL", "").strip()) or ""
         self.temperature = float(os.getenv("BIG_BRAIN_TEMPERATURE", "0.5") or 0.5)
         self.last_tool_trace = []
         self.last_thought_graph = None
@@ -140,9 +149,9 @@ class BigBrainAdapter:
         """Switch to a different model."""
         self.model = model_name
 
-    def _start_got_turn(self, prompt: str):
+    def _start_got_turn(self, prompt: str, pattern=None):
         from agents.brains.brain_got import start_brain_turn
-        return start_brain_turn("big_brain", prompt)
+        return start_brain_turn("big_brain", prompt, pattern=pattern)
 
     def _finish_got_turn(self, turn, response: str, status: str = "completed",
                          branch_candidates=None, evidence_by_id=None) -> str:
@@ -287,10 +296,15 @@ class BigBrainAdapter:
                 })
                 continue
             
-            # Execute the tool
+            # Execute the tool. ARCH-ENG-164: this dispatcher is now gated — mutating
+            # tools require the `_DISPATCH_CAPABILITY` token, the same token the
+            # hardened handlers require. The `safety_gate.check` above is what
+            # earned it: ALLOWED is the only branch that reaches here.
             try:
+                from agents.safety.calling import _DISPATCH_CAPABILITY
                 from agents.safety.legacy_tools import execute_tool
-                result = execute_tool(fn_name, arguments)
+                result = execute_tool(fn_name, arguments,
+                                      authorization=_DISPATCH_CAPABILITY)
             except Exception as e:
                 result = f"[Tool execution error: {e}]"
             
@@ -356,7 +370,7 @@ class BigBrainAdapter:
                     "tool_calls": [
                         {
                             "id": tc.id,
-                            "type": "tc.function",
+                            "type": "function",
                             "function": {
                                 "name": tc.function.name,
                                 "arguments": tc.function.arguments
@@ -463,6 +477,29 @@ class BigBrainAdapter:
             the selection. Ignored for direct (max_branches=1) patterns.
         evidence_by_id: optional {evidence_id: Evidence} used to score branches.
         """
+        # Enforcement (Security's design): a cloud-backed brain is $-capped by the
+        # daily budget AND call-count-limited, keyed on the RESOLVED provider
+        # (self.provider), not the role label — one point covers all four GUI
+        # doors (chat_tab:414/450, dialogue_tab:3015/3055) plus any future direct
+        # caller, so enforcement can't drift. Local brains are never gated (the
+        # 2-brain local path is unchanged). Fails open on infra error, matching
+        # worker_llm_mixin. Billable-by-name, never gated on recorded cost.
+        try:
+            from agents.safety.cost import enforcement_skip_decision, is_local_provider
+            from agents.safety.provider_rate_limiter import get_provider_rate_limiter
+            _skip, _reason = enforcement_skip_decision(self.provider, self.db)
+            if _skip:
+                return (f"[{DRIVER.current_name}: {_reason}. Skipping the call "
+                        f"to stay within budget.]")
+            # Call-count backstop only for BILLABLE providers (local is free and
+            # uncapped — no need to count it, and it avoids a per-call DB bump).
+            if not is_local_provider(self.provider):
+                _rl = get_provider_rate_limiter().acquire(self.provider)
+                if not _rl.get("allow", True):
+                    return (f"[{DRIVER.current_name}: {_rl.get('reason') or 'rate limited'}. "
+                            f"Skipping the call.]")
+        except Exception:
+            pass
         # GUI is the source of truth for model selection
         if self.model == "unknown" or not self.model:
             return f"[{DRIVER.current_name}: No model selected. Please choose a model in the Providers & GPU tab.]"
@@ -528,7 +565,24 @@ class BigBrainAdapter:
                 {"role": "user", "content": user_message}
             ]
 
-        got_turn = self._start_got_turn(user_message)
+        # ARCH-ENG-317: a plain dialogue turn is back-and-forth talk, not an
+        # orchestration problem. The BrainTurnGraph resolver keyword-matches
+        # the ENTIRE turn context — the opportunity board routinely contains
+        # "options"/"compare"/"evidence" — so casual conversation was labelled
+        # tree_of_thoughts/graph_of_thoughts/react even though no branching
+        # happened (no production caller supplies branch candidates). Record
+        # the honest, linear skeleton instead; the graph itself stays, since it
+        # is the session's inspectable record. A turn that deliberately
+        # carries branch candidates still resolves its pattern normally.
+        got_pattern = None
+        if dialogue_mode and not branch_candidates:
+            from agents.cognition.reasoning_modes import (
+                PatternSelection, ReasoningPattern)
+            got_pattern = PatternSelection(
+                ReasoningPattern.DIRECT_DIALOGUE,
+                "plain dialogue turn: back-and-forth conversation needs "
+                "no branching")
+        got_turn = self._start_got_turn(user_message, pattern=got_pattern)
         try:
             client = self._get_client()
             
@@ -610,6 +664,17 @@ class BigBrainAdapter:
                 prompt_tokens = max(1, prompt_chars // 4)
                 completion_tokens = max(1, resp_chars // 4)
                 tps = (prompt_tokens + completion_tokens) / elapsed if elapsed > 0 else 0.0
+                # ARCH-ENG: a roster can back this brain with a cloud provider
+                # (self.provider != llamacpp). Record the REAL cost so a
+                # cloud-backed brain counts against the daily budget and
+                # CostGuard can skip it — the old hardcoded 0.0 let it bill
+                # freely. Local brains stay 0.0 (free).
+                try:
+                    from agents.safety.cost import estimate_call_cost
+                    _call_cost = estimate_call_cost(
+                        self.provider, self.model, prompt_tokens, completion_tokens)
+                except Exception:
+                    _call_cost = 0.0
                 self.db.log_llm_call(
                     model=self.model,
                     provider=getattr(self, "last_provider", "big-brain"),
@@ -621,8 +686,20 @@ class BigBrainAdapter:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     tokens_per_second=tps,
-                    cost_usd=0.0,
+                    cost_usd=_call_cost,
                 )
+                # ARCH-ENG-243 (BD-01): emit the typed llm_spend event the
+                # Insights panel's spend KPI reads (it sums est_usd over the
+                # event log -- "Cloud API cost only"). Local/unpriced paths
+                # estimate 0.0 and record only in llm_calls, so they are not
+                # emitted as spend events; the DB Stats identity lives there.
+                if _call_cost > 0:
+                    from agents.core.event_logger import StructuredEventLogger
+                    StructuredEventLogger.instance().llm_spend_event(
+                        model=self.model,
+                        provider=getattr(self, "last_provider", "big-brain"),
+                        tokens=prompt_tokens + completion_tokens,
+                        est_usd=_call_cost)
             except Exception:
                 pass  # Stats logging must never break the response
             if not str(answer or "").strip():

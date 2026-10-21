@@ -41,9 +41,25 @@ MUTATING_TOOL_NAMES: FrozenSet[str] = frozenset({
     "workshop_proposal",
     "workshop_account",
     "workshop_payment",
+    # ARCH-ENG-248 (AY-01): typing a workshop document into existence is a
+    # state change (and `workshop_account_remove` destroys a record), so these
+    # keep the human in the loop exactly like the older typed writers.
+    "workshop_proposal_status",
+    "workshop_research",
+    "workshop_script",
+    "workshop_application",
+    "workshop_account_remove",
+    "workshop_deliverable",
+    "workshop_note",
     "run_command",
     "record_payment",
     "social_post",
+    # ARCH-ENG-227: proposes a change to this program's own source. Classified
+    # MUTATING even though it does not itself write the target -- it creates a
+    # durable, human-reviewed artifact aimed at the codebase. READONLY would
+    # let the SafetyGate ALLOW it with no human in the loop (gate.py:122-128),
+    # which is precisely the wrong default for this.
+    "propose_code_patch",
 })
 
 # Read-only tools: no machine mutation and no external commitment.
@@ -55,6 +71,22 @@ READONLY_TOOL_NAMES: FrozenSet[str] = frozenset({
     "workshop_read",
     "workshop_storage",
     "workshop_search",
+    # ARCH-ENG-248 (AY-01): the typed READ half. No mutation, no external
+    # commitment -- `workshop_account_get`/`_list` mask passwords, so they are
+    # safe to auto-approve even though the underlying store is a secret file.
+    "workshop_proposal_list",
+    "workshop_proposal_get",
+    "workshop_research_read",
+    "workshop_research_list",
+    "workshop_script_read",
+    "workshop_script_list",
+    "workshop_application_list",
+    "workshop_account_get",
+    "workshop_account_list",
+    "workshop_payment_get",
+    "workshop_payment_list",
+    "workshop_deliverable_list",
+    "workshop_note_list",
     "file_read",
     "file_list",
     "query_db",

@@ -1,4 +1,4 @@
-# MrBot1000 v2.1.99 — Multi-Brain AI-Powered Earning Agent
+# MrBot1000 v2.1.132 — Multi-Brain AI-Powered Earning Agent
 
 A real-time AI agent system for automated earning opportunity discovery, execution, and lifecycle tracking. It is local-first: the default brain runtime runs on your machine across every detected GPU and the CPU/RAM pool, while optional cloud providers are explicitly configured by the operator.
 
@@ -6,7 +6,7 @@ A real-time AI agent system for automated earning opportunity discovery, executi
 > function-level map of every file, and [`docs/LEGACY_AUDIT.md`](docs/LEGACY_AUDIT.md)
 > for the status of the retired central-Manager architecture.
 
-## Highlights (through v2.1.99)
+## Highlights (through v2.1.110)
 
 - **Device-centric N-brain runtime** (`agents/runtime/device_registry.py` + `agents/runtime/dual_brain.py`): one source of truth for device→slot→role→endpoint/model. The runtime detects every GPU and the CPU/RAM pool and assigns each an ordered slot — slot 0/1 are the classic Big/Small brains (back-compat), slots 2+ are extra devices (e.g. a CPU/RAM brain). Per-device enable/role/model/settings persist in `settings.json`. The active local or cloud provider is selected from Settings.
 - **Shared-skills peer council Dialogue** (`agents/cognition/speaker_registry.py`): every enabled brain runs the same earning-agent skillset, differing only by a customizable per-device name (Edward Hurst, Jacob Stanley, Chris Borrows, …). Each brain independently reads the shared transcript — human + teammates + tool results — and decides whether to answer the human, react to a teammate, or push the goal. Names are editable in the Management tab (`BIG_BRAIN_NAME`/`SMALL_BRAIN_NAME`/`BRAIN_SLOT{n}_NAME`).
@@ -423,7 +423,7 @@ dotted path (e.g. `from agents.earning.task_executor import ...`); the old flat
 | `app/action_pipeline.py` | Proposal validation and controlled execution safeguards |
 | `app/database.py` | SQLite persistence for actions, thoughts, evidence, LLM stats, and runtime state |
 | `app/theme_config.py` / `ui.py` | Theme presets, custom theme values, widget styling, and optional effects |
-| `app/version.py` | Public application version source (`2.1.99`) |
+| `app/version.py` | Public application version source (`2.1.132`) |
 | `Agent.md` / `README.md` / `CHANGELOG.md` | Runtime contract, current system overview, and release history |
 | `tests/` | Focused regression and subsystem tests |
 | `tools/github_publish/` | Personal publish-mirror tooling (git-ignored; syncs a sanitized copy to GitHub) |
@@ -522,7 +522,7 @@ it is not a separate visible tab.
 
 - **Agent.md** — Runtime contract for any model interacting with the system
 - **README.md** (this file) — Current system overview, tab inventory, and configuration guide
-- **CHANGELOG.md** — Full change history (current release v2.1.99)
+- **CHANGELOG.md** — Full change history (current release v2.1.110)
 - **docs/codemap/** — Full function-level codebase map (every file, every function)
 - **docs/LEGACY_AUDIT.md** — Status of the retired central-Manager / worker-team architecture
 - **ARCHITECTURE_MAP.md** — Subsystem map, dependency assessment, consolidation plan

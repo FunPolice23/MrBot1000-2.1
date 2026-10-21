@@ -21,7 +21,8 @@ import inspect
 import os
 import sys
 
-MAIN = r"D:\MrBot1000_2.0\main.py"
+from pathlib import Path
+MAIN = str(Path(__file__).resolve().parents[2] / "main.py")
 
 
 def _guarded_block():

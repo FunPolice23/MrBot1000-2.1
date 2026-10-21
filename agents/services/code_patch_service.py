@@ -8,6 +8,8 @@ Safety contract:
 - ``target_path`` must resolve to a real file under ``root_dir`` (no ``..``
   escape, no absolute path outside root, no symlink escape).
 - Only allowlisted text/config extensions are patchable.
+- Files on ``PROTECTED_SOURCE_FILES`` or ``FILENAME_BLOCKLIST`` are refused,
+  matching the file-write and coder paths (ARCH-ENG-288).
 - A backup is always written before the first file mutation.
 - After write, ``verify`` runs (default: ``py_compile``). On any failure the
   file is rolled back to its exact original bytes.
@@ -55,6 +57,29 @@ class CodePatch:
             self.patch_id = uuid.uuid4().hex
 
 
+# ARCH-ENG-227: THE PROCESS-WIDE HANDLE ON THE ONE LIVE SERVICE.
+#
+# The GUI reaches the service through `EarningServices.code_patch_service`, which
+# requires a MainWindow. A tool handler has no window, so without this the new
+# `propose_code_patch` tool could only ever work inside the GUI -- which would
+# make it unreachable from exactly the place that needs it.
+#
+# `CodePatchService.__init__` registers itself here. Deliberately NOT a global
+# `get_root()`: the composition root already exists and already builds this
+# object, so the honest wiring is "the service announces itself" rather than
+# "callers reconstruct the object graph a second way".
+_CODE_PATCH_SERVICE = None
+
+
+def get_code_patch_service():
+    """Return the live `CodePatchService`, or None if self-improvement is off.
+
+    None is a normal answer, not an error: `composition_root` only builds the
+    service when the `self_improvement` feature flag is on.
+    """
+    return _CODE_PATCH_SERVICE
+
+
 class CodePatchService:
     """Owns the backup/apply/verify/rollback lifecycle for approved patches."""
 
@@ -84,6 +109,10 @@ class CodePatchService:
         # (verified_at, status, backup_path, ...). Feeds the monitor.
         self._applied: dict[str, dict] = {}
 
+        # ARCH-ENG-227: announce this instance so non-GUI callers
+        # (the tool handler) can reach the one the composition root built.
+        global _CODE_PATCH_SERVICE
+        _CODE_PATCH_SERVICE = self
     # ── in-use tracking ──────────────────────────────────────────────────────
     def mark_in_use(self, target_or_module: str) -> None:
         """Record that a file (path or dotted module) is currently loaded/used."""
@@ -92,6 +121,21 @@ class CodePatchService:
             self._in_use_files.add(fp)
 
     def mark_free(self, target_or_module: str) -> None:
+        """Release a file. Applying what was waiting is `drain`'s job, not this.
+
+        ARCH-ENG-227: an earlier draft of this ticket folded the drain in here
+        ("releasing a file is the event that unblocks a waiter"). That was
+        wrong, and the existing tests caught it: `mark_free` frees and `drain`
+        applies are separate, deliberate steps, and conflating them meant a
+        caller that freed a file and then drained -- the documented pattern --
+        found the queue already emptied and got `[]` back.
+
+        The real gap was never that `mark_free` should drain. It is that
+        NOTHING EVER CALLED `drain()`, so a queued patch sat forever and an
+        operator's approved change silently never landed. That is now wired at
+        the points where deferred work should be picked up: after an approval,
+        and on the self-improvement monitor tick.
+        """
         fp = self._resolve_for_inuse(target_or_module)
         if fp:
             self._in_use_files.discard(fp)
@@ -111,8 +155,47 @@ class CodePatchService:
             if rel.startswith("..") or os.path.isabs(rel):
                 return None
             return os.path.join(self.root_dir, rel)
-        # dotted module path (e.g. gui.tab_builders) -> guess file path
-        return self._module_to_file.get(t)
+        # ARCH-ENG-227: A DOTTED NAME USED TO RESOLVE TO None UNLESS IT HAD
+        # BEEN REGISTERED -- AND NOTHING EVER CALLED `register_module`.
+        #
+        # So `_module_to_file` was permanently empty, `_resolve_for_inuse`
+        # returned None for every dotted name, `mark_in_use("gui.tabs.chat")`
+        # silently did nothing, and `_in_use_files` stayed empty forever.
+        # That in turn made BOTH deferral guards unreachable:
+        # `apply_approved`'s `... and self._in_use_files and target in ...`
+        # and `drain`'s identical test. The in-use machinery was correct,
+        # tested, and unreachable.
+        #
+        # Resolving through `importlib` means a dotted name works without a
+        # registration pass. Registering every entry in `sys.modules` instead
+        # would be worse than useless: almost every source file is imported at
+        # startup, so "in use" would become "always", and no patch could ever
+        # apply at all. In-use means "actively being written or hot-reloaded",
+        # which is what `mark_in_use` is for.
+        if t in self._module_to_file:
+            return self._module_to_file[t]
+        try:
+            import importlib.util
+            spec = importlib.util.find_spec(t)
+        except (ImportError, ValueError, ModuleNotFoundError, AttributeError):
+            return None
+        origin = getattr(spec, "origin", None) if spec else None
+        if not origin or origin in ("built-in", "frozen", "namespace"):
+            return None
+        resolved = os.path.abspath(origin)
+        # CONTAINMENT. Without this, `mark_in_use("json")` resolved to the
+        # stdlib copy under the Python install and added it to `_in_use_files` --
+        # a path the patch service could never patch anyway, so it could only
+        # ever produce a confusing match. A dotted name is worth resolving only
+        # if it names something inside this repo, which is the only place
+        # `apply_approved` will ever write.
+        try:
+            root = os.path.realpath(self.root_dir)
+            if os.path.commonpath([os.path.realpath(resolved), root]) != root:
+                return None
+        except ValueError:      # cross-drive
+            return None
+        return resolved
 
     def _in_use(self, target: str) -> bool:
         return target in self._in_use_files
@@ -226,6 +309,24 @@ class CodePatchService:
         ext = os.path.splitext(candidate)[1].lower()
         if ext not in PATCHABLE_EXTENSIONS:
             raise ValueError(f"target extension .{ext} is not patchable")
+        # ARCH-ENG-288 (B-01/B-02): the patch service is a third source-write
+        # path, and it used to skip the two guards the other paths enforce.
+        # A basename match is deliberate: the workers match by basename so
+        # "./main.py", "app/main.py" and an absolute path are all refused.
+        from agents.brains.base_worker import PROTECTED_SOURCE_FILES
+        from agents.brains.worker_safety import FILENAME_BLOCKLIST
+
+        basename = os.path.basename(candidate).lower()
+        protected = {name.lower() for name in PROTECTED_SOURCE_FILES}
+        blocked = {name.lower() for name in FILENAME_BLOCKLIST}
+        if basename in protected:
+            raise ValueError(
+                f"target '{basename}' is a protected app source file; "
+                f"use an external editor for intentional dev changes")
+        if basename in blocked:
+            raise ValueError(
+                f"target '{basename}' is on the filename blocklist and is "
+                f"never writable through the patch service")
         # Store the validated, repo-rooted absolute path.
         patch.target_path = os.path.join(root, rel)
 

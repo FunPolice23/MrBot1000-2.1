@@ -82,8 +82,49 @@ def _first(x):
     return x or 0
 
 
+# ARCH-ENG-221: (path, mtime_ns, size) -> full metadata dict.
+# Same key shape as `_HEADER_CACHE` / `_SCALAR_CACHE` below, so a model edited
+# on disk invalidates naturally.
+_FULL_CACHE: Dict[Any, Any] = {}
+_FULL_CACHE_MAX = 8
+
+
 def read_metadata(path: str) -> Dict[str, Any]:
-    """Return the model's GGUF metadata K/V as a dict. Empty on failure."""
+    """Return the model's GGUF metadata K/V as a dict. Empty on failure.
+
+    ARCH-ENG-221: NOW CACHED, keyed on (path, mtime_ns, size).
+
+    This was uncached and called on EVERY chat turn, for both brains, via
+    `model_profile._read_gguf_metadata` -> `big_brain.py:509` /
+    `small_brain.py:301`. Each call walked the whole KV table with
+    `_read_val`, and vtype 9 MATERIALISES the value: `tokenizer.ggml.tokens`
+    is 151k-293k entries and `merges` ~280k more, decoded into Python `str`
+    objects. Measured cost was ~300 ms of CPU and 50-80 MB of transient
+    allocation per request, on the worker thread, to produce a dict of
+    architecture strings that cannot change between turns.
+
+    The sibling readers `read_scalar_metadata` and `read_header_metadata` were
+    already cached; this one was simply missed. `dual_brain.py:420` even
+    carries a comment describing the materialisation problem.
+
+    Behaviour is unchanged -- the returned dict is identical. Callers that
+    genuinely want the large arrays still get them; they just stop paying for
+    them on every turn.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    # ARCH-ENG-221: named `_cache_key`, NOT `key`. The loop below already binds
+    # `key` to each metadata key STRING, and a first draft of this cache reused
+    # that name -- so the value was stored under whatever key happened to be read
+    # last, and every subsequent lookup (which used the tuple) missed. The cache
+    # silently did nothing while appearing to be populated.
+    _cache_key = (path, st.st_mtime_ns, st.st_size)
+    hit = _FULL_CACHE.get(_cache_key)
+    if hit is not None:
+        return dict(hit)          # copy: callers must not mutate the cache
+
     out: Dict[str, Any] = {}
     try:
         with open(path, "rb") as f:
@@ -99,7 +140,14 @@ def read_metadata(path: str) -> Dict[str, Any]:
                 out[key] = _read_val(f, vtype)
     except Exception:
         return {}
-    return out
+    if out:
+        # Bounded: a few model files, not every model ever inspected. Evicts
+        # least-recently-inserted, which for this access pattern (one active
+        # model per brain) is the right one.
+        if len(_FULL_CACHE) >= _FULL_CACHE_MAX:
+            _FULL_CACHE.pop(next(iter(_FULL_CACHE)), None)
+        _FULL_CACHE[_cache_key] = out
+    return dict(out)
 
 
 # Value types whose size is fixed regardless of content — safe to seek past.

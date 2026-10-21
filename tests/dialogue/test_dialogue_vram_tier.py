@@ -123,13 +123,15 @@ def test_log_record_reports_the_same_tier_as_the_prompt_path():
     14B on a 6GB card ran 'compact' but the log recorded 'full' — misleading
     any diagnosis that reads the log.
     """
-    import gui.tabs.dialogue_tab as dt
     from gui.tabs.dialogue_tab import DialogueTab
 
     tab = _tab()
     tab._brain_gpu_vram_gb = lambda small: 6.0
     captured = {}
-    dt._append_dialogue_log = lambda rec: captured.update(rec)
+    # ARCH-ENG-273 (AV-02): the writer is now reached through the INSTANCE seam,
+    # which is bound at construction. A test must replace the seam on the object
+    # it drives; patching the module function would intercept nothing.
+    tab._append_dialogue_log = lambda rec: captured.update(rec)
     tab._log_dialogue_turn("Jacob Stanley", "accepted", "test reply")
     assert captured.get("tier") == "compact", (
         f"log tier must be VRAM-capped, got {captured.get('tier')!r}")

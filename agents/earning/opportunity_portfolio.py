@@ -527,6 +527,33 @@ class QueuePolicy:
     max_effort_hours: float = 40.0
     max_expected_hourly: float = 200.0
 
+    # ARCH-ENG-216: the theoretical maximum of the weighted sum below.
+    #
+    # `score()` returns an UNBOUNDED weighted sum, not a 0..1 fraction: with
+    # every normalised term at 1.0 and the cost terms at 0.0 it reaches
+    # 1.0 + 0.5 + 0.6 + 0.4 + 2.0 = 4.5, and the cost terms can drag it below
+    # zero. Observed range in practice is roughly -0.8 .. 3.4.
+    #
+    # That mattered because `policy_score` is persisted and the Opportunities tab
+    # treats it as a percentage: it renders `policy_score * 100` and filters on
+    # `policy_score < min_percent / 100`. So a legitimate score of 1.04 displayed
+    # as "104%", and an operator's "minimum 50%" actually meant 0.5 on a 0..3.4
+    # scale -- far more permissive than they intended.
+    #
+    # The persisted contract is now 0..1. `score()` keeps its own semantics
+    # ("higher = more attractive") because `ranked_by_score` sorts on it;
+    # `rescore_all` normalises on the way to disk.
+    @classmethod
+    def theoretical_max(cls) -> float:
+        """Upper bound of the default weighted sum. Used to normalise to 0..1."""
+        return (max(0.0, cls.w_expected_hourly)
+                + max(0.0, cls.w_confidence)
+                + max(0.0, cls.w_risk)
+                + max(0.0, cls.w_skill_fit)
+                + max(0.0, cls.w_deadline_urgency)
+                + max(0.0, cls.w_effort)
+                + max(0.0, cls.w_priority_override))
+
     def score(self, entry: PortfolioEntry, now: float) -> float:
         """Compute a priority score for an entry (higher = more attractive)."""
         if self.scorer is not None:
@@ -595,10 +622,52 @@ class WorkQueue:
     # ── Scoring & ordering ──────────────────────────────────────────────────────
 
     def compute_scores(self, now: float) -> List[tuple]:
-        """Compute policy_score for every non-terminal entry. Returns [(entry, score)]."""
+        """Compute policy_score for every non-terminal entry. Returns [(entry, score)].
+
+        READ PATH. This does not persist -- see `rescore_all` for the write
+        path. ARCH-ENG-216: these two were conflated, and the result was that
+        `PortfolioEntry.policy_score` had no legitimate writer at all.
+        """
         entries = [e for e in self.portfolio.list_all() if not e.work_status.is_terminal]
         scored = [(e, self.policy.score(e, now)) for e in entries]
         return scored
+
+    def rescore_all(self, now: float | None = None) -> int:
+        """PERSIST policy_score for every non-terminal entry. Returns the count.
+
+        ARCH-ENG-216. `QueuePolicy.score()` already computed exactly this value
+        and `compute_scores` returned it to its single caller -- which then threw
+        it away. Nothing ever wrote the column.
+
+        That left `policy_score` with one writer, and it was the wrong one:
+        `autonomous_loop` assigned `result.paid`, a BOOL, to a field declared
+        `policy_score: float`. Every opportunity the autonomous loop touched was
+        written as 0.0 and rendered "0%", then filtered out by the
+        Opportunities tab's minimum-score control -- so work the agent had
+        actually performed disappeared from the operator's view.
+
+        Beyond the type error, "was this paid" is not the same question as "how
+        attractive is this opportunity". A payment outcome overwrote a quality
+        score. That assignment is gone; this method is the column's real writer.
+        """
+        now = time.time() if now is None else now
+        ceiling = self.policy.theoretical_max() if self.policy else 1.0
+        if ceiling <= 0:
+            ceiling = 1.0
+        written = 0
+        for entry, score in self.compute_scores(now):
+            # ARCH-ENG-216: `score()` is an unbounded weighted sum; the persisted
+            # column is a 0..1 fraction. Normalise here, on the way to disk, so
+            # the Opportunities tab's `* 100` display and `/ 100` filter are
+            # both correct. Clamping (rather than a bare divide) keeps a
+            # negative score representable as 0 rather than as a negative
+            # percentage.
+            normalised = max(0.0, min(1.0, score / ceiling))
+            if entry.policy_score != normalised:
+                entry.policy_score = normalised
+                self.portfolio.update(entry)
+                written += 1
+        return written
 
     def prioritized(self, now: float) -> List[PortfolioEntry]:
         """Return non-terminal entries sorted by policy_score descending (the queue order)."""

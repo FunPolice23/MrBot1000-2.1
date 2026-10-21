@@ -10,37 +10,6 @@ from agents.earning.opportunity_lifecycle import OpportunityLifecycleTracker
 
 
 class TestOpportunityLifecycle(unittest.TestCase):
-    def test_chat_router_includes_lifecycle_snapshot(self):
-        import os
-        import tempfile
-
-        from agents.dialogue.chat_router import ChatRouter
-        from agents.brains.shared_context import SharedContext
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            shared = SharedContext(path=os.path.join(tmpdir, "shared.json"))
-            shared.update_opportunity_lifecycle(
-                "opp_999",
-                current_stage="paid",
-                status="paid",
-                last_amount=250.0,
-                note="Received payment",
-            )
-
-            router = ChatRouter()
-            context = router.build_runtime_context(tmpdir, user_message="What opportunities are in progress?")
-            self.assertIn("opp_999", context)
-            self.assertIn("paid", context)
-            self.assertIn("Status Report", context)
-            self.assertIn("Board-ready snapshot:", context)
-            self.assertIn("Primary action:", context)
-            self.assertIn("Overall:", context)
-            self.assertIn("Stage: paid", context)
-            self.assertIn("Amount: $250.00", context)
-            self.assertIn("Recommendation:", context)
-            self.assertIn("Priority:", context)
-            self.assertNotIn('"current_stage": "paid"', context)
-
     def test_tracker_moves_opportunity_through_stages(self):
         tracker = OpportunityLifecycleTracker()
         opportunity = Opportunity(

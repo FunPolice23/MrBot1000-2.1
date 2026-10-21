@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import ast
 import os
+import py_compile
 import re
+import tempfile
 import time
 import json
 import keyword
@@ -30,6 +32,12 @@ from pathlib import Path
 from typing import List, Dict, Optional, Callable, Tuple
 
 from agents.safety.authorization import AuthorizedActionDispatcher
+
+# ARCH-ENG-203: the single canonical boolean-environment parser. Used for
+# PIPELINE_ALLOW_SELF_IMPROVE, which `agents.core.feature_flags` also reads
+# -- the two previously disagreed, leaving the self-improvement gate open on
+# one path and closed on the other.
+from app.effects import env_bool
 
 ROOT_FOLDER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -371,7 +379,11 @@ class ActionPipeline:
         self._summarizer_worker = None
         
         # Self-improvement permission (from env)
-        self.allow_self_improve = os.getenv("PIPELINE_ALLOW_SELF_IMPROVE", "false").lower() == "true"
+        # ARCH-ENG-203: was `.lower() == "true"`. `feature_enabled()` reads the
+        # SAME variable through `app.effects.env_bool`, which accepts 1/yes/on.
+        # This narrower form disagreed with it: for `PIPELINE_ALLOW_SELF_IMPROVE=1`
+        # the gate read closed here and open there. One parser, one answer.
+        self.allow_self_improve = env_bool("PIPELINE_ALLOW_SELF_IMPROVE", False)
 
         # Validators in priority order
         self._validators = [
@@ -540,6 +552,42 @@ class ActionPipeline:
                                f"Created {action.target_path}",
                                path=str(path))
 
+    # ARCH-ENG-276 (AQ-02): MODIFY IS NOW AS SAFE AS PATCH.
+    #
+    # The old path wrote `<target>.bak` beside the file at apply time and then
+    # never used it. A failed or half-written save left the target broken, with
+    # a stray .bak in the operator's tree; there was no revert. The approved
+    # `propose_code_patch` path (ARCH-ENG-227) already had the right contract:
+    # back up first, replace atomically, verify, and roll back on any failure.
+    # Modify now follows it. Backups go to `.mrbot_backups/action_pipeline/`
+    # instead of next to the target, and are byte-exact so a revert restores
+    # the original file including line endings.
+
+    def _backup_modify_target(self, path: Path, original: bytes) -> Path:
+        """Write a byte-exact backup before mutating ``path``. Raises on failure."""
+        backup_dir = self.root / ".mrbot_backups" / "action_pipeline"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        backup = backup_dir / f"{path.name}.{stamp}.{os.getpid()}.bak"
+        backup.write_bytes(original)
+        return backup
+
+    @staticmethod
+    def _atomic_write_bytes(path: Path, content: bytes) -> None:
+        """Replace ``path`` in one step, so a crash never leaves it half-written."""
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".modifytmp")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+            os.replace(tmp, str(path))
+        except BaseException:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
     def _exec_modify_file(self, action: ProposedAction) -> ExecutionResult:
         if not action.target_path:
             return ExecutionResult(False, "No target_path specified")
@@ -550,17 +598,55 @@ class ActionPipeline:
             return ExecutionResult(False,
                                    f"File not found: {action.target_path}")
 
-        # Backup original
-        backup = path.with_suffix(path.suffix + ".bak")
-        backup.write_text(path.read_text(encoding="utf-8"),
-                          encoding="utf-8")
+        # 1. BACK UP FIRST, byte-exact. No backup means no mutation: a write
+        #    that cannot be reverted must never start.
+        try:
+            original = path.read_bytes()
+            backup = self._backup_modify_target(path, original)
+        except Exception as exc:
+            self._log(f"[Pipeline] REFUSED {action.target_path}: "
+                      f"backup failed ({exc})")
+            return ExecutionResult(
+                False,
+                f"Modify refused: could not back up {action.target_path} ({exc})",
+                path=str(path))
 
-        path.write_text(action.code, encoding="utf-8")
+        # 2. Atomic replace.
+        try:
+            self._atomic_write_bytes(path, action.code.encode("utf-8"))
+        except Exception as exc:
+            self._revert_modify(path, original, backup)
+            return ExecutionResult(
+                False,
+                f"Modify failed and was reverted: {exc}",
+                path=str(path))
+
+        # 3. Verify; roll back on any failure so a broken file is never left
+        #    behind. Only Python is compile-checked; other text has no verifier.
+        if path.suffix.lower() == ".py":
+            try:
+                py_compile.compile(str(path), doraise=True)
+            except Exception as exc:
+                self._revert_modify(path, original, backup)
+                return ExecutionResult(
+                    False,
+                    f"Modify rejected and reverted (compile check): {exc}",
+                    path=str(path))
+
         self._log(f"[Pipeline] MODIFIED {action.target_path} "
                   f"(backup: {backup.name})")
         return ExecutionResult(True,
                                f"Modified {action.target_path} (backup saved)",
                                path=str(path))
+
+    def _revert_modify(self, path: Path, original: bytes, backup: Path) -> None:
+        """Restore the exact original bytes after a failed modify."""
+        try:
+            self._atomic_write_bytes(path, original)
+            self._log(f"[Pipeline] REVERTED {path.name} from {backup.name}")
+        except Exception as exc:
+            self._log(f"[Pipeline] REVERT FAILED for {path}: {exc}; "
+                      f"original is at {backup}")
 
     def _exec_delete_file(self, action: ProposedAction) -> ExecutionResult:
         # Deletes are only allowed with explicit confirmation flag

@@ -175,9 +175,14 @@ class TestLoopSafety(unittest.TestCase):
         request = Message(
             message_type=MessageType.PLAN_REQUEST,
             source="coordinator", destination="big",
-            correlation_id=run.correlation_id,
+            # ARCH-ENG-247: the coordinator now PUBLISHES its stage messages
+            # (it previously only logged them), so the run's own
+            # (coordinator -> big) edge is already in the bus's loop-
+            # prevention set for this correlation. A genuinely fresh
+            # correlation is what "fresh" means now.
+            correlation_id=f"fresh-{run.run_id}",
             payload={"run_id": run.run_id})
-        # Fresh message_id -> accepted.
+        # Fresh message_id + fresh correlation -> accepted.
         self.assertTrue(bus.publish(request))
         request.message_id = request.message_id  # reuse same id (dedup)
         request.message_id = run.stages[0].request_id  # duplicate id

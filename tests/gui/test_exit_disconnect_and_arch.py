@@ -9,7 +9,8 @@
 import sys
 import unittest
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 _XING = r"D:/llama.cpp/models/Xing4.0-29B-A4B-Q4_K_M.gguf"          # unknown arch
 _GLM = r"D:/llama.cpp/models/GLM-4.7-Flash-REAP-23B-A3B-UD-Q3_K_XL.gguf"  # known

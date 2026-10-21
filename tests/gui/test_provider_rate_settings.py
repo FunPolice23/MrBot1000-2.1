@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agents.safety.provider_rate_limiter import is_local_provider
 

@@ -7,6 +7,13 @@ farming is where *capital* (not just gas) is lost, so B5 adds a real gate.
 The screen is heuristic on injectable signals until live oracles (on-chain contract age, TVL
 history, honeypot sim) are wired — exactly like B3's `eligibility_fn` / B4's gas oracle. The
 *gating logic* is real: a failed rug screen cannot pass.
+
+ARCH-ENG-141: an unknown contract age FAILS CLOSED for any protocol outside
+``TRUSTED_PROTOCOLS``. It previously only raised a soft flag, which — combined with the fact
+that no production caller ever injects the ``honeypot``/``contract_age_days`` signals —
+meant the two hard-fail rules were unreachable and a 2-day-old honeypot farm screened
+``medium`` (reproduced by execution). ``TRUSTED_PROTOCOLS`` is an operator-side hardcoded
+allowlist, so it is the only exemption.
 """
 
 from dataclasses import dataclass, field
@@ -68,8 +75,24 @@ def screen_opportunity(opp,
     if honeypot is True:
         fails.append("honeypot detected")
 
-    # Unknown / young contract.
-    if contract_age_days is not None and contract_age_days < MIN_CONTRACT_AGE_DAYS:
+    # Unknown / young contract. On a capital-loss gate "unknown" must not mean
+    # "pass": a protocol whose deployment date cannot be verified is
+    # indistinguishable from a 2-day-old honeypot farm, so it fails closed.
+    #
+    # ARCH-ENG-141: this used to be flag-only. Because BOTH production callers
+    # (`discovery_sources.py:195`, `earning_pipeline.py:602`) invoke
+    # `screen_rug_pull(opps)` with no signals at all, the `honeypot` and
+    # `contract_age_days` hard fails above could never fire in production —
+    # reproduced by execution: a 2-day-old honeypot farm at 50000% APY screened
+    # `risk=medium, passed=True` and survived `filter_by_risk("medium")`.
+    #
+    # TRUSTED_PROTOCOLS is the operator's own hardcoded allowlist — not a field
+    # any external API can set — so it is the only exemption, and it is what
+    # keeps the one protocol that can actually emit today (Lido) discoverable.
+    if contract_age_days is None:
+        if not trusted:
+            fails.append("contract age unknown; failing closed (unverifiable deployment date)")
+    elif contract_age_days < MIN_CONTRACT_AGE_DAYS:
         fails.append(f"contract age {contract_age_days:.0f}d < {MIN_CONTRACT_AGE_DAYS}d")
 
     # TVL collapse: compare latest vs peak in the recent history window.

@@ -25,7 +25,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agents.safety.handlers import _resolve_db_path, _tool_query_db
 

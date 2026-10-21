@@ -95,7 +95,6 @@ class ThinkingBox(QFrame):
 class ChatTab(QWidget):
     """Full conversation between human and Small Brain."""
     
-    escalation_needed = Signal(str)
     # Emitted after a completed user->Small Brain exchange so an optional bridge
     # (e.g. the Dialogue tab) can continue the thread with a Big Brain follow-up.
     exchange_complete = Signal(str, str)  # user_msg, small_brain_reply
@@ -222,12 +221,15 @@ class ChatTab(QWidget):
             clean = channel_pattern.sub('', response).strip()
             return thinking, clean
         
-        # Pattern 3: <think>...</think>
-        think_pattern = re.compile(r'<think>(.*?)</think>', re.DOTALL)
-        match = think_pattern.search(response)
-        if match:
-            thinking = match.group(1).strip()
-            clean = think_pattern.sub('', response).strip()
+        # Pattern 3: closed think blocks -- BE-01 (ARCH-ENG-239): through
+        # the canonical matcher in agents/brains/worker_thinking,
+        # case-insensitive and shared with the safety/response.py strip
+        # path, so a block in different casing cannot be displayed on one
+        # path and stripped on another.
+        from agents.brains.worker_thinking import split_think_blocks
+
+        thinking, clean = split_think_blocks(response)
+        if thinking:
             return thinking, clean
         
         return None, response
@@ -251,7 +253,9 @@ class ChatTab(QWidget):
 
         # Run inference in background thread
         self.worker = InferenceWorker(self.small_brain, msg, self.conversation_history)
-        self.worker.finished.connect(self._on_small_brain_response)
+        # ARCH-ENG-210: follows the renamed signal -- the worker no longer
+        # shadows QThread.finished.
+        self.worker.response_ready.connect(self._on_small_brain_response)
         self.worker.start()
 
     def _gpu_window(self):
@@ -363,7 +367,7 @@ class ChatTab(QWidget):
         v2.1.61 (ARCH-ENG-074): the Chat tab runs InferenceWorker/EscalationWorker
         QThreads that make long provider HTTP calls (the 27B Big Brain). On window
         close mid-generation those workers are still running; their queued
-        `finished`/`big_done`/`small_summary`/`failed`/`exchange_complete` signals
+        `response_ready`/`big_done`/`small_summary`/`failed`/`exchange_complete`
         land on widgets being torn down and dereference dead C++ objects, aborting
         the interpreter (python.exe Qt6Core.dll 0xc0000409). Disconnect the
         workers' signals here (the same disconnect-before-destroy treatment
@@ -379,7 +383,11 @@ class ChatTab(QWidget):
             if worker is None:
                 continue
             try:
-                for sig_name in ("finished", "big_done", "small_summary", "failed"):
+                # ARCH-ENG-210: "finished" -> "response_ready"; the old name is
+                # the inherited QThread signal now, and disconnecting THAT would
+                # break the deleteLater wiring above.
+                for sig_name in ("response_ready", "big_done",
+                                 "small_summary", "failed"):
                     sig = getattr(worker, sig_name, None)
                     if sig is not None:
                         try:
@@ -398,23 +406,38 @@ class ChatTab(QWidget):
 
 class InferenceWorker(QThread):
     """Background worker for running LLM inference without blocking GUI."""
-    
-    finished = Signal(str)  # Response text
-    
+
+    # ARCH-ENG-210: this used to be `finished = Signal(str)`, which SHADOWED
+    # the inherited zero-argument `QThread.finished`. Two things broke at once:
+    #
+    # 1. Qt's own thread-completion emission resolved to a one-argument slot, so
+    #    `worker.finished.connect(worker.deleteLater)` was calling deleteLater
+    #    from inside `run()` -- scheduling deletion while the thread was still
+    #    executing.
+    # 2. `deleteLater` is deferred to the GUI thread's event loop, which can run
+    #    it before `run()` returns.
+    #
+    # The signal is renamed to what it actually carries, which is also the fix
+    # ARCH-ENG-168 applied to DialogueWorker for the identical reason. The real
+    # `QThread.finished` is inherited again and now drives `deleteLater`, which
+    # is the one moment it is safe: the thread has genuinely stopped.
+    response_ready = Signal(str)  # Response text
+
     def __init__(self, small_brain, user_msg, history):
         super().__init__()
         self.small_brain = small_brain
         self.user_msg = user_msg
         self.history = history
-        self.finished.connect(self.deleteLater)
-    
+        # The inherited QThread.finished -- emitted after run() returns.
+        QThread.finished.connect(self, self.deleteLater)
+
     def run(self):
         """Run inference in background thread."""
         try:
             response = self.small_brain.chat(self.user_msg, self.history)
-            self.finished.emit(response)
+            self.response_ready.emit(response)
         except Exception as e:
-            self.finished.emit(f"Error: {str(e)}")
+            self.response_ready.emit(f"Error: {str(e)}")
 
 
 class EscalationWorker(QThread):
@@ -435,9 +458,22 @@ class EscalationWorker(QThread):
         self.big_brain = big_brain
         self.user_msg = user_msg
         self.history = history
-        self.big_done.connect(self.deleteLater)
-        self.small_summary.connect(self.deleteLater)
-        self.failed.connect(self.deleteLater)
+        # ARCH-ENG-210: these three were EACH connected to `self.deleteLater`.
+        # `big_done` is emitted at line 448 -- and a SECOND long model call runs
+        # at 449-451, after it. So deleteLater was scheduled for an object whose
+        # run() was still executing: the GUI thread processed the DeferredDelete
+        # and the process died with
+        #     QThread: Destroyed while thread is still running
+        # exit code 0xC0000409. Reproduced standalone under this venv.
+        #
+        # Any Chat turn that tripped `should_escalate` killed python.exe. It
+        # looked intermittent because it is a race, but the wide window between
+        # the two model calls made it near-certain.
+        #
+        # Deletion is now driven by the inherited QThread.finished, which is
+        # emitted only after run() has returned. The three payload signals carry
+        # content and are connected only to the UI handlers.
+        QThread.finished.connect(self, self.deleteLater)
 
     def run(self):
         try:

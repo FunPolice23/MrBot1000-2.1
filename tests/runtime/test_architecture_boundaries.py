@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from agents.core.architecture_boundaries import UsageLedger, check_import_boundaries
+from tests.support.architecture_boundaries import UsageLedger, check_import_boundaries
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

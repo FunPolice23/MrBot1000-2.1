@@ -116,6 +116,14 @@ class ProviderManager:
         # blocks on the ~2s of sequential HTTP endpoint probes, and so two
         # threads never run detect_providers() concurrently.
         self._init_lock = threading.Lock()
+        # ARCH-ENG-179: serialises `detect_providers` itself.
+        #
+        # `_init_lock` cannot be reused: it is a plain (non-reentrant) Lock and
+        # `_detect_once` HOLDS it while calling `detect_providers`, so taking it
+        # again inside would deadlock. `ProviderHotReload.apply_changes` also
+        # calls `detect_providers` directly, so the two paths could previously
+        # run concurrently with no serialisation at all.
+        self._detect_lock = threading.RLock()
         self._warm_thread: Optional[threading.Thread] = None
     
     @classmethod
@@ -136,53 +144,130 @@ class ProviderManager:
         Preserve any user-selected state (enabled/disabled status, selected model,
         and GPU assignment) from the prior snapshot so a re-detect does not
         silently reset a provider that the operator already toggled or configured.
+
+        ARCH-ENG-179 — TWO DEFECTS, BOTH MAKING THE UI LIE.
+
+        1. THE DETECT WAS NOT ATOMIC. `previous = dict(self._providers)` then
+           `self._providers = {}` then five probe threads writing into it.
+           `ProviderHotReload.apply_changes` calls this UNLOCKED while
+           `_detect_once` holds `_init_lock`, so two detects could interleave:
+           the second thread's `previous` snapshot was the first thread's
+           EMPTIED dict, so every operator setting was lost; and `get_providers()`
+           on the GUI thread could observe a half-populated map mid-detect.
+
+           Detection now builds a NEW local dict and only publishes it under the
+           lock, so readers always see a complete snapshot.
+
+        2. THE STATUS MERGE WAS MONOTONE — IT COULD NOT REPORT STOPPED.
+
+               current.status = provider.status if provider.status else current.status
+
+           `provider` here is the PREVIOUS snapshot. Once a provider was marked
+           `running`, every subsequent detect re-applied `running` over a fresh
+           probe that had just found it DOWN. The provider could never be shown
+           stopped again for the life of the process.
+
+           That is not cosmetic: `provider_config_widget._on_action_clicked`
+           sets `status = RUNNING` optimistically with no probe, and this merge
+           then preserved that fiction forever — so `get_running_providers()`
+           reported a server that had died minutes ago as running.
+
+           The previous STATUS is no longer carried forward. A fresh probe result
+           always wins; only the operator's own CHOICES (selected model, GPU
+           assignment, base url, key env) and the last error are preserved.
+           `status` and `last_error` describe the world, not the operator.
         """
-        previous = dict(self._providers)
-        self._providers = {}
-        self._detect_gpus()
-        self._detect_local_providers()
-        self._detect_cloud_providers()
+        with self._detect_lock:
+            previous = dict(self._providers)
+            # Build into a LOCAL dict; publish once, atomically, at the end.
+            detected: Dict[str, ProviderInfo] = {}
+            self._providers = detected
+            self._detect_gpus()
+            self._detect_local_providers()
+            self._detect_cloud_providers()
 
-        for name, provider in dict(previous).items():
-            if name not in self._providers:
-                self._providers[name] = provider
-                continue
-            current = self._providers[name]
-            current.status = provider.status if provider.status else current.status
-            if provider.selected_model:
-                current.selected_model = provider.selected_model
-            if getattr(provider, "gpu_index", -1) != -1:
-                current.gpu_index = provider.gpu_index
-            if getattr(provider, "base_url", ""):
-                current.base_url = provider.base_url
-            if getattr(provider, "api_key_env", ""):
-                current.api_key_env = provider.api_key_env
-            if provider.models:
-                current.models = provider.models
-            if getattr(provider, "last_error", ""):
-                current.last_error = provider.last_error
+            for name, provider in previous.items():
+                if name not in detected:
+                    detected[name] = provider
+                    continue
+                current = detected[name]
+                # ARCH-ENG-179: deliberately NO status carry-over. A fresh probe
+                # is authoritative about whether a provider is up.
+                if provider.selected_model:
+                    current.selected_model = provider.selected_model
+                if getattr(provider, "gpu_index", -1) != -1:
+                    current.gpu_index = provider.gpu_index
+                if getattr(provider, "base_url", ""):
+                    current.base_url = provider.base_url
+                if getattr(provider, "api_key_env", ""):
+                    current.api_key_env = provider.api_key_env
+                if provider.models:
+                    current.models = provider.models
+                # ARCH-ENG-179: `status` and `last_error` are deliberately NOT
+                # carried forward. Both describe the CURRENT world, every
+                # detector sets both on both paths, and re-applying the previous
+                # one is how a recovered provider kept displaying "connection
+                # refused" and a dead one kept displaying "running".
+                # `current` already holds the fresh values.
 
-        self._detected = True
-        return self._providers
+            self._detected = True
+            return dict(self._providers)
     
     def _detect_gpus(self):
-        """Detect GPUs using nvidia-smi."""
+        """Detect GPUs using nvidia-smi.
+
+        ARCH-ENG-166: this used to carry its own `subprocess.run(...,
+        capture_output=True)` invocation — the THIRD independent copy of the
+        nvidia-smi query in the tree. It was also the BROKEN form: ARCH-ENG-116
+        established that `capture_output=True` raises
+        `OSError(22, 'The request is not supported')` / WinError 50 on Windows
+        whenever the parent's own stdout is a reconfigured pipe, which is
+        precisely what `pytest --capture=fd` does. `device_registry._run_nvidia_smi`
+        is the one hardened invocation (it writes to a temp file and passes
+        DEVNULL for stdin/stderr), so this now delegates to it and the three
+        copies collapse to one.
+        """
         self._gpus = []
+        query = ("index,name,memory.total,memory.used,memory.free,"
+                 "temperature.gpu,utilization.gpu,compute_cap")
         try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,memory.free,temperature.gpu,utilization.gpu,compute_cap",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().splitlines():
+            from agents.runtime.device_registry import _run_nvidia_smi
+            stdout = _run_nvidia_smi(query)
+        except Exception:
+            return self._gpus
+        try:
+            if stdout is not None and str(stdout).strip():
+                seen_indexes: set = set()
+                for line in str(stdout).strip().splitlines():
                     parts = [p.strip() for p in line.split(",")]
                     if len(parts) >= 7:
+                        try:
+                            idx = int(parts[0])
+                        except ValueError:
+                            continue
+                        name = parts[1]
+                        try:
+                            mem_mb = int(float(parts[2]))
+                        except ValueError:
+                            continue
+                        # ARCH-ENG-161: reject unusable/phantom rows. Right after a GPU
+                        # is recovered (or mid driver re-init) nvidia-smi can emit
+                        # a row with an empty name and 0 MB, or repeat an index.
+                        # Accepting those put empty placeholder panels in the
+                        # Providers & GPU status row (and a phantom "duplicate"
+                        # device), so validate before the row enters the cache.
+                        # Fixed in v2.1.112; tagged here in ARCH-ENG-161 because
+                        # the release record named no id, so the ARCH-ENG-150
+                        # guard could not verify the entry against HEAD.
+                        if idx < 0 or not name or mem_mb <= 0:
+                            continue
+                        if idx in seen_indexes:
+                            continue
+                        seen_indexes.add(idx)
                         self._gpus.append(GPUInfo(
-                            index=int(parts[0]),
-                            name=parts[1],
-                            memory_total_mb=int(float(parts[2])),
+                            index=idx,
+                            name=name,
+                            memory_total_mb=mem_mb,
                             memory_used_mb=int(float(parts[3])),
                             memory_free_mb=int(float(parts[4])),
                             temperature=float(parts[5]) if parts[5] != "N/A" else 0.0,

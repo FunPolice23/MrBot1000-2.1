@@ -79,6 +79,15 @@ class CollaborationTab(QWidget):
         self.run_btn = QPushButton("▶ Run Collaboration")
         self.run_btn.clicked.connect(self._run_collaboration)
         control.addWidget(self.run_btn)
+        # ARCH-ENG-247 (AN-02): the first production consumer of bus
+        # cancellation. Stop cancels the active run's correlation; the
+        # coordinator checks the token before the next stage, so no further
+        # model calls are made and the remaining stage deliveries are
+        # refused by the bus.
+        self.stop_btn = QPushButton("■ Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_collaboration)
+        control.addWidget(self.stop_btn)
         layout.addLayout(control)
 
         splitter = QSplitter(Qt.Vertical)
@@ -133,13 +142,28 @@ class CollaborationTab(QWidget):
         self.goal_changed.emit(goal)  # mirror to Dialogue
         self.run_btn.setEnabled(False)
         self.run_btn.setText("…")
+        self.stop_btn.setEnabled(True)
+        self.stop_btn.setText("■ Stop")
         self.worker = CollaborationWorker(self.coordinator, goal)
         self.worker.finished.connect(self._on_run_done)
         self.worker.start()
 
+    def _stop_collaboration(self):
+        """Cancel the active run (ARCH-ENG-247): cooperative, at the next
+        stage boundary -- no model call is interrupted mid-call."""
+        try:
+            cancelled = self.coordinator.cancel_active_run(
+                "operator pressed Stop on the Collaboration tab")
+        except Exception:
+            cancelled = False
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setText("stopping…" if cancelled else "■ Stop")
+
     def _on_run_done(self, _payload):
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶ Run Collaboration")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setText("■ Stop")
         self.refresh()
 
     def refresh(self):

@@ -2,23 +2,81 @@
 
 from __future__ import annotations
 
+import os
+import re
 
-_THINK_OPEN = "<think>"
-_THINK_CLOSE = "</think>"
+# BE-01 (ARCH-ENG-239): THE one matcher for thinking-marker blocks. Four live
+# implementations of this match existed with DIFFERENT case rules:
+# agents/safety/response.py:173 matched case-insensitively (the main dialogue
+# path), response.py's profile branch, chat_tab.py's pattern 3 and this
+# module's split_thinking matched lowercase only. A model emitting `<THINK>`
+# or `<Think>` had its private reasoning stripped on one path and printed to
+# the operator on the others. Every strip/split of think blocks goes through
+# this compiled matcher now; the policies that legitimately differ between
+# paths (split-vs-strip, unclosed-block handling) are separate from the
+# MATCH, which must never differ.
+_THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+
+
+def strip_think_blocks(text: str) -> str:
+    """Remove every closed think block, case-insensitively, from visible text."""
+    if not text:
+        return ""
+    return _THINK_BLOCK_RE.sub("", text).strip()
+
+
+def split_think_blocks(content: str):
+    """Return ``(thinking, answer)`` for CLOSED think blocks.
+
+    The thinking of the first block, with every block removed from the
+    answer; ``("", content)`` when no closed block exists. An UNCLOSED block
+    is an in-progress stream, not a verdict -- for that policy the legacy
+    :func:`split_thinking` remains the contract to call.
+    """
+    if not content:
+        return "", content or ""
+    match = _THINK_BLOCK_RE.search(content)
+    if match:
+        return (
+            match.group(1).strip(),
+            _THINK_BLOCK_RE.sub("", content).strip(),
+        )
+    return "", content
+
+
+_THINK_OPEN_RE = re.compile(r"<think>", re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think>", re.IGNORECASE)
 
 
 def split_thinking(content: str):
-    """Return ``(thinking, answer)`` from a model response."""
-    if not content or _THINK_OPEN not in content:
+    """Return ``(thinking, answer)`` from a model response.
+
+    BE-01 (ARCH-ENG-239): the match now goes through the shared canonical
+    matcher, so a `<THINK>`/`<Think>` marker splits the same way a lowercase
+    one always did. The legacy unclosed-block policy below is deliberately
+    PRESERVED: an unclosed block is treated as an in-progress stream (all
+    considerate content retained as `thinking`, empty answer) -- changing
+    that policy is not what this fix is about.
+    """
+    if not content:
         return "", content or ""
-    start = content.index(_THINK_OPEN) + len(_THINK_OPEN)
-    close_idx = content.find(_THINK_CLOSE, start)
-    if close_idx == -1:
-        return content[start:], ""
-    return (
-        content[start:close_idx].strip(),
-        content[close_idx + len(_THINK_CLOSE):].strip(),
-    )
+    match = _THINK_BLOCK_RE.search(content)
+    if match:
+        return (
+            match.group(1).strip(),
+            _THINK_BLOCK_RE.sub("", content).strip(),
+        )
+    # Legacy policy, preserved: an UNCLOSED block -- everything after the
+    # opener (if any) counts as thinking, and the answer is empty, so a
+    # half-streamed block never leaks into what the operator sees as the
+    # answer.
+    open_match = _THINK_OPEN_RE.search(content)
+    if open_match:
+        start = open_match.end()
+        close = _THINK_CLOSE_RE.search(content, start)
+        if close is None:
+            return content[start:].strip(), ""
+    return "", content
 
 
 def read_think_level(chat: bool) -> str:
@@ -74,5 +132,6 @@ def record_model_reasoning(model_name: str) -> None:
 
 __all__ = [
     "read_think_level", "split_thinking",
+    "strip_think_blocks", "split_think_blocks",  # BE-01 (ARCH-ENG-239) canonical matchers
     "model_emits_reasoning", "record_model_reasoning",
 ]

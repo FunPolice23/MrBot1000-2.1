@@ -16,9 +16,11 @@ Safety rules:
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
+from agents.core.feature_flags import feature_enabled
 from agents.integrations.crypto import CryptoPayments, CryptoPaymentRequest, CryptoPaymentError
 from agents.safety.guard import SafetyGuard, SafetyAction
 from agents.safety.approval import (
@@ -31,6 +33,48 @@ from agents.safety.approval import (
 # assert_approval_covers contract), so one approval id can never be replayed
 # against a different send.
 _CRYPTO_SEND_TOOL = "crypto_send"
+
+
+# ── ARCH-ENG-237 (BB-01): recipient validation at the entry boundary ──────────
+# The earning tab once proposed payments to a hardcoded placeholder recipient,
+# and the scoped approval faithfully asked the human to authorize a real
+# transfer to it. ARCH-ENG-130's scoping guarantees the operator approves
+# *precisely what was requested* — it cannot notice that what was requested
+# should never have been requested. Validation happens HERE, at the boundary
+# where the recipient enters the payment machinery, so every current and future
+# caller is protected; a correct mechanism does not launder incorrect input.
+_EVM_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+_SOLANA_CHAINS = {"solana"}
+
+
+def _recipient_rejection(chain, to_address: str) -> Optional[str]:
+    """Return a refusal reason for an unusable recipient, else None.
+
+    Deliberate policy on the two shapes a recipient can take the same wrong way:
+    a syntactically valid but obviously-dummy address (201/... all 40 hex
+    characters identical — the classic "0xA*40" placeholder) is also refused.
+    No real key would ever collide into 42 identical characters, and on a
+    payment surface the burned-to-zero-address case is not spared an explicit
+    human-authored destination.
+    """
+    addr = (to_address or "").strip()
+    if not addr:
+        return "recipient address is empty"
+    chain_value = (getattr(chain, "value", None) or str(chain)).lower()
+    if chain_value in _SOLANA_CHAINS:
+        if not _SOLANA_ADDRESS_RE.match(addr):
+            return (f"recipient '{addr[:20]}…' is not a valid Solana address "
+                    "(expecting 32-44 base58 characters)")
+        return None
+    # EVM family (ethereum / polygon / base and defaults).
+    if not _EVM_ADDRESS_RE.match(addr):
+        return (f"recipient '{addr[:20]}…' is not a valid EVM address "
+                "(expecting 0x + 40 hex characters)")
+    if len(set(addr[2:].lower())) == 1:
+        return (f"recipient '{addr}' is a placeholder, not a real destination "
+                "(all 40 characters are identical)")
+    return None
 
 
 class RealCryptoOperator:
@@ -51,6 +95,32 @@ class RealCryptoOperator:
         memo: str = "",
     ) -> Dict[str, Any]:
         """Propose a payment for human approval."""
+        # ARCH-ENG-281 (D-01): `crypto_operations` used to gate NOTHING. The
+        # flag was defined and documented, but no crypto entry point read it,
+        # so a disabled operator could still create requests and enqueue
+        # approvals. The gate belongs at the operator's entry boundary, before
+        # any request or approval exists.
+        if not feature_enabled("crypto_operations"):
+            return {
+                "ok": False,
+                "request_id": "",
+                "status": "disabled",
+                "error": ("Crypto operations are disabled "
+                          "(set MRBOT_ENABLE_CRYPTO=1 to enable); no payment "
+                          "request was created."),
+            }
+
+        # ARCH-ENG-237 (BB-01): refuse an unusable recipient BEFORE any request
+        # is created or any approval is enqueued — fail closed at content entry.
+        rejection = _recipient_rejection(chain, to_address)
+        if rejection:
+            return {
+                "ok": False,
+                "request_id": "",
+                "status": "invalid_recipient",
+                "error": rejection,
+            }
+
         # Create local request
         request = self.crypto.create_payment(from_address, to_address, amount, currency, chain, memo)
 
@@ -139,6 +209,17 @@ class RealCryptoOperator:
         refuses those) — and NEVER calls ``try_real_payment`` unless a valid,
         scoped approval is present.
         """
+        # ARCH-ENG-281 (D-01): a real send is the highest-risk crypto action,
+        # so the feature boundary is checked before the request is even read.
+        if not feature_enabled("crypto_operations"):
+            return {
+                "ok": False,
+                "status": "disabled",
+                "error": ("Crypto operations are disabled "
+                          "(set MRBOT_ENABLE_CRYPTO=1 to enable); no funds "
+                          "were moved."),
+            }
+
         request = self.crypto.get_request(request_id)
         if not request:
             return {"ok": False, "error": "Request not found"}

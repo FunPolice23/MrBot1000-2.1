@@ -125,6 +125,18 @@ class WebController:
         "prove your humanity" wall and a robots.txt that forbids the path) come
         back marked human-open-only rather than as a misleading stub.
         """
+        # ARCH-ENG-290 (I-01): the SSRF guard was applied at the tool boundary
+        # but not here, so every other caller of the browsing layer inherited
+        # an unguarded fetch. The invariant is now structural: no read page,
+        # no direct scrape, no Playwright fallback without this check.
+        from agents.safety.instructions import InstructionGate
+        if not InstructionGate._is_safe_fetch_url(url):
+            return {
+                "ok": False, "url": url,
+                "error": ("Fetch refused: the URL does not resolve to a public "
+                          "address (SSRF guard)"),
+                "ssrf_blocked": True,
+            }
         try:
             # Respect robots.txt before fetching: a host that disallows the
             # path is human-open-only (e.g. Reddit answers scripted clients
@@ -239,6 +251,16 @@ class WebController:
 
     def scrape(self, url: str) -> Dict[str, Any]:
         """Scrape a URL and return structured data."""
+        # ARCH-ENG-290 (I-01): scrape issues its own requests.get for
+        # headings after read_page, so guard it explicitly too.
+        from agents.safety.instructions import InstructionGate
+        if not InstructionGate._is_safe_fetch_url(url):
+            return {
+                "ok": False, "url": url,
+                "error": ("Fetch refused: the URL does not resolve to a public "
+                          "address (SSRF guard)"),
+                "ssrf_blocked": True,
+            }
         page = self.read_page(url)
         if not page.get("ok"):
             return page

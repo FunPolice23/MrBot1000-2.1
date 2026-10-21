@@ -31,6 +31,7 @@ def model_context_tokens(
             text=True,
             timeout=8,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            encoding="utf-8", errors="replace",
         ).stdout
         match = re.search(r"context length\s+(\d+)", output)
         if match:

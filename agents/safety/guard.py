@@ -244,7 +244,13 @@ class RecursionDetectorLayer(SafetyLayer):
 
 
 class ToolFirewallLayer(SafetyLayer):
-    """Enforces tool allow/deny lists."""
+    """Enforces tool allow/deny lists.
+
+    ARCH-ENG-257 (AE-01): the four runtime mutators (`add_to_denylist`,
+    `add_to_allowlist`, `remove_from_denylist`, `remove_from_allowlist`)
+    were deleted. The lists are fixed at construction from settings, so the
+    setters advertised an editing capability nothing used.
+    """
     
     name = "tool_firewall"
     priority = 80
@@ -286,21 +292,13 @@ class ToolFirewallLayer(SafetyLayer):
         
         return None
     
-    def add_to_denylist(self, tool_name: str):
-        self.denylist.add(tool_name)
-    
-    def add_to_allowlist(self, tool_name: str):
-        self.allowlist.add(tool_name)
-    
-    def remove_from_denylist(self, tool_name: str):
-        self.denylist.discard(tool_name)
-    
-    def remove_from_allowlist(self, tool_name: str):
-        self.allowlist.discard(tool_name)
-
-
 class HumanApprovalLayer(SafetyLayer):
-    """Requires human approval for high-value actions."""
+    """Requires human approval for high-value actions.
+
+    ARCH-ENG-258 (AE-03): `set_approval_callback` was deleted;
+    `self._callback` was initialised to None and never assigned, while the
+    layer enqueues directly into the shared `HumanApprovalQueue`.
+    """
     
     name = "human_approval"
     priority = 70
@@ -316,10 +314,6 @@ class HumanApprovalLayer(SafetyLayer):
         self._owned_max = self.config.get("owned_max", 256)
         self._lock = threading.Lock()
         self._callback = None
-
-    def set_approval_callback(self, callback: Callable):
-        """Set callback for when human approves/rejects."""
-        self._callback = callback
 
     @property
     def pending_approvals(self) -> List[Dict]:
@@ -567,7 +561,12 @@ class HumanApprovalLayer(SafetyLayer):
 
 
 class RateLimiterLayer(SafetyLayer):
-    """Rate limiting per tool and per provider."""
+    """Rate limiting per tool and per provider.
+
+    ARCH-ENG-259 (AE-04): `get_remaining` and the orchestration wrapper
+    `check_and_raise` had zero callers and were deleted; callers inspect the
+    `SafetyDecision` returned by `check`.
+    """
     
     name = "rate_limiter"
     priority = 60
@@ -629,15 +628,6 @@ class RateLimiterLayer(SafetyLayer):
         counters[key].append(now)
         return True
     
-    def get_remaining(self, key: str, limit: int = None) -> int:
-        """Get remaining calls for a key."""
-        now = time.time()
-        with self._lock:
-            counters = self._tool_counters.get(key, []) + self._provider_counters.get(key, [])
-            recent = [t for t in counters if now - t < 60]
-            return max(0, (limit or self.default_limit) - len(recent))
-
-
 # ── Safety Guard Orchestrator ────────────────────────────────────────────
 
 class SafetyGuard:
@@ -715,13 +705,6 @@ class SafetyGuard:
             layer="all",
             suggested_action=""
         )
-    
-    def check_and_raise(self, action: SafetyAction):
-        """Check and raise SafetyViolation if blocked."""
-        result = self.check(action)
-        if result.blocked:
-            raise SafetyViolation(result)
-        return result
     
     def get_layer(self, name: str) -> Optional[SafetyLayer]:
         """Get a specific safety layer by name."""

@@ -11,7 +11,8 @@ import sys
 import unittest
 from unittest import mock
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import agents.earning.got as got_mod
 from agents.dialogue.opportunity_analysis import rank_board_entries

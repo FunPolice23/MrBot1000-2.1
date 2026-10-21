@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -19,13 +20,45 @@ logger = logging.getLogger("mrbot.gui.analytics_tab")
 class AnalyticsTab(QWidget):
     """Analytics tab — market data and strategy performance."""
 
+    # ARCH-ENG-221: the price fetch is emitted from a worker thread, so the
+    # widget update must arrive back on the GUI thread via a queued connection.
+    price_fetched = Signal(str, float, float)
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._price_cache: Dict[str, tuple] = {}
+        self._fetching = False
+        self.price_fetched.connect(self._on_price_fetched)
         self._setup_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._auto_refresh)
-        self._timer.start(60000)  # Auto-refresh every 60s
+        # ARCH-ENG-221: NOT started here. A widget that is constructed but never
+        # shown never receives `hideEvent`, so starting in `__init__` left the
+        # timer -- and its network fetch -- running for a tab the operator may
+        # never open. `showEvent` starts it; `hideEvent` stops it.
+        self._timer.setInterval(60000)  # Auto-refresh every 60s
+
+    def showEvent(self, event):
+        self._timer.start(60000)
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        # ARCH-ENG-221: THE TIMER RAN FOR THE WHOLE PROCESS LIFETIME,
+        # HIDDEN OR NOT, AND EVERY TICK BLOCKED THE GUI THREAD ON A NETWORK
+        # CALL. `urlopen("api.coingecko.com", timeout=10)` ran directly in
+        # `_auto_refresh`. On a flaky ISP, VPN, or proxy that is a
+        # multi-second frozen window every minute, for the life of the process,
+        # on a tab the operator may not even be looking at.
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def _on_price_fetched(self, symbol: str, price: float, change: float):
+        """GUI-thread slot. Applies a result fetched by the worker."""
+        self._price_cache[symbol] = (time.time(), price, change)
+        self.crypto_price.setText(f"${price:,.2f}")
+        color = "#00ff88" if change >= 0 else "#ff5252"
+        self.crypto_change.setText(f"{change:+.2f}%")
+        self.crypto_change.setStyleSheet(f"color: {color};")
 
     def _setup_ui(self):
         root = QVBoxLayout(self)
@@ -119,14 +152,49 @@ class AnalyticsTab(QWidget):
     def _auto_refresh(self):
         """Auto-refresh market data (best-effort, no error popup)."""
         try:
-            self._fetch_price(self.crypto_combo.currentText())
+            self._fetch_price_async(self.crypto_combo.currentText())
         except Exception:
             pass
+
+    def _fetch_price_async(self, symbol: str) -> None:
+        """ARCH-ENG-221: fetch on a worker thread; never block the GUI thread.
+
+        The synchronous `_fetch_price` is kept for the explicit button press and
+        for tests, but nothing periodic may call it any more.
+        """
+        if self._fetching:
+            return                      # never stack fetches
+        cached = self._price_cache.get(symbol)
+        if cached and time.time() - cached[0] < 60:
+            return                      # fresh enough; nothing to do off-thread
+
+        self._fetching = True
+
+        def _work():
+            try:
+                price, change = self._fetch_price_data(symbol)
+            except Exception as exc:
+                logger.debug("analytics price fetch failed: %s", exc)
+                price = change = None
+            finally:
+                self._fetching = False
+            if price is not None:
+                self.price_fetched.emit(symbol, price, change)
+
+        threading.Thread(target=_work, name="analytics-price", daemon=True).start()
 
     def cleanup(self):
         """Stop periodic refresh before the main window is torn down."""
         if self._timer.isActive():
             self._timer.stop()
+        # ARCH-ENG-221: a queued `price_fetched` emission landing after teardown
+        # touches widgets that Qt has already destroyed. The worker is a daemon
+        # thread and the connection is queued, so the window exists -- but
+        # stopping here makes the intent explicit rather than incidental.
+        try:
+            self.price_fetched.disconnect()
+        except (RuntimeError, TypeError):
+            pass
 
     def _on_refresh_crypto_price(self):
         """Refresh crypto price on button click."""
@@ -140,11 +208,26 @@ class AnalyticsTab(QWidget):
             self.status_label.setText(f"Error: {e}")
             self.status_label.setStyleSheet("color: #ff5252;")
 
-    def _fetch_price(self, symbol: str):
-        """Fetch crypto price from CoinGecko (free, no API key)."""
+    def _fetch_price_data(self, symbol: str) -> tuple:
+        """Do the network fetch. Returns (price, change). BLOCKS -- never call
+        this on the GUI thread; use `_fetch_price_async`."""
         import urllib.request
         import json
 
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol}&vs_currencies=usd&include_24h_change=true"
+        req = urllib.request.Request(url, headers={"User-Agent": "MrBot1000"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        if symbol not in data:
+            raise KeyError(symbol)
+        return data[symbol].get("usd", 0), data[symbol].get("usd_24h_change", 0)
+
+    def _fetch_price(self, symbol: str):
+        """Fetch crypto price from CoinGecko (free, no API key).
+
+        SYNCHRONOUS -- blocks the calling thread for up to 10 s. Only for the
+        explicit button press; `_auto_refresh` uses `_fetch_price_async`.
+        """
         # Check cache first (60s TTL)
         cached = self._price_cache.get(symbol)
         if cached and time.time() - cached[0] < 60:

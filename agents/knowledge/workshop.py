@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pathlib import Path
@@ -61,9 +62,37 @@ def _atomic_write_json(path: str, data: Any) -> None:
 
 WORKSHOP_ROOT = os.getenv("MRBOT_WORKSHOP_ROOT") or os.getenv(
     "AI_WORKSHOP_ROOT") or r"D:\ai_workshop"
-DEFAULT_WORKSHOP_MAX_BYTES = 10 * 1024 * 1024 * 1024
+# ARCH-ENG-221: WAS 10 GiB.
+#
+# The target machine has 32 GB of RAM, and a 10 GB workshop quota lets the
+# workspace consume a third of the machine's entire memory budget as disk,
+# starving the page cache and swap headroom that a locally-hosted 8-10 GB GGUF
+# model depends on. The quota is still overridable via MRBOT_WORKSHOP_MAX_BYTES
+# for an operator who wants the old headroom.
+DEFAULT_WORKSHOP_MAX_BYTES = 2 * 1024 * 1024 * 1024
 WORKSHOP_MAX_BYTES = int(os.getenv(
     "MRBOT_WORKSHOP_MAX_BYTES", str(DEFAULT_WORKSHOP_MAX_BYTES)))
+
+# ARCH-ENG-221: largest single file `read_file` will return.
+#
+# `read_file` did an uncapped `f.read()`, and its result flows to
+# `redact_secrets(...)` in `agents/safety/handlers.py:247` and then into a tool
+# result -- i.e. into RAM *and* into the model's context window. With a 2 GiB
+# quota, one call could try to pull 2 GiB into a prompt. The truncation is
+# explicit rather than silent, so the model can see that it is looking at a
+# fragment instead of believing it read the whole file.
+WORKSHOP_MAX_READ_BYTES = int(os.getenv(
+    "MRBOT_WORKSHOP_MAX_READ_BYTES", str(256 * 1024)))
+WORKSHOP_TRUNCATION_MARKER = (
+    "\n\n[... TRUNCATED: file is {shown:,} of {total:,} bytes. "
+    "Use read_file_slice(start, end) for the rest.]")
+
+# ARCH-ENG-221: how long a computed disk-usage total may be reused when idle.
+_USAGE_CACHE_TTL_S = 30.0
+
+# ARCH-ENG-221: was a bare `results[:20]` applied after the walk. Hoisted so the
+# walk itself can stop, which is where all the cost was.
+_SEARCH_FILE_LIMIT = 20
 
 PATHS = {
     "root": WORKSHOP_ROOT,
@@ -75,11 +104,45 @@ PATHS = {
     "accounts": os.path.join(WORKSHOP_ROOT, "accounts"),
     "deliverables": os.path.join(WORKSHOP_ROOT, "deliverables"),
     "learning": os.path.join(WORKSHOP_ROOT, "learning"),
-    "templates": os.path.join(WORKSHOP_ROOT, "templates"),
+    # ARCH-ENG-245 (AY-02, 11G): the "templates" category was removed with
+    # the dead template subsystem -- get_template served four hardcoded
+    # skeleton strings it never wrote to disk, save_template wrote files
+    # into templates/ that NOTHING could ever read back, and nothing wrote
+    # or read either (22 dead of 52 methods). Proposal copy is superseded by
+    # the live, data-driven A/B mechanism (agents/knowledge/
+    # proposal_templates.py, wired at agents/earning/proposal.py:25); the
+    # document skeletons an LLM persona can generate natively. Keeping the
+    # PATHS entry would have mkdir'd an empty templates/ directory at every
+    # Workshop init, forever, for no writer and no reader.
     "notes": os.path.join(WORKSHOP_ROOT, "notes"),
     "crypto": os.path.join(WORKSHOP_ROOT, "crypto"),
     "memory": os.path.join(WORKSHOP_ROOT, "memory"),
 }
+
+
+class WorkshopWriteError(RuntimeError):
+    """A workshop write was refused or failed.
+
+    ARCH-ENG-215. `Workshop.write_file` returns False for an unsafe path, an
+    exceeded storage quota, an empty disk, a permission error, or any other
+    exception. Seven creator methods discarded that boolean and returned the
+    path unconditionally, so the caller was told a document existed when no
+    file had been written.
+
+    The agent-visible consequence: `workshop_proposal` returned
+    `[Proposal created: proposals/proposal_acme_20261018.md]` for a file that
+    did not exist, and the model told the operator it had prepared the proposal.
+    """
+
+    def __init__(self, what: str, filepath: str, reason: str = ""):
+        self.what = what
+        self.filepath = filepath
+        super().__init__(
+            f"{what} could not be written to {filepath}"
+            + (f": {reason}" if reason else "")
+            + ". The file was NOT created. Check the workshop storage quota, "
+              "the path, and write permissions, then retry."
+        )
 
 
 class Workshop:
@@ -89,6 +152,8 @@ class Workshop:
         configured_root = root or WORKSHOP_ROOT
         self.root = str(Path(configured_root).expanduser().resolve())
         self.max_bytes = max(0, int(WORKSHOP_MAX_BYTES if max_bytes is None else max_bytes))
+        # ARCH-ENG-221: (monotonic_now, total_bytes). None means "not computed".
+        self._usage_cache: Optional[tuple[float, int]] = None
         self.paths = {
             name: os.path.join(self.root, name)
             for name in PATHS
@@ -101,7 +166,12 @@ class Workshop:
         self._tasks_file = os.path.join(self.root, "tasks.json")
     
     def _ensure_dirs(self):
-        """Create all workshop directories if they don't exist."""
+        """Create all workshop directories if they don't exist.
+
+        ARCH-ENG-221: no `_invalidate_usage()` here, deliberately -- `makedirs`
+        creates zero-byte directories, so the usage total cannot have changed.
+        Adding the call would be noise implying a mutation that did not happen.
+        """
         for path in self.paths.values():
             os.makedirs(path, exist_ok=True)
 
@@ -120,6 +190,25 @@ class Workshop:
         return str(candidate)
 
     def _usage_bytes(self) -> int:
+        """Total bytes on disk under the workshop root.
+
+        ARCH-ENG-221: THIS WAS A FULL RECURSIVE WALK ON EVERY SINGLE WRITE.
+
+        `_can_write` calls `storage_stats()` -> `_usage_bytes()` from both
+        `write_file` and `append_file`, so creating or appending to a single file
+        cost a `Path.rglob("*")` plus an `is_file()` and a `stat()` syscall for
+        every file in the entire workshop tree. At a few thousand files that is
+        seconds on NTFS, serialised in front of every tool-driven file creation.
+
+        Now cached, and invalidated by every mutator in this class. The
+        invalidation is what makes the cache CORRECT (a TTL alone would let the
+        quota be exceeded by a burst of writes); the TTL only bounds the idle
+        cost when nothing is being written.
+        """
+        now = time.monotonic()
+        cached = self._usage_cache
+        if cached is not None and (now - cached[0]) < _USAGE_CACHE_TTL_S:
+            return cached[1]
         total = 0
         for path in Path(self.root).rglob("*"):
             if path.is_file():
@@ -127,7 +216,12 @@ class Workshop:
                     total += path.stat().st_size
                 except OSError:
                     pass
+        self._usage_cache = (now, total)
         return total
+
+    def _invalidate_usage(self) -> None:
+        """ARCH-ENG-221: drop the cached usage total after a mutation."""
+        self._usage_cache = None
 
     def storage_stats(self) -> Dict[str, int]:
         """Return quota and physical free-space information for the workshop."""
@@ -158,6 +252,7 @@ class Workshop:
             return False
         try:
             os.makedirs(path, exist_ok=True)
+            self._invalidate_usage()  # ARCH-ENG-221
             return True
         except OSError:
             return False
@@ -170,11 +265,35 @@ class Workshop:
             filepath = self._safe_path(filepath)
             if not filepath:
                 return "Error reading file: path is outside workshop"
+            total = os.path.getsize(filepath)
+            limit = WORKSHOP_MAX_READ_BYTES
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
+                text = f.read(limit)
+            if total > len(text.encode("utf-8", "replace")):
+                text += WORKSHOP_TRUNCATION_MARKER.format(shown=limit, total=total)
+            return text
         except Exception as e:
             return f"Error reading file: {e}"
     
+    def _write_or_raise(self, filepath: str, content: str, what: str) -> str:
+        """Write, and refuse to report success if the write did not happen.
+
+        ARCH-ENG-215. Every creator method below returned `filepath`
+        unconditionally after discarding `write_file`'s boolean. That is the
+        same shape as the ARCH-ENG-204 backup bug (log a warning, write anyway,
+        report success) and it is the one this codebase keeps producing: a
+        claim the code has not verified.
+
+        Raising is safe here because every tool handler already wraps the call
+        in `try/except Exception` and returns `[<Tool> error: ...]`, which the
+        ARCH-ENG-214 deny-list classifies as NOT executed. So the failure now
+        travels the whole chain truthfully: disk -> raise -> `[Proposal error]`
+        -> `_tool_status` -> `error` in the transcript.
+        """
+        if not self.write_file(filepath, content):
+            raise WorkshopWriteError(what, filepath)
+        return filepath
+
     def write_file(self, filepath: str, content: str) -> bool:
         """Write a file to the workshop."""
         try:
@@ -188,6 +307,7 @@ class Workshop:
             
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(content)
+            self._invalidate_usage()  # ARCH-ENG-221
             return True
         except Exception as e:
             return False
@@ -205,6 +325,7 @@ class Workshop:
             
             with open(filepath, "a", encoding="utf-8") as f:
                 f.write(content)
+            self._invalidate_usage()  # ARCH-ENG-221
             return True
         except Exception:
             return False
@@ -306,8 +427,7 @@ class Workshop:
 
 """
         
-        self.write_file(filepath, content)
-        return filepath
+        return self._write_or_raise(filepath, content, "Proposal")
     
     def get_proposal(self, filename: str) -> str:
         """Read a proposal file."""
@@ -356,8 +476,7 @@ class Workshop:
 
 """
         
-        self.write_file(filepath, content_text)
-        return filepath
+        return self._write_or_raise(filepath, content_text, "Research note")
     
     def read_research(self, filename: str) -> str:
         """Read a research file."""
@@ -397,8 +516,7 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 {code}
 """
         
-        self.write_file(filepath, content)
-        return filepath
+        return self._write_or_raise(filepath, content, "Script")
     
     def read_script(self, filename: str) -> str:
         """Read a script file."""
@@ -440,8 +558,7 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 
 """
         
-        self.write_file(filepath, content)
-        return filepath
+        return self._write_or_raise(filepath, content, "Application document")
     
     def list_applications(self) -> List[Dict[str, Any]]:
         """List all applications."""
@@ -528,6 +645,7 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         (ARCH-ENG-066).
         """
         _atomic_write_json(self._accounts_file, accounts)
+        self._invalidate_usage()  # ARCH-ENG-221
     
     # ── Payment Methods ────────────────────────────────────────────────────
     
@@ -586,6 +704,7 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
     def _save_payments(self, payments: Dict[str, Dict[str, str]]):
         """Save payments to file atomically (temp + fsync + os.replace)."""
         _atomic_write_json(self._payments_file, payments)
+        self._invalidate_usage()  # ARCH-ENG-221
     
     # ── Deliverables ───────────────────────────────────────────────────────
     
@@ -607,103 +726,18 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 
 """
         
-        self.write_file(filepath, content_text)
-        return filepath
+        return self._write_or_raise(filepath, content_text, "Deliverable")
     
     def list_deliverables(self) -> List[Dict[str, Any]]:
         """List all deliverables."""
         return self.list_files("deliverables")
     
-    # ── Templates ─────────────────────────────────────────────────────────
-    
-    def get_template(self, template_name: str) -> str:
-        """Get a template by name."""
-        templates = {
-            "proposal": """# Proposal: [TITLE]
-
-**Client:** [CLIENT]
-**Platform:** [PLATFORM]
-**Budget:** $[AMOUNT]
-
-## Summary
-[1-2 sentence pitch]
-
-## Approach
-[How you'll do the work]
-
-## Timeline
-[When you'll deliver]
-
-## Why Me
-[Your qualifications]
-
-## Next Steps
-[What the client should do next]
-""",
-            "application": """# Application: [POSITION]
-
-**Platform:** [PLATFORM]
-**Job Type:** [TYPE]
-
-## Cover Letter
-[Your pitch]
-
-## Skills
-- 
-
-## Experience
-- 
-
-## Availability
-[When you can start]
-""",
-            "research_note": """# [TITLE]
-
-**Date:** [DATE]
-**Tags:** [TAGS]
-
-## Summary
-
-
-## Key Findings
-- 
-
-## Action Items
-- [ ] 
-
-## Sources
-- 
-""",
-            "invoice": """# Invoice
-
-**From:** MrBot1000 (Edward Hurst + Jacob Stanley)
-**To:** [CLIENT]
-**Date:** [DATE]
-
-## Services
-| Item | Description | Amount |
-|------|-------------|--------|
-| [SERVICE] | [DESCRIPTION] | $[AMOUNT] |
-
-**Total:** $[AMOUNT]
-
-**Payment Method:** [METHOD]
-
-## Notes
-- Payment due within [DAYS] days
-- 
-""",
-        }
-        
-        return templates.get(template_name, "Template not found")
-    
-    def save_template(self, name: str, content: str) -> str:
-        """Save a custom template."""
-        filename = f"template_{name}.md"
-        filepath = os.path.join("templates", filename)
-        self.write_file(filepath, content)
-        return filepath
-    
+    # ARCH-ENG-245 (AY-02, 11G): the template subsystem -- get_template
+    # (four hardcoded skeleton strings nothing ever requested) and
+    # save_template (wrote template files NOTHING could read back; the pair
+    # was never connected) -- is DELETED. Proposal copy is superseded by the
+    # live A/B mechanism in agents/knowledge/proposal_templates.py; document
+    # skeletons are what an LLM persona generates natively.
     # ── Notes ──────────────────────────────────────────────────────────────
     
     def add_note(self, title: str, content: str, tags: List[str] = None) -> str:
@@ -723,8 +757,7 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 {content}
 """
         
-        self.write_file(filepath, content_text)
-        return filepath
+        return self._write_or_raise(filepath, content_text, "Note")
     
     def list_notes(self) -> List[Dict[str, Any]]:
         """List all notes."""
@@ -733,40 +766,62 @@ Created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
     # ── Search ─────────────────────────────────────────────────────────────
     
     def search_files(self, query: str, subdir: str = "") -> List[Dict[str, str]]:
-        """Search files by name or content."""
-        results = []
+        """Search files by name or content.
+
+        ARCH-ENG-221: TWO COSTS WERE PAID IN FULL AND THEN THROWN AWAY.
+
+        1. `content = f.read()` was uncapped, so every candidate file was read
+           whole -- with a 2 GiB quota that is a 2 GiB read per candidate.
+           Content matching now reads at most `WORKSHOP_MAX_READ_BYTES`, which
+           is ample for a substring test and bounded for a file of any size.
+           A match beyond that window is missed, so the row says which window
+           was searched rather than implying a whole-file search.
+
+        2. `return results[:20]` truncated the list AFTER the walk had already
+           read every file in the tree. The cap saved the caller 20 rows and
+           saved the machine nothing. The walk now stops as soon as the cap is
+           reached.
+        """
+        results: List[Dict[str, str]] = []
         dirpath = self._safe_path(subdir or ".")
         if not dirpath or not os.path.isdir(dirpath):
             return []
-        
+
+        limit = WORKSHOP_MAX_READ_BYTES
+        scope_note = f"content (first {limit // 1024} KiB)"
+        needle = query.lower()
         for root_dir, dirs, files in os.walk(dirpath):
             for filename in files:
                 filepath = os.path.join(root_dir, filename)
-                
+
                 # Search by name
-                if query.lower() in filename.lower():
+                if needle in filename.lower():
                     results.append({
                         "name": filename,
                         "path": os.path.relpath(filepath, self.root),
                         "match": "filename",
                     })
+                    if len(results) >= _SEARCH_FILE_LIMIT:
+                        return results
                     continue
-                
+
                 # Search by content (text files only)
                 if filename.endswith((".md", ".txt", ".py", ".js", ".json", ".csv")):
                     try:
                         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                            content = f.read()
-                            if query.lower() in content.lower():
+                            content = f.read(limit)
+                            if needle in content.lower():
                                 results.append({
                                     "name": filename,
                                     "path": os.path.relpath(filepath, self.root),
-                                    "match": "content",
+                                    "match": scope_note,
                                 })
+                                if len(results) >= _SEARCH_FILE_LIMIT:
+                                    return results
                     except Exception:
                         pass
-        
-        return results[:20]  # Limit results
+
+        return results
     
     # ── Stats ──────────────────────────────────────────────────────────────
     
@@ -808,38 +863,17 @@ def get_workshop() -> Workshop:
 
 # ── Convenience Functions ──────────────────────────────────────────────────
 
-def read_workshop_file(filepath: str) -> str:
-    """Read a file from the workshop."""
-    return get_workshop().read_file(filepath)
 
-def write_workshop_file(filepath: str, content: str) -> bool:
-    """Write a file to the workshop."""
-    return get_workshop().write_file(filepath, content)
 
-def list_workshop_files(subdir: str = "") -> List[Dict[str, Any]]:
-    """List files in a workshop subdirectory."""
-    return get_workshop().list_files(subdir)
 
-def search_workshop(query: str) -> List[Dict[str, str]]:
-    """Search workshop files."""
-    return get_workshop().search_files(query)
 
 def create_proposal(title: str, client: str, description: str, **kwargs) -> str:
     """Create a new proposal."""
     return get_workshop().create_proposal(title, client, description, **kwargs)
 
-def create_research_note(title: str, content: str, **kwargs) -> str:
-    """Create a research note."""
-    return get_workshop().add_research(title, content, **kwargs)
-
-def get_template(name: str) -> str:
-    """Get a template."""
-    return get_workshop().get_template(name)
 
 
-def get_workshop_storage() -> Dict[str, int]:
-    """Return current workshop quota and free-space statistics."""
-    return get_workshop().storage_stats()
+
 
 
 if __name__ == "__main__":

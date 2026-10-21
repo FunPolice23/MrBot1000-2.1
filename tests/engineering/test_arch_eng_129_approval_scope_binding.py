@@ -32,7 +32,8 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import agents.safety.handlers as H
 from agents.evidence.evidence import (

@@ -15,7 +15,14 @@ Each goal has:
 - budget_usd: max LLM spend allowed for this goal
 - deadline: optional timestamp
 
-Goals are persisted to SQLite and reported into the event logger.
+Goals are persisted to SQLite, reported into the event logger, and CREDITED
+from it: ARCH-ENG-244 wired the tracker to the production event stream
+(main.py forwards every logged event to process_event) and gave the
+operator a management surface — the Management tab's Earning Goals card is
+the only place goals are created, paused and viewed. Credits flow through
+add_evidence only, whose verified-guard is the single decision that moves
+money (BF-02): a credit exists if and only if the evidence row is verified
+and its amount is positive.
 """
 from __future__ import annotations
 
@@ -360,14 +367,14 @@ class GoalTracker:
 
     # ── Progress ─────────────────────────────────────────────────────────
 
-    def add_earnings(self, goal_id: str, amount_usd: float, source: str = ""):
-        """Add verified earnings to a goal."""
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE goals SET current_usd = current_usd + ? WHERE id = ?",
-                (amount_usd, goal_id),
-            )
-            conn.commit()
+    # ARCH-ENG-244 (BF-02): `add_earnings` is DELETED. Its docstring claimed
+    # "Add verified earnings to a goal" while its body was a bare
+    # `UPDATE goals SET current_usd = current_usd + ?` — the verified-guard
+    # the contract needed sat 35 lines away in the then-dead `add_evidence`,
+    # and two spellings of one money decision sat 35 lines apart (11Q).
+    # There is now exactly ONE credit path: add_evidence, whose guard
+    # (`verified and amount_usd > 0`) is the single decision that moves
+    # money. Event-driven credits (process_event) go through it.
 
     def check_completion(self, goal_id: str):
         """Check if a goal is completed and update status."""
@@ -411,78 +418,96 @@ class GoalTracker:
             "overall_progress": round(overall_progress, 1),
         }
 
-    # ── Event processing (Phase 6: wired to event logger) ────────────────
+    # ── Event processing (live: main.py forwards every logged event here) ─
 
     def process_event(self, event) -> None:
-        """Process an event from the event logger and update relevant goals.
+        """Process an event from the event logger and credit matching goals.
 
-        Called for every logged event. Looks for events that indicate progress
-        toward goals (earnings, submissions, completions) and updates the
-        matching goal's current_usd and status.
+        Called for every logged event (from main.py's event-logger hook).
+        This is ARCH-ENG-244's REAL contract: the production stream is
+        ARCH-ENG-243's typed earning event (event_type "earning", details
+        carrying revenue/cost/platform/success, action "finalized:<state>").
+        The previous version invented a vocabulary ('earning.freelance',
+        details['amount_usd']) that no live event ever used -- BF-03's
+        recorded seam -- and its auto-match could credit a goal by a path
+        string an event never carried.
+
+        Crediting rules -- add_evidence is the ONLY credit path and keeps
+        its verified-guard (BF-02), so a credit exists if and only if the
+        evidence row is verified and its amount is positive:
+
+        - amount comes from details["revenue"], the lifecycle's
+          VERIFIED-EFFECTIVE value: a payment the ledger could not verify
+          arrives as revenue 0, so the tracker can never credit an
+          unverified dollar.
+        - evidence rows: every goal-BOUND finalized outcome is RECORDed.
+          It credits (verified=True) only when the effective state is
+          "paid" (the verified-payment state); every other state is
+          recorded with verified=False and never moves current_usd.
+        - binding: an explicit details["goal_id"] or a "goal:<id>" tag
+          binds the event to one goal. Without a binding, a paid finalize
+          credits the first ACTIVE goal whose metadata.platforms declares
+          the event's platform (operator-declared in the Management tab's
+          Earning Goals card). With no explicit and no declared binding,
+          the tracker does NOT guess what an unbound amount belongs to --
+          no credit.
         """
         if not event or not hasattr(event, 'event_type'):
             return
+        if getattr(event, 'event_type', '') != 'earning':
+            return
 
-        event_type = getattr(event, 'event_type', '')
-        source = getattr(event, 'source', '')
         details = getattr(event, 'details', {}) or {}
-
-        # Look for goal-related tags
+        action = str(details.get('action', '') or '')
+        if not action.startswith('finalized:'):
+            return
+        state = action.split(':', 1)[1].strip().lower()
+        try:
+            amount = float(details.get('revenue', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        platform = str(details.get('platform', '') or '')
         tags = getattr(event, 'tags', []) or []
+
         goal_id = details.get('goal_id')
         if not goal_id:
-            # Check tags for goal:<id>
             for tag in tags:
-                if tag.startswith('goal:'):
-                    goal_id = tag[5:]
+                if isinstance(tag, str) and tag.startswith('goal:'):
+                    goal_id = tag[len('goal:'):]
                     break
 
-        # If no goal_id, check if we can match by event type
-        if not goal_id:
-            self._auto_match_event(event_type, source, details)
-            return
-
-        # Update the specific goal
-        amount = details.get('amount_usd', 0.0)
-        if amount > 0:
-            self.add_earnings(goal_id, amount, source or event_type)
-        self.check_completion(goal_id)
-
-    def _auto_match_event(self, event_type: str, source: str, details: Dict[str, Any]):
-        """Try to auto-match an event to an active goal based on event type."""
-        path_map = {
-            'earning.freelance': 'freelance',
-            'earning.microtask': 'microtask',
-            'earning.crypto': 'crypto',
-            'earning.bounty': 'bounty',
-            'earning.trading': 'trading',
-            'earning.content': 'content',
-            'payment.received': None,  # Any path
-        }
-
-        amount = details.get('amount_usd', 0.0)
-        if amount <= 0:
-            return
-
-        target_path = path_map.get(event_type)
-        active_goals = self.list_active()
-        if not active_goals:
-            return
-
-        if target_path is None:
-            # Credit to first active goal with matching source
-            for goal in active_goals:
-                if goal.path == source or source in goal.path:
-                    self.add_earnings(goal.id, amount, source or event_type)
+        if goal_id:
+            # Explicit binding: record the outcome; credit only a verified
+            # payment (the lifecycle's effective state is the authority).
+            creditable = (state == 'paid' and amount > 0)
+            self.add_evidence(goal_id, EvidenceRow(
+                type='earning_event',
+                source=platform or 'earning-event',
+                amount_usd=amount,
+                description=action,
+                verified=creditable,
+            ))
+            self.check_completion(goal_id)
+        elif state == 'paid' and amount > 0 and platform:
+            # Operator-declared platform binding: the goal's
+            # metadata.platforms names the platforms that count toward it.
+            # No declared binding -> no credit: an unbound amount is not
+            # something the tracker assigns by guesswork.
+            want = platform.strip().lower()
+            for goal in self.list_active():
+                declared = [
+                    str(p).strip().lower()
+                    for p in (goal.metadata or {}).get('platforms', [])
+                ]
+                if want in declared:
+                    self.add_evidence(goal.id, EvidenceRow(
+                        type='earning_event', source=platform,
+                        amount_usd=amount,
+                        description=f'{action} (platform binding)',
+                        verified=True,
+                    ))
                     self.check_completion(goal.id)
-                    return
-        else:
-            # Credit to first active goal with matching path
-            for goal in active_goals:
-                if goal.path == target_path:
-                    self.add_earnings(goal.id, amount, source or event_type)
-                    self.check_completion(goal.id)
-                    return
+                    break
 
     # ── Internal helpers ─────────────────────────────────────────────────
 

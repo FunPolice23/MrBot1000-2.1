@@ -20,6 +20,7 @@ import re
 import time
 from typing import List, Optional
 
+from agents.core.feature_flags import feature_enabled
 from agents.earning.opportunity_models import Opportunity, BaseOpportunitySource, classify_category
 
 
@@ -134,6 +135,16 @@ class FiverrSource(BaseOpportunitySource):
 class SocialSource(BaseOpportunitySource):
     name = "social"
 
+    def is_enabled(self) -> bool:
+        """ARCH-ENG-286 (W-02): the live gate for social automation.
+
+        The only `social_automation` check used to sit inside the dead
+        `EarningPipeline._discover_source` island, so the live source ran
+        regardless of the flag. Gating at the source makes every caller --
+        the DiscoveryEngine, the scheduler, and the GUI scan -- honor it.
+        """
+        return feature_enabled("social_automation")
+
     def _discover(self, query: Optional[str] = None,
                   categories: Optional[List[str]] = None,
                   page: int = 1) -> List[Opportunity]:
@@ -160,6 +171,10 @@ class SocialSource(BaseOpportunitySource):
 class AirdropSource(BaseOpportunitySource):
     name = "airdrop"
 
+    def is_enabled(self) -> bool:
+        """ARCH-ENG-286 (W-02): honor the airdrop flag on the live scan path."""
+        return feature_enabled("airdrop_claiming")
+
     def _discover(self, query: Optional[str] = None,
                   categories: Optional[List[str]] = None,
                   page: int = 1) -> List[Opportunity]:
@@ -184,6 +199,10 @@ class AirdropSource(BaseOpportunitySource):
 
 class DefiSource(BaseOpportunitySource):
     name = "defi"
+
+    def is_enabled(self) -> bool:
+        """ARCH-ENG-286 (W-02): honor the DeFi flag on the live scan path."""
+        return feature_enabled("defi_scanning")
 
     def _discover(self, query: Optional[str] = None,
                   categories: Optional[List[str]] = None) -> List[Opportunity]:

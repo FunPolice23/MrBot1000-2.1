@@ -70,7 +70,16 @@ class SubmissionRamp:
         self._memory = memory
 
     def _platform_key(self, platform: str) -> str:
-        return (platform or "unknown").strip().title() or "unknown"
+        # ARCH-ENG-144: delegate to the single authority in EarningMemory so this
+        # writer and every reader can never disagree about the key spelling again.
+        # This local `.title()` used to be the ONLY normalisation in the system,
+        # while all readers passed the raw platform string — so the ramp stored
+        # "Upwork" and the win-rate guard read "upwork", saw total=0, and
+        # failed OPEN on a proven 0%-win-rate platform.
+        try:
+            return self._memory.platform_key(platform)
+        except Exception:
+            return (platform or "unknown").strip().title() or "unknown"
 
     def _reputation(self, platform: str) -> dict:
         if self._memory is not None:

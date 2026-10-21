@@ -7,7 +7,8 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 _MTP_MODEL = r"D:/llama.cpp/models/Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf"
 _NO_MTP_MODEL = r"D:/llama.cpp/models/GLM-4.7-Flash-REAP-23B-A3B-UD-Q3_K_XL.gguf"

@@ -145,6 +145,20 @@ class SelfImprovementEngine:
     def get_tag_success_rate(self, tag: str) -> float:
         return self.state.tag_success_rates.get(tag, 0.5)
 
+    def score_strategy(self, strategy: str) -> float:
+        """ARCH-ENG-280 (A-01): public, normalized read of a strategy's weights.
+
+        Returns 0.5 for the default weights, >0.5 for a strategy whose learned
+        weights beat the baseline, and <0.5 for one below it. The pipeline's
+        filter calls this alongside the platform and tag getters; before this,
+        the three read methods had no caller anywhere and the learned state
+        never influenced a live decision.
+        """
+        weights = self.get_strategy_weights(strategy)
+        raw = self._strategy_score(weights)
+        baseline = self._strategy_score(self.DEFAULT_WEIGHTS) or 1.0
+        return max(0.0, min(1.0, 0.5 * (raw / baseline)))
+
     def get_recommendation(self) -> Dict[str, Any]:
         """Return a recommendation dict for the next opportunity scan.
 
@@ -250,6 +264,14 @@ class SelfImprovementEngine:
         """
         if self.state.total_outcomes < self.MIN_OUTCOMES:
             return
+
+        # ARCH-ENG-280 (A-01): seed a weight entry for every strategy that has
+        # outcomes. `record_outcome` never populated `strategy_weights`, so
+        # `get_strategy_weights()` always returned DEFAULT_WEIGHTS even after
+        # the engine had learned from many verified outcomes.
+        for record in self.state.outcomes:
+            if record.strategy and record.strategy not in self.state.strategy_weights:
+                self.state.strategy_weights[record.strategy] = StrategyWeights()
 
         for strategy, weights in self.state.strategy_weights.items():
             # Calculate average outcome for this strategy

@@ -34,17 +34,21 @@ def detect_vram_gb() -> int:
     operator's real hardware (e.g. a GTX 1660S 6GB) instead of guessing.
     """
     # 1) nvidia-smi — most reliable when the NVIDIA driver is present.
+    # ARCH-ENG-166: this used to carry its own
+    # `subprocess.run(..., capture_output=True)` invocation — one of THREE
+    # independent copies of the nvidia-smi query in the tree. It was also the
+    # BROKEN form: ARCH-ENG-116 established that `capture_output=True` raises
+    # OSError(22) / WinError 50 on Windows whenever the parent's stdout is a
+    # reconfigured pipe (exactly what `pytest --capture=fd` does), so this
+    # function silently returned 0 VRAM and every caller under-tuned. It now
+    # delegates to the one hardened invocation.
     try:
-        import subprocess
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if out.returncode == 0:
-            vals = [int(x.strip()) for x in out.stdout.splitlines() if x.strip().isdigit()]
-            if vals:
-                # total across GPUs; single-GPU boxes are the norm here.
-                return sum(vals) // 1024
+        from agents.runtime.device_registry import _run_nvidia_smi
+        out = _run_nvidia_smi("memory.total")
+        vals = [int(x.strip()) for x in str(out or "").splitlines() if x.strip().isdigit()]
+        if vals:
+            # total across GPUs; single-GPU boxes are the norm here.
+            return sum(vals) // 1024
     except Exception:
         pass
     # 2) torch.cuda — covers other CUDA vendors and confirms a GPU is present.

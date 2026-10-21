@@ -30,6 +30,33 @@ def _cloud_failover_enabled() -> bool:
         "0", "false", "no", "off")
 
 
+# The one and only reader of a provider's {prefix}_MAIN_ENABLED /
+# {prefix}_CHAT_ENABLED / DISABLE_{prefix} triple (F4 consolidation).
+#
+# This logic used to exist TWICE: here and as a closure inside
+# `gui/builders/tab_feature_builders.py:create_settings_tab`. Two copies of a
+# reader that decides which brains a provider feeds is exactly how they drift —
+# one side learns a rule (e.g. an unset variable means "enabled") and the other
+# doesn't, and the Role dropdown then shows a different answer depending on
+# which panel built it. Both call sites now go through this function.
+#
+# Missing/blank variables count as ENABLED (the historical default of both
+# copies): an operator who never touched a provider's role sees "Both".
+def role_from_env(prefix: str) -> str:
+    """Map a provider's role env triple to a Role-dropdown label."""
+    if os.getenv(f"DISABLE_{prefix}", "false").lower() == "true":
+        return "Disabled"
+    main = os.getenv(f"{prefix}_MAIN_ENABLED", "true").lower() != "false"
+    chat = os.getenv(f"{prefix}_CHAT_ENABLED", "true").lower() != "false"
+    if main and chat:
+        return "Both"
+    if main:
+        return "Main only"
+    if chat:
+        return "Chat only"
+    return "Disabled"
+
+
 class ProviderConfigWidget(QWidget):
     """Dynamic provider configuration widget with hot-reload support."""
 
@@ -603,11 +630,8 @@ class ProviderConfigWidget(QWidget):
 
     @staticmethod
     def _role_from_env(prefix: str) -> str:
-        if os.getenv(f"DISABLE_{prefix}", "false").lower() == "true":
-            return "Disabled"
-        main = os.getenv(f"{prefix}_MAIN_ENABLED", "true").lower() != "false"
-        chat = os.getenv(f"{prefix}_CHAT_ENABLED", "true").lower() != "false"
-        return "Both" if main and chat else "Main only" if main else "Chat only" if chat else "Disabled"
+        """Role label for a provider (delegates to the one shared reader)."""
+        return role_from_env(prefix)
 
     def _persist_provider_field(self, prefix: str, field: str, value: str):
         self._persist_provider_field_value(f"{prefix}_{field}", value)

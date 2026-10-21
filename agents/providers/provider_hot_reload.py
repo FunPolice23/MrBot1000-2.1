@@ -28,12 +28,19 @@ class ProviderHotReload:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_config: Dict[str, str] = {}
+        # ARCH-ENG-225: AN EVENT, NOT A SLEEP.
+        #
+        # The loop used to `time.sleep(interval)`, so `stop_monitoring()` could
+        # not interrupt it -- it had to wait out the full interval before the
+        # thread observed `_running = False`. An Event wakes the thread at once,
+        # which is what makes a prompt shutdown possible at all.
+        self._stop_event = threading.Event()
     
     @classmethod
     def instance(cls) -> "ProviderHotReload":
         if cls._instance is None:
             cls._instance = cls()
-        return cls
+        return cls._instance
     
     def register_callback(self, callback: Callable[[Dict[str, str]], None]):
         """Register a callback to be called when config changes."""
@@ -50,23 +57,63 @@ class ProviderHotReload:
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._monitor_loop, args=(interval,), daemon=True)
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._monitor_loop, args=(interval,), daemon=True,
+            name="provider-hot-reload")
         self._thread.start()
-    
-    def stop_monitoring(self):
-        """Stop monitoring."""
+
+    def stop_monitoring(self, unregister_all: bool = False):
+        """Stop monitoring. Idempotent.
+
+        ARCH-ENG-225: THIS METHOD HAD **ZERO CALLERS** IN THE ENTIRE CODEBASE.
+
+        `start_monitoring` is called once, at `main.py:543`. Nothing ever called
+        this. So the 2-second polling thread ran for the life of the process and
+        was only ended by the interpreter killing it at exit -- a daemon thread
+        executing Python while the interpreter is finalising.
+
+        That is not theoretical. A full-suite run on this machine terminated with
+        "Windows fatal exception: access violation", the faulting thread being
+        `_monitor_loop` at the `time.sleep` on line 69. `MainWindow.shutdown`
+        already documents this exact hazard for tab-owned threads ("Leaving
+        them running leaks threads and crashes PySide6 at process exit"); this
+        thread was simply missing from that list.
+
+        `unregister_all` additionally drops the registered callbacks. Callbacks
+        are bound methods of the main window, so leaving them registered keeps
+        the whole window alive for as long as this singleton exists.
+        """
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-    
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                # Do not leave a reference to a thread we failed to join.
+                pass
+        self._thread = None
+        if unregister_all:
+            self._callbacks.clear()
+
+    @property
+    def is_running(self) -> bool:
+        """ARCH-ENG-225: whether the monitor thread is meant to be live."""
+        return self._running
+
     def _monitor_loop(self, interval: float):
-        """Main monitoring loop."""
-        while self._running:
+        """Main monitoring loop.
+
+        ARCH-ENG-225: waits on the stop Event rather than sleeping, so shutdown
+        does not have to outlast a poll interval.
+        """
+        while not self._stop_event.is_set():
             try:
                 self._check_for_changes()
             except Exception:
                 pass
-            time.sleep(interval)
+            if self._stop_event.wait(interval):
+                break
     
     def _check_for_changes(self):
         """Check if .env file has changed and notify callbacks."""

@@ -98,9 +98,13 @@ def executed_tools(monkeypatch):
     """Count ``execute_tool`` calls instead of running any irreversible tool."""
     calls = []
 
-    def fake_execute_tool(tool, arguments, approved=False):
+    def fake_execute_tool(tool, arguments, approved=False, approval_id=None):
+        # ARCH-ENG-165: `approval_id` is accepted (and forwarded) because the
+        # production caller now passes it, which makes the dispatcher verify the
+        # approval against the queue via `assert_approval_covers` instead of
+        # trusting a bare boolean. Recorded here so a test can assert it.
         calls.append({"tool": tool, "arguments": arguments,
-                      "approved": approved})
+                      "approved": approved, "approval_id": approval_id})
         return f"ran {tool}"
 
     monkeypatch.setattr(dispatch, "execute_tool", fake_execute_tool)

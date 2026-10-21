@@ -16,7 +16,8 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # Import order matters: agents.safety.calling imports chat_completion at module
 # load, so importing chat_completion FIRST hits a pre-existing circular import.

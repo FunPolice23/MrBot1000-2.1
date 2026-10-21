@@ -573,7 +573,7 @@ class _PersistHost(_PersistBase):
         self._snapshots.append(len(self._snapshots) + 1)
         return {"n": len(self._snapshots)}
 
-    def _write_env_values(self, values):
+    def _write_env_values(self, values, remove_keys=None):
         """Stand in for the real .env writer, including its save confirmation."""
         self.writes.append(dict(values))
         time.sleep(0.05)
@@ -702,7 +702,7 @@ def test_worker_never_arms_the_drain_timer():
                 node.body.pop(0)
     async_code = ast.unparse(async_tree)
     arm_at = async_code.index("_arm_persist_drain()")
-    start_at = async_code.index("_start_persist_write(values)")
+    start_at = async_code.index("_start_persist_write(values")
     assert arm_at < start_at, (
         "the drain is armed after the writer starts, so a fast writer can win "
         "the race and install a dead cross-thread timer")
@@ -711,7 +711,7 @@ def test_worker_never_arms_the_drain_timer():
 def test_drain_survives_a_fast_writer_winning_the_race():
     """A zero-cost writer must not be able to kill the re-arm permanently."""
     class _FastHost(_PersistHost):
-        def _write_env_values(self, values):
+        def _write_env_values(self, values, remove_keys=None):
             self.writes.append(dict(values))
             self._emit_persist_saved()   # no sleep: the worker finishes at once
 

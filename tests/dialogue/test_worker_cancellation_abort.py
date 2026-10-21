@@ -61,7 +61,10 @@ class TestWorkerCancellationAbort(unittest.TestCase):
 
         finished = []
         errors = []
-        worker.finished.connect(lambda resp, spk: finished.append((resp, spk)))
+        # ARCH-ENG-168: the response signal is `response_ready`; it used to be
+        # `finished`, which shadowed the inherited 0-arity QThread.finished.
+        worker.response_ready.connect(
+            lambda resp, spk: finished.append((resp, spk)))
 
         # Cancel BEFORE the first real chunk so the very first stream call
         # raises — this is the prompt-eval/generation-blocked path.

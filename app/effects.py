@@ -17,6 +17,55 @@ import os
 from dataclasses import dataclass, field, asdict
 
 
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def env_bool(name: str, default: bool, env: dict | None = None) -> bool:
+    """Parse a boolean environment setting. THE single definition (ARCH-ENG-203).
+
+    This codebase once had four parsers for the same `MRBOT_FX_*` values and
+    they disagreed:
+
+        ``in ("1","true","yes","on")``            empty string -> False
+        three-state ``_env_bool``                 empty string -> default
+        ``.lower() == "true"``                   empty string -> False
+        ``.lower() != "false"``                  empty string -> True
+
+    The last two sat four lines apart in the same function, seeding two
+    checkboxes four lines apart. An operator hand-editing `.env` to
+    `MRBOT_FX_ANTIALIASING=1` got antialiasing enabled in the renderer while
+    the checkbox beside it showed unchecked. Nothing errored; the screen simply
+    disagreed with the behaviour.
+
+    The three-state form is the correct one, and it is the only one where an
+    unrecognised value has a defined answer. The rule here:
+
+      * unset or empty  -> `default` (not False -- the previous behaviour made
+        an empty value silently disable a feature that defaults to on)
+      * a true token    -> True
+      * a false token   -> False
+      * anything else   -> `default`
+
+    That last rule is the important one. A typo like `MRBOT_FX_SHADOWS=ture`
+    resolves to the documented default instead of to False, so a misspelt
+    setting cannot quietly switch a feature off. `main.py` writes
+    `str(bool)` -- "True"/"False" -- which the lower-casing here handles.
+    """
+    source = os.environ if env is None else env
+    raw = source.get(name)
+    if raw is None:
+        return default
+    token = str(raw).strip().lower()
+    if not token:
+        return default
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    return default
+
+
 @dataclass
 class EffectSettings:
     antialiasing: bool = True
@@ -33,11 +82,10 @@ class EffectSettings:
     @classmethod
     def from_env(cls, env: dict | None = None) -> "EffectSettings":
         env = os.environ if env is None else env
+
         def b(name, default):
-            v = env.get(f"MRBOT_FX_{name.upper()}")
-            if v is None:
-                return default
-            return v.strip().lower() in ("1", "true", "yes", "on")
+            return env_bool(f"MRBOT_FX_{name.upper()}", default, env=env)
+
         def s(name, default):
             v = env.get(f"MRBOT_FX_{name.upper()}")
             return v if v else default

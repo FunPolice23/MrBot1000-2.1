@@ -8,7 +8,7 @@ MrBot1000 is a real-time AI agent system for **automated earning opportunity dis
 ## Identity
 - **Name**: MrBot1000
 - **Mode**: Real operation, not simulation
-- **Version**: 2.1.95 (tracked in `app/version.py`; see `CHANGELOG.md`)
+- **Version**: 2.1.114 (tracked in `app/version.py`; see `CHANGELOG.md`)
 - **Goal**: discover real earning opportunities, execute actionable work, validate outputs, and persist outcomes in local database
 
 ---
@@ -140,6 +140,23 @@ The active provider is not inferred from API-key presence alone. Disabled provid
 are excluded, and the selected local provider is preferred over other local routes.
 MTP (multi-token prediction) is detected per model from GGUF tensor names and greyed
 out in the UI when the model has no MTP head.
+
+### Economic Decision Policy
+
+The autonomous loop's economics gate reads its thresholds from `settings.json`
+under the `economic_policy` block (`agents/earning/economic_policy.py:
+load_policy`). Recognized keys match `DecisionPolicy` field names exactly —
+`minimum_expected_net_value`, `minimum_risk_adjusted_hourly_return`,
+`maximum_payment_delay_hours`, `minimum_confidence`, `maximum_risk_penalty`,
+`available_productive_hours`, `required_autonomy_level`,
+`maximum_prediction_age_seconds`, `policy_version` — and a key that does not
+match a field configures nothing.
+
+Absent, partial or corrupt settings fall back to the shipped defaults, which are
+deliberately permissive so the loop still runs; a value out of range for its
+field keeps the default rather than inverting a gate. When the policy returns
+DEFER or REJECT, the loop finalizes the run as a `reject` that never reaches
+`execute`, and the reason names the verdict.
 
 ### Hardware Requirements
 - **GPU**: 6GB VRAM minimum (GTX 1660 Super or better) for a GPU-hosted brain; a

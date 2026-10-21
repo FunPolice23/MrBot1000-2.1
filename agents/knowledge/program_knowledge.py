@@ -18,7 +18,12 @@ from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = PROJECT_ROOT / "dual_brain.db"
+# The memory DB path is overridable so a test run is structurally incapable of
+# writing the operator's live conversation memory (ARCH-ENG-156). Production
+# resolves to <repo>/dual_brain.db exactly as before; only an explicit
+# MRBOT_DUAL_BRAIN_DB_PATH redirects it.
+DB_PATH = PROJECT_ROOT / os.environ.get(
+    "MRBOT_DUAL_BRAIN_DB_PATH", "dual_brain.db")
 
 
 class ProgramKnowledge:
@@ -372,16 +377,18 @@ class KnowledgeContext:
         context_parts.append(f"# {ProgramKnowledge.PROGRAM_NAME} v{ProgramKnowledge.PROGRAM_VERSION}")
         context_parts.append(ProgramKnowledge.CORE_IDENTITY)
         
-        # Add relevant memories
-        if query:
-            memories = self.db.search_memories(query, limit=5)
-        else:
-            memories = self.db.get_memories(limit=5, min_importance=0.5)
-        
-        if memories:
+        # Add relevant memories. ARCH-ENG-297 (J-01): route through the
+        # freshness-aware layered retriever so expired/quarantined entries are
+        # excluded and working/episodic/semantic/procedural/policy layers are
+        # available to the prompt instead of a raw table scan.
+        from agents.knowledge.layered_memory import LayeredMemoryRetriever
+        entries = LayeredMemoryRetriever(self.db).retrieve(
+            query, limit=5, min_confidence=0.0)
+        if entries:
             context_parts.append("\n## RELEVANT MEMORIES")
-            for mem in memories:
-                context_parts.append(f"- [{mem['category']}] {mem['title']}: {mem['content'][:200]}")
+            for mem in entries:
+                context_parts.append(
+                    f"- [{mem.category}] {mem.title}: {mem.content[:200]}")
         
         # Add lessons learned
         lessons = self.db.get_lessons(limit=3)

@@ -203,14 +203,6 @@ class BrainControlRow(QWidget):
         """True only if the box is both enabled (model supports MTP) and checked."""
         return self.mtp_check.isEnabled() and self.mtp_check.isChecked()
 
-    def set_mtp(self, enabled: bool) -> None:
-        """Programmatically set the MTP checkbox (after availability is known)."""
-        self.mtp_check.blockSignals(True)
-        try:
-            self.mtp_check.setChecked(bool(enabled) and self.mtp_check.isEnabled())
-        finally:
-            self.mtp_check.blockSignals(False)
-
     # ── Live updates (called by the parent panel) ────────────────────────────
     def set_device_label(self, label: str) -> None:
         """Update the header to show which device this brain runs on."""

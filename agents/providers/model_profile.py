@@ -511,34 +511,6 @@ def supports_vision(
     return any(hint in haystack for hint in _VISION_FAMILY_HINTS)
 
 
-def extract_thinking_from_content(content: str, profile: dict[str, Any]) -> tuple[str, str]:
-    """Extract thinking blocks from content based on family format.
-
-    Returns (thinking_text, visible_text).
-    """
-    if not content:
-        return "", ""
-    thinking_kind = profile.get("thinking", "none")
-    if thinking_kind == "channel_thought":
-        # Gemma 4: <|channel>thought\n...\n<channel|>
-        import re
-        thinking_parts = re.findall(r"<\|channel>thought\s*(.*?)\s*<\|channel\|>", content, re.DOTALL)
-        thinking = "\n".join(thinking_parts)
-        visible = re.sub(r"<\|channel>thought\s*.*?\s*<\|channel\|>", "", content, flags=re.DOTALL).strip()
-        return thinking.strip(), visible
-    # Standard <think>...</think>
-    thinking_tag = profile.get("thinking_tag", "<think>")
-    end_tag = thinking_tag.replace("<", "</")
-    import re
-    thinking_parts = re.findall(re.escape(thinking_tag) + r"\s*(.*?)\s*" + re.escape(end_tag), content, re.DOTALL)
-    thinking = "\n".join(thinking_parts)
-    visible = re.sub(
-        re.escape(thinking_tag) + r"\s*.*?\s*" + re.escape(end_tag),
-        "", content, flags=re.DOTALL
-    ).strip()
-    return thinking, visible
-
-
 def build_extra_body(profile: dict[str, Any], enable_thinking: bool = True) -> dict[str, Any]:
     """Build the extra_body dict for a model-family-compatible request."""
     body: dict[str, Any] = {}

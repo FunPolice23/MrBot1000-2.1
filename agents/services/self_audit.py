@@ -105,12 +105,29 @@ class AuditFinding:
 
 @dataclass
 class AuditReport:
-    """Complete audit results."""
+    """Complete audit results.
+
+    ARCH-ENG-236 (AJ-02 restated): a report must never read as a clean bill
+    of health when its audits were data-starved. ``basis`` records, per
+    category value, the data basis each audit actually saw (rows examined for
+    table-backed audits; 1 when a gated in-memory or on-disk source was
+    present and available for the check). A category with basis 0 -- or one
+    that never declared a basis at all because its source was absent -- is
+    *insufficient*: it could not distinguish "no problems" from "no data",
+    and :meth:`conclusion` says so. Under ARCH-ENG-158 the outcome tables are
+    empty *by design* and stay empty until verified payment evidence exists,
+    so this state is the layer's expected resting state, not a transient.
+    """
     findings: List[AuditFinding] = field(default_factory=list)
     audited_at: float = field(default_factory=time.time)
     total_opportunities: int = 0
     total_platforms: int = 0
     total_strategies: int = 0
+    # ARCH-ENG-236: category value -> rows examined (or 1 for available
+    # gated sources). Populated by each audit from inside.
+    basis: Dict[str, int] = field(default_factory=dict)
+    # One string per audit whose own body raised despite the run-level guard.
+    audit_errors: List[str] = field(default_factory=list)
 
     @property
     def critical_count(self) -> int:
@@ -119,6 +136,40 @@ class AuditReport:
     @property
     def high_count(self) -> int:
         return sum(1 for f in self.findings if f.severity == Severity.HIGH)
+
+    @property
+    def insufficient_audits(self) -> List[str]:
+        """Audits that ran but could not see any data to base a verdict on."""
+        return sorted(
+            cat.value for cat in AuditCategory
+            if self.basis.get(cat.value, 0) <= 0
+        )
+
+    @property
+    def data_complete(self) -> bool:
+        """True only when every audit saw a basis and none errored."""
+        return not self.insufficient_audits and not self.audit_errors
+
+    def conclusion(self) -> str:
+        """One honest line: never a clean bill on data-starved audits."""
+        if self.audit_errors:
+            return (
+                f"audit errors ({len(self.audit_errors)}); conclusions "
+                "unreliable until the errors clear"
+            )
+        if self.findings:
+            return (
+                f"{len(self.findings)} findings"
+                + ("" if self.data_complete else
+                   f" (data-starved audits: {len(self.insufficient_audits)})")
+            )
+        if self.data_complete:
+            return "no problems found (all 14 audits had data)"
+        return (
+            f"INSUFFICIENT DATA: {len(self.insufficient_audits)} of "
+            f"{len(AuditCategory)} audits had no rows -- no findings must "
+            "not be read as healthy"
+        )
 
     def by_category(self, cat: AuditCategory) -> List[AuditFinding]:
         return [f for f in self.findings if f.category == cat]
@@ -133,6 +184,10 @@ class AuditReport:
             "total_opportunities": self.total_opportunities,
             "total_platforms": self.total_platforms,
             "total_strategies": self.total_strategies,
+            "basis": dict(self.basis),
+            "audit_errors": list(self.audit_errors),
+            "data_complete": self.data_complete,
+            "conclusion": self.conclusion(),
         }
 
 
@@ -159,23 +214,37 @@ class SelfAuditEngine:
     # ── Main entry ─────────────────────────────────────────────────────────────
 
     def run_audit(self) -> AuditReport:
-        """Run the full self-audit and return a report."""
+        """Run the full self-audit and return a report.
+
+        ARCH-ENG-236 (AJ-01): each audit runs under a run-level guard, so an
+        audit whose own body raises is recorded on the report as an error
+        rather than being silently dropped into a clean-looking report. The
+        per-audit data basis -- see AuditReport -- is what keeps the empty
+        ARCH-ENG-158 tables from reading as "no problems found".
+        """
         report = AuditReport()
 
-        self._audit_repeated_failures(report)
-        self._audit_prediction_errors(report)
-        self._audit_bad_strategies(report)
-        self._audit_poor_platforms(report)
-        self._audit_poor_categories(report)
-        self._audit_poor_task_types(report)
-        self._audit_low_performing_variants(report)
-        self._audit_high_cost_workflows(report)
-        self._audit_human_intervention(report)
-        self._audit_execution_failures(report)
-        self._audit_stale_providers(report)
-        self._audit_stale_categories(report)
-        self._audit_security_problems(report)
-        self._audit_documentation_drift(report)
+        audits = (
+            (AuditCategory.REPEATED_FAILURES, self._audit_repeated_failures),
+            (AuditCategory.PREDICTION_ERRORS, self._audit_prediction_errors),
+            (AuditCategory.BAD_STRATEGIES, self._audit_bad_strategies),
+            (AuditCategory.POOR_PLATFORMS, self._audit_poor_platforms),
+            (AuditCategory.POOR_CATEGORIES, self._audit_poor_categories),
+            (AuditCategory.POOR_TASK_TYPES, self._audit_poor_task_types),
+            (AuditCategory.LOW_PERFORMING_VARIANTS, self._audit_low_performing_variants),
+            (AuditCategory.HIGH_COST_WORKFLOWS, self._audit_high_cost_workflows),
+            (AuditCategory.HUMAN_INTERVENTION, self._audit_human_intervention),
+            (AuditCategory.EXECUTION_FAILURES, self._audit_execution_failures),
+            (AuditCategory.STALE_PROVIDERS, self._audit_stale_providers),
+            (AuditCategory.STALE_CATEGORIES, self._audit_stale_categories),
+            (AuditCategory.SECURITY_PROBLEMS, self._audit_security_problems),
+            (AuditCategory.DOCUMENTATION_DRIFT, self._audit_documentation_drift),
+        )
+        for category, audit in audits:
+            try:
+                audit(report)
+            except Exception as exc:  # ARCH-ENG-236: an error is not silence
+                report.audit_errors.append(f"{category.value}: {exc}")
 
         return report
 
@@ -185,6 +254,8 @@ class SelfAuditEngine:
         """Identify opportunities with repeated failure patterns."""
         platforms = self._get_all_platforms()
         report.total_platforms = len(platforms)
+        # ARCH-ENG-236: declare the data basis this verdict rests on.
+        report.basis[AuditCategory.REPEATED_FAILURES.value] = len(platforms)
 
         for platform in platforms:
             rep = self.memory.get_platform_reputation(platform)
@@ -219,8 +290,12 @@ class SelfAuditEngine:
 
     def _audit_prediction_errors(self, report: AuditReport) -> None:
         """Identify systematic prediction errors."""
+        # ARCH-ENG-236: count every accuracy record and metric row this audit
+        # had access to, whatever the verdict turns out to be.
+        rows_seen = 0
         accuracy = self.memory.get_prediction_accuracy("global", "global")
         if accuracy:
+            rows_seen += 1
             sample_size = accuracy.get("sample_size", 0)
             if sample_size >= self.min_sample_size:
                 rev_error = abs(accuracy.get("revenue_error_pct", 0.0))
@@ -245,6 +320,7 @@ class SelfAuditEngine:
         for dim in ("category", "platform", "task_type"):
             try:
                 metrics_list = self.memory.compute_all_metrics(dim)
+                rows_seen += len(metrics_list)
                 for m in metrics_list:
                     if m.sample_size >= self.min_sample_size:
                         eva = abs(m.expected_vs_actual_return - 1.0)
@@ -267,6 +343,8 @@ class SelfAuditEngine:
                             ))
             except Exception:
                 pass
+        # ARCH-ENG-236: declare the data basis this verdict rests on.
+        report.basis[AuditCategory.PREDICTION_ERRORS.value] = rows_seen
 
     # ── 3. Bad strategies ────────────────────────────────────────────────────
 
@@ -281,6 +359,8 @@ class SelfAuditEngine:
                        FROM search_strategy WHERE used_count >= ?""",
                     (self.min_sample_size,)
                 ).fetchall()
+                # ARCH-ENG-236: declare the data basis this verdict rests on.
+                report.basis[AuditCategory.BAD_STRATEGIES.value] = len(rows)
 
             strategies = []
             for row in rows:
@@ -327,6 +407,8 @@ class SelfAuditEngine:
     def _audit_poor_platforms(self, report: AuditReport) -> None:
         """Identify platforms with consistently poor outcomes."""
         platforms = self._get_all_platforms()
+        # ARCH-ENG-236: declare the data basis this verdict rests on.
+        report.basis[AuditCategory.POOR_PLATFORMS.value] = len(platforms)
         for platform in platforms:
             rep = self.memory.get_platform_reputation(platform)
             if rep is None:
@@ -359,6 +441,8 @@ class SelfAuditEngine:
         """Identify opportunity categories with poor performance."""
         try:
             all_metrics = self.memory.compute_all_metrics("category")
+            # ARCH-ENG-236: declare the data basis this verdict rests on.
+            report.basis[AuditCategory.POOR_CATEGORIES.value] = len(all_metrics)
             for m in all_metrics:
                 if m.sample_size < self.min_sample_size:
                     continue
@@ -389,6 +473,8 @@ class SelfAuditEngine:
         """Identify task types with poor performance."""
         try:
             all_metrics = self.memory.compute_all_metrics("task_type")
+            # ARCH-ENG-236: declare the data basis this verdict rests on.
+            report.basis[AuditCategory.POOR_TASK_TYPES.value] = len(all_metrics)
             for m in all_metrics:
                 if m.sample_size < self.min_sample_size:
                     continue
@@ -420,6 +506,9 @@ class SelfAuditEngine:
         """Identify low-performing proposal variants."""
         try:
             variants = self.memory.get_successful_patterns("proposal_variant", min_confidence=0.0)
+            # ARCH-ENG-236: declare the basis BEFORE the early return, so an
+            # empty pattern table reads as insufficient, not silent-clean.
+            report.basis[AuditCategory.LOW_PERFORMING_VARIANTS.value] = len(variants)
             if not variants:
                 return
             for v in variants:
@@ -453,6 +542,8 @@ class SelfAuditEngine:
             return
         try:
             opp_ids = self._get_all_opportunity_ids()
+            # ARCH-ENG-236: declare the data basis this verdict rests on.
+            report.basis[AuditCategory.HIGH_COST_WORKFLOWS.value] = len(opp_ids)
             for opp_id in opp_ids:
                 try:
                     profile = self.accounting.get_profile(opp_id)
@@ -494,6 +585,8 @@ class SelfAuditEngine:
             human_required = [e for e in all_entries if getattr(e, 'work_status', None) and
                               e.work_status.value == 'awaiting_approval']
             total = len(all_entries)
+            # ARCH-ENG-236: the portfolio is the data basis; its rows are the check.
+            report.basis[AuditCategory.HUMAN_INTERVENTION.value] = max(total, 1)
             if total > 0:
                 human_rate = len(human_required) / total
                 if human_rate > self.human_intervention_threshold:
@@ -524,6 +617,8 @@ class SelfAuditEngine:
             if portfolio is None:
                 return
             all_entries = portfolio.load_all()
+            # ARCH-ENG-236: the portfolio is the data basis; its rows are the check.
+            report.basis[AuditCategory.EXECUTION_FAILURES.value] = max(len(all_entries), 1)
             blocked = [e for e in all_entries if getattr(e, 'work_status', None) and
                        e.work_status.value in ('blocked', 'failed', 'rejected')]
             for entry in blocked:
@@ -550,6 +645,8 @@ class SelfAuditEngine:
         platforms = self._get_all_platforms()
         now = time.time()
         stale_cutoff = now - (self.stale_days * 86400)
+        # ARCH-ENG-236: declare the data basis this verdict rests on.
+        report.basis[AuditCategory.STALE_PROVIDERS.value] = len(platforms)
 
         for platform in platforms:
             rep = self.memory.get_platform_reputation(platform)
@@ -582,6 +679,8 @@ class SelfAuditEngine:
         try:
             all_metrics = self.memory.compute_all_metrics("category")
             now = time.time()
+            # ARCH-ENG-236: declare the data basis this verdict rests on.
+            report.basis[AuditCategory.STALE_CATEGORIES.value] = len(all_metrics)
             for m in all_metrics:
                 last_active = getattr(m, 'last_active', 0)
                 if m.sample_size >= self.min_sample_size and last_active > 0:
@@ -612,6 +711,10 @@ class SelfAuditEngine:
         try:
             wallet_mgr = getattr(self.memory, 'wallet_manager', None)
             if wallet_mgr:
+                # ARCH-ENG-236: this audit's basis is the gated in-memory
+                # source, not its row count -- zero failed wallet operations
+                # is a real, confirmable verdict, not starvation.
+                report.basis[AuditCategory.SECURITY_PROBLEMS.value] = 1
                 failed_ops = getattr(wallet_mgr, 'failed_operations', [])
                 for op in failed_ops:
                     report.findings.append(AuditFinding(
@@ -639,6 +742,8 @@ class SelfAuditEngine:
             improvements_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "IMPROVEMENTS.md")
             if os.path.exists(improvements_path):
                 content = open(improvements_path, encoding="utf-8").read()
+                # ARCH-ENG-236: the file's presence is the basis for this local check.
+                report.basis[AuditCategory.DOCUMENTATION_DRIFT.value] = 1
                 completed = len(re.findall(r'\| H\d+ .* \| Complete \|', content))
                 versions = len(re.findall(r'## \[\d+\.\d+\.\d+[a-z]\]', content))
                 if completed > 0 and versions > 0:

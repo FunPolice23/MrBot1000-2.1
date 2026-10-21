@@ -1,7 +1,6 @@
 import pytest
 
 from agents.cognition import (
-    CognitionRecord,
     ThoughtEdge,
     ThoughtEdgeKind,
     ThoughtGraph,
@@ -64,18 +63,15 @@ def test_graph_dependency_blocks_until_dependency_is_supported():
     assert ready.recommendation == "supported"
 
 
-def test_graph_rejects_dependency_cycles_and_serializes_on_record():
+def test_graph_rejects_dependency_cycles():
     graph = ThoughtGraph()
     graph.add_node(ThoughtNode("a", ThoughtNodeKind.CLAIM, "a"))
     graph.add_node(ThoughtNode("b", ThoughtNodeKind.CLAIM, "b"))
     graph.add_edge(ThoughtEdge("a", "b", ThoughtEdgeKind.DEPENDS_ON))
     with pytest.raises(ValueError, match="cycle"):
         graph.add_edge(ThoughtEdge("b", "a", ThoughtEdgeKind.DEPENDS_ON))
-
-    record = CognitionRecord(goal="review", persona="edward", thought_graph=graph)
-    payload = record.to_dict()
-    assert payload["thought_graph"]["nodes"][0]["kind"] == "claim"
-    assert payload["thought_graph"]["edges"][0]["kind"] == "depends_on"
+    # ARCH-ENG-233: the CognitionRecord serialization assertions that used to
+    # follow this test are gone with the deleted record cluster.
 
 
 def test_graph_wide_measurement_is_available_for_diagnostics():

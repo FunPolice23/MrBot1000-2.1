@@ -42,6 +42,21 @@ class Wallet:
 class WalletManager:
     """Manages crypto wallets for the agent system."""
 
+    # H30b / ARCH-ENG-154: ONE shared instance for the whole process. The GUI has
+    # two independent consumers of this class — the Payments tab and the Earnings
+    # tab — and each constructing its own would hold a private `_wallets` dict
+    # while `add_wallet` rewrites the whole file, so a wallet added on one
+    # surface would be invisible to the other until it reloaded. Same hazard as
+    # `wallet_manager.resolve_wallet_root`, on the other side of the seam.
+    _SHARED: "WalletManager | None" = None
+
+    @classmethod
+    def shared(cls, state_path: str = "") -> "WalletManager":
+        """The process-wide wallet store. First caller's path wins."""
+        if cls._SHARED is None:
+            cls._SHARED = cls(state_path)
+        return cls._SHARED
+
     def __init__(self, state_path: str = ""):
         self.state_path = state_path or os.path.join(os.path.expanduser("~"), ".mrbot1000", "wallets.json")
         self._wallets: Dict[str, Wallet] = {}

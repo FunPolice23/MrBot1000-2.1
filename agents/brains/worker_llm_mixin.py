@@ -193,6 +193,22 @@ class WorkerLLMMixin:
                                 prompt_tokens=_p_tok,
                                 completion_tokens=_c_tok,
                                 tokens_per_second=round(_tps, 2))
+                            # ARCH-ENG-243 (BD-01): the typed spend event the
+                            # Insights spend KPI reads -- estimated with the
+                            # same pricer as the brain adapters, so a
+                            # cloud-backed worker bills honestly costed
+                            # events (local paths estimate 0.0 and stay
+                            # out of the event log; llm_calls keeps them).
+                            from agents.safety.cost import estimate_call_cost
+                            _call_cost = estimate_call_cost(
+                                name, model, _p_tok, _c_tok)
+                            if _call_cost > 0:
+                                from agents.core.event_logger import (
+                                    StructuredEventLogger)
+                                StructuredEventLogger.instance().llm_spend_event(
+                                    model=model, provider=name,
+                                    tokens=_p_tok + _c_tok,
+                                    est_usd=_call_cost)
                     except Exception as _log_err:
                         self.log_signal.emit(f"[LLM] stats log skipped: {_log_err}")
                     self.last_provider = name

@@ -26,8 +26,11 @@ class ProviderProbeWorker(QThread):
                     loaded = {str(item).strip().lower() for item in models}
                     running = available and bool(wanted and wanted in loaded)
                 else:
+                    # Pass the provider so a CLOUD probe carries its Bearer
+                    # token — without it a valid cloud brain probes 401 and the
+                    # Providers & GPU row shows "Stopped" forever.
                     running, models = self.checker.check_endpoint(
-                        self.target, timeout=2)
+                        self.target, timeout=2, provider=self.provider)
             else:
                 running, models = self.checker.check_llama_server(
                     self.target, timeout=2)

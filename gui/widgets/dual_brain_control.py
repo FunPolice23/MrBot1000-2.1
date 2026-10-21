@@ -144,34 +144,54 @@ class GPUStatusWorker(QThread):
         self.requestInterruption()
     
     def _get_gpu_status(self):
-        """Get GPU status via nvidia-smi."""
+        """Get GPU status via nvidia-smi.
+
+        ARCH-ENG-183 — TWO DEFECTS HERE.
+
+        1. `subprocess.run(..., capture_output=True)` IS THE BROKEN FORM.
+           ARCH-ENG-116 established that it raises
+           `OSError(22, 'The request is not supported')` / WinError 50 on
+           Windows whenever the parent's stdout is a reconfigured pipe, which is
+           what `pytest --capture=fd` does. Combined with the blanket
+           `except Exception: pass` below, the GPU panel silently froze on its
+           last values with nothing anywhere. Now it uses the one hardened
+           nvidia-smi invocation (ARCH-ENG-116/166).
+
+        2. ONE BAD ROW ABORTED THE WHOLE POLL. `int(parts[4])` raises
+           ValueError when utilization reads `N/A` — which nvidia-smi does emit
+           routinely for idle/unsupported fields — and that exception was caught
+           by the outer handler, so the function returned an EMPTY list and EVERY
+           GPU vanished from the panel. Row parsing is now per-row: a bad row is
+           skipped and the rest are reported.
+
+        A third `stop()` definition also existed below this one, shadowed by the
+        first; it is removed, because a duplicated teardown method is a trap for
+        the next reader.
+        """
         gpus = []
+        query = "index,name,memory.used,memory.total,utilization.gpu"
         try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().split("\n"):
-                    parts = [p.strip() for p in line.split(",")]
-                    if len(parts) >= 5:
-                        gpus.append({
-                            "index": int(parts[0]),
-                            "name": parts[1],
-                            "memory_used_mb": int(parts[2]),
-                            "memory_total_mb": int(parts[3]),
-                            "utilization": int(parts[4])
-                        })
+            from agents.runtime.device_registry import _run_nvidia_smi
+            stdout = _run_nvidia_smi(query)
         except Exception:
-            pass  # parsing is best-effort; return empty list on any error
+            return gpus          # best-effort; no GPU data is a valid answer
+        for line in str(stdout or "").strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5:
+                continue
+            # ARCH-ENG-183: per-row tolerance. `N/A` is routine in nvidia-smi
+            # output and must not cost us every OTHER gpu.
+            try:
+                gpus.append({
+                    "index": int(parts[0]),
+                    "name": parts[1],
+                    "memory_used_mb": int(float(parts[2])),
+                    "memory_total_mb": int(float(parts[3])),
+                    "utilization": int(float(parts[4])) if parts[4] != "N/A" else 0,
+                })
+            except (ValueError, TypeError):
+                continue
         return gpus
-    
-    def stop(self):
-        """Stop the polling loop."""
-        self.running = False
-        self.requestInterruption()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -191,13 +211,6 @@ class _WheelEventFilter(QObject):
         super().__init__(parent)
         self.combo = combo
     
-    def eventFilter(self, obj, event):
-        # Block wheel events when dropdown is not open
-        if event.type() == event.Type.Wheel and not self.combo.view().isVisible():
-            return True  # Event handled — block it
-        return False  # Pass through
-
-
 class _ModelLabelAdapter:
     """Legacy shim: lets the backend call ``sb_model_label.setText(name)``.
 
@@ -268,6 +281,12 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
     _restart_ready = Signal(bool)
     _external_lifecycle_finished = Signal(bool, bool, str)
     _vram_estimate_ready = Signal(int, str, object)
+    # ARCH-ENG-182: marshals a "clear the Loading state" request from a raw
+    # worker thread onto the GUI thread. `_do_restart` runs on a
+    # `threading.Thread`, which has NO Qt event loop, so a
+    # `QTimer.singleShot` from there never fires and the brain row stays stuck
+    # at "Loading...". Emitting to a slot on this QObject is queued instead.
+    _loading_clear_requested = Signal(bool)
     # Background threads (model restart, VRAM estimate) must not touch QWidgets
     # directly — that is undefined behaviour in Qt and shows up as random freezes
     # and access violations. They emit this instead; the slot runs on the GUI
@@ -315,7 +334,6 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         from agents.providers.provider_manager import ProviderManager
         self.provider_manager = ProviderManager.instance()
         self._hardware_tensor_types = {}
-        self._provider_panels_built = False
         self.provider_detection_ready.connect(self._on_provider_detection_ready)
         
         # Track which providers we started (vs already running)
@@ -326,6 +344,9 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         self._vram_estimates = {}
         self._vram_estimate_inflight = set()
         self._vram_estimate_ready.connect(self._on_vram_estimate_ready)
+        # ARCH-ENG-182: queued onto the GUI thread by Qt, which is what a
+        # `QTimer.singleShot` from a raw `threading.Thread` could not do.
+        self._loading_clear_requested.connect(self._on_loading_clear_requested)
 
         # Guard against auto-restart loops from probe-triggered combo changes
         self._suppress_model_change_restart = False
@@ -427,9 +448,13 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         # The subtitle/provider summary were rendered from an empty cache during
         # construction; refresh them now that detection has populated it.
         self._update_gpu_subtitle()
-        if not self._provider_panels_built:
-            self._build_provider_panels()
-            self._provider_panels_built = True
+        # ARCH-ENG-140: _build_provider_panels was deliberately REMOVED. It built
+        # 12+ QFrames, never parented or added them to any layout, and discarded
+        # them on every detection-ready callback. Its controls were nonetheless
+        # live: _on_model_changed fired on currentTextChanged and wrote BOTH
+        # BIG_BRAIN_MODEL and SMALL_BRAIN_MODEL to .env — so picking one item in
+        # an invisible panel rewrote persisted config for both roles. The live
+        # path is ProviderConfigWidget (tab_feature_builders.py:1910).
 
     def _update_gpu_subtitle(self):
         """Render the GPU-count subtitle from the current detection cache."""
@@ -447,129 +472,6 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             label.setText(text)
         except Exception:
             pass
-
-    def _build_provider_panels(self):
-        """Build provider-specific configuration panels with failover support."""
-        from agents.providers.provider_manager import ProviderManager, ProviderStatus
-        
-        pm = self.provider_manager
-        # Pure render path — never force detection here. Only reached after
-        # background detection has populated the cache (via
-        # _on_provider_detection_ready), so detect=False is always a cache hit.
-        providers = pm.get_providers(detect=False)
-        gpus = pm.get_gpus(detect=False)
-        
-        # Create provider selection panel
-        if hasattr(self, 'provider_group'):
-            # Clear existing widgets
-                pass
-        
-        # Build provider selection UI
-        self.provider_panels = {}
-        
-        for name, provider in providers.items():
-            panel = self._create_provider_panel(name, provider, gpus)
-            self.provider_panels[name] = panel
-    
-    def _create_provider_panel(self, name, provider, gpus):
-        """Create a configuration panel for a specific provider."""
-        frame = QFrame()
-        frame.setStyleSheet(f"""
-            QFrame {{
-                background: #1a1a1a;
-                border: 2px solid #333;
-                border-radius: 8px;
-                padding: 8px;
-            }}
-        """)
-        layout = QVBoxLayout(frame)
-        
-        # Provider header
-        header = QHBoxLayout()
-        status_color = "#4caf50" if provider.status == "running" else "#ff5252" if provider.status == "stopped" else "#ff9800"
-        status_label = QLabel(f"● {provider.name}")
-        status_label.setStyleSheet(f"color: {status_color}; font-weight: bold; font-size: 12px;")
-        header.addWidget(status_label)
-        
-        header.addStretch()
-        
-        # GPU assignment
-        if provider.is_local and gpus:
-            gpu_combo = QComboBox()
-            gpu_combo.addItem("Auto", -1)
-            for gpu in gpus:
-                gpu_combo.addItem(f"GPU {gpu.index}: {gpu.name}", gpu.index)
-            gpu_combo.setCurrentIndex(provider.gpu_index + 1)
-            gpu_combo.currentIndexChanged.connect(lambda idx, n=name: self._on_gpu_assignment_changed(n, idx - 1))
-            header.addWidget(QLabel("GPU:"))
-            header.addWidget(gpu_combo)
-        
-        layout.addLayout(header)
-        
-        # Model selection
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("Model:"))
-        model_combo = QComboBox()
-        model_combo.setEditable(True)
-        if provider.models:
-            model_combo.addItems(provider.models)
-        if provider.selected_model:
-            model_combo.setCurrentText(provider.selected_model)
-        model_combo.currentTextChanged.connect(lambda text, n=name: self._on_model_changed(n, text))
-        model_layout.addWidget(model_combo, stretch=1)
-        layout.addLayout(model_layout)
-        
-        # Provider-specific settings
-        if provider.is_cloud:
-            # Cloud provider settings
-            settings_layout = QHBoxLayout()
-            settings_layout.addWidget(QLabel("Context:"))
-            ctx_spin = QSpinBox()
-            ctx_spin.setRange(1048576, 1048576)
-            ctx_spin.setValue(provider.context_size)
-            ctx_spin.valueChanged.connect(lambda val, n=name: self._on_context_changed(n, val))
-            settings_layout.addWidget(ctx_spin)
-            layout.addLayout(settings_layout)
-        else:
-            # Local provider settings
-            settings_layout = QGridLayout()
-            settings_layout.addWidget(QLabel("Context:"), 0, 0)
-            ctx_spin = QSpinBox()
-            ctx_spin.setRange(2048, 524288)
-            ctx_spin.setValue(provider.context_size)
-            ctx_spin.valueChanged.connect(lambda val, n=name: self._on_context_changed(n, val))
-            settings_layout.addWidget(ctx_spin, 0, 1)
-            layout.addLayout(settings_layout)
-        
-        return frame
-    
-    def _on_gpu_assignment_changed(self, provider_name, gpu_index):
-        """Handle GPU assignment change."""
-        self.provider_manager.assign_provider_to_gpu(provider_name, gpu_index)
-        self._log(f"Assigned {provider_name} to GPU {gpu_index}")
-    
-    def _on_model_changed(self, provider_name, model_name):
-        """Handle model selection change."""
-        provider = self.provider_manager.get_provider(provider_name)
-        if provider:
-            provider.selected_model = model_name
-            values = {
-                "BIG_BRAIN_MODEL": model_name,
-                "SMALL_BRAIN_MODEL": model_name,
-            }
-            os.environ.update(values)
-            try:
-                from main import set_env_values
-                set_env_values(values)
-            except Exception:
-                pass
-            self._log(f"Selected model {model_name} for {provider_name}")
-    
-    def _on_context_changed(self, provider_name, context_size):
-        """Handle context size change."""
-        provider = self.provider_manager.get_provider(provider_name)
-        if provider:
-            provider.context_size = context_size
 
     def _wire_start_stop_buttons(self):
         """Wire up start/stop buttons after class body is fully defined.
@@ -666,95 +568,45 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             kv = "q8_0" if "q8_0" in supported else (next(iter(supported), "f16"))
         return context, batch, threads, gpu_layers, kv
 
-    def _build_gpu_hardware_settings(self, parent_layout):
-        """Show hardware-specific options for every detected GPU.
+    def _apply_hardware_tensor_options(self):
+        """Limit KV choices to the assigned GPU's supported tensor profile.
 
-        GPU 0 and GPU 1 are controlled by the Big/Small Brain runtime rows.
-        Additional devices are displayed as available hardware until a runtime
-        role is assigned to them; this keeps the UI honest about what is live.
+        ARCH-ENG-194: `__init__` calls this immediately after `setup_ui()`
+        (line 375), but the `sb_kv_combo` / `bb_kv_combo` it reads are not
+        created by `setup_ui` itself -- they are assigned later by
+        `_alias_legacy_settings_attrs`, which runs when the brain rows are built.
+        So whether these attributes exist at construction time depends on
+        whether device detection produced brain rows at all.
+
+        On a machine with no detected GPU rows, that made construction raise
+        `AttributeError: 'DualBrainControl' object has no attribute
+        'sb_kv_combo'` -- a crash in `__init__`, not a degraded panel. Found by
+        the new mixin-contract guard, which constructs the widget directly.
+
+        A method called from `__init__` must not assume later-initialised state
+        exists, so the combos are resolved defensively and a missing one is
+        skipped. This is also the honest behaviour: with no row there is no
+        combo to constrain.
         """
         from agents.providers.provider_manager import supported_tensor_types
         from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
 
-        group = QGroupBox("🖥 Detected GPU Hardware Settings")
-        group.setStyleSheet("""
-            QGroupBox {
-                color: #03dac6;
-                font-weight: bold;
-                border: 2px solid #03dac6;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 15px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }
-        """)
-        grid = QGridLayout(group)
-        grid.setColumnStretch(0, 3)
-        grid.setColumnStretch(1, 2)
-        grid.setColumnStretch(2, 2)
-        grid.setColumnStretch(3, 3)
-        self.gpu_hardware_controls = {}
-        runtime = self.runtime or DualBrainRuntime.from_env()
-        assigned_roles = {
-            runtime.config(BrainRole.BIG).device: "Big Brain",
-            runtime.config(BrainRole.SMALL).device: "Small Brain",
-        }
-
-        gpus = sorted(self.provider_manager.get_gpus(detect=False), key=lambda gpu: gpu.index)
-        if not gpus:
-            grid.addWidget(QLabel("No CUDA GPUs detected. CPU-safe settings are active."), 0, 0, 1, 4)
-        for row, gpu in enumerate(gpus):
-            runtime_role = assigned_roles.get(gpu.index)
-            role_text = runtime_role or "Available / unassigned"
-            capability = f"SM {gpu.compute_capability}" if gpu.compute_capability else "SM unknown"
-            header = QLabel(
-                f"GPU {gpu.index}: {gpu.name} · {capability} · "
-                f"{gpu.memory_total_mb / 1024:.1f} GB · {role_text}")
-            header.setStyleSheet("color: #bdbdbd; font-size: 11px;")
-            grid.addWidget(header, row, 0)
-
-            options = list(gpu.tensor_types or supported_tensor_types(gpu.compute_capability))
-            kv_combo = QComboBox()
-            kv_combo.addItems(options)
-            kv_combo.setToolTip(
-                f"KV/tensor types supported by {gpu.name} ({capability}): "
-                + ", ".join(options))
-            kv_combo.setEnabled(runtime_role is None)
-            if runtime_role == "Big Brain":
-                kv_combo.setCurrentText(self.bb_kv_combo.currentText())
-                kv_combo.setToolTip("Live setting is controlled by Big Brain KV above.")
-            elif runtime_role == "Small Brain":
-                kv_combo.setCurrentText(self.sb_kv_combo.currentText())
-                kv_combo.setToolTip("Live setting is controlled by Small Brain KV above.")
-            grid.addWidget(kv_combo, row, 1)
-
-            details = QLabel("KV types: " + ", ".join(options))
-            details.setStyleSheet("color: #888; font-size: 10px;")
-            grid.addWidget(details, row, 2, 1, 2)
-            self.gpu_hardware_controls[gpu.index] = {
-                "kv_combo": kv_combo,
-                "options": options,
-                "role": runtime_role,
-            }
-
-        parent_layout.addWidget(group)
-
-    def _apply_hardware_tensor_options(self):
-        """Limit KV choices to the assigned GPU's supported tensor profile."""
-        from agents.providers.provider_manager import supported_tensor_types
-        from agents.runtime.dual_brain import BrainRole, DualBrainRuntime
-
         gpus = {gpu.index: gpu for gpu in self.provider_manager.get_gpus(detect=False)}
-        for small, combo in ((True, self.sb_kv_combo), (False, self.bb_kv_combo)):
+        for small, name in ((True, "sb_kv_combo"), (False, "bb_kv_combo")):
+            combo = getattr(self, name, None)
+            if combo is None:
+                # The brain rows have not been built yet (or never will be).
+                # `_apply_hardware_tensor_options` is also called again at
+                # line 446 once detection completes, so nothing is lost.
+                continue
             role = BrainRole.SMALL if small else BrainRole.BIG
             runtime = self.runtime or DualBrainRuntime.from_env()
             device = runtime.config(role).device
             gpu = gpus.get(device)
             options = gpu.tensor_types if gpu else supported_tensor_types(cpu=True)
+            if not options:
+                # An empty option list would make `options[0]` raise below.
+                continue
             current = combo.currentText()
             combo.blockSignals(True)
             combo.clear()
@@ -778,12 +630,21 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             role = BrainRole.SMALL if small else BrainRole.BIG
             device = runtime.config(role).device
             gpu = gpus.get(device)
-            options = self._hardware_tensor_types[small]
+            # ARCH-ENG-194: `.get`, not `[...]`. The loop above now skips a brain
+            # whose combo does not exist yet, so a direct index raised KeyError
+            # here -- the same latent assumption, one level down. The summary line
+            # is a convenience; a missing profile must not take down the panel.
+            options = self._hardware_tensor_types.get(small)
+            if not options:
+                continue
             if gpu:
                 sm = f"SM {gpu.compute_capability}" if gpu.compute_capability else "SM unknown"
                 profiles.append(f"{'Small' if small else 'Big'}: {gpu.name} ({sm}) -> {', '.join(options)}")
             else:
                 profiles.append(f"{'Small' if small else 'Big'}: CPU / system RAM -> {', '.join(options)}")
+        if profiles:
+            self.tensor_profile_label.setText(
+                "Hardware tensor/KV profiles: " + " | ".join(profiles))
         self.tensor_profile_label.setText("Hardware tensor/KV profiles: " + " | ".join(profiles))
         self._sync_gpu_hardware_controls()
 
@@ -848,41 +709,6 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         self._wire_start_stop_buttons()
         self._wire_refresh_buttons()
         self._wire_settings_signals()
-
-    def _get_fallback_provider(self, exclude_provider=None):
-        """Get a fallback provider for failover."""
-        from agents.providers.provider_manager import ProviderStatus
-        
-        providers = self.provider_manager.get_providers(detect=False)
-        
-        # Priority: local running > cloud running > local stopped
-        for name, provider in providers.items():
-            if name == exclude_provider:
-                continue
-            if provider.status == ProviderStatus.RUNNING:
-                return name
-        
-        # Try cloud providers
-        for name, provider in providers.items():
-            if name == exclude_provider:
-                continue
-            if provider.is_cloud and provider.status == ProviderStatus.RUNNING:
-                return name
-        
-        return None
-    
-    def _failover_to_cloud(self, failed_provider):
-        """Failover from failed local provider to cloud."""
-        fallback = self._get_fallback_provider(failed_provider)
-        if fallback:
-            self._log(f"⚠️ {failed_provider} failed, failing over to {fallback}")
-            # Update UI to reflect failover
-            self._apply_provider_status({
-                f"{failed_provider}_running": False,
-                f"{fallback}_running": True,
-            })
-        else:
-            self._log(f"❌ {failed_provider} failed, no fallback available!")
 
     def _apply_plan_device_assignment(self, small, big):
         """Assign role→device from the device registry (detection + policy).
@@ -1542,6 +1368,41 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             if getattr(self, "_seeding_settings", 0) > 0:
                 return
             if self.runtime is None:
+                # ARCH-ENG-197: DO NOT SILENTLY DISCARD THE EDIT.
+                #
+                # This used to `return` here, BEFORE `apply_to(cfg)` and before
+                # `_persist_settings_async()`. So any ctx / threads / batch /
+                # gpu-layers / kv edit made before device detection finished was
+                # dropped completely: not applied, not written, and not logged.
+                #
+                # That window is not exotic. Detection runs on a background
+                # thread and the panel is interactive as soon as it paints, so
+                # the first few seconds of a session are exactly when an operator
+                # is most likely to reach for a spinner.
+                #
+                # `_snapshot_settings_values()` reads only widgets and needs no
+                # runtime, so the PERSIST half of the work can always be done. Only
+                # the in-memory `apply_to(cfg)` genuinely needs a config object, so
+                # that is what gets deferred: the slot is recorded, and
+                # `_apply_runtime` replays it once a runtime exists.
+                #
+                # Previously the setting survived neither the session nor the
+                # restart, and the operator had no way to know.
+                try:
+                    pending = getattr(self, "_pending_slot_applies", None)
+                    if pending is None:
+                        pending = set()
+                        self._pending_slot_applies = pending
+                    pending.add(int(slot))
+                    persist = getattr(self, "_persist_settings_async", None)
+                    if persist is not None:
+                        persist()
+                    self._log(
+                        "Settings saved to file; applying to the running server "
+                        "once device detection finishes."
+                    )
+                except Exception:
+                    pass
                 return
             rows = getattr(self, "_settings_rows", [])
             if not (0 <= slot < len(rows)):
@@ -1569,6 +1430,38 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         except Exception:
             pass
 
+
+    def _replay_pending_slot_applies(self):
+        """ARCH-ENG-197: apply edits made before a runtime existed.
+
+        `_on_brain_settings_changed` persists immediately but defers the
+        in-memory `apply_to(cfg)` when `self.runtime` is None, recording the slot
+        here. This replays those edits once detection has produced a runtime, so
+        "saved to file, applied when detection finishes" is a promise the panel
+        actually keeps.
+
+        Runs AFTER `_apply_runtime`'s own seeding, so the operator's value wins
+        over the detected default -- which is the correct order: an explicit edit
+        should not be overwritten by a fallback that ran later.
+        """
+        pending = sorted(getattr(self, "_pending_slot_applies", None) or set())
+        if not pending or self.runtime is None:
+            return
+        rows = getattr(self, "_settings_rows", [])
+        for slot in pending:
+            try:
+                if not (0 <= slot < len(rows)):
+                    continue
+                cfg = self.runtime.slot_config(slot)
+                if cfg is None:
+                    continue
+                rows[slot].apply_to(cfg)
+            except Exception:
+                continue
+        try:
+            self._pending_slot_applies.clear()
+        except Exception:
+            self._pending_slot_applies = set()
 
     def _apply_runtime(self):
         """Seed ctx spins + endpoint labels from the canonical runtime (if any)."""
@@ -1736,6 +1629,13 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 pass
         except Exception:
             pass  # runtime seeding is best-effort; never break the panel
+        # ARCH-ENG-197: last, so an edit made before detection finished is applied
+        # AFTER the detected defaults -- an explicit operator choice must not be
+        # overwritten by a fallback that happened to run later.
+        try:
+            self._replay_pending_slot_applies()
+        except Exception:
+            pass
 
     def _snapshot_settings_values(self) -> dict:
         """Build the llama.cpp settings dict from the current widget state.
@@ -1783,18 +1683,44 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 except RuntimeError:
                     values[f"{_role}_BRAIN_ENABLED"] = os.getenv(
                         f"{_role}_BRAIN_ENABLED", "true")
-            # v2.1.9: advanced llama.cpp flags (per brain). A control left at its
-            # "not set" sentinel writes no key, so the flag stays omitted.
+            # v2.1.9: advanced llama.cpp flags (per brain). ARCH-ENG-314: a
+            # control at its "not set" sentinel yields no value AND names its
+            # stale key for removal, so un-setting a control finally persists.
+            self._stale_env_keys = set()
             for _grp in ("sb_adv_group", "bb_adv_group"):
                 _controls = getattr(self, _grp, None)
                 if not _controls:
                     continue
                 _prefix = "SMALL_BRAIN" if _grp.startswith("sb_") else "BIG_BRAIN"
-                values.update(self._llama_flag_values(_prefix, _controls))
+                _vals, _stale = self._llama_flag_values(_prefix, _controls)
+                values.update(_vals)
+                self._stale_env_keys.update(_stale)
+            # N-brain roster (Phase 4): the roster lives in settings.json, not
+            # .env, so it is persisted here as a side effect rather than as an
+            # entry in `values`. BOTH save handlers own this write (the
+            # two-handler rule) — this one and main.py:save_settings.
+            self._persist_brain_roster()
             return values
         except Exception as e:
             self._log(f"Failed to snapshot llama.cpp settings: {e}")
             return {}
+
+    def _persist_brain_roster(self) -> None:
+        """Persist the N-brain roster to settings.json (Phase 4).
+
+        The roster lives in settings.json (not .env), so it is written as a side
+        effect of the settings snapshot rather than as an entry in `values`.
+        Called from BOTH save handlers (this one and main.py:save_settings) per
+        the two-handler rule. Never raises — a failed roster write must not
+        abort the .env write that follows.
+        """
+        try:
+            from gui.widgets.brain_roster_panel import save_roster_from
+            panel = getattr(self, "brain_roster_panel", None)
+            if save_roster_from(panel) is None:
+                self._log("⚠️ Brain roster not persisted (save failed).")
+        except Exception as exc:
+            self._log(f"⚠️ Brain roster not persisted: {exc}")
 
     def _persist_settings(self):
         """Persist the llama.cpp customization values to `.env` (v2.1).
@@ -1818,7 +1744,9 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 self._log("⚠️ Settings not persisted: set_env_values unavailable.")
                 return
             try:
-                set_env_values(values)
+                set_env_values(
+                    values,
+                    remove_keys=getattr(self, "_stale_env_keys", None))
             except EnvWriteRefused as refusal:
                 # Test isolation: a test run must never rewrite operator config.
                 self._log(f"⚠️ Settings not persisted: {refusal}")
@@ -1829,7 +1757,10 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 # file — an interrupted write_text can truncate .env.
                 repo_env = pathlib.Path(__file__).resolve().parents[2] / ".env"
                 try:
-                    set_env_values(values, path=repo_env)
+                    set_env_values(
+                        values,
+                        path=repo_env,
+                        remove_keys=getattr(self, "_stale_env_keys", None))
                 except Exception as exc:
                     self._log(f"⚠️ Settings could not be persisted: {exc}")
                     return
@@ -1894,7 +1825,8 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             grid.addWidget(lbl, row, col)
             return lbl
 
-        def _spin(key, lo, hi, default, tip, row, col, special=None, suffix=""):
+        def _spin(key, lo, hi, default, tip, row, col, special=None, suffix="",
+                  unset=None):
             sp = _SP()
             sp.setRange(lo, hi)
             sp.setValue(int(os.getenv(f"{prefix}_{key}", str(default)) or default))
@@ -1904,12 +1836,22 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 sp.setSuffix(suffix)
             if special is not None:
                 sp.setSpecialValueText(special)
+            if unset is None:
+                # ARCH-ENG-314: the per-control "this value means UNSET"
+                # predicate. Default: a sentinel floor ("(default)" at the
+                # minimum) or the conventional 0/-1 "off" value.
+                if special is not None:
+                    unset = lambda v, minv=lo: v == minv  # noqa: E731
+                else:
+                    unset = lambda v: v <= 0  # noqa: E731
+            sp._flag_unset = unset
             sp.setToolTip(tip)
             grid.addWidget(sp, row, col)
             controls[key] = sp
             return sp
 
-        def _dspin(key, lo, hi, default, tip, row, col, step=0.05, decimals=2):
+        def _dspin(key, lo, hi, default, tip, row, col, step=0.05, decimals=2,
+                   unset=None):
             sp = _DSP()
             sp.setRange(lo, hi)
             sp.setSingleStep(step)
@@ -1917,6 +1859,10 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             sp.setValue(float(os.getenv(f"{prefix}_{key}", str(default)) or default))
             sp.setFixedWidth(90)
             sp.setStyleSheet(spin_qss)
+            if unset is None:
+                # Float flags here all use 0.0 == off/not set.
+                unset = lambda v: v <= 0.0  # noqa: E731
+            sp._flag_unset = unset
             sp.setToolTip(tip)
             grid.addWidget(sp, row, col)
             controls[key] = sp
@@ -2226,17 +2172,22 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         tag, possibly with a brand prefix (``Ternary-Bonsai`` vs ``Bonsai``)."""
         return DualBrainControl._token_prefix(a, b) or DualBrainControl._token_suffix(a, b)
 
-    def _llama_flag_values(self, prefix: str, controls: dict) -> dict:
-        """Convert one group's controls into env key/value pairs.
+    def _llama_flag_values(self, prefix: str, controls: dict) -> tuple:
+        """Convert one group's controls into env key/value pairs and stale keys.
 
-        A control at its "not set" sentinel produces NO key, so the flag is
-        omitted from the launch command and llama.cpp keeps its own default.
+        Returns ``(values, stale_keys)``. A control at its "not set" sentinel
+        produces NO value — instead it names its ``{prefix}_{key}`` for
+        REMOVAL, because a leftover line from a previous state must not
+        resurrect the flag (ARCH-ENG-314: unchecking/“(default)”-ing/clearing
+        a control used to leave the old line in .env forever, so the operator's
+        change was silently reverted on every rebuild).
         """
         values = {}
+        stale = []
         try:
             from PySide6.QtWidgets import QCheckBox, QComboBox, QLineEdit
         except Exception:
-            return values
+            return values, stale
 
         def _put(key, value):
             values[f"{prefix}_{key}"] = str(value)
@@ -2246,38 +2197,45 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 if isinstance(widget, QComboBox):
                     text = widget.currentText().strip()
                     if text.startswith("("):
-                        continue  # "(default)" -> no key
+                        stale.append(f"{prefix}_{key}")  # "(default)" -> unset
+                        continue
                     _put(key, text)
                 elif isinstance(widget, QLineEdit):
                     text = widget.text().strip()
                     if text:
                         _put(key, text)
+                    else:
+                        stale.append(f"{prefix}_{key}")
                 elif isinstance(widget, QCheckBox):
-                    # Only a CHECKED box writes a key. An unchecked box means
-                    # "not set", so the flag is omitted and llama.cpp keeps its
-                    # own default — writing "false" here would invert the
-                    # meaning (e.g. --no-kv-offload would be emitted by an
-                    # UNchecked "keep KV in RAM" box).
+                    # A CHECKED box writes "true" — for the "keep X in system
+                    # RAM" checkboxes the parser maps this to the --no-…-offload
+                    # form (ARCH-ENG-315). An UNCHECKED box means "not set": the
+                    # key must be REMOVED so the operator's change persists;
+                    # writing nothing (the old behaviour) left the previous
+                    # value in .env and re-checked the box on every reload.
                     if widget.isChecked():
                         _put(key, "true")
+                    else:
+                        stale.append(f"{prefix}_{key}")
                 else:
-                    # Spin boxes use an out-of-range sentinel for "not set".
+                    # Spin boxes: unset metadata decides (per-control lambdas
+                    # attached in _build_llama_flag_group), falling back to the
+                    # historic out-of-range sentinel rules.
                     val = widget.value()
+                    unset_test = getattr(widget, "_flag_unset", None)
                     special = widget.specialValueText()
                     if special and val == widget.minimum():
-                        continue
-                    if isinstance(val, float):
-                        if val == 0.0:
-                            continue  # 0.0 == disabled for every float flag here
+                        stale.append(f"{prefix}_{key}")
+                    elif unset_test is not None and unset_test(val):
+                        stale.append(f"{prefix}_{key}")
+                    elif isinstance(val, float):
                         _put(key, f"{val:g}")
                     else:
-                        if val <= 0:
-                            continue  # 0/negative == not set for int flags
                         _put(key, val)
             except RuntimeError:
                 # Widget's C++ side is gone (tab rebuilt); skip it.
                 continue
-        return values
+        return values, stale
 
     def setup_ui(self):
         """Build the control panel UI with dynamic provider and GPU detection."""
@@ -2334,11 +2292,27 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         # Dynamic GPU widgets based on detected GPUs
         self.gpu_widgets = {}
         colors = ["#bb86fc", "#03dac6", "#ff9800", "#4caf50", "#e91e63", "#9c27b0"]
-        for i, gpu in enumerate(gpus):
-            color = colors[i % len(colors)]
-            widget = self._create_gpu_widget(gpu.index, gpu.name, color)
+        # ARCH-ENG-161: dedupe by index and skip unusable rows before rendering.
+        # nvidia-smi can transiently report a phantom row (empty name / 0 MB) or a
+        # repeated index right after a GPU is recovered; rendering those produced
+        # empty placeholder panels that looked like duplicate devices.
+        # `gpu_widgets` is keyed by index, so a duplicate also silently orphaned
+        # the real one. Fixed in v2.1.112; tagged ARCH-ENG-161 so the
+        # ARCH-ENG-150 guard can verify the release record against HEAD.
+        seen_gpu_indexes: set = set()
+        shown = 0
+        for gpu in gpus:
+            idx = getattr(gpu, "index", -1)
+            name = (getattr(gpu, "name", "") or "").strip()
+            mem = getattr(gpu, "memory_total_mb", 0) or 0
+            if idx < 0 or not name or mem <= 0 or idx in seen_gpu_indexes:
+                continue
+            seen_gpu_indexes.add(idx)
+            color = colors[shown % len(colors)]
+            shown += 1
+            widget = self._create_gpu_widget(idx, name, color)
             gpu_layout.addWidget(widget)
-            self.gpu_widgets[gpu.index] = widget
+            self.gpu_widgets[idx] = widget
         
         # If no GPUs detected, show a label
         if not gpus:
@@ -2356,6 +2330,19 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         # drive which devices host which brain. Nothing is hardcoded — a new
         # GPU appears here automatically on the next detection.
         self._build_device_panel(layout)
+
+        # ── N-Brain Roster panel removed (ARCH-ENG-309) ────────────────────
+        # This slot between Compute Devices and Provider Control held the
+        # per-tier count spinners (Big/Small Brains) and one editable
+        # provider/model/device row per slot — a second model-selection
+        # surface that could disagree with Provider Control, which is the
+        # single place model selection and per-slot settings are edited.
+        # The roster DATA (settings.json) still drives extra slots at
+        # launch; only this editing surface is gone.
+        # Kept on purpose: cleanup() still calls flush_pending_roster_edit
+        # (a safe no-op with no panel) because ARCH-ENG-153 pins that flush
+        # structurally, and brain_roster_panel.py keeps its standalone
+        # unit tests.
 
         # ── Provider Control Panel ──────────────────────────────────────
         provider_group = QGroupBox("🎛️ Provider Control (One-Click Launch)")
@@ -2808,54 +2795,82 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         tok_speed_label.setStyleSheet("color: #888; font-size: 9px;")
         layout.addWidget(tok_speed_label)
 
-        # Store references
-        if index == 0:
-            self.gpu0_est_bar = est_bar
-            self.gpu0_act_bar = act_bar
-            self.gpu0_kv_bar = kv_bar
-            self.gpu0_label = name_label
-            self.gpu0_model_label = model_label
-            self.gpu0_ctx_label = ctx_label
-            self.gpu0_est_detail = est_detail
-            self.gpu0_act_detail = act_detail
-            self.gpu0_kv_detail = kv_detail
-            self.gpu0_status = status_label
-            self.gpu0_progress = progress_bar
-            self.gpu0_tok_speed = tok_speed_label
-            # Live generation progress (updated from dialogue).
-            self._gpu_gen_start = {}
-            self._gpu_tok_count = {}
-            self._gpu_tok_running = {}
-        else:
-            self.gpu1_est_bar = est_bar
-            self.gpu1_act_bar = act_bar
-            self.gpu1_kv_bar = kv_bar
-            self.gpu1_label = name_label
-            self.gpu1_model_label = model_label
-            self.gpu1_ctx_label = ctx_label
-            self.gpu1_est_detail = est_detail
-            self.gpu1_act_detail = act_detail
-            self.gpu1_kv_detail = kv_detail
-            self.gpu1_status = status_label
-            self.gpu1_progress = progress_bar
-            self.gpu1_tok_speed = tok_speed_label
-            self._gpu_gen_start = {}
-            self._gpu_tok_count = {}
-            self._gpu_tok_running = {}
-
+        # Store references.
+        #
+        # ARCH-ENG-177: this was `if index == 0: ... else: ...`, so EVERY
+        # non-zero index assigned the `gpu1_*` names. On a 3-GPU box GPU 2's
+        # creation overwrote GPU 1's references, and no `gpu2_*` attribute was
+        # ever created. Every `update_gpu_*` / `_set_gpu_*` call for index >= 1
+        # then wrote GPU N's telemetry onto GPU 1's labels — GPU 1 showed wrong
+        # numbers and GPU 2 showed none at all.
+        #
+        # That directly contradicts the premise of the whole app: one brain
+        # server per detected GPU, each with its own telemetry.
+        #
+        # Now every index gets its own names, and `gpu0_*` / `gpu1_*` are kept
+        # as ALIASES for indices 0 and 1 because a lot of existing code reads
+        # those attributes directly by name.
+        refs = {
+            "est_bar": est_bar, "act_bar": act_bar, "kv_bar": kv_bar,
+            "label": name_label, "model_label": model_label,
+            "ctx_label": ctx_label, "est_detail": est_detail,
+            "act_detail": act_detail, "kv_detail": kv_detail,
+            "status": status_label, "progress": progress_bar,
+            "tok_speed": tok_speed_label,
+        }
+        for suffix, widget in refs.items():
+            setattr(self, f"gpu{index}_{suffix}", widget)
+        # Registry the setters can consult for ANY index, not just 0/1.
+        registry = getattr(self, "_gpu_widget_refs", None)
+        if registry is None:
+            registry = {}
+            self._gpu_widget_refs = registry
+        registry[int(index)] = refs
+        # Live generation progress state (updated from dialogue).
+        self._gpu_gen_start = {}
+        self._gpu_tok_count = {}
+        self._gpu_tok_running = {}
         return frame
     
     # ═══════════════════════════════════════════════════════════════════
     # GPU STATUS UPDATES
     # ═══════════════════════════════════════════════════════════════════
     def pause_background(self):
-        """Reduce nvidia-smi polling while the tab is hidden."""
+        """Reduce polling while the tab is hidden.
+
+        ARCH-ENG-230: THIS ONLY SLOWED THE GPU WORKER. THE 4 s STATUS TIMER RAN
+        ANYWAY.
+
+        `pause_background` exists to cut background cost for a hidden tab, and
+        `tab_lifecycle` calls it on every tab switch away. But it only set
+        `gpu_worker.interval_ms = 15000`. The `_status_timer` at :405 -- a 4 s
+        `QTimer` driving `_refresh_provider_status` -- kept firing for the life
+        of the process, hidden or not.
+
+        Each tick spawned a probe thread, and `_probe_with_deadline` expands that
+        into one extra thread per visible GPU row, each doing `urlopen(timeout=2)`
+        serially, plus a `settings.json` read from `_runtime_from_settings`. So
+        a hidden Providers & GPU tab was still doing N+1 thread spawns and a
+        disk read every four seconds.
+
+        The provider liveness check is genuinely worth keeping while hidden: it
+        is what makes a brain that died on its own show as stopped rather than
+        frozen at "Running" (ARCH-ENG-073). So this slows the timer rather than
+        stopping it -- the guarantee survives, the cost does not.
+        """
         try:
             w = getattr(self, "gpu_worker", None)
             if w is not None:
                 w.interval_ms = 15000
         except Exception:
             pass
+        try:
+            timer = getattr(self, "_status_timer", None)
+            if timer is not None:
+                timer.setInterval(20000)
+        except Exception:
+            pass
+
 
     def resume_background(self):
         """Restore fast nvidia-smi polling when the tab is shown again."""
@@ -2865,6 +2880,15 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 w.interval_ms = 2000
                 if not w.isRunning():
                     w.start()
+        except Exception:
+            pass
+        # ARCH-ENG-230: also restore the status-timer interval that
+        # `pause_background` slowed. Without this the tab stays at the
+        # hidden 20 s cadence for the rest of the session.
+        try:
+            timer = getattr(self, "_status_timer", None)
+            if timer is not None:
+                timer.setInterval(4000)
         except Exception:
             pass
 
@@ -2942,43 +2966,85 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                 self._set_gpu_ctx(idx, "—")
                 self._set_gpu_status(idx, "—")
 
+    def _gpu_ref(self, idx: int, suffix: str):
+        """The widget registered for GPU `idx`, for ANY index.
+
+        ARCH-ENG-177. Every setter below used
+        `... if idx == 0 else gpu1_...`, which sent every index >= 1 to GPU 1's
+        widgets. `gpu2`, `gpu3`, ... never existed as attributes, so on a 3+ GPU
+        box GPU 2's telemetry overwrote GPU 1's panel and GPU 2's own panel never
+        updated.
+
+        Resolution order:
+          1. the per-index registry built in `_create_gpu_widget`
+          2. the `gpu{idx}_{suffix}` attribute (set for every index now)
+          3. None -- the caller does nothing, which is correct for an index with
+             no panel.
+
+        Deliberately NOT falling back to `gpu1_*`: silently writing one device's
+        numbers onto another device's panel is worse than showing nothing.
+        """
+        try:
+            i = int(idx)
+        except (TypeError, ValueError):
+            return None
+        registry = getattr(self, "_gpu_widget_refs", None) or {}
+        refs = registry.get(i)
+        if refs is not None:
+            return refs.get(suffix)
+        return getattr(self, f"gpu{i}_{suffix}", None)
+
     def _set_gpu_bar(self, idx, bar_type, pct, color):
-        """Set a GPU bar value and color."""
-        if idx == 0:
-            bar = getattr(self, f"gpu0_{bar_type}_bar", None)
-        else:
-            bar = getattr(self, f"gpu1_{bar_type}_bar", None)
+        """Set a GPU bar value and color.
+
+        ARCH-ENG-230: THE STYLESHEET IS ONLY REBUILT WHEN IT CHANGED.
+
+        This runs for three bars per GPU every 2 s (15 s when hidden), from
+        `_on_gpu_status_updated`. `QProgressBar.setStyleSheet` is not a plain
+        assignment: it invalidates the widget style, re-runs the polish and
+        relayouts the bar and its ancestors. Four repolish cycles per GPU per
+        tick, writing the same colour almost every time because VRAM zones
+        change rarely.
+        """
+        bar = self._gpu_ref(idx, f"{bar_type}_bar")
         if bar:
             bar.setValue(pct)
-            # Rebuild the stylesheet with the new chunk color
             base = bar.property("base_stylesheet")
             if base:
-                bar.setStyleSheet(base.replace("{CHUNK_COLOR}", color))
+                css = base.replace("{CHUNK_COLOR}", color)
+                if bar.styleSheet() != css:
+                    bar.setStyleSheet(css)
 
     def _set_gpu_detail(self, idx, detail_type, text):
         """Set a GPU detail label. detail_type: 'est', 'act', 'kv'."""
-        label = getattr(self, f"gpu0_{detail_type}_detail", None) if idx == 0 else getattr(self, f"gpu1_{detail_type}_detail", None)
+        label = self._gpu_ref(idx, f"{detail_type}_detail")
         if label:
             label.setText(text)
 
     def _set_gpu_model(self, idx, text):
         """Set the model name label."""
-        label = getattr(self, f"gpu0_model_label", None) if idx == 0 else getattr(self, f"gpu1_model_label", None)
+        label = self._gpu_ref(idx, "model_label")
         if label:
             label.setText(f"Model: {text}")
 
     def _set_gpu_ctx(self, idx, text):
         """Set the context label."""
-        label = getattr(self, f"gpu0_ctx_label", None) if idx == 0 else getattr(self, f"gpu1_ctx_label", None)
+        label = self._gpu_ref(idx, "ctx_label")
         if label:
             label.setText(text)
 
     def _set_gpu_status(self, idx, text):
-        """Set the status line with color."""
-        label = getattr(self, f"gpu0_status", None) if idx == 0 else getattr(self, f"gpu1_status", None)
+        """Set the status line with color.
+
+        ARCH-ENG-230: same re-polish problem as `_set_gpu_bar` -- the colour is
+        one of three values and changes far less often than this runs.
+        """
+        label = self._gpu_ref(idx, "status")
         if label:
             color = "#4caf50" if "✅" in text else "#ff9800" if "⚠️" in text else "#888"
-            label.setStyleSheet(f"color: {color}; font-size: 10px; font-weight: bold; padding-top: 4px;")
+            css = f"color: {color}; font-size: 10px; font-weight: bold; padding-top: 4px;"
+            if label.styleSheet() != css:
+                label.setStyleSheet(css)
             label.setText(text)
 
     def clear_gpu_progress(self, slot: int = 0):
@@ -3367,8 +3433,46 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         except Exception as e:
             self._log(f"❌ Failed to switch {label} model: {e}")
 
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, lambda: self._set_loading(small, False, ""))
+            # ARCH-ENG-182: THIS RAN ON A RAW `threading.Thread`, NOT ON THE QT
+            # THREAD. `_do_restart` is started with `threading.Thread` (see
+            # `_restart_brain_with`), so it has NO Qt event loop.
+            # `QTimer.singleShot(0, ...)` from such a thread posts a timer event
+            # to a loop that does not exist: the callback may never run, and the
+            # brain row is left stuck at "Loading…" with no error anywhere — the
+            # operator's model switch silently did nothing.
+            #
+            # The fix marshals the GUI update through a Qt signal, which Qt
+            # queues onto the GUI thread for us, instead of calling a widget
+            # method (or a timer) directly from a worker.
+            self._clear_loading_on_gui_thread(small)
+
+    def _on_loading_clear_requested(self, small: bool) -> None:
+        """ARCH-ENG-182: GUI-thread handler for a worker's loading-clear request.
+
+        Runs on the Qt thread because the signal is emitted from a worker and
+        this object's thread affinity is the GUI thread, so the connection is
+        queued. Guarded because the widget can be mid-teardown.
+        """
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self._set_loading(bool(small), False, "")
+        except RuntimeError:
+            pass
+
+    def _clear_loading_on_gui_thread(self, small: bool) -> None:
+        """Clear a brain row's Loading state, always on the Qt thread.
+
+        ARCH-ENG-182. Safe to call from a worker thread, from the GUI thread, or
+        mid-teardown: it only emits a signal connected to a plain Qt slot, so Qt
+        performs the queued hand-off. Emitting from a non-GUI thread to a slot on
+        a GUI object is a queued connection, which is exactly the required
+        behaviour — unlike `QTimer.singleShot` from the same thread.
+        """
+        try:
+            self._loading_clear_requested.emit(bool(small))
+        except RuntimeError:
+            pass          # the underlying C++ object is gone; nothing to do
 
     def _continue_model_restart(self, small: bool):
         """Continue a model restart on the Qt GUI thread."""
@@ -3456,68 +3560,97 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         setattr(self, attr, None)
         setattr(self, flag, False)
 
-    def _pid_on_port(self, port: int):
-        """Return the PID bound to 127.0.0.1:<port> (listening), or None."""
-        try:
-            out = subprocess.run(
-                ["netstat", "-ano", "-p", "tcp"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW).stdout
-        except Exception:
-            return None
-        for ln in out.splitlines():
-            parts = ln.split()
-            if len(parts) >= 5 and parts[0] == "TCP":
-                local = parts[1]
-                state = parts[3] if len(parts) >= 5 else ""
-                pid = parts[4]
-                if state == "LISTENING" and local.endswith(f":{port}") and pid.isdigit():
-                    return int(pid)
-        return None
-
     def _pids_on_port(self, port: int):
-        """Return ALL PIDs bound (LISTENING) to 127.0.0.1:<port>.
+        """Every PID LISTENING on `port`, de-duplicated.
 
-        More than one can exist when a duplicate llama-server slipped through
-        (SO_REUSEADDR lets two bind one port) or a stale server from a prior
-        run lingers. Stop must kill every one of them, so this returns a list.
+        ARCH-ENG-187: delegates to the ONE shared implementation in
+        `device_registry`. This copy and `check_llama_process` each had their own
+        version, and they had already drifted apart — one filtered for
+        `llama-server.exe`, the other for `llama.exe`, so each was wrong about a
+        case the other got right. A port's occupancy is a system fact; it does
+        not need to be re-derived per caller.
         """
-        pids = []
-        try:
-            out = subprocess.run(
-                ["netstat", "-ano", "-p", "tcp"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW).stdout
-        except Exception:
-            return pids
-        for ln in out.splitlines():
-            parts = ln.split()
-            if len(parts) >= 5 and parts[0] == "TCP":
-                local = parts[1]
-                state = parts[3]
-                pid = parts[4]
-                if state == "LISTENING" and local.endswith(f":{port}") and pid.isdigit():
-                    pids.append(int(pid))
-        return pids
+        from agents.runtime.device_registry import pids_listening_on
+        return pids_listening_on(port)
+
+    def _process_image_name(self, pid: int) -> str:
+        """Lower-cased executable name for `pid`, or "" if it cannot be read.
+
+        ARCH-ENG-171/187: used to decide whether a PID bound to a brain port is
+        one of OUR llama-server processes and may therefore be killed.
+        """
+        from agents.runtime.device_registry import process_image_name
+        return process_image_name(pid)
+
+    @staticmethod
+    def _is_llama_image(image_name: str) -> bool:
+        """True only for a llama.cpp server image.
+
+        ARCH-ENG-171/187: delegates to the shared predicate. Deliberately
+        narrow — the app spawns `llama-server.exe`, `llama.exe` is the legacy
+        alias some launcher scripts produce, and nothing else is accepted. The
+        whole point is that a port alone does not identify a process we own.
+        """
+        from agents.runtime.device_registry import is_llama_server_image
+        return is_llama_server_image(image_name)
 
     def _kill_llama_on_port(self, port: int):
-        """Kill EVERY process listening on 127.0.0.1:<port>.
+        """Kill every LLAMA-SERVER process listening on 127.0.0.1:<port>.
 
-        Works for servers started outside this panel (CREATE_NO_WINDOW servers
-        have no matching window title) AND removes duplicates/stale instances
-        that share the port — a single-PID kill left the extra server running,
-        which is why "Stop" appeared to leave one open.
+        Works for servers this panel started (CREATE_NO_WINDOW servers have no
+        matching window title) AND removes duplicate/stale instances that share
+        the port — a single-PID kill left the extra server running, which is
+        why "Stop" appeared to leave one open.
+
+        ARCH-ENG-171: THIS USED TO KILL *ANY* PROCESS ON THE PORT.
+
+        There was no image-name verification, so the port was treated as proof
+        of ownership. That is not true here: `ProviderManager._detect_lm_studio`
+        defaults to `http://127.0.0.1:1234/v1`, and 1234 IS the Big Brain port
+        (`agents/runtime/dual_brain.py` ROLE_DEFAULTS). An operator running LM
+        Studio — or anything else that grabbed 1234 first — had it force-killed
+        by pressing Stop on a brain, with no warning and no way to tell why.
+
+        It was also called for servers this app explicitly ADOPTED and promised
+        not to manage (`brain_launch_worker` sets `we_started_* = False` for
+        those, precisely so Stop would leave them alone).
+
+        Now: a PID is killed only if its image name is a llama.cpp server. An
+        unrecognised listener is reported and left running, because destroying
+        a stranger's process is far worse than leaving a port occupied — and the
+        message tells the operator which PID is in the way.
+
+        `netstat` also reports a listener twice for some addresses (`0.0.0.0:`
+        and `[::]:` on v4+v6), so PIDs are de-duplicated before any kill; a
+        repeated kill of the same PID is both wasteful and can race.
         """
         killed = []
+        skipped = []
+        seen = set()
         for pid in self._pids_on_port(port):
+            if pid in seen:
+                continue          # netstat reports v4 and v6 rows for one socket
+            seen.add(pid)
+            image = self._process_image_name(pid)
+            if not self._is_llama_image(image):
+                skipped.append((pid, image or "unknown"))
+                continue
             try:
                 subprocess.run(
                     ["taskkill", "/F", "/PID", str(pid)],
                     capture_output=True, text=True, timeout=5,
+                    encoding="utf-8", errors="replace",
                     creationflags=subprocess.CREATE_NO_WINDOW)
                 killed.append(pid)
             except Exception:
                 pass
+        if skipped:
+            detail = ", ".join(f"PID {p} ({i})" for p, i in skipped)
+            self._log(
+                f"Port {port} is held by a process that is not a llama-server: "
+                f"{detail}. Left running — press Stop again once the port is "
+                f"free, or stop that process yourself."
+            )
         return killed
 
     def _brain_models_url(self, small: bool) -> str:
@@ -3531,47 +3664,6 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             return cfg.models_path or f"http://127.0.0.1:{self._brain_port(small)}/v1/models"
         except Exception:
             return f"http://127.0.0.1:{self._brain_port(small)}/v1/models"
-
-    def _launch_and_wait(self, role_name: str, cmd, port: int):
-        """Launch a server, then prove its endpoint is ready before reporting success."""
-        log_path = os.path.join(tempfile.gettempdir(), f"mrbot-{role_name.lower()}-llama-server.log")
-        try:
-            log_file = open(log_path, "w", encoding="utf-8", errors="replace")
-            proc = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-        except Exception:
-            raise
-
-        deadline = time.monotonic() + 120.0
-        last_error = "server did not answer"
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                log_file.close()
-                try:
-                    with open(log_path, encoding="utf-8", errors="replace") as f:
-                        tail = f.read()[-1200:].strip()
-                except OSError:
-                    tail = ""
-                raise RuntimeError(f"process exited with code {proc.returncode}; log={log_path}\n{tail}")
-            running, models = self.provider_checker.check_llama_server(port, timeout=2)
-            if running:
-                log_file.close()
-                return proc, log_path, models
-            last_error = f"no response on :{port}"
-            time.sleep(1.0)
-
-        log_file.close()
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        raise RuntimeError(f"{last_error} after 15s; log={log_path}")
 
     def _log(self, message):
         """Append a timestamped message to the provider event log.
@@ -3606,6 +3698,15 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
     def cleanup(self):
         """Stop and join provider workers before this control is destroyed."""
         self._closing = True
+        # ARCH-ENG-153: flush any debounced roster edit before teardown. The
+        # panel's only writer is a 400 ms single-shot timer, and closing the
+        # window stops the event loop before it fires — so an edit made in the
+        # last moments was silently discarded on every exit.
+        try:
+            from gui.widgets.brain_roster_panel import flush_pending_roster_edit
+            flush_pending_roster_edit(getattr(self, "brain_roster_panel", None))
+        except Exception:
+            pass
         # v2.1.60 (ARCH-ENG-073): stop the periodic provider-status poller so it
         # doesn't fire after teardown (probing dead ports on a destroyed widget).
         status_timer = getattr(self, "_status_timer", None)
@@ -3632,6 +3733,14 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
             "_small_probe_worker", "_big_probe_worker",
             "_small_stop_worker", "_big_stop_worker",
             "_small_launch_worker", "_big_launch_worker",
+            # ARCH-ENG-181: the prep workers were missing from this list. They
+            # are QThreads that do GGUF inspection before a launch, so one left
+            # running at teardown aborts the process with the access-violation /
+            # exit-139 class this method exists to prevent.
+            "_small_prep_worker", "_big_prep_worker",
+            # ...and so are the per-slot launch workers for extra devices
+            # (slots 2+ in the N-brain roster), which had no teardown at all.
+            *self._slot_launch_worker_names(),
         ):
             worker = getattr(self, name, None)
             try:
@@ -3641,6 +3750,26 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
                     worker.wait(3000)
             except RuntimeError:
                 pass
+
+        # ARCH-ENG-181: CALL THE BACKEND'S cleanup.
+        #
+        # `DualBrainControl(ProviderLifecycleBackend, QWidget)` mixes the backend
+        # in as a base class, and `ProviderLifecycleBackend.cleanup` holds the
+        # carefully-ordered teardown (closing flag FIRST so callbacks stop
+        # re-arming, probe-thread join, then every worker). This override
+        # shadowed it and never called `super()`, so NONE of that ran for the
+        # widget — the one case that matters. The base class docstring is
+        # explicit about the failure it prevents: "letting that escape would
+        # abort teardown and leave the remaining threads running".
+        #
+        # Ordering: this method's own work runs first (it stops the widget's
+        # poller and flushes the roster edit), then the base class performs the
+        # full worker teardown. `_closing` is already set above, so the base
+        # class's re-set is idempotent.
+        try:
+            super().cleanup()
+        except Exception:
+            pass
 
     def _all_gpu_workers(self):
         """Return every live GPUStatusWorker this control has ever started.
@@ -3657,6 +3786,26 @@ class DualBrainControl(ProviderLifecycleBackend, QWidget):
         if current is not None:
             workers.add(current)
         return list(workers)
+
+    def _slot_launch_worker_names(self):
+        """ARCH-ENG-181: attribute names of every per-slot LAUNCH worker.
+
+        The N-brain roster stores extra devices' launchers as
+        `_slot_{n}_launch_worker` (set in `ProviderLifecycleBackend._launch_slot`).
+        Those QThreads had NO teardown at all, so an extra brain's launcher could
+        still be running when Qt destroyed the widget — the "QThread: Destroyed
+        while thread is still running" abort this method exists to prevent.
+
+        Discovered by scanning instance attributes rather than a fixed list, so a
+        slot added later is covered automatically.
+        """
+        import re as _re
+        try:
+            names = list(vars(self))
+        except TypeError:
+            return []
+        return [n for n in names
+                if _re.fullmatch(r"_slot_\d+_launch_worker", n)]
 
 
 # Preserve the historical test/import surface while callers migrate to the

@@ -9,9 +9,40 @@ import os
 import time
 import re
 import json
+import logging
 import xml.etree.ElementTree as ET
 from typing import List, Optional
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+# ARCH-ENG-266 (AP-01): this module's observability was 15 bare print() calls,
+# so every discovery count and every source failure was invisible unless the
+# operator was watching a console. Worse, the "opt-in disabled" lines below are
+# the ONLY place the operator is told that referral and faucet discovery exist
+# at all -- a switched-off feature that is never announced is indistinguishable
+# from one that was never built. Counts/failures go to the logger; the two
+# opt-in states ALSO raise a one-per-process notification through the
+# established NotificationService (the same pattern agents/safety/approval.py
+# uses), because silence there is the defect.
+_ANNOUNCED_OPT_IN: set = set()
+
+
+def _announce_opt_in(feature: str, env_var: str) -> None:
+    """Tell the operator, once per process, that a built feature is off."""
+    if feature in _ANNOUNCED_OPT_IN:
+        return
+    _ANNOUNCED_OPT_IN.add(feature)
+    message = (
+        f"{feature} discovery is built in but switched off. Set "
+        f"{env_var}=1 in .env to enable it."
+    )
+    try:
+        from agents.core.notifications import NotificationService
+        NotificationService.instance().info(f"{feature} discovery is off", message)
+    except Exception as exc:  # never let the notice break discovery
+        logger.debug("Could not raise opt-in notice for %s: %s", feature, exc)
+
 
 import requests
 try:
@@ -188,36 +219,42 @@ class EarningDiscoverer:
         # 1. Reddit r/CryptoCurrency posts
         opps = self._discover_reddit()
         all_opps.extend(opps)
-        print(f"[Discover] Found {len(opps)} from Reddit")
+        logger.info("[Discover] Found %d from Reddit", len(opps))
 
         # 2. Twitter crypto earning posts
         opps = self._discover_twitter_crypto()
         all_opps.extend(opps)
         twitter_state = "bearer token not configured" if not os.getenv("TWITTER_BEARER_TOKEN", "").strip() else "API search not implemented"
-        print(f"[Discover] Found {len(opps)} from Twitter ({twitter_state})")
+        logger.info("[Discover] Found %d from Twitter (%s)", len(opps), twitter_state)
 
         # 3. GitHub bounty programs
         opps = self._discover_github_bounties()
         all_opps.extend(opps)
-        print(f"[Discover] Found {len(opps)} from GitHub")
+        logger.info("[Discover] Found %d from GitHub", len(opps))
 
         # 4. Discord bot commands (simulated - check for bot commands)
         opps = self._discover_discord_bots()
         all_opps.extend(opps)
         discord_state = "bot token not configured" if not os.getenv("DISCORD_BOT_TOKEN", "").strip() else "guild search not implemented"
-        print(f"[Discover] Found {len(opps)} from Discord bots ({discord_state})")
+        logger.info("[Discover] Found %d from Discord bots (%s)", len(opps), discord_state)
 
         # 5. Search for referral programs (opt-in only — disabled by default)
         opps = self._discover_referral_programs()
         all_opps.extend(opps)
         referral_state = "opt-in disabled" if os.getenv("ALLOW_REFERRAL_DISCOVERY", "0").strip().lower() not in ("1", "true", "yes") else "live pages verified"
-        print(f"[Discover] Found {len(opps)} from referral programs ({referral_state})")
+        logger.info("[Discover] Found %d from referral programs (%s)",
+                    len(opps), referral_state)
+        if referral_state == "opt-in disabled":
+            _announce_opt_in("Referral", "ALLOW_REFERRAL_DISCOVERY")
 
         # 6. Faucets and micro-payments (opt-in only — disabled by default)
         opps = self._discover_faucets()
         all_opps.extend(opps)
         faucet_state = "opt-in disabled" if os.getenv("ALLOW_FAUCET_DISCOVERY", "0").strip().lower() not in ("1", "true", "yes") else "live pages verified"
-        print(f"[Discover] Found {len(opps)} from faucets ({faucet_state})")
+        logger.info("[Discover] Found %d from faucets (%s)",
+                    len(opps), faucet_state)
+        if faucet_state == "opt-in disabled":
+            _announce_opt_in("Faucet", "ALLOW_FAUCET_DISCOVERY")
 
         return self._deduplicate(all_opps)
 
@@ -289,7 +326,7 @@ class EarningDiscoverer:
                             required_action="claim", risk_level="medium",
                         ))
         except Exception as e:
-            print(f"  Reddit error: {e}")
+            logger.warning("Reddit error: %s", e)
         return opps
 
     @staticmethod
@@ -305,11 +342,11 @@ class EarningDiscoverer:
         try:
             resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
             if resp.status_code != 200 or not resp.text.strip():
-                print(f"  Reddit JSON unavailable ({resp.status_code}); trying RSS")
+                logger.warning("Reddit JSON unavailable (%s); trying RSS", resp.status_code)
                 return None
             return resp.json()
         except Exception as exc:
-            print(f"  Reddit JSON error ({exc}); trying RSS")
+            logger.warning("Reddit JSON error (%s); trying RSS", exc)
             return None
 
     @staticmethod
@@ -318,7 +355,7 @@ class EarningDiscoverer:
         try:
             resp = requests.get(url, headers={"User-Agent": "MrBot1000-discovery/2.1"}, timeout=10)
             if resp.status_code != 200 or not resp.text.strip():
-                print(f"  Reddit RSS unavailable ({resp.status_code})")
+                logger.warning("Reddit RSS unavailable (%s)", resp.status_code)
                 return None
             root = ET.fromstring(resp.text)
             children = []
@@ -330,7 +367,7 @@ class EarningDiscoverer:
                 children.append({"data": {"id": entry_id, "title": title, "selftext": "", "url": link_url}})
             return {"data": {"children": children}}
         except Exception as exc:
-            print(f"  Reddit RSS error ({exc})")
+            logger.warning("Reddit RSS error (%s)", exc)
             return None
 
     def _discover_twitter_crypto(self) -> List[EarningOpportunity]:
@@ -369,7 +406,7 @@ class EarningDiscoverer:
                 timeout=15,
             )
             if resp.status_code != 200:
-                print(f"  GitHub search unavailable ({resp.status_code})")
+                logger.warning("GitHub search unavailable (%s)", resp.status_code)
                 return []
             issues = resp.json().get("items", [])
 
@@ -441,7 +478,7 @@ class EarningDiscoverer:
                     min_amount=bounty, payment_type="usd", required_action="submit_pr"))
 
         except Exception as e:
-            print(f"  GitHub error: {e}")
+            logger.warning("GitHub error: %s", e)
 
         return opps
 

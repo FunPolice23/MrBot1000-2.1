@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
     QPushButton, QLineEdit, QPlainTextEdit, QMessageBox,
@@ -36,9 +36,6 @@ from agents.safety.approval import (
 
 class RegistrationPanel(QWidget):
     """Operator-driven, approval-gated platform registration."""
-
-    # Emitted after a registration attempt so a parent can log/refresh.
-    registration_done = Signal(str, bool, str)  # platform, ok, message
 
     def __init__(self, parent: Optional[QWidget] = None,
                  service=None, vault=None, approval_queue=None):
@@ -266,7 +263,6 @@ class RegistrationPanel(QWidget):
         ok = bool(out.get("ok"))
         msg = out.get("reason") or out.get("note") or ""
         self.status.setText(("Registered: " if ok else "Registration refused: ") + msg)
-        self.registration_done.emit(platform, ok, msg)
         if not ok:
             QMessageBox.information(self, "Registration", msg or "refused")
 

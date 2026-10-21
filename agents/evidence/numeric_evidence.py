@@ -72,13 +72,20 @@ def unsupported_values(response_text: str, context_text: str) -> List[str]:
     """Monetary values cited in the response but absent from the supplied context.
 
     Returns the raw matched strings (e.g. ``"$9,999.00"``) for reporting. An empty
-    list means every cited value is backed by the context.
+    list means every cited value is backed by the context (zero is exempt:
+    ARCH-ENG-308 -- it can only understate earnings, never fabricate them).
     """
     supported = set(extract_monetary_values(context_text))
     out: List[str] = []
     seen: set[Decimal] = set()
     for raw, value in extract_monetary_spans(response_text):
-        if value in supported or value in seen:
+        # ARCH-ENG-308: a zero cannot be fabricated earnings -- it can only
+        # understate them, and small models routinely write "$0" as shorthand
+        # for an unpaid listing. Reporting it as an "unsupported value" asked
+        # the operator to verify nothing, which drowned real findings in
+        # noise. Zero needs no context evidence; every nonzero value is
+        # checked exactly as before.
+        if value == 0 or value in supported or value in seen:
             continue
         seen.add(value)
         out.append(raw)

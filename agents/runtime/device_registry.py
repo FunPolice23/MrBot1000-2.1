@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -135,6 +137,20 @@ def _settings_path(root: Optional[str] = None) -> str:
     return os.path.join(base, SETTINGS_FILE)
 
 
+# ARCH-ENG-172: one lock for every settings.json read-modify-write.
+#
+# `merge_settings_file` is called from main.py and brain_roster.py;
+# `save_policy` from five sites in dual_brain_control.py. Both are read-merge-
+# write, and neither was synchronized, so an interleaving pair silently dropped
+# one writer's top-level key. A ReentrantLock is used because `save_policy` and
+# `merge_settings_file` call into each other's helpers.
+#
+# This is the same failure mode as ARCH-ENG-162 (`_persist` in
+# OpportunityLifecycleTracker): an unserialized read-modify-write over a shared
+# file, where the last writer wins and the other writer's data is gone.
+_SETTINGS_WRITE_LOCK = threading.RLock()
+
+
 def policy_path(root: Optional[str] = None) -> str:
     """Return the device-policy file path, honoring the test isolation override.
 
@@ -186,8 +202,49 @@ def merge_settings_file(updates: dict, root: Optional[str] = None) -> bool:
     destructive effect.
 
     Every writer to this shared file must go through this function.
+
+    ARCH-ENG-172: "must go through this function" was NOT TRUE. Both this
+    function and ``save_policy`` duplicated the read-merge-write, so a
+    ``save_policy`` call could interleave with a ``merge_settings_file`` call.
+
+    Two defects, both real on this path:
+
+    1. NO LOCK AROUND THE WHOLE SEQUENCE. Read -> ``data.update`` -> write is
+       three steps. ``merge_settings_file`` is called from ``main.py`` and
+       ``brain_roster.py``; ``save_policy`` from five sites in
+       ``dual_brain_control.py``. A ``devices`` save that read the file a
+       millisecond before a ``roster`` save wrote it would then replace it with
+       a snapshot that has no ``roster`` key — silently discarding an operator
+       edit. There is no merge-at-write, so last-writer-wins drops the other
+       writer's key entirely.
+
+    2. A COLLIDING TEMP NAME. Both used ``f"{path}.tmp-{os.getpid()}"``. The PID
+       is per-PROCESS, so every writer inside one process shared ONE temp file.
+       Two threads opened it for writing: the second truncated the first's
+       output mid-``json.dump``, and whichever reached ``os.replace`` first
+       published a TRUNCATED settings file. The next read hits
+       ``json.JSONDecodeError`` and quarantines the operator's settings as
+       corrupt — losing per-device models, roles, and every tuning value.
+
+    Fixed with a module-level lock around the whole sequence and a per-writer
+    temp name. Note this is the same failure mode as ARCH-ENG-162 in
+    ``OpportunityLifecycleTracker._persist``, one file format over: a fixed temp
+    path plus an unserialized read-modify-write.
     """
     path = policy_path(root)
+    with _SETTINGS_WRITE_LOCK:
+        return _merge_and_write_settings(path, updates)
+
+
+def _read_settings_for_merge(path: str) -> tuple:
+    """Read settings.json for a merge, quarantining an unparseable file.
+
+    Returns ``(data, corrupt_reason)``. Never raises and never deletes operator
+    data: an unreadable file is ROTATED ASIDE to ``<name>.corrupt-<n>`` so the
+    operator can inspect it, then the caller writes a clean file. Doing the
+    quarantine inside the merge rather than the write is what ARCH-ENG-055 fixed
+    — previously one unreadable byte made every future save fail silently.
+    """
     data: dict = {}
     corrupt: Optional[str] = None
     if os.path.exists(path):
@@ -201,8 +258,6 @@ def merge_settings_file(updates: dict, root: Optional[str] = None) -> bool:
         except (OSError, ValueError, UnicodeDecodeError) as exc:
             corrupt = f"{type(exc).__name__}: {exc}"
     if corrupt is not None:
-        # Same quarantine as save_policy: never overwrite operator data we could
-        # not read, and never delete it.
         try:
             n = 1
             while True:
@@ -213,9 +268,22 @@ def merge_settings_file(updates: dict, root: Optional[str] = None) -> bool:
             os.replace(path, cand)
         except OSError:
             pass
-    data.update(updates)
+    return data, corrupt
+
+
+def _atomic_write_settings(path: str, data: dict) -> bool:
+    """Write `data` to `path` atomically, with a PER-WRITER temp name.
+
+    ARCH-ENG-172: the temp name used to be ``<path>.tmp-<pid>``. A PID is
+    per-PROCESS, so two threads in one process shared one temp file: the second
+    truncated the first's output mid-``json.dump`` and the survivor published a
+    truncated settings file, which the next read quarantined as corrupt —
+    destroying every per-device model, role and tuning value the operator had
+    set. The name now includes the thread id so each writer owns its file.
+    """
+    import threading as _threading
+    tmp = f"{path}.tmp-{os.getpid()}-{_threading.get_ident()}"
     try:
-        tmp = f"{path}.tmp-{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
             f.flush()
@@ -229,6 +297,13 @@ def merge_settings_file(updates: dict, root: Optional[str] = None) -> bool:
         except OSError:
             pass
         return False
+
+
+def _merge_and_write_settings(path: str, updates: dict) -> bool:
+    """Read-merge-write settings.json. Caller must hold `_SETTINGS_WRITE_LOCK`."""
+    data, _corrupt = _read_settings_for_merge(path)
+    data.update(updates)
+    return _atomic_write_settings(path, data)
 
 
 def save_policy(policy: DevicePolicy, root: Optional[str] = None) -> bool:
@@ -242,53 +317,37 @@ def save_policy(policy: DevicePolicy, root: Optional[str] = None) -> bool:
     lived inside the same ``try`` as the write, so one unreadable byte made
     ``save_policy`` return False forever and per-device settings never
     persisted again — the operator lost every edit with no error anywhere.
+
+    ARCH-ENG-172: this duplicated `merge_settings_file`'s read-merge-write
+    verbatim, and both were unsynchronized. It now shares one locked helper, so
+    a device-policy save can no longer overwrite a `roster`/`providers` key
+    written a millisecond earlier by `main.py` or `brain_roster.py`.
     """
     path = policy_path(root)
-    data: dict = {}
-    corrupt: Optional[str] = None
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data = loaded
-            else:
-                corrupt = "not a JSON object"
-        except (OSError, ValueError, UnicodeDecodeError) as exc:
-            corrupt = f"{type(exc).__name__}: {exc}"
-    if corrupt is not None:
-        # Quarantine the bad file so the operator can inspect it, then write a
-        # clean policy. Never delete operator data outright.
-        try:
-            n = 1
-            while True:
-                cand = f"{path}.corrupt-{n}"
-                if not os.path.exists(cand):
-                    break
-                n += 1
-            os.replace(path, cand)
-        except OSError:
-            pass
-    data.setdefault("devices", {})
-    data["devices"]["enabled"] = dict(policy.enabled)
-    data["devices"]["role"] = dict(policy.role)
-    data["devices"]["models"] = dict(policy.models)
-    data["devices"]["settings"] = {k: dict(v) for k, v in policy.settings.items()}
-    try:
-        tmp = f"{path}.tmp-{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        return True
-    except OSError:
-        try:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-        except OSError:
-            pass
-        return False
+    updates: dict = {"devices": {}}
+    updates["devices"]["enabled"] = dict(policy.enabled)
+    updates["devices"]["role"] = dict(policy.role)
+    updates["devices"]["models"] = dict(policy.models)
+    updates["devices"]["settings"] = {k: dict(v) for k, v in policy.settings.items()}
+
+    with _SETTINGS_WRITE_LOCK:
+        data, _corrupt = _read_settings_for_merge(path)
+        # Merge, do not replace: `data["devices"]` may already carry keys this
+        # policy does not model, and every OTHER top-level key (roster,
+        # providers, theme) must survive untouched.
+        devices = data.get("devices")
+        if not isinstance(devices, dict):
+            devices = {}
+        for key, value in updates["devices"].items():
+            devices[key] = value
+        data["devices"] = devices
+        written = _atomic_write_settings(path, data)
+        if written:
+            # ARCH-ENG-221: a policy edit changes which devices are enabled and
+            # which role owns what, so any cached detection result is now stale
+            # by definition. Only on success -- a failed write changed nothing.
+            invalidate_device_cache()
+        return written
 
 
 # ── Detection ────────────────────────────────────────────────────────────────
@@ -348,6 +407,17 @@ def _run_nvidia_smi(query: str) -> str:
     whichever of the three standard streams it is given, and leaving stdin
     implicit made it inherit the capture pipe. So all three are named
     explicitly here.
+
+    ARCH-ENG-186: RETURN AN EMPTY STRING ON A NON-ZERO EXIT.
+    `check=False` with a discarded return code meant a FAILED nvidia-smi was
+    indistinguishable from a successful one that happened to print nothing: its
+    stdout (which is where a driver error would not go — stderr is DEVNULL)
+    was returned and parsed. The two callers redirected here by ARCH-ENG-166
+    (`provider_manager._detect_gpus`, `llm.detect_vram_gb`) each used to check
+    `result.returncode == 0` on their own copy of the call, so routing them here
+    silently dropped that check. A non-zero exit now yields "" — the same
+    "no devices" answer the callers produced before, and the only honest one:
+    a query that did not succeed says nothing about what hardware is present.
     """
     import subprocess
     import tempfile
@@ -365,11 +435,15 @@ def _run_nvidia_smi(query: str) -> str:
     try:
         fd, path = tempfile.mkstemp(prefix="mrb_smi_", suffix=".csv")
         handle = os.fdopen(fd, "w+", encoding="utf-8", errors="replace")
-        subprocess.run(argv,
-                       stdin=subprocess.DEVNULL,
-                       stdout=handle,
-                       stderr=subprocess.DEVNULL,
-                       timeout=5, creationflags=flags, check=False)
+        result = subprocess.run(argv,
+                                stdin=subprocess.DEVNULL,
+                                stdout=handle,
+                                stderr=subprocess.DEVNULL,
+                                timeout=5, creationflags=flags, check=False)
+        if getattr(result, "returncode", 0) != 0:
+            # ARCH-ENG-186: the query failed; report no rows rather than
+            # whatever partial text landed in the temp file.
+            return ""
         handle.flush()
         handle.seek(0)
         return handle.read()
@@ -384,6 +458,129 @@ def _run_nvidia_smi(query: str) -> str:
                 os.unlink(path)
             except Exception:
                 pass
+
+
+# ── Local process introspection ───────────────────────────────────────────────
+# ARCH-ENG-187: ONE implementation, shared by the two callers that need it.
+#
+# `DualBrainControl` and `ProviderStatusChecker.check_llama_process` both need to
+# answer "is a llama.cpp server listening on this port, and whose is it". They
+# each had their own copy, and the copies had already diverged into two
+# different bugs (below). The two facts that must be right are:
+#
+#   * which executable names count as "ours" — the app spawns `llama-server.exe`,
+#     while one copy filtered for `llama.exe` and therefore ALWAYS reported
+#     "no llama process", which reads as a confident negative;
+#   * that a port alone is not proof of ownership — 1234 is both the Big Brain
+#     port and LM Studio's default, so a port-only check either kills a stranger
+#     (ARCH-ENG-171) or, at best, cannot say which process it found.
+
+
+def _run_windows_text(argv: List[str], timeout: float = 5.0) -> str:
+    """Run a Windows console tool and return its stdout, hardened.
+
+    ARCH-ENG-116: all three standard handles are named EXPLICITLY. Leaving
+    `stdin` implicit made the child inherit the parent's capture pipe, and
+    `_get_handles` must duplicate whichever handles it is given — which fails
+    with `OSError(22, 'The request is not supported')` / WinError 50 under
+    `pytest --capture=fd`. A non-zero exit yields "" (see `_run_nvidia_smi`,
+    ARCH-ENG-186: a query that did not succeed says nothing).
+    """
+    import subprocess
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout, creationflags=flags, check=False,
+        )
+    except Exception:
+        return ""
+    if getattr(result, "returncode", 0) != 0:
+        return ""
+    return (getattr(result, "stdout", b"") or b"").decode(
+        "utf-8", errors="replace")
+
+
+#: Executable names this application may treat as its own llama.cpp server.
+#:
+#: ARCH-ENG-187: the app spawns `llama-server.exe` (see `BrainLaunchWorker`).
+#: `llama.exe` is the legacy alias some launcher scripts produce. Nothing else is
+#: accepted — the whole point is that a port does not identify a process we own.
+_LLAMA_SERVER_IMAGES = ("llama-server", "llama")
+
+
+def is_llama_server_image(image_name: str) -> bool:
+    """True only for a llama.cpp server executable name.
+
+    ARCH-ENG-187: deliberately narrow, and deliberately NOT "contains llama" —
+    `llama-server-helper.exe` and `xllama.exe` are somebody else's process.
+    """
+    name = (image_name or "").strip().lower()
+    if not name.endswith(".exe"):
+        return False
+    return name[:-4] in _LLAMA_SERVER_IMAGES
+
+
+def process_image_name(pid: int) -> str:
+    """Lower-cased executable name for `pid`, or "" if it cannot be read."""
+    try:
+        out = _run_windows_text(
+            ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"])
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        parts = [p.strip().strip('"') for p in line.split('","')]
+        if not parts:
+            continue
+        name = parts[0].strip('"').strip()
+        if name.lower().endswith(".exe"):
+            return name.lower()
+    return ""
+
+
+def pids_listening_on(port: int) -> List[int]:
+    """Every PID in LISTENING state on `port`, de-duplicated.
+
+    More than one can exist when a duplicate llama-server slipped through
+    (SO_REUSEADDR lets two bind one port) or a stale server from a prior run
+    lingers. `netstat` also reports one socket twice for some addresses
+    (`0.0.0.0:` and `[::]:` across v4+v6), so the list is de-duplicated here
+    rather than by each caller — a repeated kill of the same PID is both
+    wasteful and can race.
+    """
+    try:
+        want = int(port)
+    except (TypeError, ValueError):
+        return []
+    out = _run_windows_text(["netstat", "-ano", "-p", "tcp"])
+    pids: List[int] = []
+    seen = set()
+    for ln in out.splitlines():
+        parts = ln.split()
+        if len(parts) >= 5 and parts[0] == "TCP":
+            local, state, pid = parts[1], parts[3], parts[4]
+            if state == "LISTENING" and local.endswith(f":{want}") and pid.isdigit():
+                value = int(pid)
+                if value not in seen:
+                    seen.add(value)
+                    pids.append(value)
+    return pids
+
+
+def llama_server_pids_on(port: int) -> List[int]:
+    """The PIDs on `port` that are llama.cpp servers OURS may manage.
+
+    The port tells you WHO IS THERE; the image name tells you WHOSE IT IS.
+    Callers that kill what this returns can no longer destroy a stranger's
+    process (ARCH-ENG-171), and callers that merely probe no longer report a
+    confident "no server" when the listener was a different program
+    (ARCH-ENG-187).
+    """
+    return [pid for pid in pids_listening_on(port)
+            if is_llama_server_image(process_image_name(pid))]
 
 
 def _detect_gpus() -> List[ComputeDevice]:
@@ -471,12 +668,67 @@ def _detect_gpus() -> List[ComputeDevice]:
     return devices
 
 
+# ARCH-ENG-221: (monotonic_now, devices) for the detection cache below.
+_DEVICE_CACHE: Optional[tuple] = None
+
+# How long a detection result may be reused. Matching `DUAL_BRAIN_HEALTH_TTL`
+# (10 s) so the two caches on the display path age at the same rate.
+_DEVICE_CACHE_TTL_S = float(os.getenv("MRBOT_DEVICE_CACHE_TTL", "10"))
+
+
+def invalidate_device_cache() -> None:
+    """ARCH-ENG-221: force the next `detect_devices` to re-run nvidia-smi.
+
+    Needed by anything that changes what is attached -- a provider start or
+    stop, a device policy edit, or a UI action that wants live truth right now
+    rather than up to one TTL old.
+    """
+    global _DEVICE_CACHE
+    _DEVICE_CACHE = None
+
+
 def detect_devices(include_cpu: bool = True) -> List[ComputeDevice]:
-    """All detected compute devices: GPUs (by VRAM desc) then the CPU pool."""
+    """All detected compute devices: GPUs (by VRAM desc) then the CPU pool.
+
+    ARCH-ENG-221: NOW CACHED. THIS RAN ON EVERY CHAT TURN.
+
+    `_hardware_line()` in both `big_brain.py:200` and `small_brain.py:170` calls
+    this to build one line of the system prompt. `_detect_gpus()` spawns
+    `nvidia-smi` as a subprocess and parses its output, so the whole NVML
+    cold-start plus process creation was paid once per prompt, per brain --
+    measured at hundreds of milliseconds on a loaded 6-core machine, for a
+    string that cannot change between turns.
+
+    `_detect_gpus` itself is deliberately left UNCACHED, because tests patch it
+    directly and a cache there would silently serve one test's mock to another.
+
+    A copy of the list is returned so a caller sorting or mutating it cannot
+    corrupt the cache.
+    """
+    global _DEVICE_CACHE, _LAST_DETECT_ERROR
+    now = time.monotonic()
+    # `include_cpu` changes the RESULT, not just the length, so it is part of
+    # the key. Caching on time alone would let a `include_cpu=False` caller be
+    # handed a list containing the CPU pool.
+    if (_DEVICE_CACHE is not None
+            and _DEVICE_CACHE[0] == include_cpu
+            and (now - _DEVICE_CACHE[2]) < _DEVICE_CACHE_TTL_S):
+        # ARCH-ENG-222: restore the error string that was captured WITH these
+        # devices. `_LAST_DETECT_ERROR` is module-global state written by
+        # `_detect_gpus`, and `dual_brain_control.py:800` reads it to show the
+        # reboot hint. Without this, a cache hit returned a device list from the
+        # previous probe while the error text described a DIFFERENT probe --
+        # two observations from two moments presented as one. That is the
+        # ARCH-ENG-179/185/188 defect in a new place.
+        _LAST_DETECT_ERROR = _DEVICE_CACHE[3]
+        return list(_DEVICE_CACHE[1])
+
     devices = _detect_gpus()
+    detect_error = _LAST_DETECT_ERROR
     devices.sort(key=lambda d: d.memory_gb, reverse=True)
     if include_cpu:
         devices.append(_detect_cpu())
+    _DEVICE_CACHE = (include_cpu, list(devices), now, detect_error)
     return devices
 
 
@@ -589,7 +841,8 @@ def format_assignments(assignments: List[DeviceAssignment]) -> str:
 
 __all__ = [
     "ComputeDevice", "DevicePolicy", "DeviceAssignment",
-    "detect_devices", "load_policy", "save_policy", "resolve_assignments",
+    "detect_devices", "invalidate_device_cache", "load_policy", "save_policy",
+    "resolve_assignments",
     "brain_placements", "format_assignments", "policy_path",
     "BIG_VRAM_GB", "SMALL_VRAM_GB",
 ]

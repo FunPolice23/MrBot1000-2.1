@@ -40,3 +40,16 @@ def test_discussion_exhausts_budget_without_fabricating_consensus():
         "jacob", DiscussionPurpose.VERIFY, "Insufficient evidence"))
     assert discussion.status is DiscussionStatus.BUDGET_EXHAUSTED
     assert discussion.resolution == ""
+
+
+# ARCH-ENG-233: relocated from tests/runtime/test_collaboration_failures.py,
+# which was deleted with the CognitionRecord island. This half tests the live
+# BoundedDiscussion: once the turn budget is fully consumed, further turns are
+# rejected even when they would otherwise be admissible.
+def test_discussion_rejects_turns_after_budget_is_fully_consumed():
+    discussion = BoundedDiscussion("verify", max_turns=1)
+    assert discussion.add_turn(DiscussionTurn(
+        "Edward", DiscussionPurpose.PROPOSE, "proposal"))
+    assert not discussion.add_turn(DiscussionTurn(
+        "Jacob", DiscussionPurpose.CHALLENGE, "retry", ["ev-1"]))
+    assert discussion.status is DiscussionStatus.BUDGET_EXHAUSTED

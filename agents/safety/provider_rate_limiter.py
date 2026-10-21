@@ -30,13 +30,21 @@ from app.library import TokenBucket
 
 # Providers that run on the user's own hardware — no monetary cost, so never
 # $-capped by default. Rate-limit still applies (they share CPU/GPU).
-_LOCAL_MARKERS = ("ollama", "local", "llama", "llamacpp", "vllm", "lmstudio",
-                  "koboldcpp")
+#
+# Classification is delegated to the single canonical implementation
+# (agents.safety.cost.is_local_provider) so the budget guard and the rate
+# limiter can never disagree about what is local. It matches the dual-brain
+# adapter names (big-brain/small-brain) and the LOCAL_PROVIDERS set by exact /
+# spelling-robust comparison — deliberately NOT bare substring: a substring
+# match classified cloud providers such as ``llama-cloud`` and
+# ``localstack-cloud`` as local (they contain "llama"/"local"), letting them
+# escape the daily cap while the FREE local brain was correctly uncapped.
 
 
 def is_local_provider(name: str) -> bool:
-    n = (name or "").lower()
-    return any(m in n for m in _LOCAL_MARKERS)
+    """True for on-machine providers (never $-capped by default)."""
+    from agents.safety.cost import is_local_provider as _canonical
+    return _canonical(name)
 
 
 # Provider-aware defaults: (rate_per_sec, max_calls_per_day). Local providers get

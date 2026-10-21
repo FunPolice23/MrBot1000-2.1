@@ -33,10 +33,11 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 SCANNER_PATH = os.path.join(
-    r"D:\MrBot1000_2.0", "agents", "earning", "airdrop_scanner.py"
+    str(Path(__file__).resolve().parents[2]), "agents", "earning", "airdrop_scanner.py"
 )
 
 BTC_PRICE_HEADLINE = "Bitcoin holds at $95,000 as airdrop season begins"

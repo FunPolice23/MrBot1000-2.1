@@ -301,7 +301,14 @@ class FreelanceFinder:
             "api", "backend", "frontend", "fullstack", "mobile", "ios", "android",
         ]
         text_lower = text.lower()
-        return [s for s in common_skills if s in text_lower]
+        # ARCH-ENG-263 (AU-01): substring matching made short tokens fire
+        # inside unrelated words -- "ai" in "email"/"training", "sql" in
+        # "mysql", "api" in "capital", "ios" in "opinions" -- so a gig could
+        # inherit skills it never mentioned. Word boundaries are the contract
+        # the list's entries are written in ("data analysis" still matches as
+        # a phrase; "node" still matches "node.js").
+        return [s for s in common_skills
+                if re.search(r"\b" + re.escape(s) + r"\b", text_lower)]
 
     @staticmethod
     def _extract_time(text: str) -> str:

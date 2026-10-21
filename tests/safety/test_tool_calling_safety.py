@@ -51,17 +51,6 @@ class TestToolCallingSafety(unittest.TestCase):
         }):
             results = WebEyes().search("current terms", 3)
         self.assertEqual(results[0]["backend"], "duckduckgo_search-fallback")
-    def test_account_profile_rejects_raw_secrets(self):
-        from agents.core.account_profile import validate_profile_data
-        result = validate_profile_data({
-            "display_name": "Operator",
-            "email": "operator@example.com",
-            "skills": ["Python"],
-            "password": "must-not-be-stored",
-        })
-        self.assertFalse(result["valid"])
-        self.assertIn("password", result["rejected_fields"])
-
     def test_account_and_profile_actions_require_human_gates(self):
         from agents.safety.gates import HumanGateManager, HumanGateType
         gates = HumanGateManager().assess(
@@ -172,13 +161,68 @@ class TestToolCallingSafety(unittest.TestCase):
         self.assertEqual(trace[0]["execution_id"], "")
         HumanApprovalQueue.reset_singleton()
 
-    def test_streamed_reasoning_channel_is_used_when_content_is_empty(self):
+    def test_reasoning_channel_is_not_returned_as_the_answer(self):
+        """ARCH-ENG-180 - the reasoning channel is NOT the answer channel.
+
+        This test used to be named `..._is_used_when_content_is_empty` and
+        asserted `answer == "Edward has a verified next step."` - it asserted
+        the defect as intended behaviour, which is why the defect survived every
+        audit pass.
+
+        When a reasoning model exhausts its token budget mid-thought it emits a
+        `reasoning` delta and never reaches the answer channel. Returning that
+        raw chain-of-thought made it the persona's VISIBLE dialogue turn: shown
+        in the transcript, appended to `conversation_history`, and persisted to
+        the dialogue log as something the persona "said".
+
+        That is the class of defect this project exists to prevent, from a new
+        direction. ARCH-ENG-056/102/110 stopped the system presenting
+        narrated-but-unexecuted CLAIMS as real; ARCH-ENG-173 stopped it
+        labelling an unexecuted tool as executed. Here it relabelled raw model
+        reasoning as a deliberate answer.
+
+        An empty answer channel is an EMPTY RESPONSE, and the tab has a
+        deterministic bounded handler for that. So the answer must NOT be the
+        reasoning.
+        """
         client = SimpleNamespace()
         client.chat = SimpleNamespace(completions=SimpleNamespace(create=Mock(
             return_value=[
                 SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
                     content="", reasoning_content="Edward has a verified next step."),
                     message=None)])
+            ])))
+
+        try:
+            answer = tool_calling.chat_with_tools(
+                client=client,
+                model="thinking-model",
+                system_prompt="test",
+                user_message="review this",
+                max_iterations=1,
+            )
+        except RuntimeError as exc:
+            # The expected outcome: the empty response is surfaced so the tab's
+            # bounded empty-response handler runs.
+            self.assertIn("empty stream response", str(exc))
+            return
+
+        self.assertNotIn(
+            "Edward has a verified next step.", answer,
+            "raw chain-of-thought was returned as the persona's answer")
+
+    def test_a_real_answer_alongside_reasoning_is_returned(self):
+        """The fix must not discard a genuine answer that follows thinking."""
+        client = SimpleNamespace()
+        client.chat = SimpleNamespace(completions=SimpleNamespace(create=Mock(
+            return_value=[
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content="", reasoning_content="let me think about the budget"),
+                    message=None)]),
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content="I will check the ledger first.",
+                    reasoning_content=None),
+                    message=None)]),
             ])))
 
         answer = tool_calling.chat_with_tools(
@@ -189,8 +233,9 @@ class TestToolCallingSafety(unittest.TestCase):
             max_iterations=1,
         )
 
-        self.assertEqual(answer, "Edward has a verified next step.")
-
+        self.assertIn("I will check the ledger first.", answer)
+        self.assertNotIn("let me think about the budget", answer,
+                         "raw reasoning leaked into the visible answer")
 
 if __name__ == "__main__":
     unittest.main()

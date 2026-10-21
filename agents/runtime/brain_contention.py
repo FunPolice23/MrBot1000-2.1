@@ -35,8 +35,31 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Leave headroom so the estimate itself, the CUDA context, and OS/driver
 # overhead never push a "just fits" placement over the edge.
-VRAM_SAFETY_MARGIN_GB = 1.0
+# Reduced from 1.0 GB to 0.5 GB to allow launches with modest VRAM shortfalls
+# (the previous margin was overly conservative for many mid‑range GPUs).
+VRAM_SAFETY_MARGIN_GB = 0.5
 RAM_SAFETY_MARGIN_GB = 2.0
+
+# ARCH-ENG-220: HOST-SIDE MEMORY A GPU BRAIN STILL COSTS.
+#
+# `estimate_model_ram_gb` used to add KV to system RAM only when
+# `gpu_layers == 0`. With full GPU offload the offload fraction is 1.0, so the
+# estimate collapsed to exactly 0.0 -- the model claimed a fully-offloaded GPU
+# brain consumes NO system RAM at all.
+#
+# That hides real memory pressure on exactly the machines that need it most. A
+# GPU-resident brain still costs host memory for the CUDA context and driver
+# allocations, the staging buffers the backend uses to move tensors across PCIe,
+# and host-side allocator slack the CUDA caching allocator does not return.
+#
+# On a 6 GB card (a GTX 1660 Super, say) the KV cache for a large context is the
+# part that does NOT fit alongside the weights. llama.cpp spills it to system
+# RAM rather than failing, so a brain can look fine on VRAM and still be one
+# context increase away from exhausting the host -- the failure mode that shows
+# up as a machine that suddenly cannot launch anything.
+#
+# So: KV that does not fit in VRAM is charged to system RAM.
+HOST_OVERHEAD_GB = 0.6
 
 
 # ── Footprint estimation ────────────────────────────────────────────────────
@@ -129,6 +152,58 @@ def estimate_model_ram_gb(model_path: str, gpu_layers: Optional[int], ctx: int,
     return ram
 
 
+def estimate_kv_spill_gb(weights_vram_gb: float, kv_gb: Optional[float],
+                         device_vram_gb: Optional[float]) -> float:
+    """ARCH-ENG-220: KV that cannot fit in VRAM and therefore lands in system RAM.
+
+    Weights are placed first -- they are what the device is for -- so whatever
+    VRAM remains after them is what KV competes for. Any excess spills to host
+    memory, which is how llama.cpp actually behaves rather than a failure mode.
+
+    A `device_vram_gb` of None means "unknown" and yields NO spill. Callers fail
+    closed on unknown totals elsewhere; inventing a spill figure from an unknown
+    card size would be a guess presented as a measurement.
+    """
+    if not kv_gb or kv_gb <= 0:
+        return 0.0
+    if device_vram_gb is None or device_vram_gb <= 0:
+        return 0.0
+    room = max(0.0, float(device_vram_gb) - float(weights_vram_gb))
+    return max(0.0, float(kv_gb) - room)
+
+
+def brain_ram_footprint_gb(model_path: str, gpu_layers: Optional[int], ctx: int,
+                           device_vram_gb: Optional[float] = None,
+                           *, weights_gb: Optional[float] = None,
+                           n_layer: Optional[float] = None,
+                           kv_gb: Optional[float] = None) -> Optional[float]:
+    """ARCH-ENG-220: system RAM a brain occupies, GPU brains included.
+
+    Composes three parts:
+
+      * non-offloaded weight layers resident in host memory
+      * KV that spilled because the device could not hold it
+      * a flat host overhead per brain (CUDA context, staging buffers)
+
+    `estimate_model_ram_gb` is retained unchanged for callers that want the
+    weights-only figure; the gates use this one.
+    """
+    fp = _resolve_footprint(model_path, gpu_layers, ctx,
+                            weights_gb=weights_gb, n_layer=n_layer, kv_gb=kv_gb)
+    if fp is None:
+        return None
+    frac = _offload_fraction(gpu_layers, fp["n_layer"])
+    ram = fp["weights_gb"] * (1.0 - frac)
+    if gpu_layers == 0:
+        # CPU-only: the whole KV cache lives in system RAM too.
+        ram += fp["kv_gb"]
+    else:
+        ram += estimate_kv_spill_gb(fp["weights_gb"] * frac, fp["kv_gb"],
+                                    device_vram_gb)
+        ram += HOST_OVERHEAD_GB
+    return ram
+
+
 # ── Placement accessors (tolerant of dict or object) ────────────────────────
 
 def _get(placement: Any, key: str, default=None):
@@ -181,8 +256,16 @@ def device_headroom(device: Any, placements: List[Any],
         nl = _get(p, "n_layer", None)
         kv = _get(p, "kv_gb", None)
         v = estimate_model_vram_gb(model, gl, ctx, weights_gb=w, n_layer=nl, kv_gb=kv)
-        r = estimate_model_ram_gb(model, gl, ctx, weights_gb=w, n_layer=nl, kv_gb=kv)
-        if v is not None and is_gpu and _placement_on_device(p, device):
+        on_this_device = is_gpu and _placement_on_device(p, device)
+        # ARCH-ENG-220: pass THIS device's VRAM so KV that does not fit is
+        # charged to system RAM. Previously the RAM figure was weights-only for a
+        # fully-offloaded brain, so a GPU placement consumed 0 GB of host memory
+        # no matter how much KV it spilled.
+        r = brain_ram_footprint_gb(
+            model, gl, ctx,
+            device_vram_gb=(device.memory_gb if on_this_device else None),
+            weights_gb=w, n_layer=nl, kv_gb=kv)
+        if v is not None and on_this_device:
             vram_used += v
         if r is not None:
             ram_used += r
@@ -221,7 +304,15 @@ def can_add_brain(device: Any, placements: List[Any], candidate: Any,
 
     is_gpu = getattr(device, "is_gpu", False)
     cand_vram = estimate_model_vram_gb(model, gl, ctx, weights_gb=w, n_layer=nl, kv_gb=kv) if is_gpu else 0.0
-    cand_ram = estimate_model_ram_gb(model, gl, ctx, weights_gb=w, n_layer=nl, kv_gb=kv)
+    # ARCH-ENG-220: this candidate's RAM cost must include the KV that will not
+    # fit on THIS device, plus its host overhead. `estimate_model_ram_gb` alone
+    # returns 0.0 for a fully-offloaded GPU brain, so asking "does adding a
+    # second brain exhaust system RAM?" always answered "no" regardless of how
+    # much memory the pair actually needed.
+    cand_ram = brain_ram_footprint_gb(
+        model, gl, ctx,
+        device_vram_gb=(getattr(device, "memory_gb", None) if is_gpu else None),
+        weights_gb=w, n_layer=nl, kv_gb=kv)
 
     # Fail closed on an unknown footprint.
     if cand_ram is None or (is_gpu and cand_vram is None):

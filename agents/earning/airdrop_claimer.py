@@ -146,6 +146,28 @@ class AirdropClaimer:
             self.failed.append(airdrop.id)
             return plan
 
+        # ARCH-ENG-217: ENFORCE `gas_exceeds_value`.
+        #
+        # `plan()` has always computed this flag -- `gas_exceeds_value(gas,
+        # expected)` -- and shown it to the human in the plan. But
+        # `safe_to_claim` comes from `is_safe_to_claim(airdrop)`, which is a
+        # risk/KYC/dedup heuristic that knows nothing about gas. So the flag
+        # was computed, displayed, approved by a human reading it, and then
+        # ignored: a $0.25 airdrop costing $40 of gas would proceed to a real
+        # on-chain transaction destroying the value it claims to collect.
+        #
+        # The confirmation callback is a human gate, not an economic one. Being
+        # SHOWN a cost that exceeds the payout does not make spending it correct,
+        # and the flag existed precisely to express that judgement -- it just
+        # never reached the decision.
+        #
+        # Failing closed: an unprofitable claim is never worth a network action,
+        # and if the gas model is ever wrong the safe direction is to skip the
+        # claim rather than spend real money discovering it was not.
+        if plan.gas_exceeds_value:
+            self.failed.append(airdrop.id)
+            return plan
+
         # Resolve the actual action URL only now (post-confirmation): a malicious
         # claim_url is never fetched until a human has explicitly approved the plan.
         before_bal = read_balance(wallet_manager, wallet_name) if wallet_manager else None

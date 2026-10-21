@@ -12,8 +12,11 @@ Covers the adopt-existing-listener pre-flight and the conditional stop():
 import os
 import sys
 import threading
+from pathlib import Path
 
-os.chdir(r'D:/MrBot1000_2.0')
+# ARCH-ENG-151: the repo root is derived from THIS file, never hardcoded — a
+# literal path made the suite import the LIVE repo's modules under a clone.
+os.chdir(str(Path(__file__).resolve().parents[2]))
 
 import pytest
 

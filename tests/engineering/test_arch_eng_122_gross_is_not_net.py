@@ -15,7 +15,8 @@ recorded and confidence is reduced.
 import sys
 import unittest
 
-sys.path.insert(0, r"D:\MrBot1000_2.0")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agents.earning.opportunity_intelligence import (
     OpportunityIntelligenceEngine, SemanticEstimate,

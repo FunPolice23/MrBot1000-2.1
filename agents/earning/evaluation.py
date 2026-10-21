@@ -173,7 +173,12 @@ def evaluate_opportunity(
             "python", "ai", "data", "write", "content",
             "code", "dev", "review", "test",
         ]
-        matched = sum(1 for skill in skills if skill in title_desc)
+        # ARCH-ENG-263 (AX-03): the same substring defect as AU-01. "ai" in
+        # "email" and "data" in "metadata" credited skills the posting never
+        # named, inflating skill_match exactly when the LLM path had failed
+        # and this heuristic was all that was left.
+        matched = sum(1 for skill in skills
+                      if re.search(r"\b" + re.escape(skill) + r"\b", title_desc))
         opportunity.skill_match = min(
             1.0, base_skill + (matched / len(skills)) * 0.5
         )
